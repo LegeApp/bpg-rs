@@ -5,7 +5,7 @@
 //!
 //! Ported from the still-image (`!animated`, no-alpha) path of
 //! `bpg_encoder_encode` in `libbpg-0.9.8/bpgenc.c:2360-2601`. Alpha,
-//! animation, >8-bit and lossless are `TODO(extension)`.
+//! animation, and lossless are `TODO(extension)`. 8/10/12-bit are supported.
 
 use bpg_format::{BpgHeader, ColorSpaceCode, PixelFormat};
 use bpg_hevc::{build_modified_hevc, HevcError};
@@ -22,7 +22,8 @@ pub struct HevcEncodeParams {
     pub height: u32,
     /// HEVC chroma_format_idc (0=gray,1=420,2=422,3=444).
     pub chroma_format: ChromaFormat,
-    /// 8 for the M1 path. TODO(extension): 10/12-bit.
+    /// 8, 10, or 12. The backend must select an x265 build supporting this
+    /// depth (see `bpg-x265-sys`'s multilib build for 10/12-bit).
     pub bit_depth: u8,
     /// Quantizer, 0-51 (CQP rate-control mode).
     pub qp: u8,
@@ -96,8 +97,8 @@ pub fn encode_still_image(
     qp: u8,
     compress_level: u8,
 ) -> Result<Vec<u8>, EncodeError> {
-    if image.bit_depth != 8 {
-        return Err(EncodeError::Unsupported("only 8-bit input (M1)"));
+    if ![8, 10, 12].contains(&image.bit_depth) {
+        return Err(EncodeError::Unsupported("bit depth must be 8, 10, or 12"));
     }
     if image.has_alpha {
         return Err(EncodeError::Unsupported("alpha not supported (M1)"));

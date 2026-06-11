@@ -11,13 +11,13 @@ fn round_up(v: u32, cb_size: u32) -> u32 {
 /// Pad a single plane so its width/height become `(w1, h1)`, replicating the
 /// right/bottom edge samples. `(w1, h1)` must be >= the plane's current
 /// dimensions.
-pub fn pad_plane(plane: &Plane<u8>, w1: u32, h1: u32) -> Plane<u8> {
+pub fn pad_plane<T: Copy + Default>(plane: &Plane<T>, w1: u32, h1: u32) -> Plane<T> {
     let c_w = plane.width as usize;
     let c_h = plane.height as usize;
     let c_w1 = w1 as usize;
     let c_h1 = h1 as usize;
 
-    let mut data = vec![0u8; c_w1 * c_h1];
+    let mut data = vec![T::default(); c_w1 * c_h1];
 
     // Copy existing rows and pad horizontally.
     for y in 0..c_h {

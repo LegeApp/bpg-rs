@@ -160,9 +160,24 @@ unsafe fn encode_impl(
         param_free(p);
         return Err(macro_err("image has too few planes for chroma format"));
     }
-    for i in 0..c_count {
-        (*pic).planes[i] = image.planes[i].data.as_ptr() as *mut c_void;
-        (*pic).stride[i] = image.planes[i].stride as c_int;
+    // `Image` always stores samples as `u16` (matching `bpgenc.c`'s internal
+    // `PIXEL = uint16_t`). x265's 8-bit build expects 1-byte `uint8_t`
+    // samples (mirroring `image_convert16to8`); 10/12-bit builds expect
+    // 2-byte `uint16_t` samples directly, with `stride` in bytes.
+    let mut u8_planes: Vec<Vec<u8>> = Vec::new();
+    if image.bit_depth == 8 {
+        for i in 0..c_count {
+            u8_planes.push(image.planes[i].data.iter().map(|&v| v as u8).collect());
+        }
+        for i in 0..c_count {
+            (*pic).planes[i] = u8_planes[i].as_ptr() as *mut c_void;
+            (*pic).stride[i] = image.planes[i].stride as c_int;
+        }
+    } else {
+        for i in 0..c_count {
+            (*pic).planes[i] = image.planes[i].data.as_ptr() as *mut c_void;
+            (*pic).stride[i] = (image.planes[i].stride * 2) as c_int;
+        }
     }
     (*pic).bitDepth = image.bit_depth as c_int;
 

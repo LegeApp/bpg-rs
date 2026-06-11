@@ -88,15 +88,17 @@ impl ColorConvertState {
         }
     }
 
-    /// Convert one 8-bit RGB triple to (Y, Cb, Cr).
-    pub fn rgb_to_ycc(&self, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
-        let (r, g, b) = (r as i64, g as i64, b as i64);
+    /// Convert one RGB triple (`in_bit_depth`-wide samples) to (Y, Cb, Cr)
+    /// (`out_bit_depth`-wide samples, returned widened to `u16` so callers
+    /// don't need to special-case 8 vs 10/12-bit storage).
+    pub fn rgb_to_ycc<P: Into<i64>>(&self, r: P, g: P, b: P) -> (u16, u16, u16) {
+        let (r, g, b) = (r.into(), g.into(), b.into());
         let [c0, c1, c2, c3, c4, c5, c6, c7, c8] = self.coeffs;
         let shift = self.c_shift;
         let y = clamp_pix((c0 * r + c1 * g + c2 * b + self.y_offset) >> shift, self.pixel_max);
         let cb = clamp_pix(((c3 * r + c4 * g + c5 * b + self.c_rnd) >> shift) + self.c_center, self.pixel_max);
         let cr = clamp_pix(((c6 * r + c7 * g + c8 * b + self.c_rnd) >> shift) + self.c_center, self.pixel_max);
-        (y as u8, cb as u8, cr as u8)
+        (y as u16, cb as u16, cr as u16)
     }
 }
 
@@ -107,7 +109,7 @@ mod tests {
     #[test]
     fn ycbcr_full_range_known_values() {
         let cvt = ColorConvertState::new(8, 8, ColorSpace::YCbCr, false);
-        let cases: [((u8, u8, u8), (u8, u8, u8)); 7] = [
+        let cases: [((u8, u8, u8), (u16, u16, u16)); 7] = [
             ((0, 0, 0), (0, 128, 128)),
             ((255, 255, 255), (255, 128, 128)),
             ((255, 0, 0), (76, 85, 255)),
@@ -124,7 +126,7 @@ mod tests {
     #[test]
     fn ycbcr_limited_range_known_values() {
         let cvt = ColorConvertState::new(8, 8, ColorSpace::YCbCr, true);
-        let cases: [((u8, u8, u8), (u8, u8, u8)); 7] = [
+        let cases: [((u8, u8, u8), (u16, u16, u16)); 7] = [
             ((0, 0, 0), (16, 128, 128)),
             ((255, 255, 255), (235, 128, 128)),
             ((255, 0, 0), (81, 90, 240)),
@@ -136,5 +138,14 @@ mod tests {
         for ((r, g, b), expected) in cases {
             assert_eq!(cvt.rgb_to_ycc(r, g, b), expected, "rgb=({r},{g},{b})");
         }
+    }
+
+    #[test]
+    fn ycbcr_10bit_output_scales_up() {
+        // 8-bit input -> 10-bit output: full-scale white maps to 1023, mid
+        // values scale roughly by 4x relative to the 8-bit table above.
+        let cvt = ColorConvertState::new(8, 10, ColorSpace::YCbCr, false);
+        assert_eq!(cvt.rgb_to_ycc(0u8, 0, 0), (0, 512, 512));
+        assert_eq!(cvt.rgb_to_ycc(255u8, 255, 255), (1023, 512, 512));
     }
 }

@@ -10,6 +10,30 @@
 //! correct but slower encoder, which is fine for M1 (correctness, not speed).
 //! Set `BPG_X265_ENABLE_ASM=1` to re-enable assembly where an assembler is
 //! available.
+//!
+//! ## 10-bit support (multilib build)
+//!
+//! A single x265 build only supports one internal bit depth. To support
+//! 10-bit BPGs alongside the 8-bit path, this build script follows x265's
+//! standard "multilib" recipe (`build/linux/multilib.sh` upstream):
+//!
+//! 1. Build a 10-bit static lib with `HIGH_BIT_DEPTH=ON`, `MAIN12=OFF`,
+//!    `EXPORT_C_API=OFF` (its public symbols land in the `x265_10bit::` C++
+//!    namespace, set via the `X265_NS` macro), into a separate cmake build
+//!    directory, and copy its `libx265.a` out as `libx265_main10.a`.
+//! 2. Build the normal 8-bit static lib with `EXPORT_C_API=ON` (default,
+//!    namespace `x265`), `LINKED_10BIT=ON`, and `EXTRA_LIB` pointing at
+//!    `libx265_main10.a`.
+//!
+//! The main lib's `x265_api_query`/`x265_api_get` (in `encoder/api.cpp`)
+//! dispatch `bitDepth == 10` requests into `x265_10bit::x265_api_query`.
+//! At link time both static libs are passed to the linker in
+//! `-lx265 -lx265_main10` order, which resolves the cross-namespace
+//! references in a single left-to-right pass (the 10-bit lib has no
+//! references back into the main lib).
+//!
+//! Set `BPG_X265_SKIP_10BIT=1` to build only the 8-bit lib (faster
+//! iteration); `bpg-x265` will then only support `bit_depth == 8`.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -21,22 +45,64 @@ fn main() {
         .join("../../../x265_4.1/source")
         .canonicalize()
         .expect("vendored x265 source not found at ../../../x265_4.1/source");
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-env-changed=BPG_X265_ENABLE_ASM");
+    println!("cargo:rerun-if-env-changed=BPG_X265_SKIP_10BIT");
 
     let enable_asm = env::var("BPG_X265_ENABLE_ASM").as_deref() == Ok("1");
+    let skip_10bit = env::var("BPG_X265_SKIP_10BIT").as_deref() == Ok("1");
 
-    // --- Build x265 (static, 8-bit, no CLI) via cmake. ---
-    let dst = cmake::Config::new(&x265_src)
+    // --- Optionally build the 10-bit lib first (EXPORT_C_API=0, namespace
+    // x265_10bit), so its archive can be linked into the main 8-bit build. ---
+    let main10_lib_dir = if !skip_10bit {
+        let dst10 = cmake::Config::new(&x265_src)
+            .out_dir(out_dir.join("x265-10bit"))
+            .define("ENABLE_SHARED", "OFF")
+            .define("ENABLE_CLI", "OFF")
+            .define("ENABLE_ASSEMBLY", if enable_asm { "ON" } else { "OFF" })
+            .define("ENABLE_TESTS", "OFF")
+            .define("CMAKE_BUILD_TYPE", "Release")
+            .define("HIGH_BIT_DEPTH", "ON")
+            .define("MAIN12", "OFF")
+            .define("EXPORT_C_API", "OFF")
+            .build_target("x265-static")
+            .build();
+        let build_dir10 = dst10.join("build");
+
+        let main10_lib_dir = out_dir.join("x265-main10-lib");
+        std::fs::create_dir_all(&main10_lib_dir).expect("failed to create main10 lib dir");
+        std::fs::copy(
+            build_dir10.join("libx265.a"),
+            main10_lib_dir.join("libx265_main10.a"),
+        )
+        .expect("failed to copy 10-bit libx265.a to libx265_main10.a");
+        Some(main10_lib_dir)
+    } else {
+        None
+    };
+
+    // --- Build the main x265 lib (8-bit, EXPORT_C_API=1, no CLI) via cmake,
+    // linking in the 10-bit lib if present. ---
+    let mut main_cfg = cmake::Config::new(&x265_src);
+    main_cfg
         .define("ENABLE_SHARED", "OFF")
         .define("ENABLE_CLI", "OFF")
         .define("ENABLE_ASSEMBLY", if enable_asm { "ON" } else { "OFF" })
         .define("ENABLE_TESTS", "OFF")
         .define("CMAKE_BUILD_TYPE", "Release")
-        .build_target("x265-static")
-        .build();
+        .build_target("x265-static");
+    if let Some(main10_lib_dir) = &main10_lib_dir {
+        main_cfg
+            .define(
+                "EXTRA_LIB",
+                main10_lib_dir.join("libx265_main10.a").to_str().unwrap(),
+            )
+            .define("LINKED_10BIT", "ON");
+    }
+    let dst = main_cfg.build();
 
     // cmake-rs builds into <dst>/build; the static lib and generated
     // x265_config.h both land there.
@@ -46,6 +112,10 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}", build_dir.display());
     println!("cargo:rustc-link-lib=static=x265");
+    if let Some(main10_lib_dir) = &main10_lib_dir {
+        println!("cargo:rustc-link-search=native={}", main10_lib_dir.display());
+        println!("cargo:rustc-link-lib=static=x265_main10");
+    }
     // x265 is C++ and uses pthreads / libm / libdl.
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=pthread");
@@ -66,7 +136,7 @@ fn main() {
         .generate()
         .expect("bindgen failed to generate x265 bindings");
 
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
+    let out_path = out_dir.join("bindings.rs");
     bindings
         .write_to_file(&out_path)
         .expect("failed to write bindings.rs");
