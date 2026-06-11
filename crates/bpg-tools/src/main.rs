@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use bpg_encode::encode_still_image;
+use bpg_encode::{encode_still_image, EncoderTuning};
 use bpg_image::{ColorSpace, Image};
 use bpg_x265::X265Encoder;
 
@@ -122,7 +122,16 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let backend = X265Encoder::new();
-    let bpg = encode_still_image(image, &backend, args.qp, args.compress_level)?;
+    // M1 CLI uses the neutral tune (x265 --tune ssim, no overrides), which
+    // reproduces the byte-for-byte-identical-to-C-reference output. The
+    // tuning system (bpg-tune) will supply a richer EncoderTuning here later.
+    let bpg = encode_still_image(
+        image,
+        &backend,
+        args.qp,
+        args.compress_level,
+        EncoderTuning::neutral(),
+    )?;
 
     std::fs::write(&args.output, &bpg)?;
     eprintln!(
