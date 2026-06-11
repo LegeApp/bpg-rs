@@ -1,0 +1,20 @@
+# Rust build artifacts
+/bpg-rs/target/
+
+# libbpg-0.9.8 build artifacts (rebuildable via `make`)
+libbpg-0.9.8/**/*.o
+libbpg-0.9.8/**/*.d
+libbpg-0.9.8/**/*.a
+libbpg-0.9.8/bpgenc
+libbpg-0.9.8/bpgdec
+libbpg-0.9.8/bpgview
+libbpg-0.9.8/*.exe
+libbpg-0.9.8/*.lib
+libbpg-0.9.8/*.zip
+libbpg-0.9.8/obj_dll/
+libbpg-0.9.8/x265.out/
+libbpg-0.9.8/x265/build/
+
+# misc
+*.swp
+.claude/

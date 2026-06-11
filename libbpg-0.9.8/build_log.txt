@@ -1,0 +1,32 @@
+========================================
+Building BPG Native Library with JCTVC
+========================================
+
+========================================
+Step 1: Compiling JCTVC TLibCommon
+========================================
+Compiling ContextModel.cpp...
+In file included from <command-line>:
+./gcc15_time_fix.h:28:9: error: 'clock_t' has not been declared in '::'
+   28 | using ::clock_t;
+      |         ^~~~~~~
+./gcc15_time_fix.h:30:9: error: 'tm' has not been declared in '::'
+   30 | using ::tm;
+      |         ^~
+./gcc15_time_fix.h:33:5: error: 'clock_t' does not name a type
+   33 |     clock_t clock(void);
+      |     ^~~~~~~
+./gcc15_time_fix.h:13:1: note: 'clock_t' is defined in header '<ctime>'; this is probably fixable by adding '#include <ctime>'
+   12 | #include <time.h>
+  +++ |+#include <ctime>
+   13 | 
+
+========================================
+Build FAILED!
+========================================
+Check the error messages above.
+
+Common issues:
+  - Missing MinGW/MSYS2 g++ compiler
+  - Missing C++ headers
+  - Syntax errors in JCTVC source

@@ -1,0 +1,12 @@
+{'name': 'x265_q24_420_m9', 'encoder': 'x265', 'qp': 24, 'cfmt': '420', 'm': 9, 'extra': '', 'size_bytes': 1360171, 'enc_time_s': 2.03, 'psnr': 43.822635, 'ssim': 0.992456}
+{'name': 'jctvc_q24_420_m9', 'encoder': 'jctvc', 'qp': 24, 'cfmt': '420', 'm': 9, 'extra': '', 'size_bytes': 1161897, 'enc_time_s': 56.448, 'psnr': 41.909782, 'ssim': 0.989427}
+{'name': 'x265_q32_420_m9', 'encoder': 'x265', 'qp': 32, 'cfmt': '420', 'm': 9, 'extra': '', 'size_bytes': 905711, 'enc_time_s': 1.571, 'psnr': 37.626204, 'ssim': 0.973537}
+{'name': 'jctvc_q32_420_m9', 'encoder': 'jctvc', 'qp': 32, 'cfmt': '420', 'm': 9, 'extra': '', 'size_bytes': 773494, 'enc_time_s': 44.406, 'psnr': 36.07133, 'ssim': 0.962919}
+{'name': 'x265_q40_420_m9', 'encoder': 'x265', 'qp': 40, 'cfmt': '420', 'm': 9, 'extra': '', 'size_bytes': 484155, 'enc_time_s': 1.299, 'psnr': 31.336704, 'ssim': 0.873526}
+{'name': 'jctvc_q40_420_m9', 'encoder': 'jctvc', 'qp': 40, 'cfmt': '420', 'm': 9, 'extra': '', 'size_bytes': 319434, 'enc_time_s': 44.573, 'psnr': 28.821392, 'ssim': 0.794266}
+{'name': 'x265_q24_444', 'encoder': 'x265', 'qp': 24, 'cfmt': '444', 'm': None, 'extra': '', 'size_bytes': 1430821, 'enc_time_s': 1.808, 'psnr': 45.686976, 'ssim': 0.994611}
+{'name': 'jctvc_q24_444', 'encoder': 'jctvc', 'qp': 24, 'cfmt': '444', 'm': None, 'extra': '', 'size_bytes': 1229864, 'enc_time_s': 69.255, 'psnr': 43.775505, 'ssim': 0.99229}
+{'name': 'x265_q32_444', 'encoder': 'x265', 'qp': 32, 'cfmt': '444', 'm': None, 'extra': '', 'size_bytes': 957758, 'enc_time_s': 1.636, 'psnr': 39.182303, 'ssim': 0.978267}
+{'name': 'jctvc_q32_444', 'encoder': 'jctvc', 'qp': 32, 'cfmt': '444', 'm': None, 'extra': '', 'size_bytes': 809494, 'enc_time_s': 64.003, 'psnr': 37.231166, 'ssim': 0.967374}
+{'name': 'x265_q40_444', 'encoder': 'x265', 'qp': 40, 'cfmt': '444', 'm': None, 'extra': '', 'size_bytes': 496210, 'enc_time_s': 1.282, 'psnr': 31.728664, 'ssim': 0.876461}
+{'name': 'jctvc_q40_444', 'encoder': 'jctvc', 'qp': 40, 'cfmt': '444', 'm': None, 'extra': '', 'size_bytes': 324395, 'enc_time_s': 55.794, 'psnr': 28.940135, 'ssim': 0.795216}

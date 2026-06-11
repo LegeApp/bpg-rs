@@ -1,0 +1,312 @@
+# libbpg Makefile
+# 
+# Compile options:
+#
+# Enable compilation of Javascript decoder with Emscripten
+#USE_EMCC=y
+# Enable x265 for better performance
+USE_X265=y
+# Use system x265 library
+CONFIG_SYSTEM_X265=1
+# Enable JCTVC code (using both x265 and JCTVC)
+USE_JCTVC=y
+# Compile bpgview (SDL and SDL_image libraries needed)
+#USE_BPGVIEW=y
+# Enable it to use bit depths > 12 (need more tests to validate encoder)
+#USE_JCTVC_HIGH_BIT_DEPTH=y
+# Uncomment to enable the OpenGL based BPG viewer application (needs SDL and OpenGL)
+# CONFIG_VIEW=1
+# Enable for compilation on MacOS X
+#CONFIG_APPLE=y
+# Installation prefix
+prefix=/usr/local
+
+
+#################################
+
+ifdef CONFIG_WIN32
+CROSS_PREFIX:=x86_64-w64-mingw32-
+#CROSS_PREFIX=i686-w64-mingw32-
+EXE:=.exe
+else
+CROSS_PREFIX:=
+EXE:=
+endif
+
+CC=$(CROSS_PREFIX)gcc
+CXX=$(CROSS_PREFIX)g++
+AR=$(CROSS_PREFIX)ar
+EMCC=emcc
+
+PWD:=$(shell pwd)
+
+CFLAGS:=-Os -Wall -MMD -pipe -fno-asynchronous-unwind-tables -fdata-sections -ffunction-sections -fno-math-errno -fno-signed-zeros -fno-tree-vectorize -fomit-frame-pointer
+CFLAGS+=-D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -D_REENTRANT
+CFLAGS+=-I.
+CFLAGS+=-DCONFIG_BPG_VERSION=\"$(shell cat VERSION)\"
+ifdef USE_JCTVC_HIGH_BIT_DEPTH
+CFLAGS+=-DRExt__HIGH_BIT_DEPTH_SUPPORT
+endif
+
+# Emscriptem config
+EMLDFLAGS:=-s "EXPORTED_FUNCTIONS=['_bpg_decoder_open','_bpg_decoder_decode','_bpg_decoder_get_info','_bpg_decoder_start','_bpg_decoder_get_frame_duration','_bpg_decoder_get_line','_bpg_decoder_close','_malloc','_free']"
+EMLDFLAGS+=-s NO_FILESYSTEM=1 -s NO_BROWSER=1
+#EMLDFLAGS+=-O1 --pre-js pre.js --post-js post.js
+# Note: the closure compiler is disabled because it adds unwanted global symbols
+EMLDFLAGS+=-O3 --memory-init-file 0 --closure 0 --pre-js pre.js --post-js post.js
+EMCFLAGS:=$(CFLAGS)
+
+LDFLAGS=-g
+ifdef CONFIG_APPLE
+LDFLAGS+=-Wl,-dead_strip
+else
+LDFLAGS+=-Wl,--gc-sections
+endif
+CFLAGS+=-g
+CXXFLAGS=$(CFLAGS)
+
+PROGS=bpgdec$(EXE) bpgenc$(EXE)
+ifdef USE_BPGVIEW
+PROGS+=bpgview$(EXE)
+endif
+ifdef USE_EMCC
+PROGS+=bpgdec.js bpgdec8.js bpgdec8a.js
+endif
+
+all: $(PROGS) libbpg_native.a
+
+# Target to build only JCTVC encoder
+jctvc: clean
+	$(MAKE) USE_JCTVC=y USE_X265= bpgenc$(EXE)
+
+LIBBPG_OBJS:=$(addprefix libavcodec/, \
+hevc_cabac.o  hevc_filter.o  hevc.o         hevcpred.o  hevc_refs.o\
+hevcdsp.o     hevc_mvs.o     hevc_ps.o   hevc_sei.o\
+utils.o cabac.o golomb.o videodsp.o )
+LIBBPG_OBJS+=$(addprefix libavutil/, mem.o buffer.o log2_tab.o frame.o pixdesc.o md5.o )
+LIBBPG_OBJS+=libbpg.o
+
+LIBBPG_JS_OBJS:=$(patsubst %.o, %.js.o, $(LIBBPG_OBJS)) tmalloc.js.o
+
+LIBBPG_JS8_OBJS:=$(patsubst %.o, %.js8.o, $(LIBBPG_OBJS)) tmalloc.js8.o
+
+LIBBPG_JS8A_OBJS:=$(patsubst %.o, %.js8a.o, $(LIBBPG_OBJS)) tmalloc.js8a.o
+
+$(LIBBPG_OBJS): CFLAGS+=-D_ISOC99_SOURCE -D_POSIX_C_SOURCE=200112 -D_XOPEN_SOURCE=600 -DHAVE_AV_CONFIG_H -std=c99 -D_GNU_SOURCE=1 -DUSE_VAR_BIT_DEPTH -DUSE_PRED
+
+$(LIBBPG_JS_OBJS): EMCFLAGS+=-D_ISOC99_SOURCE -D_POSIX_C_SOURCE=200112 -D_XOPEN_SOURCE=600 -DHAVE_AV_CONFIG_H -std=c99 -D_GNU_SOURCE=1 -DUSE_VAR_BIT_DEPTH
+
+$(LIBBPG_JS8_OBJS): EMCFLAGS+=-D_ISOC99_SOURCE -D_POSIX_C_SOURCE=200112 -D_XOPEN_SOURCE=600 -DHAVE_AV_CONFIG_H -std=c99 -D_GNU_SOURCE=1
+
+$(LIBBPG_JS8A_OBJS): EMCFLAGS+=-D_ISOC99_SOURCE -D_POSIX_C_SOURCE=200112 -D_XOPEN_SOURCE=600 -DHAVE_AV_CONFIG_H -std=c99 -D_GNU_SOURCE=1 -DUSE_PRED
+
+BPGENC_OBJS:=bpgenc.o
+BPGENC_LIBS:=
+
+ifdef USE_X265
+CFLAGS+=-DUSE_X265
+ifdef CONFIG_SYSTEM_X265
+# Using system x265
+BPGENC_LIBS+=-lx265
+BPGENC_OBJS+=x265_glue.o
+bpgenc.o: CFLAGS+=-DUSE_X265
+x265_glue.o: CFLAGS+=$(shell pkg-config --cflags x265)
+else
+# Building x265 from source
+X265_LIBS:=./x265.out/8bit/libx265.a ./x265.out/10bit/libx265.a ./x265.out/12bit/libx265.a
+BPGENC_OBJS+=x265_glue.o $(X265_LIBS)
+bpgenc.o: CFLAGS+=-DUSE_X265
+x265_glue.o: CFLAGS+=-I./x265/source -I./x265.out/8bit
+x265_glue.o: $(X265_LIBS)
+endif
+
+ifdef CONFIG_WIN32
+CMAKE_OPTS:=-DCMAKE_TOOLCHAIN_FILE=../../x265/build/msys/toolchain-x86_64-w64-mingw32.cmake
+else
+CMAKE_OPTS:=
+endif
+
+x265.out:
+	mkdir -p x265.out/8bit x265.out/10bit x265.out/12bit
+	cd x265.out/12bit && cmake ../../x265/source $(CMAKE_OPTS) -DHIGH_BIT_DEPTH=ON -DEXPORT_C_API=OFF -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DMAIN12=ON
+	cd x265.out/10bit && cmake ../../x265/source $(CMAKE_OPTS) -DHIGH_BIT_DEPTH=ON -DEXPORT_C_API=OFF -DENABLE_SHARED=OFF -DENABLE_CLI=OFF -DMAIN10=ON
+	cd x265.out/8bit && cmake ../../x265/source $(CMAKE_OPTS) -DLINKED_10BIT=ON -DLINKED_12BIT=ON -DENABLE_SHARED=OFF -DENABLE_CLI=OFF
+
+# use this target to manually rebuild x265
+x265_make: | x265.out
+	$(MAKE) -C x265.out/12bit
+	$(MAKE) -C x265.out/10bit
+	$(MAKE) -C x265.out/8bit
+
+x265_clean:
+	rm -rf x265.out
+
+$(X265_LIBS): x265_make
+
+endif # USE_X265
+
+ifdef USE_JCTVC
+# JCTVC source files
+JCTVC_SRCS := \
+    jctvc/TAppEncCfg.cpp \
+    jctvc/TAppEncTop.cpp \
+    jctvc/program_options_lite.cpp \
+    $(wildcard jctvc/TLibCommon/*.cpp) \
+    $(wildcard jctvc/TLibEncoder/*.cpp) \
+    $(wildcard jctvc/TLibVideoIO/*.cpp) \
+    jctvc/libmd5/libmd5.c
+
+# Convert source files to object files
+JCTVC_OBJS := $(patsubst %.cpp,%.o,$(filter %.cpp,$(JCTVC_SRCS))) \
+              $(patsubst %.c,%.o,$(filter %.c,$(JCTVC_SRCS)))
+
+# JCTVC compiler flags
+JCTVC_CFLAGS := -I$(PWD)/jctvc \
+               -I$(PWD)/jctvc/TLibCommon \
+               -I$(PWD)/jctvc/TLibEncoder \
+               -I$(PWD)/jctvc/TLibVideoIO \
+               -I$(PWD)/jctvc/libmd5
+JCTVC_CFLAGS += -Wno-sign-compare -Wno-unused-parameter -Wno-missing-field-initializers \
+                -Wno-misleading-indentation -Wno-class-memaccess
+JCTVC_CFLAGS += -DMSYS_PROJECT -D_MSYS2 -D_CRT_SECURE_NO_DEPRECATE -D_CRT_SECURE_NO_WARNINGS \
+                -D_CRT_NONSTDC_NO_WARNINGS -D_WIN32_WINNT=0x0600 -DUSE_JCTVC -D_ISOC99_SOURCE -D_GNU_SOURCE \
+                -DHAVE_STRING_H -DHAVE_STDINT_H -DHAVE_INTTYPES_H -DHAVE_MALLOC_H -D__STDC_LIMIT_MACROS
+
+# Add to global CFLAGS
+CFLAGS += $(JCTVC_CFLAGS)
+CXXFLAGS += $(JCTVC_CFLAGS) -std=c++11
+
+# Compile JCTVC C++ source files
+%.o: %.cpp
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Compile JCTVC C source files
+%.o: %.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Build JCTVC static library
+jctvc/libjctvc.a: $(JCTVC_OBJS)
+	@mkdir -p jctvc
+	$(AR) rcs $@ $^
+
+# Add JCTVC to build
+BPGENC_OBJS += jctvc_glue.o jctvc/libjctvc.a
+BPGENC_LIBS += -lstdc++ -lpthread -lrt -lm
+
+# Special rules for jctvc_glue.o and bpgenc.o
+jctvc_glue.o: jctvc_glue.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+bpgenc.o: CFLAGS += -DUSE_JCTVC
+
+# Clean target
+jctvc_clean:
+	rm -f $(JCTVC_OBJS) jctvc/libjctvc.a
+
+clean: jctvc_clean
+
+endif # USE_JCTVC
+
+
+ifdef CONFIG_WIN32
+
+BPGDEC_LIBS:=-lpng -lz
+BPGENC_LIBS+=-lpng -ljpeg -lz
+BPGVIEW_LIBS:=-lmingw32 -lSDLmain -lSDL_image -lSDL -mwindows
+
+else
+
+ifdef CONFIG_APPLE
+LIBS:=
+else
+ifneq (,$(findstring MINGW,$(shell uname -s)))
+LIBS:=
+else ifneq (,$(findstring MSYS,$(shell uname -s)))
+LIBS:=
+else
+LIBS:=-lrt
+endif
+endif # !CONFIG_APPLE
+LIBS+=-lm -lpthread
+
+BPGDEC_LIBS:=-lpng $(LIBS)
+BPGENC_LIBS+=-lpng -ljpeg $(LIBS)
+BPGVIEW_LIBS:=-lSDL_image -lSDL $(LIBS)
+
+endif #!CONFIG_WIN32
+
+bpgenc.o: CFLAGS+=-Wno-unused-but-set-variable
+
+libbpg.a: $(LIBBPG_OBJS)
+	$(AR) rcs $@ $^
+
+# Native library for FFI: decoder + in-memory encoder + API
+bpgenc_lib.o: bpgenc.c
+	$(CC) $(CFLAGS) -UUSE_JCTVC -DBPG_ENCODER_LIB -DUSE_X265 -Wno-unused-but-set-variable -Wno-unused-function $(shell pkg-config --cflags x265 2>/dev/null) -c -o $@ $<
+
+bpg_api.o: bpg_api.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+libbpg_native.a: $(LIBBPG_OBJS) bpgenc_lib.o x265_glue.o bpg_api.o
+	$(AR) rcs $@ $^
+
+bpgdec$(EXE): bpgdec.o libbpg.a
+	$(CC) $(LDFLAGS) -o $@ $^ $(BPGDEC_LIBS)
+
+bpgenc$(EXE): $(BPGENC_OBJS)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(BPGENC_LIBS)
+
+bpgview$(EXE): bpgview.o libbpg.a
+	$(CC) $(LDFLAGS) -o $@ $^ $(BPGVIEW_LIBS)
+
+bpgdec.js: $(LIBBPG_JS_OBJS) post.js
+	$(EMCC) $(EMLDFLAGS) -s TOTAL_MEMORY=33554432 -o $@ $(LIBBPG_JS_OBJS)
+
+bpgdec8.js: $(LIBBPG_JS8_OBJS) post.js
+	$(EMCC) $(EMLDFLAGS) -s TOTAL_MEMORY=33554432 -o $@ $(LIBBPG_JS8_OBJS)
+
+bpgdec8a.js: $(LIBBPG_JS8A_OBJS) post.js
+	$(EMCC) $(EMLDFLAGS) -s TOTAL_MEMORY=33554432 -o $@ $(LIBBPG_JS8A_OBJS)
+
+size:
+	strip bpgdec
+	size bpgdec libbpg.o libavcodec/*.o libavutil/*.o | sort -n
+	gzip < bpgdec | wc
+
+install: bpgenc bpgdec
+	install -s -m 755 $^ $(prefix)/bin
+
+CLEAN_DIRS=doc html libavcodec libavutil \
+     jctvc jctvc/TLibEncoder jctvc/TLibVideoIO jctvc/TLibCommon jctvc/libmd5
+
+clean: x265_clean
+	rm -f $(PROGS) *.o *.a *.d *~ $(addsuffix /*.o, $(CLEAN_DIRS)) \
+          $(addsuffix /*.d, $(CLEAN_DIRS)) $(addsuffix /*~, $(CLEAN_DIRS)) \
+          $(addsuffix /*.a, $(CLEAN_DIRS))
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c -o $@ $<
+
+%.js.o: %.c
+	$(EMCC) $(EMCFLAGS) -c -o $@ $<
+
+%.js8.o: %.c
+	$(EMCC) $(EMCFLAGS) -c -o $@ $<
+
+%.js8a.o: %.c
+	$(EMCC) $(EMCFLAGS) -c -o $@ $<
+
+-include $(wildcard *.d)
+-include $(wildcard libavcodec/*.d)
+-include $(wildcard libavutil/*.d)
+-include $(wildcard jctvc/*.d)
+-include $(wildcard jctvc/TLibEncoder/*.d)
+-include $(wildcard jctvc/TLibVideoIO/*.d)
+-include $(wildcard jctvc/TLibCommon/*.d)
+-include $(wildcard jctvc/libmd5/*.d)
+

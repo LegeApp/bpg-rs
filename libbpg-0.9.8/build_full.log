@@ -1,0 +1,151 @@
+========================================
+Building BPG Native Library with JCTVC
+========================================
+
+========================================
+Step 1: Compiling JCTVC TLibCommon
+========================================
+Compiling ContextModel.cpp...
+Compiling ContextModel3DBuffer.cpp...
+Compiling Debug.cpp...
+Compiling SEI.cpp...
+Compiling TComBitStream.cpp...
+Compiling TComCABACTables.cpp...
+Compiling TComChromaFormat.cpp...
+Compiling TComDataCU.cpp...
+Compiling TComInterpolationFilter.cpp...
+Compiling TComLoopFilter.cpp...
+jctvc\TLibCommon\TComLoopFilter.cpp: In member function 'Void TComLoopFilter::xDeblockCU(TComDataCU*, UInt, UInt, DeblockEdgeDir)':
+jctvc\TLibCommon\TComLoopFilter.cpp:208:34: warning: array subscript [0, 1] is outside array bounds of 'Bool* [2]' {aka 'bool* [2]'} [-Warray-bounds=]
+  208 |     if ( m_aapbEdgeFilter[edgeDir][uiPartIdx] && uiBSCheck )
+      |          ~~~~~~~~~~~~~~~~~~~~~~~~^
+In file included from jctvc\TLibCommon\TComLoopFilter.cpp:38:
+jctvc\TLibCommon\TComLoopFilter.h:60:13: note: while referencing 'TComLoopFilter::m_aapbEdgeFilter'
+   60 |   Bool*     m_aapbEdgeFilter[NUM_EDGE_DIR];
+      |             ^~~~~~~~~~~~~~~~
+jctvc\TLibCommon\TComLoopFilter.cpp: In function 'Void TComLoopFilter::xDeblockCU(TComDataCU*, UInt, UInt, DeblockEdgeDir)':
+jctvc\TLibCommon\TComLoopFilter.cpp:208:34: warning: array subscript [0, 1] is outside array bounds of 'Bool* [2]' {aka 'bool* [2]'} [-Warray-bounds=]
+  208 |     if ( m_aapbEdgeFilter[edgeDir][uiPartIdx] && uiBSCheck )
+      |          ~~~~~~~~~~~~~~~~~~~~~~~~^
+jctvc\TLibCommon\TComLoopFilter.h:60:13: note: while referencing 'TComLoopFilter::m_aapbEdgeFilter'
+   60 |   Bool*     m_aapbEdgeFilter[NUM_EDGE_DIR];
+      |             ^~~~~~~~~~~~~~~~
+Compiling TComMotionInfo.cpp...
+Compiling TComPattern.cpp...
+Compiling TComPic.cpp...
+Compiling TComPicSym.cpp...
+Compiling TComPicYuv.cpp...
+jctvc\TLibCommon\TComPicYuv.cpp: In member function 'Void TComPicYuv::destroy()':
+jctvc\TLibCommon\TComPicYuv.cpp:149:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  149 |     if (m_ctuOffsetInBuffer[chan]) delete[] m_ctuOffsetInBuffer[chan]; m_ctuOffsetInBuffer[chan] = NULL;
+      |     ^~
+jctvc\TLibCommon\TComPicYuv.cpp:149:72: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  149 |     if (m_ctuOffsetInBuffer[chan]) delete[] m_ctuOffsetInBuffer[chan]; m_ctuOffsetInBuffer[chan] = NULL;
+      |                                                                        ^~~~~~~~~~~~~~~~~~~
+jctvc\TLibCommon\TComPicYuv.cpp:150:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  150 |     if (m_subCuOffsetInBuffer[chan]) delete[] m_subCuOffsetInBuffer[chan]; m_subCuOffsetInBuffer[chan] = NULL;
+      |     ^~
+jctvc\TLibCommon\TComPicYuv.cpp:150:76: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  150 |     if (m_subCuOffsetInBuffer[chan]) delete[] m_subCuOffsetInBuffer[chan]; m_subCuOffsetInBuffer[chan] = NULL;
+      |                                                                            ^~~~~~~~~~~~~~~~~~~~~
+Compiling TComPicYuvMD5.cpp...
+Compiling TComPrediction.cpp...
+jctvc\TLibCommon\TComPrediction.cpp: In member function 'Void TComPrediction::xPredIntraPlanar(const Pel*, Int, Pel*, Int, UInt, UInt, ChannelType, ChromaFormat)':
+jctvc\TLibCommon\TComPrediction.cpp:771:42: warning: 'topRow' may be used uninitialized [-Wmaybe-uninitialized]
+  771 |     bottomRow[k]  = bottomLeft - topRow[k];
+      |                                  ~~~~~~~~^
+jctvc\TLibCommon\TComPrediction.cpp:750:34: note: 'topRow' declared here
+  750 |   Int leftColumn[MAX_CU_SIZE+1], topRow[MAX_CU_SIZE+1], bottomRow[MAX_CU_SIZE], rightColumn[MAX_CU_SIZE];
+      |                                  ^~~~~~
+Compiling TComRdCost.cpp...
+Compiling TComRdCostWeightPrediction.cpp...
+Compiling TComRom.cpp...
+Compiling TComSampleAdaptiveOffset.cpp...
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp: In destructor 'virtual TComSampleAdaptiveOffset::~TComSampleAdaptiveOffset()':
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp:119:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  119 |   if (m_signLineBuf1) delete[] m_signLineBuf1; m_signLineBuf1 = NULL;
+      |   ^~
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp:119:48: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  119 |   if (m_signLineBuf1) delete[] m_signLineBuf1; m_signLineBuf1 = NULL;
+      |                                                ^~~~~~~~~~~~~~
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp:120:3: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  120 |   if (m_signLineBuf2) delete[] m_signLineBuf2; m_signLineBuf2 = NULL;
+      |   ^~
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp:120:48: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  120 |   if (m_signLineBuf2) delete[] m_signLineBuf2; m_signLineBuf2 = NULL;
+      |                                                ^~~~~~~~~~~~~~
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp: In member function 'Void TComSampleAdaptiveOffset::offsetBlock(ComponentID, Int, Int*, Pel*, Pel*, Int, Int, Int, Int, Bool, Bool, Bool, Bool, Bool, Bool, Bool, Bool)':
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp:317:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  317 |     if (m_signLineBuf1) delete[] m_signLineBuf1; m_signLineBuf1 = NULL;
+      |     ^~
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp:317:50: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  317 |     if (m_signLineBuf1) delete[] m_signLineBuf1; m_signLineBuf1 = NULL;
+      |                                                  ^~~~~~~~~~~~~~
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp:320:5: warning: this 'if' clause does not guard... [-Wmisleading-indentation]
+  320 |     if (m_signLineBuf2) delete[] m_signLineBuf2; m_signLineBuf2 = NULL;
+      |     ^~
+jctvc\TLibCommon\TComSampleAdaptiveOffset.cpp:320:50: note: ...this statement, but the latter is misleadingly indented as if it were guarded by the 'if'
+  320 |     if (m_signLineBuf2) delete[] m_signLineBuf2; m_signLineBuf2 = NULL;
+      |                                                  ^~~~~~~~~~~~~~
+Compiling TComSlice.cpp...
+Compiling TComTrQuant.cpp...
+Compiling TComTU.cpp...
+Compiling TComWeightPrediction.cpp...
+Compiling TComYuv.cpp...
+
+========================================
+Step 2: Compiling JCTVC TLibEncoder
+========================================
+Compiling NALwrite.cpp...
+Compiling SEIwrite.cpp...
+Compiling SyntaxElementWriter.cpp...
+Compiling TEncAnalyze.cpp...
+Compiling TEncBinCoderCABAC.cpp...
+Compiling TEncBinCoderCABACCounter.cpp...
+Compiling TEncCavlc.cpp...
+jctvc\TLibEncoder\TEncCavlc.cpp: In member function 'virtual Void TEncCavlc::codeSPS(TComSPS*)':
+jctvc\TLibEncoder\TEncCavlc.cpp:547:16: warning: unused variable 'rpsList' [-Wunused-variable]
+  547 |   TComRPSList* rpsList = pcSPS->getRPSList();
+      |                ^~~~~~~
+jctvc\TLibEncoder\TEncCavlc.cpp:548:33: warning: unused variable 'rps' [-Wunused-variable]
+  548 |   TComReferencePictureSet*      rps;
+      |                                 ^~~
+Compiling TEncCu.cpp...
+Compiling TEncEntropy.cpp...
+Compiling TEncGOP.cpp...
+jctvc\TLibEncoder\TEncGOP.cpp: In member function 'Void TEncGOP::compressGOP(Int, Int, TComList<TComPic*>&, TComList<TComPicYuv*>&, std::__cxx11::list<AccessUnit>&, Bool, Bool, InputColourSpaceConversion, Bool)':
+jctvc\TLibEncoder\TEncGOP.cpp:648:5: error: 'clock_t' was not declared in this scope
+  648 |     clock_t iBeforeTime = clock();
+      |     ^~~~~~~
+jctvc\TLibEncoder\TEncGOP.cpp:51:1: note: 'clock_t' is defined in header '<ctime>'; this is probably fixable by adding '#include <ctime>'
+   50 | #include <math.h>
+  +++ |+#include <ctime>
+   51 | 
+jctvc\TLibEncoder\TEncGOP.cpp:1665:32: error: 'clock' was not declared in this scope
+ 1665 |     Double dEncTime = (Double)(clock()-iBeforeTime) / CLOCKS_PER_SEC;
+      |                                ^~~~~
+jctvc\TLibEncoder\TEncGOP.cpp:1665:32: note: 'clock' is defined in header '<ctime>'; this is probably fixable by adding '#include <ctime>'
+jctvc\TLibEncoder\TEncGOP.cpp:1665:40: error: 'iBeforeTime' was not declared in this scope
+ 1665 |     Double dEncTime = (Double)(clock()-iBeforeTime) / CLOCKS_PER_SEC;
+      |                                        ^~~~~~~~~~~
+jctvc\TLibEncoder\TEncGOP.cpp:1665:55: error: 'CLOCKS_PER_SEC' was not declared in this scope
+ 1665 |     Double dEncTime = (Double)(clock()-iBeforeTime) / CLOCKS_PER_SEC;
+      |                                                       ^~~~~~~~~~~~~~
+jctvc\TLibEncoder\TEncGOP.cpp:1722:86: warning: 'std::mem_fun_t<_Ret, _Tp> std::mem_fun(_Ret (_Tp::*)()) [with _Ret = bool; _Tp = NALUnit]' is deprecated: use 'std::mem_fn' instead [-Wdeprecated-declarations]
+ 1722 |       AccessUnit::iterator it = find_if(accessUnit.begin(), accessUnit.end(), mem_fun(&NALUnit::isSlice));
+      |                                                                               ~~~~~~~^~~~~~~~~~~~~~~~~~~
+In file included from C:/msys64/mingw64/include/c++/15.2.0/functional:51,
+                 from jctvc\TLibEncoder\TEncGOP.cpp:40:
+C:/msys64/mingw64/include/c++/15.2.0/bits/stl_function.h:1368:5: note: declared here
+ 1368 |     mem_fun(_Ret (_Tp::*__f)())
+      |     ^~~~~~~
+
+========================================
+Build FAILED!
+========================================
+Check the error messages above.
+
+Common issues:
+  - Missing MinGW/MSYS2 g++ compiler
+  - Missing C++ headers
+  - Syntax errors in JCTVC source

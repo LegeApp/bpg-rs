@@ -1,0 +1,14 @@
+{'name': 'x265_q20_420', 'encoder': 'x265', 'qp': 20, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 1691122, 'enc_time_s': 1.49, 'psnr': 46.248516, 'ssim': 0.995217}
+{'name': 'jctvc_q20_420', 'encoder': 'jctvc', 'qp': 20, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 1433150, 'enc_time_s': 50.579, 'psnr': 44.625747, 'ssim': 0.993396}
+{'name': 'x265_q24_420', 'encoder': 'x265', 'qp': 24, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 1360088, 'enc_time_s': 1.426, 'psnr': 43.815588, 'ssim': 0.99246}
+{'name': 'jctvc_q24_420', 'encoder': 'jctvc', 'qp': 24, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 1162659, 'enc_time_s': 50.836, 'psnr': 41.932601, 'ssim': 0.989459}
+{'name': 'x265_q28_420', 'encoder': 'x265', 'qp': 28, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 1099698, 'enc_time_s': 1.368, 'psnr': 40.668375, 'ssim': 0.985343}
+{'name': 'jctvc_q28_420', 'encoder': 'jctvc', 'qp': 28, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 950866, 'enc_time_s': 54.2, 'psnr': 38.788186, 'ssim': 0.979797}
+{'name': 'x265_q32_420', 'encoder': 'x265', 'qp': 32, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 905035, 'enc_time_s': 1.514, 'psnr': 37.623117, 'ssim': 0.973526}
+{'name': 'jctvc_q32_420', 'encoder': 'jctvc', 'qp': 32, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 774238, 'enc_time_s': 51.951, 'psnr': 36.082347, 'ssim': 0.963039}
+{'name': 'x265_q36_420', 'encoder': 'x265', 'qp': 36, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 719585, 'enc_time_s': 1.405, 'psnr': 34.875957, 'ssim': 0.950562}
+{'name': 'jctvc_q36_420', 'encoder': 'jctvc', 'qp': 36, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 571609, 'enc_time_s': 47.506, 'psnr': 32.725848, 'ssim': 0.912168}
+{'name': 'x265_q40_420', 'encoder': 'x265', 'qp': 40, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 484478, 'enc_time_s': 1.14, 'psnr': 31.333258, 'ssim': 0.873817}
+{'name': 'jctvc_q40_420', 'encoder': 'jctvc', 'qp': 40, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 319896, 'enc_time_s': 45.81, 'psnr': 28.8213, 'ssim': 0.794161}
+{'name': 'x265_q44_420', 'encoder': 'x265', 'qp': 44, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 251260, 'enc_time_s': 0.984, 'psnr': 27.644186, 'ssim': 0.744667}
+{'name': 'jctvc_q44_420', 'encoder': 'jctvc', 'qp': 44, 'cfmt': '420', 'm': None, 'extra': '', 'size_bytes': 159529, 'enc_time_s': 38.26, 'psnr': 25.988166, 'ssim': 0.661553}
