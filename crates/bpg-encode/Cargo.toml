@@ -1,0 +1,10 @@
+[package]
+name = "bpg-encode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bpg-image = { path = "../bpg-image" }
+bpg-format = { path = "../bpg-format" }
+bpg-hevc = { path = "../bpg-hevc" }

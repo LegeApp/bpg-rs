@@ -1,0 +1,8 @@
+[package]
+name = "bpg-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bpg-bitstream = { path = "../bpg-bitstream" }
