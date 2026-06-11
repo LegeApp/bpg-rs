@@ -546,3 +546,49 @@ should target "did bpg-rs pick the *conservative, appropriate* tune for this
 source" (agreement with a human's source-character judgment), not "which
 params produced the smallest file at a given PSNR" — the latter reproduces
 the metric-chasing problem the tuning system is meant to avoid.
+
+## Progress update (4:2:2 chroma support)
+
+**4:2:2 chroma is implemented**, per the reprioritization above.
+
+- `bpg-image::chroma`: new `decimate_to_422(src: &Plane<u16>, bit_depth: u32)
+  -> Plane<u16>`, ported from `image_ycc444_to_ycc422`/`decimate2_h`/
+  `decimate2p1_simple` (`h_phase == 1` only, matching `decimate_to_420`'s
+  restriction). Unlike `decimate_to_420`'s horizontal pass
+  (`decimate2p1_simple16`, `shift = bit_depth - 7`, no saturation), 4:2:2 is
+  a single horizontal-only pass with a **fixed `shift = 7`** (the DP1 taps
+  sum to `2^7` regardless of bit depth) and saturates to
+  `[0, (1 << bit_depth) - 1]` via `clamp_pix`, exactly mirroring
+  `decimate2p1_simple`. Output plane keeps the source height and halves only
+  the width (`(w+1)/2`).
+- `Image::subsample_to_422(h_phase)` mirrors `subsample_to_420`: asserts
+  4:4:4 input and `h_phase == 1`, decimates planes 1/2, sets
+  `chroma_format = Yuv422`. `plane_shifts` already returned `(1, 0)` for
+  `Yuv422` (h-shift only), so `pad_to_cb_size` needed no changes.
+- `bpg-tools`: `--format` gained a `422` value; `run_encode` now matches on
+  `Format::{Yuv420, Yuv422, Yuv444}` calling `subsample_to_420(1)` /
+  `subsample_to_422(1)` / no-op respectively.
+- `bpg-encode`/`bpg-x265`/`bpg-format`/`bpg-hevc` needed **no changes**:
+  `ChromaFormat::Yuv422` -> `X265_CSP_I422` / `PixelFormat::Yuv422` mappings
+  already existed, and the generic HEVC SPS chroma_format_idc rewrite in
+  `bpg-hevc` only special-cases `chroma_format_idc == 3` (4:4:4 separate
+  planes), so `idc == 2` (4:2:2) flows through unchanged.
+
+**Verification:** `cargo run -p bpg-tools -- encode dusk.png -o out.bpg
+--backend x265 --qp 28 --format 422` produces a 1,132,583-byte `.bpg` with
+header byte 4 = `0x40` (pixel_format = 2 = YUV422, bit_depth_minus_8 = 0).
+Built the C `bpgenc`/`bpgdec` reference (required installing
+`libjpeg-dev`/`libx265-dev`/`ffmpeg` in this environment, since they were
+missing) and ran `bpgenc -e x265 -q 28 -f 422 -o ref422.bpg dusk_rgb.png`
+(system x265 3.5, vs the vendored 4.1 used by bpg-rs) — **the two `.bpg`
+files are byte-for-byte identical** (`cmp` reports no difference), despite
+the x265 version difference. `bpgdec` decodes the bpg-rs output cleanly;
+`ffmpeg` PSNR/SSIM vs `dusk_rgb.png` is ~39.99 dB / 0.9865 SSIM, consistent
+with QP28 4:2:2. The existing 8-bit 4:2:0 acceptance test (`dusk.png`,
+1,097,884 bytes) is unchanged. `cargo test` -> 35 unit tests pass (8 new
+4:2:2 tests in `bpg-image`).
+
+**Remaining (per the reprioritization above):** alpha-plane support,
+`c_h_phase==0` (MPEG2 chroma siting), RGB/YCgCo color spaces, and the
+tuning system (`bpg-analyze`/`bpg-tune`). 12-bit and lossless remain deferred
+to much later.

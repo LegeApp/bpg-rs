@@ -1,8 +1,9 @@
-//! 4:4:4 -> 4:2:0 chroma decimation, ported from `decimate2_hv` /
-//! `decimate2_h16` / `decimate2_v` in `libbpg-0.9.8/bpgenc.c`, restricted to
-//! `h_phase == 1` ("chroma half way between luma samples"), which is the
-//! phase `bpgenc` uses when the preferred chroma format is 4:2:0
-//! (`c_h_phase = (preferred_chroma_format == BPG_FORMAT_420)`).
+//! 4:4:4 -> 4:2:0 / 4:2:2 chroma decimation, ported from `decimate2_hv` /
+//! `decimate2_h16` / `decimate2_v` / `decimate2_h` / `decimate2p1_simple` in
+//! `libbpg-0.9.8/bpgenc.c`, restricted to `h_phase == 1` ("chroma half way
+//! between luma samples"), which is the phase `bpgenc` uses when the
+//! preferred chroma format is 4:2:0 or 4:2:2
+//! (`c_h_phase = (preferred_chroma_format != BPG_FORMAT_444)`).
 
 use crate::Plane;
 
@@ -91,6 +92,43 @@ pub fn decimate_to_420(src: &Plane<u16>, bit_depth: u32) -> Plane<u16> {
     }
 }
 
+/// Decimate a 4:4:4 chroma plane to 4:2:2 (half resolution horizontally
+/// only), matching `image_ycc444_to_ycc422` with `h_phase == 1`
+/// (`decimate2_h` / `decimate2p1_simple`). Unlike `decimate_to_420`'s
+/// horizontal pass (`decimate2p1_simple16`), this is a single pass with a
+/// fixed `shift = 7` (the phase-0.5 taps sum to `2^7` regardless of
+/// `bit_depth`) and saturates to `[0, (1 << bit_depth) - 1]`.
+pub fn decimate_to_422(src: &Plane<u16>, bit_depth: u32) -> Plane<u16> {
+    let w = src.width as usize;
+    let h = src.height as usize;
+    let w2 = (w + 1) / 2;
+    let pixel_max = (1i64 << bit_depth) - 1;
+
+    let mut data = vec![0u16; w2 * h];
+    for y in 0..h {
+        let row = &src.data[y * src.stride..y * src.stride + w];
+        let dst_row = &mut data[y * w2..y * w2 + w2];
+        for x in 0..w2 {
+            let center = 2 * x as i64;
+            let s = |off: i64| row[clamp_idx(center + off, w)] as i64;
+            let v = (s(-4) + s(5)) * DP1C4
+                + (s(-3) + s(4)) * DP1C3
+                + (s(-2) + s(3)) * DP1C2
+                + (s(-1) + s(2)) * DP1C1
+                + (s(0) + s(1)) * DP1C0
+                + 64;
+            dst_row[x] = clamp_pix(v >> 7, pixel_max) as u16;
+        }
+    }
+
+    Plane {
+        data,
+        width: w2 as u32,
+        height: h as u32,
+        stride: w2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +178,53 @@ mod tests {
         let dst = decimate_to_420(&src, 10);
         assert_eq!(dst.width, 8);
         assert_eq!(dst.height, 8);
+        assert!(dst.data.iter().all(|&v| v == 800));
+    }
+
+    #[test]
+    fn decimate_422_solid_color_is_unchanged() {
+        let w = 16;
+        let h = 16;
+        let src = Plane {
+            data: vec![200u16; w * h],
+            width: w as u32,
+            height: h as u32,
+            stride: w,
+        };
+        let dst = decimate_to_422(&src, 8);
+        assert_eq!(dst.width, 8);
+        assert_eq!(dst.height, 16); // height unchanged
+        assert!(dst.data.iter().all(|&v| v == 200));
+    }
+
+    #[test]
+    fn decimate_422_odd_width_rounds_up() {
+        let w = 5;
+        let h = 3;
+        let src = Plane {
+            data: vec![100u16; w * h],
+            width: w as u32,
+            height: h as u32,
+            stride: w,
+        };
+        let dst = decimate_to_422(&src, 8);
+        assert_eq!(dst.width, 3); // (5+1)/2
+        assert_eq!(dst.height, 3); // unchanged
+    }
+
+    #[test]
+    fn decimate_422_solid_color_is_unchanged_10bit() {
+        let w = 16;
+        let h = 16;
+        let src = Plane {
+            data: vec![800u16; w * h],
+            width: w as u32,
+            height: h as u32,
+            stride: w,
+        };
+        let dst = decimate_to_422(&src, 10);
+        assert_eq!(dst.width, 8);
+        assert_eq!(dst.height, 16);
         assert!(dst.data.iter().all(|&v| v == 800));
     }
 }

@@ -34,6 +34,8 @@ enum Backend {
 enum Format {
     #[value(name = "420")]
     Yuv420,
+    #[value(name = "422")]
+    Yuv422,
     #[value(name = "444")]
     Yuv444,
 }
@@ -113,8 +115,10 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
             Image::from_rgb8(&rgb, color_space, args.limited_range, args.bit_depth)
         }
     };
-    if let Format::Yuv420 = args.format {
-        image.subsample_to_420(1);
+    match args.format {
+        Format::Yuv420 => image.subsample_to_420(1),
+        Format::Yuv422 => image.subsample_to_422(1),
+        Format::Yuv444 => {}
     }
 
     let backend = X265Encoder::new();
