@@ -233,3 +233,63 @@ highest-risk remaining piece. Concretely:
 After `bpg-hevc`, proceed to step 6 (`bpg-x265-sys` vendored FFI build),
 step 7 (`bpg-x265` safe wrapper), step 8 (`bpg-encode` orchestration), step 9
 (`bpg-tools` CLI), and step 10 (end-to-end verification).
+
+---
+
+## Progress update (Milestone 1 COMPLETE)
+
+**All remaining crates implemented; the M1 acceptance test passes with a
+byte-for-byte identical decode against the C reference.**
+
+- `bpg-hevc` (step 5): implemented and tested (7 unit tests). `find_nal_end`,
+  `extract_nal`, `ModifiedSps::from_hevc_stream` (full VPS+SPS precondition
+  parser/rewriter), and `build_modified_hevc` for the no-alpha/still-image
+  case. Errors are returned as `HevcError` rather than `fprintf`+`-1`.
+- `bpg-x265-sys` (step 6): `build.rs` builds the vendored x265 at
+  `../../../x265_4.1/source` via the `cmake` crate (static lib, 8-bit,
+  `ENABLE_CLI=OFF`, `ENABLE_ASSEMBLY=OFF` — the dev environment has no
+  `nasm`/`yasm`; set `BPG_X265_ENABLE_ASM=1` where an assembler is present),
+  then bindgens `x265.h`. **Simplification vs. the original plan:** instead of
+  codegen-ing the build-number-versioned `x265_api_get_215` symbol, the safe
+  wrapper calls the non-versioned `x265_api_query(bitDepth, X265_BUILD, &err)`
+  function, which is exported directly and avoids the `include!()` glue.
+- `bpg-x265` (step 7): safe `X265Encoder` implementing
+  `bpg_encode::HevcEncoder`, ported from `x265_glue.c` (single-frame intra).
+  The x265 RC-mode enum (`X265_RC_CQP=1`) and `x265_preset_names` array are
+  `static`/anonymous in `x265.h` (not emitted by bindgen), so they are
+  redefined as constants in the wrapper.
+- `bpg-encode` (step 8): `HevcEncoder` trait, `HevcEncodeParams`,
+  `EncodeError`, and `encode_still_image` orchestration (pad → encode →
+  `build_modified_hevc` → header + payload).
+- `bpg-tools` (step 9): `clap`-based CLI with the `encode` subcommand.
+
+**End-to-end verification (step 10) — PASSED:**
+
+```
+cargo run --release -p bpg-tools -- encode ../dusk.png -o /tmp/out.bpg \
+    --backend x265 --qp 28 --format 420
+./libbpg-0.9.8/bpgdec -o /tmp/out.png /tmp/out.bpg          # decodes cleanly
+```
+
+- `out.bpg` is 1,097,884 bytes (cf. the C reference `x265_q28_420.bpg`,
+  1,099,698 bytes — the C reference also carries an alpha plane).
+- The payload begins `03 92 47 40 44` immediately after the container header
+  — **exactly** the modified-SPS target byte sequence recorded above.
+- Decoding `out.bpg` and the C reference and comparing both against `dusk.png`
+  (RGB) gives **PSNR(ours vs C-ref) = ∞** — i.e. the decoded RGB pixels are
+  *identical* to the C `bpgenc` output (both 39.4190 dB vs source). This far
+  exceeds the ±0.2 dB / ±0.002 acceptance bar.
+
+The only header-byte difference from the in-tree `test_runs/*.bpg` references
+(`0x20` vs `0x30` at offset 4) is the `alpha1_flag`: those references were
+encoded from the RGBA `dusk.png`, whereas M1 drops alpha by design.
+
+**Build/test:** `cargo test` → 25 unit tests pass across the workspace. The
+x265 static build runs from `bpg-x265-sys/build.rs` on first `cargo build`
+(requires `cmake` + a C/C++ toolchain; no assembler needed).
+
+**Open items / next milestones:** alpha-plane support (interleaved MSPS +
+`build_modified_hevc` alpha branch), >8-bit, lossless, animation, 4:2:2,
+`c_h_phase==0` (MPEG2 siting), RGB/YCgCo color spaces, and the x265
+parameter-search "candidate optimizer" described in the Context section. The
+type stubs (`TODO(extension)`) already leave room for these.

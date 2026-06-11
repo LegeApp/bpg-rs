@@ -68,26 +68,39 @@ update `bpg-rs/PLAN.md`'s progress section.
 `bpg-rs/Cargo.toml` is a Cargo workspace (resolver "2", edition 2021). Member
 crates, in dependency order:
 
+**Milestone 1 is complete and verified** — the `encode` CLI produces a `.bpg`
+that decodes with the stock `bpgdec` and is byte-for-byte pixel-identical to
+the C `bpgenc -e x265` reference (see PLAN.md's "Milestone 1 COMPLETE"
+section). All eight crates are implemented and `cargo test` passes (25 tests).
+
 | Crate | Status | Purpose |
 |---|---|---|
 | `bpg-bitstream` | **Done**, tested | `ue7` base-128 varint (container header fields) + MSB-first `BitReader`/`BitWriter` with Exp-Golomb `ue(v)` (HEVC RBSP). Ported from `put_ue`/`get_ue`/`get_bits`/`put_bits`/`*_ue_golomb` in `bpgenc.c`. No deps. |
 | `bpg-image` | **Done**, tested | `Plane<T>`, `Image`, `ChromaFormat`, `ColorSpace`, RGB→YCbCr `ColorConvertState` (`convert.rs`, BT.601/709/2020, full+limited range), 4:4:4→4:2:0 chroma decimation (`chroma.rs`, `h_phase==1` only), CTU padding (`pad.rs`). Depends on `image` crate (PNG decode). `Rgb`/`YCgCo` color spaces are `unimplemented!()`. |
 | `bpg-format` | **Done**, tested | `BpgHeader` — the fixed-size BPG container header, byte-for-byte verified against a real `bpgenc` header for `dusk.png`'s dimensions. Depends on `bpg-bitstream`. |
-| `bpg-hevc` | **Not started** (`// TODO` stub) | NAL extraction (Annex-B start codes, emulation-prevention removal) + `build_modified_sps`/`build_modified_hevc` — the highest-risk remaining piece. Ported from `bpgenc.c:1496-2169`. Depends on `bpg-bitstream`. |
-| `bpg-encode` | **Not started** (`// TODO` stub) | `HevcEncoder` trait + `encode_still_image` orchestration. Depends on `bpg-image`, `bpg-format`, `bpg-hevc`. |
-| `bpg-x265-sys` | **Not started** (`build.rs` is a no-op stub) | Vendored x265 build (cmake) + raw `bindgen` FFI bindings, including handling the versioned `x265_api_get_215` symbol. `links = "x265"`. |
-| `bpg-x265` | **Not started** (`// TODO` stub) | Safe wrapper implementing `bpg-encode::HevcEncoder` over `bpg-x265-sys`. |
-| `bpg-tools` | **Not started** (placeholder `main`) | CLI (`encode` subcommand) via `clap`, ties `bpg-image` + `bpg-encode` + `bpg-x265` together. |
+| `bpg-hevc` | **Done**, tested | `find_nal_end`/`extract_nal` (Annex-B start codes + emulation-prevention removal), `ModifiedSps::from_hevc_stream` (VPS+SPS parse/rewrite with precondition checks → `HevcError`), `build_modified_hevc` (no-alpha still-image). Ported from `bpgenc.c:1496-2169`. Depends on `bpg-bitstream`. |
+| `bpg-encode` | **Done** | `HevcEncoder` trait, `HevcEncodeParams`, `EncodeError`, `encode_still_image` orchestration (pad → encode → `build_modified_hevc` → header+payload). Depends on `bpg-image` + `bpg-format` + `bpg-hevc`. |
+| `bpg-x265-sys` | **Done** | `build.rs` builds the vendored x265 (`../../../x265_4.1/source`) via the `cmake` crate (static, 8-bit, `ENABLE_ASSEMBLY=OFF`) + `bindgen` FFI from `wrapper.h`. `links = "x265"`. Uses `x265_api_query` (non-versioned) rather than the `x265_api_get_215` symbol. |
+| `bpg-x265` | **Done** | Safe `X265Encoder` implementing `bpg-encode::HevcEncoder`, ported from `x265_glue.c` (single-frame intra). Defines `X265_RC_CQP`/preset-name constants that bindgen omits. |
+| `bpg-tools` | **Done** | `clap` CLI with the `encode` subcommand, ties `bpg-image` + `bpg-encode` + `bpg-x265` together. |
 
 Dependency graph: `bpg-bitstream` → `bpg-format`, `bpg-hevc`; `bpg-image` is
 standalone (uses the `image` crate); `bpg-encode` depends on `bpg-image` +
 `bpg-format` + `bpg-hevc`; `bpg-x265-sys` → `bpg-x265` (implements
 `HevcEncoder`); `bpg-tools` depends on all of the above via `clap`.
 
-**Current next step** (per PLAN.md): implement `bpg-hevc`
-(`extract_nals`, `ModifiedSps::from_hevc_stream`, `build_modified_hevc`),
-then `bpg-x265-sys`, `bpg-x265`, `bpg-encode`, `bpg-tools`, then end-to-end
-verification.
+**Next milestones** (per PLAN.md "Open items"): alpha-plane support, >8-bit,
+lossless, animation, 4:2:2, `c_h_phase==0` (MPEG2 chroma siting), RGB/YCgCo
+color spaces, and the x265 parameter-search "candidate optimizer". The
+`TODO(extension)` type stubs already leave room for these.
+
+### Building the x265 FFI crate
+
+`bpg-x265-sys/build.rs` compiles the vendored x265 on first `cargo build`,
+which needs `cmake` + a C/C++ toolchain. The development environment has no
+assembler, so assembly is disabled by default (correct but slower); set
+`BPG_X265_ENABLE_ASM=1` to re-enable it where `nasm`/`yasm` is installed.
+Building `bpgdec` (to verify output) is `make bpgdec` in `libbpg-0.9.8/`.
 
 ## Porting conventions
 
