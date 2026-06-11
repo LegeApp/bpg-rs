@@ -63,8 +63,24 @@ update `bpg-rs/PLAN.md`'s progress section.
   (10-bit support)" in PLAN.md): `Image` stores samples as `u16` internally
   (matching `bpgenc.c`'s `PIXEL = uint16_t`), `bpg-x265-sys` does an x265
   multilib build (8-bit + linked 10-bit), and `bpg-tools` has a
-  `-b/--bit-depth 8|10|12` option (12-bit lib not yet built). The candidate
-  optimizer remains last on the roadmap.
+  `-b/--bit-depth 8|10|12` option (12-bit lib not yet built).
+- **Roadmap update (reprioritization + tuning system)**: 12-bit and lossless
+  are deferred to much later. **4:2:2 chroma is a near-term priority**
+  alongside the already-implemented 4:2:0. The "candidate optimizer"
+  (pick-the-best-of-N-encodes) is **replaced** by a conservative,
+  source-aware **tuning system** for archival photo encoding: a `Tune` enum
+  (`Auto`/`Neutral`/`Photo`/`FilmGrain`/`Slide`/`LowLight`/`Artwork`/
+  `Screenshot`/`Scan`), an `ArchivalPolicy` (controls metadata/ICC
+  preservation, chroma subsampling, bit-depth reduction, and whether any
+  preprocessing is allowed), and an `EncodePlan` (resolved x265 params) —
+  produced by new `bpg-analyze` (feature extraction + tune classification)
+  and `bpg-tune` (Tune + ArchivalPolicy + ImageFeatures -> EncodePlan) crates.
+  No tune may apply destructive preprocessing, chase metrics at the expense
+  of source character, or drop metadata/chroma/bit-depth without policy
+  permission. A bounded `--candidate-check conservative` mode (small
+  parameter neighborhood, quality floor not quality-maximizing) may follow
+  later. See PLAN.md's "Roadmap update (reprioritization + tuning system)"
+  for the full design.
 - M1 acceptance target:
   ```
   cargo run -p bpg-tools -- encode ../dusk.png -o /tmp/out.bpg --backend x265 --qp 28 --format 420
@@ -100,11 +116,15 @@ standalone (uses the `image` crate); `bpg-encode` depends on `bpg-image` +
 `bpg-format` + `bpg-hevc`; `bpg-x265-sys` → `bpg-x265` (implements
 `HevcEncoder`); `bpg-tools` depends on all of the above via `clap`.
 
-**Next milestones**: 12-bit (a second multilib lib with `MAIN12=ON`),
-alpha-plane support, lossless, 4:2:2, `c_h_phase==0` (MPEG2 chroma siting),
-RGB/YCgCo color spaces, and the x265 parameter-search "candidate optimizer"
-(deliberately last). The `TODO(extension)` type stubs already leave room for
-these. Animation is dropped from the roadmap.
+**Next milestones**: **4:2:2 chroma** (alongside 4:2:0; near-term priority —
+`bpg-image` needs a horizontal-only `decimate_to_422`), alpha-plane support,
+`c_h_phase==0` (MPEG2 chroma siting), RGB/YCgCo color spaces, and the
+**tuning system** (`bpg-analyze` + `bpg-tune` crates, `Tune`/`ArchivalPolicy`/
+`EncodePlan` — see PLAN.md's "Roadmap update (reprioritization + tuning
+system)"), which replaces the old "candidate optimizer". **Deferred to much
+later**: 12-bit (a second multilib lib with `MAIN12=ON`) and lossless. The
+`TODO(extension)` type stubs already leave room for all of these. Animation
+is dropped from the roadmap.
 
 ### Building the x265 FFI crate
 
