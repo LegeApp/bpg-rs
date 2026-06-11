@@ -21,6 +21,12 @@ pipeline with an x265 backend, which can later host a parameter-search
 "candidate optimizer" (multiple x265 encodes per image, pick the best) since
 x265 is fast enough (~1-2s) to make that practical.
 
+> **Superseded** — see "Roadmap update (tuning system)" near the end of this
+> file. The "candidate optimizer" (pick-the-best-of-N-encodes) framing above
+> has been replaced by a conservative, source-aware **tuning system** for
+> archival photo encoding. This section is retained for historical context on
+> why x265-only was chosen.
+
 **Additional decision:** the existing system-installed `libx265` (apt
 package, v4.1/X265_BUILD=215) happens to match the version vendored at
 `/home/dk/Desktop/testers-linux/BPG/x265_4.1/` (source tree, release tag 4.1,
@@ -288,11 +294,14 @@ encoded from the RGBA `dusk.png`, whereas M1 drops alpha by design.
 x265 static build runs from `bpg-x265-sys/build.rs` on first `cargo build`
 (requires `cmake` + a C/C++ toolchain; no assembler needed).
 
-**Open items / next milestones:** alpha-plane support (interleaved MSPS +
-`build_modified_hevc` alpha branch), >8-bit, lossless, animation, 4:2:2,
-`c_h_phase==0` (MPEG2 siting), RGB/YCgCo color spaces, and the x265
-parameter-search "candidate optimizer" described in the Context section. The
-type stubs (`TODO(extension)`) already leave room for these.
+**Open items / next milestones (superseded, see later sections):** alpha-plane
+support (interleaved MSPS + `build_modified_hevc` alpha branch), >8-bit,
+lossless, animation, 4:2:2, `c_h_phase==0` (MPEG2 siting), RGB/YCgCo color
+spaces, and the x265 parameter-search "candidate optimizer" described in the
+Context section. The type stubs (`TODO(extension)`) already leave room for
+these. Animation was dropped (see "Progress update (10-bit support)") and the
+candidate optimizer was replaced by the tuning system (see "Roadmap update
+(tuning system)").
 
 ## Progress update (10-bit support)
 
@@ -346,3 +355,194 @@ existing 8-bit M1 acceptance test (`dusk.png`, byte-identical vs C reference,
 **Remaining:** 12-bit (not built, would need a second multilib lib +
 `MAIN12=ON`), the candidate optimizer (last), and the previously-listed
 alpha/4:2:2/MPEG2-siting/RGB/YCgCo items.
+
+## Roadmap update (reprioritization + tuning system)
+
+Per a roadmap review, the remaining items above are reprioritized as follows.
+
+**Deferred to much later:**
+- **12-bit support** (second multilib lib with `MAIN12=ON`).
+- **Lossless mode** (`bLossless=1`).
+
+Both remain `TODO(extension)`/`unimplemented!()` stubs; nothing about the
+current design blocks adding them later.
+
+**Promoted to a near-term milestone:**
+- **4:2:2 chroma** (`ChromaFormat::Yuv422`), alongside the already-implemented
+  4:2:0. `bpg-image` needs a `decimate_to_422`/horizontal-only decimation
+  analogous to `image_ycc444_to_ycc422`/`decimate2_h` in `bpgenc.c`
+  (4:2:0's `decimate_to_420` does both horizontal and vertical decimation via
+  `decimate2_hv`; 4:2:2 only decimates horizontally). `bpg-tools`'s
+  `--format` enum gains a `422` variant alongside `420`/`444`.
+
+**Replaces the "candidate optimizer" (described in the Context section and
+referenced as "last" throughout this file): a "tuning" system.**
+
+The original plan was a parameter-search "candidate optimizer": run multiple
+x265 encodes per image and pick the result that scores best on some metric
+(PSNR/SSIM/file size). On reflection this is the wrong default for an
+*archival* photo encoder — metric-chasing tends to push toward destructive
+choices (denoise/sharpen preprocessing, palette reduction, chroma
+subsampling, or bit-depth reduction the user didn't ask for) purely because
+they make a number go up, and it can silently strip metadata/ICC profiles
+that matter for archival use. The replacement is **conservative,
+source-aware presets ("tunes") plus an explicit archival policy**, with
+optimizer-style candidate search demoted to an optional, tightly-bounded,
+opt-in mode for later.
+
+### Three-layer model
+
+1. **Preset** — x265 speed/quality preset (`ultrafast`..`placebo`), already
+   exposed via `-m/--compress-level`. Orthogonal to the rest.
+2. **Tune** — a *source-character* hint describing what kind of image this
+   is, used to pick x265 params (and, where allowed, chroma/bit-depth
+   choices) that suit that source. This is a **bpg-rs concept**, distinct
+   from x265's own `--tune` (`psnr`/`ssim`/`grain`/`zero-latency`/
+   `fast-decode`/`animation`), which is about *encoder* behavior (e.g.
+   disabling psychovisual optimizations for PSNR/SSIM). bpg-rs's `Tune` may
+   select an x265 tune as part of its plan, but the two are not the same
+   axis.
+3. **ArchivalPolicy** — hard constraints/permissions that bound what any tune
+   is allowed to do (e.g. "never strip metadata", "never subsample chroma
+   without being asked").
+
+### `Tune` enum
+
+```rust
+pub enum Tune {
+    Auto,       // run bpg-analyze and pick one of the below
+    Neutral,    // no source-specific adjustments; safe default
+    Photo,      // typical digital-camera/phone photos
+    FilmGrain,  // scanned film / grainy sources — preserve grain, don't denoise
+    Slide,      // scanned slides/transparencies — flat fields, dust/scratches
+    LowLight,   // high-ISO/noisy photos — avoid over-smoothing noise into banding
+    Artwork,    // illustrations/digital art — sharp edges, flat color regions
+    Screenshot, // UI screenshots/rendered text/graphics — sharp edges, exact colors
+    Scan,       // document/photo scans
+}
+```
+
+`Neutral` is the safe default when a tune can't be confidently chosen.
+
+### `ArchivalPolicy`
+
+```rust
+pub struct ArchivalPolicy {
+    /// Copy through EXIF/XMP/other metadata where the container supports it.
+    pub preserve_metadata: bool,
+    /// Copy through any embedded ICC color profile.
+    pub preserve_icc_profile: bool,
+    /// Permit a tune to choose 4:2:0/4:2:2 over 4:4:4 for this image.
+    pub allow_chroma_subsampling: bool,
+    /// Permit a tune to choose an output bit depth lower than the source.
+    pub allow_down_bitdepth: bool,
+    /// Permit any pixel-level preprocessing (denoise, sharpen, etc.).
+    pub allow_preprocessing: bool,
+    /// If true, tunes may lean toward metric fidelity (PSNR/SSIM) over
+    /// perceptual choices when the two trade off.
+    pub prefer_metric_fidelity: bool,
+}
+```
+
+`--archival` on the CLI selects a policy with everything destructive turned
+off (`allow_preprocessing = false`, `preserve_metadata = true`,
+`preserve_icc_profile = true`); chroma subsampling and bit-depth choices are
+still permitted unless the user also passes flags disabling them, since those
+are normal lossy-codec parameters rather than "destructive edits".
+
+### What tunes must NOT do
+
+Regardless of `Tune`, no tune may (unless `ArchivalPolicy` explicitly allows
+it):
+- Apply denoise, sharpen, deband, or palette-reduction preprocessing to
+  pixel data.
+- Choose parameters purely to maximize a metric (PSNR/SSIM/file size) at the
+  expense of the source's character (e.g. denoising grain to improve PSNR).
+- Change chroma subsampling or bit depth without the policy permitting it.
+- Drop metadata or ICC profiles.
+
+### Per-tune behavior (x265 param choices, conceptually)
+
+- **Neutral**: no adjustments beyond preset/qp; equivalent to today's
+  behavior. Safe fallback.
+- **Photo**: psy-rd / psy-rdoq tuned for natural photo content (close to
+  x265 defaults); 4:2:0 acceptable if policy allows.
+- **FilmGrain**: higher psy-rd, `--tune grain`-like emphasis, AQ settings
+  that avoid smoothing grain into flat regions; prefer 4:4:4 or 4:2:2 over
+  4:2:0 if policy allows subsampling, since grain carries chroma detail.
+- **Slide**: similar to Photo but with AQ tuned for large flat fields with
+  occasional fine detail (dust/scratches) — avoid banding in flats without
+  smoothing out scratches.
+- **LowLight**: AQ/psy-rd chosen to avoid amplifying sensor noise into
+  blocking/banding; explicitly does *not* denoise (that would be
+  preprocessing).
+- **Artwork**: parameters favoring sharp edges and flat color regions
+  (lower AQ strength, rdoq tuned for synthetic content); 4:4:4 preferred
+  when policy allows, since artwork often has chroma edges.
+- **Screenshot**: near-lossless-leaning QP defaults, 4:4:4 preferred, no
+  chroma subsampling unless explicitly permitted — text/UI elements are
+  chroma-sensitive.
+- **Scan**: similar to Slide/Photo hybrid; AQ tuned for scanned-paper
+  texture without over-smoothing.
+- **Auto**: `bpg-analyze` extracts `ImageFeatures` from the source and maps
+  them to one of the above via `TuneAnalysis`, falling back to `Neutral` when
+  signals are inconclusive.
+
+### `EncodePlan`
+
+The output of "tune resolution" — a fully-resolved set of encoder params,
+independent of how it was derived:
+
+```rust
+pub struct EncodePlan {
+    pub chroma_format: ChromaFormat,
+    pub x265_preset: &'static str,
+    pub x265_tune: Option<&'static str>,   // x265's own --tune, if any
+    pub x265_params: BTreeMap<String, String>, // extra x265_param_parse() overrides
+    pub bpg_color_mode: ColorSpace,
+    pub warnings: Vec<String>,             // e.g. "policy disallowed 4:2:0; using 4:4:4"
+}
+```
+
+### New crates
+
+- **`bpg-analyze`**: feature extraction (`ImageFeatures`: noise estimate,
+  edge density, flat-region fraction, color histogram spread, grain
+  signature, etc.) and `TuneAnalysis` (maps `ImageFeatures` -> a suggested
+  `Tune` + human-readable reasoning string). Pure analysis, no encoding.
+- **`bpg-tune`**: maps `(Tune, ArchivalPolicy, ImageFeatures)` -> `EncodePlan`.
+  Depends on `bpg-analyze` for `Auto`. Contains the per-tune param tables
+  described above.
+
+Updated dependency graph: `bpg-analyze` is standalone (operates on
+`bpg-image::Image`); `bpg-tune` depends on `bpg-analyze` + `bpg-image`;
+`bpg-encode`/`bpg-tools` depend on `bpg-tune` to resolve an `EncodePlan`
+before calling the `HevcEncoder`.
+
+### CLI shape (future)
+
+```
+bpg-rs encode input.jpg output.bpg --quality 32 --tune auto --archival
+bpg-rs analyze input.jpg     # prints ImageFeatures + chosen Tune + reasoning
+```
+
+`analyze` is a diagnostic/dry-run command: it explains what `--tune auto`
+would choose and why, without encoding.
+
+### Optional future: bounded candidate search
+
+A `--candidate-check conservative` mode may be added later: given the
+resolved `EncodePlan`, try a small, bounded set of nearby variations (e.g.
++/-1 QP, with/without an x265 tune) and pick among them using a quality
+floor rather than a quality-maximizing search — i.e. "don't make it worse",
+not "make it as small/high-scoring as possible". This is explicitly
+secondary to the tuning system above and not required for the 4:2:2
+milestone.
+
+### Dataset/labeling note
+
+If a labeled dataset is ever built to validate `Auto` tune selection, it
+should target "did bpg-rs pick the *conservative, appropriate* tune for this
+source" (agreement with a human's source-character judgment), not "which
+params produced the smallest file at a given PSNR" — the latter reproduces
+the metric-chasing problem the tuning system is meant to avoid.
