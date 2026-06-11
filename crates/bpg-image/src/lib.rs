@@ -43,7 +43,9 @@ pub enum ColorSpace {
 
 /// A decoded/converted image ready for encoding: `width`/`height` are the
 /// *luma* (pre-padding) dimensions; chroma plane dimensions follow from
-/// `chroma_format`.
+/// `chroma_format`. Samples are stored as `u16` regardless of `bit_depth`,
+/// matching `bpgenc.c`'s internal `typedef uint16_t PIXEL` representation;
+/// values are bounded by `(1 << bit_depth) - 1`.
 #[derive(Debug, Clone)]
 pub struct Image {
     pub width: u32,
@@ -52,30 +54,69 @@ pub struct Image {
     pub chroma_format: ChromaFormat,
     pub color_space: ColorSpace,
     pub limited_range: bool,
-    pub planes: Vec<Plane<u8>>,
+    pub planes: Vec<Plane<u16>>,
     /// TODO(extension): alpha plane support.
     pub has_alpha: bool,
 }
 
 impl Image {
-    /// Convert an 8-bit RGB image to a 4:4:4 YCbCr `Image` (M1: 8-bit only).
-    pub fn from_rgb8(rgb: &image::RgbImage, color_space: ColorSpace, limited_range: bool) -> Self {
-        let width = rgb.width();
-        let height = rgb.height();
-        let cvt = ColorConvertState::new(8, 8, color_space, limited_range);
+    /// Convert an 8-bit RGB image to a 4:4:4 YCbCr `Image`, optionally
+    /// scaling up to a higher `bit_depth` (10/12-bit) during color
+    /// conversion.
+    pub fn from_rgb8(rgb: &image::RgbImage, color_space: ColorSpace, limited_range: bool, bit_depth: u8) -> Self {
+        let cvt = ColorConvertState::new(8, bit_depth as u32, color_space, limited_range);
+        Self::from_rgb_pixels(
+            rgb.width(),
+            rgb.height(),
+            rgb.pixels().map(|px| (px[0], px[1], px[2])),
+            &cvt,
+            color_space,
+            limited_range,
+            bit_depth,
+        )
+    }
 
+    /// Convert a 16-bit RGB image (e.g. a 16-bit PNG) to a 4:4:4 YCbCr
+    /// `Image`, converting to the requested `bit_depth` (10/12-bit).
+    pub fn from_rgb16(
+        rgb: &image::ImageBuffer<image::Rgb<u16>, Vec<u16>>,
+        color_space: ColorSpace,
+        limited_range: bool,
+        bit_depth: u8,
+    ) -> Self {
+        let cvt = ColorConvertState::new(16, bit_depth as u32, color_space, limited_range);
+        Self::from_rgb_pixels(
+            rgb.width(),
+            rgb.height(),
+            rgb.pixels().map(|px| (px[0], px[1], px[2])),
+            &cvt,
+            color_space,
+            limited_range,
+            bit_depth,
+        )
+    }
+
+    fn from_rgb_pixels<P: Into<i64> + Copy>(
+        width: u32,
+        height: u32,
+        pixels: impl Iterator<Item = (P, P, P)>,
+        cvt: &ColorConvertState,
+        color_space: ColorSpace,
+        limited_range: bool,
+        bit_depth: u8,
+    ) -> Self {
         let mut y_data = Vec::with_capacity((width * height) as usize);
         let mut cb_data = Vec::with_capacity((width * height) as usize);
         let mut cr_data = Vec::with_capacity((width * height) as usize);
 
-        for px in rgb.pixels() {
-            let (y, cb, cr) = cvt.rgb_to_ycc(px[0], px[1], px[2]);
+        for (r, g, b) in pixels {
+            let (y, cb, cr) = cvt.rgb_to_ycc(r, g, b);
             y_data.push(y);
             cb_data.push(cb);
             cr_data.push(cr);
         }
 
-        let plane = |data: Vec<u8>| Plane {
+        let plane = |data: Vec<u16>| Plane {
             data,
             width,
             height,
@@ -85,7 +126,7 @@ impl Image {
         Image {
             width,
             height,
-            bit_depth: 8,
+            bit_depth,
             chroma_format: ChromaFormat::Yuv444,
             color_space,
             limited_range,
@@ -153,7 +194,7 @@ mod tests {
         rgb.put_pixel(0, 1, image::Rgb([0, 0, 255]));
         rgb.put_pixel(1, 1, image::Rgb([255, 255, 255]));
 
-        let img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false);
+        let img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false, 8);
         assert_eq!(img.chroma_format, ChromaFormat::Yuv444);
         assert_eq!(img.planes.len(), 3);
         for p in &img.planes {
@@ -169,7 +210,7 @@ mod tests {
         for p in rgb.pixels_mut() {
             *p = image::Rgb([100, 100, 100]);
         }
-        let mut img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false);
+        let mut img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false, 8);
         img.subsample_to_420(1);
         assert_eq!((img.planes[1].width, img.planes[1].height), (2, 2));
 
