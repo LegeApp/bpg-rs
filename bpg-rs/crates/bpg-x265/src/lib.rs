@@ -3,6 +3,7 @@
 //! `libbpg-0.9.8` (the `open`/`encode`/`close` sequence), specialized to the
 //! M1 still-image, single-frame case.
 
+use std::ffi::CString;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
 
@@ -29,8 +30,6 @@ const X265_PRESET_NAMES: [&str; 10] = [
     "veryslow\0",
     "placebo\0",
 ];
-
-const TUNE_SSIM: &str = "ssim\0";
 
 /// The x265 HEVC backend.
 pub struct X265Encoder;
@@ -103,13 +102,47 @@ unsafe fn encode_impl(
 
     let preset_index = (params.compress_level as usize).min(X265_PRESET_NAMES.len() - 1);
     let preset = X265_PRESET_NAMES[preset_index];
+    // x265's own --tune, resolved from the tuning plan. `None` -> preset
+    // default; the M1/neutral path passes Some("ssim") for byte-identity with
+    // the C reference.
+    let tune_cstr = params
+        .tuning
+        .x265_tune
+        .as_deref()
+        .map(|s| CString::new(s).expect("x265 tune name has interior NUL"));
     param_default_preset(
         p,
         preset.as_ptr() as *const _,
-        TUNE_SSIM.as_ptr() as *const _,
+        tune_cstr.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
     );
 
-    // Mirror x265_open() in x265_glue.c.
+    // Apply the tune's soft x265_param_parse overrides BEFORE the mandatory
+    // structural/container fields below, so the container invariants always
+    // win and no tune can violate the bpg-hevc modified-SPS preconditions.
+    if let Some(param_parse) = api.param_parse {
+        for (name, val) in &params.tuning.x265_params {
+            let cname = CString::new(name.as_str())
+                .map_err(|_| macro_err("x265 param name has interior NUL"))?;
+            let cval = CString::new(val.as_str())
+                .map_err(|_| macro_err("x265 param value has interior NUL"))?;
+            let rc = param_parse(p, cname.as_ptr(), cval.as_ptr());
+            if rc != 0 {
+                param_free(p);
+                return Err(EncodeError::Backend(format!(
+                    "x265 param '{name}={val}' rejected (rc={rc}: {})",
+                    match rc {
+                        -1 => "bad name",
+                        -2 => "bad value",
+                        _ => "error",
+                    }
+                )));
+            }
+        }
+    }
+
+    // Mirror x265_open() in x265_glue.c. These mandatory fields are set AFTER
+    // the tune overrides above, guaranteeing the container invariants
+    // (intra-only, AMP, CQP, csp, bit depth, repeat-headers).
     (*p).bRepeatHeaders = 1;
     (*p).decodedPictureHashSEI = params.sei_decoded_picture_hash as c_int;
     (*p).sourceWidth = params.width as c_int;

@@ -11,10 +11,42 @@ use bpg_format::{BpgHeader, ColorSpaceCode, PixelFormat};
 use bpg_hevc::{build_modified_hevc, HevcError};
 use bpg_image::{ChromaFormat, ColorSpace, Image};
 
+/// Encoder-tuning knobs resolved from a `bpg-tune::EncodePlan`. These are the
+/// *soft* parameters a tune is allowed to set; the mandatory BPG/structural
+/// params (intra-only, AMP, CQP, csp, bit depth, repeat-headers) are always
+/// re-asserted by the backend AFTER these, so a tune can never violate the
+/// modified-SPS preconditions in `bpg-hevc`. A failure (bad x265 param name or
+/// value) surfaces as `EncodeError::Backend`, never a corrupt bitstream.
+#[derive(Debug, Clone, Default)]
+pub struct EncoderTuning {
+    /// x265's own `--tune` (psnr/ssim/grain/...), passed to
+    /// `param_default_preset`. `None` keeps x265's preset default. Note
+    /// `Default` gives `None`, which is *not* the historical `"ssim"` the M1
+    /// reference path uses — see [`EncoderTuning::neutral`].
+    pub x265_tune: Option<String>,
+    /// Ordered `x265_param_parse(name, value)` overrides (e.g.
+    /// `("psy-rd", "2.0")`, `("aq-mode", "3")`). Applied after preset+tune but
+    /// before the mandatory structural fields, so later entries win and the
+    /// container invariants always override. Order is preserved.
+    pub x265_params: Vec<(String, String)>,
+}
+
+impl EncoderTuning {
+    /// The historical M1 default: x265 `--tune ssim`, no extra overrides. This
+    /// reproduces the byte-for-byte-identical-to-C-reference behavior and is
+    /// what `Tune::Neutral` should resolve to.
+    pub fn neutral() -> Self {
+        Self {
+            x265_tune: Some("ssim".to_string()),
+            x265_params: Vec::new(),
+        }
+    }
+}
+
 /// Parameters for one HEVC encode, mirroring the subset of
 /// `HEVCEncodeParams` (`bpgenc.h`) that the M1 x265 path uses. The backend is
 /// responsible for translating these into x265 params (`x265_glue.c`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct HevcEncodeParams {
     /// Padded (CTU-aligned) luma width fed to the encoder.
     pub width: u32,
@@ -32,6 +64,10 @@ pub struct HevcEncodeParams {
     /// Emit a decoded-picture-hash SEI (0 = none).
     pub sei_decoded_picture_hash: bool,
     pub verbose: bool,
+    /// Soft encoder-tuning knobs (x265 `--tune` + extra param overrides),
+    /// resolved from a `bpg-tune::EncodePlan`. The backend applies these
+    /// before re-asserting the mandatory container/structural params.
+    pub tuning: EncoderTuning,
 }
 
 /// A HEVC backend that encodes a single intra still frame and returns its raw
@@ -96,6 +132,7 @@ pub fn encode_still_image(
     backend: &dyn HevcEncoder,
     qp: u8,
     compress_level: u8,
+    tuning: EncoderTuning,
 ) -> Result<Vec<u8>, EncodeError> {
     if ![8, 10, 12].contains(&image.bit_depth) {
         return Err(EncodeError::Unsupported("bit depth must be 8, 10, or 12"));
@@ -120,6 +157,7 @@ pub fn encode_still_image(
         compress_level,
         sei_decoded_picture_hash: false,
         verbose: false,
+        tuning,
     };
 
     // Encode -> raw Annex-B -> modified-HEVC payload.

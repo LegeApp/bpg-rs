@@ -64,6 +64,11 @@ fn main() {
             .define("ENABLE_CLI", "OFF")
             .define("ENABLE_ASSEMBLY", if enable_asm { "ON" } else { "OFF" })
             .define("ENABLE_TESTS", "OFF")
+            // Disable NUMA pool support: it makes the build depend on whether
+            // libnuma is installed (CMake auto-detects it), which is
+            // non-deterministic and would otherwise require linking -lnuma.
+            // BPG encodes one intra frame, so NUMA thread pools are moot.
+            .define("ENABLE_LIBNUMA", "OFF")
             .define("CMAKE_BUILD_TYPE", "Release")
             .define("HIGH_BIT_DEPTH", "ON")
             .define("MAIN12", "OFF")
@@ -92,6 +97,9 @@ fn main() {
         .define("ENABLE_CLI", "OFF")
         .define("ENABLE_ASSEMBLY", if enable_asm { "ON" } else { "OFF" })
         .define("ENABLE_TESTS", "OFF")
+        // See the 10-bit config above: keep NUMA off for a deterministic,
+        // libnuma-independent build.
+        .define("ENABLE_LIBNUMA", "OFF")
         .define("CMAKE_BUILD_TYPE", "Release")
         .build_target("x265-static");
     if let Some(main10_lib_dir) = &main10_lib_dir {
