@@ -148,6 +148,19 @@ impl Image {
         self.chroma_format = ChromaFormat::Yuv420;
     }
 
+    /// Subsample the chroma planes from 4:4:4 to 4:2:2, matching
+    /// `image_ycc444_to_ycc422(img, h_phase)`. Only `h_phase == 1` ("chroma
+    /// half way between luma samples") is implemented, which is the value
+    /// `bpgenc` uses when 4:2:2 is the preferred chroma format.
+    pub fn subsample_to_422(&mut self, h_phase: u8) {
+        assert_eq!(self.chroma_format, ChromaFormat::Yuv444, "subsample_to_422 requires a 4:4:4 image");
+        assert_eq!(h_phase, 1, "only h_phase == 1 is implemented");
+
+        self.planes[1] = chroma::decimate_to_422(&self.planes[1], self.bit_depth as u32);
+        self.planes[2] = chroma::decimate_to_422(&self.planes[2], self.bit_depth as u32);
+        self.chroma_format = ChromaFormat::Yuv422;
+    }
+
     /// Returns the (h_shift, v_shift) of plane `idx` relative to the luma
     /// plane: chroma plane dimensions are `(w + h_shift) >> h_shift` etc.
     fn plane_shifts(&self, idx: usize) -> (u32, u32) {
@@ -220,5 +233,36 @@ mod tests {
         // chroma is half-resolution: (8+1)>>1 padded dims = 8>>1 = 4
         assert_eq!((img.planes[1].width, img.planes[1].height), (4, 4));
         assert_eq!((img.planes[2].width, img.planes[2].height), (4, 4));
+    }
+
+    #[test]
+    fn subsample_to_422_halves_chroma_width_only() {
+        let mut rgb = image::RgbImage::new(3, 3);
+        for p in rgb.pixels_mut() {
+            *p = image::Rgb([100, 100, 100]);
+        }
+        let mut img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false, 8);
+        img.subsample_to_422(1);
+        assert_eq!(img.chroma_format, ChromaFormat::Yuv422);
+        // (3+1)/2 = 2 wide, height unchanged at 3
+        assert_eq!((img.planes[1].width, img.planes[1].height), (2, 3));
+        assert_eq!((img.planes[2].width, img.planes[2].height), (2, 3));
+    }
+
+    #[test]
+    fn pad_to_cb_size_updates_chroma_dims_for_422() {
+        let mut rgb = image::RgbImage::new(3, 3);
+        for p in rgb.pixels_mut() {
+            *p = image::Rgb([100, 100, 100]);
+        }
+        let mut img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false, 8);
+        img.subsample_to_422(1);
+
+        img.pad_to_cb_size(8);
+        assert_eq!((img.width, img.height), (8, 8));
+        assert_eq!((img.planes[0].width, img.planes[0].height), (8, 8));
+        // chroma is half-resolution horizontally only: (8>>1, 8)
+        assert_eq!((img.planes[1].width, img.planes[1].height), (4, 8));
+        assert_eq!((img.planes[2].width, img.planes[2].height), (4, 8));
     }
 }
