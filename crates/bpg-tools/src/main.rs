@@ -62,6 +62,11 @@ struct EncodeArgs {
     #[arg(short = 'q', long, default_value_t = 28)]
     qp: u8,
 
+    /// Output bit depth (8, 10, or 12). 16-bit PNG input is required to
+    /// benefit from 10/12-bit output; 8-bit input is upscaled.
+    #[arg(short = 'b', long = "bit-depth", default_value_t = 8)]
+    bit_depth: u8,
+
     /// Chroma format.
     #[arg(short = 'f', long, value_enum, default_value_t = Format::Yuv420)]
     format: Format,
@@ -82,9 +87,12 @@ struct EncodeArgs {
 fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let Backend::X265 = args.backend;
 
+    if ![8, 10, 12].contains(&args.bit_depth) {
+        return Err(format!("--bit-depth must be 8, 10, or 12 (got {})", args.bit_depth).into());
+    }
+
     // Load PNG, drop alpha (M1 ignores alpha).
     let dyn_img = image::open(&args.input)?;
-    let rgb = dyn_img.to_rgb8();
 
     let color_space = match args.color_space {
         CsArg::Ycbcr => ColorSpace::YCbCr,
@@ -92,7 +100,19 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         CsArg::Bt2020 => ColorSpace::YCbCrBt2020,
     };
 
-    let mut image = Image::from_rgb8(&rgb, color_space, args.limited_range);
+    // 16-bit PNGs are read as Rgb16 to preserve full input precision; all
+    // other inputs go through the 8-bit path (and may be upscaled to a
+    // higher output bit_depth during color conversion).
+    let mut image = match dyn_img {
+        image::DynamicImage::ImageRgb16(_) | image::DynamicImage::ImageRgba16(_) => {
+            let rgb16 = dyn_img.to_rgb16();
+            Image::from_rgb16(&rgb16, color_space, args.limited_range, args.bit_depth)
+        }
+        _ => {
+            let rgb = dyn_img.to_rgb8();
+            Image::from_rgb8(&rgb, color_space, args.limited_range, args.bit_depth)
+        }
+    };
     if let Format::Yuv420 = args.format {
         image.subsample_to_420(1);
     }

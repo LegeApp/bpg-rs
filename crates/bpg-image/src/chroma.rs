@@ -25,7 +25,7 @@ fn clamp_idx(idx: i64, len: usize) -> usize {
 /// the phase-0.5 filter, with edge samples replicated past the row bounds.
 /// Output values are intermediate (unsaturated) `int16`-range values, per
 /// `decimate2p1_simple16`.
-fn decimate_row_h(row: &[u8], w: usize, bit_depth: u32) -> Vec<i32> {
+fn decimate_row_h(row: &[u16], w: usize, bit_depth: u32) -> Vec<i32> {
     let shift = bit_depth as i64 - 7;
     let rnd = 1i64 << (shift - 1);
     let w2 = (w + 1) / 2;
@@ -46,7 +46,7 @@ fn decimate_row_h(row: &[u8], w: usize, bit_depth: u32) -> Vec<i32> {
 
 /// Decimate a 4:4:4 chroma plane to 4:2:0 (half resolution in both
 /// dimensions), matching `image_ycc444_to_ycc420` with `h_phase == 1`.
-pub fn decimate_to_420(src: &Plane<u8>, bit_depth: u32) -> Plane<u8> {
+pub fn decimate_to_420(src: &Plane<u16>, bit_depth: u32) -> Plane<u16> {
     let w = src.width as usize;
     let h = src.height as usize;
     let w2 = (w + 1) / 2;
@@ -64,7 +64,7 @@ pub fn decimate_to_420(src: &Plane<u8>, bit_depth: u32) -> Plane<u8> {
     let v_offset = 1i64 << (v_shift - 1);
     let pixel_max = (1i64 << bit_depth) - 1;
 
-    let mut data = vec![0u8; w2 * h2];
+    let mut data = vec![0u16; w2 * h2];
     for y in (0..h).step_by(2) {
         let y2 = y / 2;
         let rows: [&[i32]; 10] = std::array::from_fn(|k| {
@@ -79,7 +79,7 @@ pub fn decimate_to_420(src: &Plane<u8>, bit_depth: u32) -> Plane<u8> {
                 + (rows[3][x] as i64 + rows[6][x] as i64) * DP1C1
                 + (rows[4][x] as i64 + rows[5][x] as i64) * DP1C0
                 + v_offset;
-            dst_row[x] = clamp_pix(v >> v_shift, pixel_max) as u8;
+            dst_row[x] = clamp_pix(v >> v_shift, pixel_max) as u16;
         }
     }
 
@@ -101,7 +101,7 @@ mod tests {
         let w = 16;
         let h = 16;
         let src = Plane {
-            data: vec![200u8; w * h],
+            data: vec![200u16; w * h],
             width: w as u32,
             height: h as u32,
             stride: w,
@@ -117,7 +117,7 @@ mod tests {
         let w = 5;
         let h = 3;
         let src = Plane {
-            data: vec![100u8; w * h],
+            data: vec![100u16; w * h],
             width: w as u32,
             height: h as u32,
             stride: w,
@@ -125,5 +125,21 @@ mod tests {
         let dst = decimate_to_420(&src, 8);
         assert_eq!(dst.width, 3); // (5+1)/2
         assert_eq!(dst.height, 2); // (3+1)/2
+    }
+
+    #[test]
+    fn solid_color_is_unchanged_10bit() {
+        let w = 16;
+        let h = 16;
+        let src = Plane {
+            data: vec![800u16; w * h],
+            width: w as u32,
+            height: h as u32,
+            stride: w,
+        };
+        let dst = decimate_to_420(&src, 10);
+        assert_eq!(dst.width, 8);
+        assert_eq!(dst.height, 8);
+        assert!(dst.data.iter().all(|&v| v == 800));
     }
 }

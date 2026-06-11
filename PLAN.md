@@ -293,3 +293,56 @@ x265 static build runs from `bpg-x265-sys/build.rs` on first `cargo build`
 `c_h_phase==0` (MPEG2 siting), RGB/YCgCo color spaces, and the x265
 parameter-search "candidate optimizer" described in the Context section. The
 type stubs (`TODO(extension)`) already leave room for these.
+
+## Progress update (10-bit support)
+
+Per a roadmap review: **alpha and animation are dropped** (alpha is rarely
+present in PNGs from raw-image pipelines; their `TODO(extension)`/`has_alpha`
+stubs are left as-is but deprioritized). **>8-bit (10/12-bit) is now
+implemented**, ahead of the candidate optimizer (still last).
+
+- `bpg-image`: `Image.planes` is now `Vec<Plane<u16>>` always, matching
+  `bpgenc.c`'s internal `typedef uint16_t PIXEL` representation — values are
+  bounded by `(1 << bit_depth) - 1` for whatever `bit_depth` (8/10/12) was
+  selected at color-conversion time.
+  - `convert.rs`: `ColorConvertState::rgb_to_ycc` is now generic over the
+    input sample type (`P: Into<i64>`, i.e. `u8` or `u16`) and always returns
+    `(u16, u16, u16)`; the existing `c_shift = 31 - out_bit_depth` etc.
+    formulas were already bit-depth-generic.
+  - `chroma.rs`: `decimate_to_420`/`decimate_row_h` now operate on
+    `Plane<u16>`/`&[u16]` (arithmetic unchanged, only storage type).
+  - `pad.rs`: `pad_plane` is now `pad_plane<T: Copy + Default>`.
+  - `Image::from_rgb8(rgb, color_space, limited_range, bit_depth)` and new
+    `Image::from_rgb16(rgb16, color_space, limited_range, bit_depth)` (for
+    16-bit PNG input) both go through a shared `from_rgb_pixels` helper.
+- `bpg-encode`: `encode_still_image` now accepts `bit_depth` 8, 10, or 12
+  (was hard-`8`-only).
+- `bpg-x265`: `encode_impl` now branches on `bit_depth`: for 8-bit it
+  truncates the `u16` planes to a temporary `u8` buffer (mirroring
+  `image_convert16to8`) with `stride` in samples; for 10/12-bit it passes the
+  `u16` plane data directly with `stride * 2` (bytes), matching x265's
+  `x265_picture.stride` "bytes between row starts" convention.
+- `bpg-x265-sys`: `build.rs` now does an x265 **multilib build** for 10-bit:
+  it first builds a 10-bit static lib (`HIGH_BIT_DEPTH=ON`, `MAIN12=OFF`,
+  `EXPORT_C_API=OFF`, namespace `x265_10bit`) and copies it out as
+  `libx265_main10.a`, then builds the main 8-bit lib (`EXPORT_C_API=ON`,
+  `LINKED_10BIT=ON`, `EXTRA_LIB=<path to libx265_main10.a>`). Both archives
+  are linked (`-lx265 -lx265_main10`); `x265_api_query(10, X265_BUILD, &err)`
+  then dispatches into the linked-in `x265_10bit::` namespace. Set
+  `BPG_X265_SKIP_10BIT=1` to build only the 8-bit lib for faster iteration
+  (12-bit was not built — not needed for the 10-bit milestone).
+- `bpg-tools`: new `-b`/`--bit-depth` option (8/10/12, default 8). 16-bit PNG
+  input (`DynamicImage::ImageRgb16`/`ImageRgba16`) is read via
+  `Image::from_rgb16`; other inputs go through `Image::from_rgb8` and may be
+  upscaled to a higher output `bit_depth`.
+
+**Verification:** a synthetic 64x64 16-bit PNG (generated via the `image`
+crate) was encoded at `--bit-depth 10 --format 420 --qp 28`, producing a
+115-byte `.bpg` that `bpgdec` decodes cleanly (`-b 16` round-trips to a
+16-bit PNG with values close to the source, as expected for lossy QP28). The
+existing 8-bit M1 acceptance test (`dusk.png`, byte-identical vs C reference,
+1,097,884 bytes) still passes unchanged. `cargo test` → 27 unit tests pass.
+
+**Remaining:** 12-bit (not built, would need a second multilib lib +
+`MAIN12=ON`), the candidate optimizer (last), and the previously-listed
+alpha/4:2:2/MPEG2-siting/RGB/YCgCo items.
