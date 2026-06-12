@@ -5,6 +5,8 @@ members = [
     "crates/bpg-image",
     "crates/bpg-format",
     "crates/bpg-hevc",
+    "crates/bpg-hevc-decode",
+    "crates/bpg-decode",
     "crates/bpg-encode",
     "crates/bpg-x265-sys",
     "crates/bpg-x265",

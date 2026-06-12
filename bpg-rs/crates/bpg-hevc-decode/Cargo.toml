@@ -1,0 +1,14 @@
+[package]
+name = "bpg-hevc-decode"
+version.workspace = true
+edition = "2024"
+license.workspace = true
+description = "Pure-Rust HEVC still-picture intra decoder, vendored/adapted from heic-decoder-rs for BPG."
+
+[dependencies]
+archmage = { version = "0.8", default-features = false, features = ["macros", "safe_unaligned_simd"] }
+safe_unaligned_simd = "0.2"
+
+[features]
+default = ["std"]
+std = ["archmage/std"]

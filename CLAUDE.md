@@ -111,12 +111,21 @@ identical to the C reference.
 | `bpg-encode` | **Done** | `HevcEncoder` trait, `HevcEncodeParams`, `EncodeError`, `encode_still_image` orchestration (pad → encode → `build_modified_hevc` → header+payload). Accepts `bit_depth` 8/10/12. Depends on `bpg-image` + `bpg-format` + `bpg-hevc`. |
 | `bpg-x265-sys` | **Done** | `build.rs` builds the vendored x265 (`../../../x265_4.1/source`) via the `cmake` crate + `bindgen` FFI from `wrapper.h`. Does an x265 **multilib build**: an 8-bit lib (`EXPORT_C_API=ON`, `LINKED_10BIT=ON`) linked against a separately-built 10-bit lib (`HIGH_BIT_DEPTH=ON`, `EXPORT_C_API=OFF`, namespace `x265_10bit`, copied out as `libx265_main10.a`). `ENABLE_ASSEMBLY=OFF` by default (no `nasm`/`yasm` in dev env; `BPG_X265_ENABLE_ASM=1` to enable; `BPG_X265_SKIP_10BIT=1` to build only the 8-bit lib). `links = "x265"`. Uses `x265_api_query` (non-versioned) rather than the `x265_api_get_215` symbol. |
 | `bpg-x265` | **Done** | Safe `X265Encoder` implementing `bpg-encode::HevcEncoder`, ported from `x265_glue.c` (single-frame intra). For `bit_depth == 8` truncates the internal `u16` planes to `u8` (mirroring `image_convert16to8`); for 10/12-bit passes `u16` plane data with byte stride. Defines `X265_RC_CQP`/preset-name constants that bindgen omits. |
+| `bpg-hevc-decode` | **Done**, tested | Vendored pure-Rust HEVC still-picture intra **decoder** (`src/hevc/*` copied verbatim from `heic-decoder-rs`), with a local `error::HevcError` and a minimal `heif::HevcDecoderConfig` shim replacing the upstream's container/cancellation deps. External deps trimmed to `archmage` + `safe_unaligned_simd`; edition 2024 (let-chains). Entry point `hevc::decode(annexb) -> DecodedFrame`. See `bpg-rs/FULL_RUST_CODEC_PLAN.md` (Phase 1). |
+| `bpg-decode` | **Done**, tested | BPG still-image **decode** orchestration: BPG container -> `bpg-hevc::rebuild_annexb_from_bpg_payload` -> `bpg-hevc-decode` -> RGBA/RGB/BGR(A) output. Public API: `DecoderConfig`, `PixelLayout`, `DecodeOutput`, `ImageInfo`, `Limits`, `DecodeError`. Rejects animation/alpha/W-plane/MPEG2-siting/RGB/YCgCo as `Unsupported`. Fixture tests in `tests/fixtures.rs`. |
 | `bpg-tools` | **Done** | `clap` CLI with the `encode` subcommand, a `-b/--bit-depth 8\|10\|12` option (16-bit PNG input read via `from_rgb16`), and `--format 420\|422\|444`, ties `bpg-image` + `bpg-encode` + `bpg-x265` together. |
 
 Dependency graph: `bpg-bitstream` → `bpg-format`, `bpg-hevc`; `bpg-image` is
 standalone (uses the `image` crate); `bpg-encode` depends on `bpg-image` +
 `bpg-format` + `bpg-hevc`; `bpg-x265-sys` → `bpg-x265` (implements
-`HevcEncoder`); `bpg-tools` depends on all of the above via `clap`.
+`HevcEncoder`); `bpg-hevc-decode` is standalone (vendored decoder); `bpg-decode`
+depends on `bpg-bitstream` + `bpg-format` + `bpg-hevc` + `bpg-hevc-decode`;
+`bpg-tools` depends on all of the above via `clap`.
+
+The full Rust BPG codec roadmap (vendoring the decoder, then a Rust
+x265-derived still encoder) lives in `bpg-rs/FULL_RUST_CODEC_PLAN.md`. **Phase 1
+(vendor the decoder, remove the external `heic-decoder-rs` path dependency) is
+complete** — the repo is now self-contained.
 
 **Next milestones**: alpha-plane support, `c_h_phase==0` (MPEG2 chroma
 siting), RGB/YCgCo color spaces, and the **tuning system** (`bpg-analyze` +

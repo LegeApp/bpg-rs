@@ -1,0 +1,11 @@
+[package]
+name = "bpg-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bpg-bitstream = { path = "../bpg-bitstream" }
+bpg-format = { path = "../bpg-format" }
+bpg-hevc = { path = "../bpg-hevc" }
+bpg-hevc-decode = { path = "../bpg-hevc-decode" }

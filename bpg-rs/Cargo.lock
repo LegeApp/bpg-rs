@@ -68,6 +68,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "archmage"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0fb818f2e02ca08cc6416725044fadc84bcf5a96e2eb7ab103c966123667d86"
+dependencies = [
+ "archmage-macros",
+ "safe_unaligned_simd",
+]
+
+[[package]]
+name = "archmage-macros"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1886761e37995842cfbaf8c24d483e62d9b8c174254d29146f596d4d87efff2d"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -104,6 +125,16 @@ name = "bpg-bitstream"
 version = "0.1.0"
 
 [[package]]
+name = "bpg-decode"
+version = "0.1.0"
+dependencies = [
+ "bpg-bitstream",
+ "bpg-format",
+ "bpg-hevc",
+ "bpg-hevc-decode",
+]
+
+[[package]]
 name = "bpg-encode"
 version = "0.1.0"
 dependencies = [
@@ -127,6 +158,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bpg-hevc-decode"
+version = "0.1.0"
+dependencies = [
+ "archmage",
+ "safe_unaligned_simd",
+]
+
+[[package]]
 name = "bpg-image"
 version = "0.1.0"
 dependencies = [
@@ -137,6 +176,7 @@ dependencies = [
 name = "bpg-tools"
 version = "0.1.0"
 dependencies = [
+ "bpg-decode",
  "bpg-encode",
  "bpg-format",
  "bpg-hevc",
@@ -506,6 +546,12 @@ name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94300abf3f1ae2e2b8ffb7b58043de3d399c73fa6f4b73826402a5c457614dbe"
+
+[[package]]
+name = "safe_unaligned_simd"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9c874fb993656d484725d58fbfddb39dfcf98ebcadc1a1d09568aa6b39bafba"
 
 [[package]]
 name = "shlex"
