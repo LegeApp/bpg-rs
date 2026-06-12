@@ -110,33 +110,44 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
         });
     }
 
-    // Create frame buffer with actual bit depth and chroma format from SPS
-    let mut frame = DecodedFrame::with_params(
-        sps.pic_width_in_luma_samples,
-        sps.pic_height_in_luma_samples,
-        sps.bit_depth_y(),
-        sps.chroma_format_idc,
-    );
+    // BPG codes pic_width/height at the *display* size, which need not be a
+    // multiple of MinCbSizeY. HEVC's coding quadtree force-splits CUs that
+    // straddle the picture boundary, but the minimum-size edge CUs are still
+    // reconstructed at full CU size, writing a few samples past the display
+    // width/height. So allocate the sample planes at the CU-aligned ("coded")
+    // size and crop the alignment padding away on output. For a conformant
+    // CU-aligned stream coded_w == pic_w and this is a no-op.
+    let (sub_width_c, sub_height_c) = match sps.chroma_format_idc {
+        0 => (1u32, 1u32), // Monochrome
+        1 => (2, 2),       // 4:2:0
+        2 => (2, 1),       // 4:2:2
+        3 => (1, 1),       // 4:4:4
+        _ => (2, 2),
+    };
+    let min_cb = 1u32 << sps.log2_min_cb_size();
+    let pic_w = sps.pic_width_in_luma_samples;
+    let pic_h = sps.pic_height_in_luma_samples;
+    let coded_w = pic_w.div_ceil(min_cb) * min_cb;
+    let coded_h = pic_h.div_ceil(min_cb) * min_cb;
+
+    let mut frame =
+        DecodedFrame::with_params(coded_w, coded_h, sps.bit_depth_y(), sps.chroma_format_idc);
     frame.full_range = sps.video_full_range_flag;
     frame.matrix_coeffs = sps.matrix_coeffs;
 
-    // Set conformance window cropping from SPS
-    // Offsets are in units of SubWidthC/SubHeightC, need to convert to luma samples
+    // Crop = alignment padding (coded − display) plus the SPS conformance
+    // window. Conformance offsets are in SubWidthC/SubHeightC units.
+    let mut crop_left = 0;
+    let mut crop_right = coded_w - pic_w;
+    let mut crop_top = 0;
+    let mut crop_bottom = coded_h - pic_h;
     if sps.conformance_window_flag {
-        let (sub_width_c, sub_height_c) = match sps.chroma_format_idc {
-            0 => (1, 1), // Monochrome
-            1 => (2, 2), // 4:2:0
-            2 => (2, 1), // 4:2:2
-            3 => (1, 1), // 4:4:4
-            _ => (2, 2), // Default to 4:2:0
-        };
-        frame.set_crop(
-            sps.conf_win_offset.0 * sub_width_c,  // left
-            sps.conf_win_offset.1 * sub_width_c,  // right
-            sps.conf_win_offset.2 * sub_height_c, // top
-            sps.conf_win_offset.3 * sub_height_c, // bottom
-        );
+        crop_left += sps.conf_win_offset.0 * sub_width_c;
+        crop_right += sps.conf_win_offset.1 * sub_width_c;
+        crop_top += sps.conf_win_offset.2 * sub_height_c;
+        crop_bottom += sps.conf_win_offset.3 * sub_height_c;
     }
+    frame.set_crop(crop_left, crop_right, crop_top, crop_bottom);
 
     // Decode slice data (base layer only — skip enhancement layer NALs in L-HEVC streams)
     for nal in nal_units {

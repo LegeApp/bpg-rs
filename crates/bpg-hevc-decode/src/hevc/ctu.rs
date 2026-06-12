@@ -864,11 +864,26 @@ impl<'a> SliceContext<'a> {
                     self.derive_intra_luma_mode(x0 + half, y0 + half, prev_flags[3])?;
                 self.store_intra_mode(x0 + half, y0 + half, log2_pu_size, luma_mode_3);
 
-                // Decode chroma mode once (using first luma mode for derivation if mode=4)
-                let chroma_mode = self.decode_intra_chroma_mode(luma_mode_0)?;
-
-                // Store chroma mode for the whole CU region
-                self.store_intra_chroma_mode(x0, y0, log2_cb_size, chroma_mode);
+                // Chroma modes. Per H.265 7.3.8.5, intra_chroma_pred_mode is
+                // signaled once per PU only when ChromaArrayType == 3 (4:4:4);
+                // for 4:2:0/4:2:2 a single chroma mode covers the whole CU.
+                let chroma_mode = if self.sps.chroma_array_type() == 3 {
+                    let half = cb_size / 2;
+                    let cm0 = self.decode_intra_chroma_mode(luma_mode_0)?;
+                    self.store_intra_chroma_mode(x0, y0, log2_pu_size, cm0);
+                    let cm1 = self.decode_intra_chroma_mode(luma_mode_1)?;
+                    self.store_intra_chroma_mode(x0 + half, y0, log2_pu_size, cm1);
+                    let cm2 = self.decode_intra_chroma_mode(luma_mode_2)?;
+                    self.store_intra_chroma_mode(x0, y0 + half, log2_pu_size, cm2);
+                    let cm3 = self.decode_intra_chroma_mode(luma_mode_3)?;
+                    self.store_intra_chroma_mode(x0 + half, y0 + half, log2_pu_size, cm3);
+                    cm0
+                } else {
+                    // Single chroma mode (derived from the first luma mode if DM).
+                    let cm = self.decode_intra_chroma_mode(luma_mode_0)?;
+                    self.store_intra_chroma_mode(x0, y0, log2_cb_size, cm);
+                    cm
+                };
 
                 // NOTE: Prediction is NOT done here. It happens in decode_transform_unit_leaf
                 // and the 8x8→4x4 chroma split handler, so each TU is predicted →
@@ -1002,10 +1017,14 @@ impl<'a> SliceContext<'a> {
             false
         };
 
-        // Step 2: Decode cbf_cb and cbf_cr
-        // For 4:2:0, decode chroma cbf at this level if log2_size > 2
-        // cbf_cb/cbf_cr decoded if log2_size > 2 AND (trafoDepth == 0 OR parent cbf is set)
-        let (cbf_cb, cbf_cr) = if log2_size > 2 {
+        // Step 2: Decode cbf_cb and cbf_cr.
+        // Per H.265 7.3.8.8: chroma cbf is decoded when
+        //   (log2TrafoSize > 2 && ChromaArrayType != 0) || ChromaArrayType == 3.
+        // The `|| == 3` clause means 4:4:4 decodes chroma cbf even at 4x4
+        // (log2_size == 2), where it is otherwise inherited from the parent.
+        let cat = self.sps.chroma_array_type();
+        let decode_chroma_cbf = (log2_size > 2 && cat != 0) || cat == 3;
+        let (cbf_cb, cbf_cr) = if decode_chroma_cbf {
             // Decode cbf_cb if trafo_depth == 0 (always) or parent had cbf_cb
             let cb = if trafo_depth == 0 || cbf_cb_parent {
                 let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
@@ -1084,11 +1103,14 @@ impl<'a> SliceContext<'a> {
                 frame,
             )?;
 
-            // For 4:2:0, if we split from 8x8 to 4x4, predict + decode chroma now
-            // (because 4x4 children can't have chroma TUs)
-            if log2_size == 3 {
+            // For 4:2:0 (and 4:2:2), if we split from 8x8 to 4x4, the children
+            // are 4x4 luma TUs that can't carry chroma, so the single chroma TB
+            // for the 8x8 region is predicted + decoded now at the parent level.
+            // 4:4:4 does NOT do this — its 4x4 children each carry their own
+            // chroma TUs (handled in the leaf), so skip when ChromaArrayType==3.
+            if log2_size == 3 && cat != 3 {
                 let sis = self.sps.strong_intra_smoothing_enabled_flag;
-                let scan_order = residual::get_scan_order(2, intra_chroma_mode.as_u8(), 1);
+                let scan_order = residual::get_scan_order(2, intra_chroma_mode.as_u8(), 1, cat);
 
                 // Predict and apply Cb
                 intra::predict_intra(frame, x0 / 2, y0 / 2, 2, intra_chroma_mode, 1, sis);
@@ -1183,12 +1205,13 @@ impl<'a> SliceContext<'a> {
         // Look up intra mode at actual TU position (correct for NxN where sub-TUs differ)
         let actual_luma_mode = self.get_intra_mode_at(x0, y0);
         let sis = self.sps.strong_intra_smoothing_enabled_flag;
+        let cat = self.sps.chroma_array_type();
 
         // Predict luma at TU level BEFORE residual application
         // This ensures each TU reads reconstructed neighbors from prior TUs
         intra::predict_intra(frame, x0, y0, log2_size, actual_luma_mode, 0, sis);
 
-        let scan_order = residual::get_scan_order(log2_size, actual_luma_mode.as_u8(), 0);
+        let scan_order = residual::get_scan_order(log2_size, actual_luma_mode.as_u8(), 0, cat);
 
         // Decode and apply luma residuals (adds to prediction already in frame)
         if cbf_luma {
@@ -1206,11 +1229,29 @@ impl<'a> SliceContext<'a> {
             self.decode_and_apply_residual(x0, y0, log2_size, 0, scan_order, frame)?;
         }
 
-        // Decode chroma: predict + residual per component if not handled by parent
-        if log2_size >= 3 {
+        if cat == 3 {
+            // 4:4:4: chroma transform blocks mirror luma exactly — same size,
+            // same position, decoded at every leaf (including 4x4). Each TU's
+            // chroma mode is looked up per-position (NxN gives one per PU).
+            let chroma_mode = self.get_intra_chroma_mode_at(x0, y0);
+            let chroma_scan_order =
+                residual::get_scan_order(log2_size, chroma_mode.as_u8(), 1, cat);
+
+            intra::predict_intra(frame, x0, y0, log2_size, chroma_mode, 1, sis);
+            if cbf_cb {
+                self.decode_and_apply_residual(x0, y0, log2_size, 1, chroma_scan_order, frame)?;
+            }
+            intra::predict_intra(frame, x0, y0, log2_size, chroma_mode, 2, sis);
+            if cbf_cr {
+                self.decode_and_apply_residual(x0, y0, log2_size, 2, chroma_scan_order, frame)?;
+            }
+        } else if log2_size >= 3 {
+            // 4:2:0 / 4:2:2: chroma is half-width; a single chroma TB at
+            // (x0/2, y0/2) of size log2_size-1 covers this luma TU. (4x4 luma
+            // TUs carry no chroma — handled by the parent 8x8 split above.)
             let chroma_log2_size = log2_size - 1;
             let chroma_scan_order =
-                residual::get_scan_order(chroma_log2_size, intra_chroma_mode.as_u8(), 1);
+                residual::get_scan_order(chroma_log2_size, intra_chroma_mode.as_u8(), 1, cat);
 
             // Predict and apply Cb
             intra::predict_intra(
@@ -1254,7 +1295,8 @@ impl<'a> SliceContext<'a> {
                 )?;
             }
         }
-        // Note: if log2_size < 3, chroma was predicted+decoded by parent when splitting from 8x8
+        // Note: if log2_size < 3 (and not 4:4:4), chroma was predicted+decoded
+        // by the parent when splitting from 8x8.
 
         Ok(())
     }

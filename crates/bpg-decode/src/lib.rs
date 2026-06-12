@@ -277,15 +277,13 @@ fn reject_unsupported(file: &bpg_format::BpgFile<'_>) -> Result<(), DecodeError>
     // reference), so use stock bpgdec to decode those until the Rust decoder
     // gains real chroma support. See FULL_RUST_CODEC_PLAN.md (Phase 1 follow-up).
     match file.header.pixel_format {
-        PixelFormat::Gray | PixelFormat::Yuv420 | PixelFormat::Yuv420Video => {}
+        PixelFormat::Gray
+        | PixelFormat::Yuv420
+        | PixelFormat::Yuv420Video
+        | PixelFormat::Yuv444 => {}
         PixelFormat::Yuv422 | PixelFormat::Yuv422Video => {
             return Err(DecodeError::Unsupported(
-                "4:2:2 decode (Rust decoder supports 4:2:0 only)",
-            ))
-        }
-        PixelFormat::Yuv444 => {
-            return Err(DecodeError::Unsupported(
-                "4:4:4 decode (Rust decoder supports 4:2:0 only)",
+                "4:2:2 decode (not yet implemented in the Rust decoder)",
             ))
         }
     }

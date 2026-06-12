@@ -33,15 +33,18 @@ pub enum ScanOrder {
 ///
 /// Per H.265 Table 6-5 and libde265 get_intra_scan_idx():
 /// - For luma (c_idx=0): directional scan applies at log2_size 2 and 3
-/// - For chroma (c_idx>0) in 4:2:0: directional scan only at log2_size 2
-///   (log2_size 3 would be 8x8 chroma which doesn't exist in 4:2:0)
-pub fn get_scan_order(log2_size: u8, intra_mode: u8, c_idx: u8) -> ScanOrder {
+/// - For chroma (c_idx>0): directional scan at log2_size 2, plus log2_size 3
+///   when `chroma_array_type == 3` (4:4:4, where chroma TBs reach 8x8). For
+///   4:2:0/4:2:2 chroma only the 4x4 block uses a directional scan.
+pub fn get_scan_order(log2_size: u8, intra_mode: u8, c_idx: u8, chroma_array_type: u8) -> ScanOrder {
     let use_directional = if c_idx == 0 {
         // Luma: 4x4 or 8x8
         log2_size == 2 || log2_size == 3
+    } else if chroma_array_type == 3 {
+        // 4:4:4 chroma mirrors luma: 4x4 and 8x8 get directional scans.
+        log2_size == 2 || log2_size == 3
     } else {
-        // Chroma in 4:2:0: only 4x4 gets directional scan
-        // (for 4:4:4, log2_size == 3 would also apply, but we only support 4:2:0)
+        // 4:2:0 / 4:2:2 chroma: only the 4x4 block gets a directional scan.
         log2_size == 2
     };
 

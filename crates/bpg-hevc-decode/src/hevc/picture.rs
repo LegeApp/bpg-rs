@@ -212,6 +212,28 @@ impl DecodedFrame {
         }
     }
 
+    /// Chroma subsampling factors `(SubWidthC, SubHeightC)` for this frame's
+    /// chroma format (4:2:0 -> (2,2), 4:2:2 -> (2,1), 4:4:4/mono -> (1,1)).
+    pub fn chroma_subsampling(&self) -> (u32, u32) {
+        match self.chroma_format {
+            1 => (2, 2),
+            2 => (2, 1),
+            _ => (1, 1), // 4:4:4 and monochrome/fallback
+        }
+    }
+
+    /// Dimensions of the component plane `c_idx` (0 = luma) in samples. Chroma
+    /// planes use ceil division so odd luma sizes round up, matching
+    /// `with_params`' allocation.
+    pub fn component_dims(&self, c_idx: u8) -> (u32, u32) {
+        if c_idx == 0 || self.chroma_format == 0 {
+            (self.width, self.height)
+        } else {
+            let (sw, sh) = self.chroma_subsampling();
+            (self.width.div_ceil(sw), self.height.div_ceil(sh))
+        }
+    }
+
     /// Convert a single YCbCr pixel to RGB.
     /// y_val, cb_val, cr_val are 8-bit values (0-255).
     /// Selects coefficient matrix based on `matrix_coeffs` field.

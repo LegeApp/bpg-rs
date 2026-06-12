@@ -249,12 +249,9 @@ fn fill_border_samples(
     // Resolve plane once to avoid per-pixel match dispatch
     let (plane, stride) = frame.plane(c_idx);
 
-    let (frame_w, frame_h) = if c_idx == 0 {
-        (frame.width, frame.height)
-    } else {
-        // Chroma is half resolution for 4:2:0
-        (frame.width / 2, frame.height / 2)
-    };
+    // Component-plane dimensions: luma is full-res; chroma depends on the
+    // subsampling (4:2:0 -> W/2xH/2, 4:2:2 -> W/2xH, 4:4:4 -> WxH).
+    let (frame_w, frame_h) = frame.component_dims(c_idx);
 
     let avail_left = x > 0;
     let avail_top = y > 0;

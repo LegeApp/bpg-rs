@@ -58,28 +58,33 @@ fn clock_animation_is_unsupported() {
 }
 
 #[test]
-fn non_420_chroma_is_unsupported() {
-    // The vendored decoder only reconstructs 4:2:0 correctly; 4:2:2 and 4:4:4
-    // must be rejected rather than decoded to garbage. The encoder still
-    // produces valid 4:2:2/4:4:4 BPG (these fixtures came from stock bpgenc).
-    for name in ["solid422.bpg", "solid444.bpg"] {
-        let data = local_fixture(name);
-        let err = DecoderConfig::new()
-            .decode(&data, PixelLayout::Rgb8)
-            .expect_err(&format!("{name} must be rejected, not decoded"));
-        assert!(matches!(err, DecodeError::Unsupported(_)), "got {err:?}");
-    }
+fn yuv444_decodes() {
+    // 4:4:4 is supported (chroma TBs mirror luma). Fixture is a 64x64 solid
+    // teal from stock bpgenc -f 444.
+    let data = local_fixture("solid444.bpg");
+    let info = ImageInfo::from_bytes(&data).expect("probe solid444");
+    assert!(matches!(
+        info.pixel_format,
+        bpg_format::PixelFormat::Yuv444
+    ));
+    let out = DecoderConfig::new()
+        .decode(&data, PixelLayout::Rgb8)
+        .expect("4:4:4 must decode");
+    assert_eq!((out.width, out.height), (64, 64));
+    assert_eq!(out.data.len(), 64 * 64 * 3);
 }
 
 #[test]
-fn non_420_chroma_error_message() {
-    let data = local_fixture("solid444.bpg");
+fn yuv422_is_unsupported() {
+    // 4:2:2 is not yet implemented in the Rust decoder; it must be rejected
+    // rather than decoded to garbage. (The encoder still produces valid 4:2:2.)
+    let data = local_fixture("solid422.bpg");
     let err = DecoderConfig::new()
         .decode(&data, PixelLayout::Rgb8)
-        .expect_err("4:4:4 must be rejected");
+        .expect_err("4:2:2 must be rejected");
     assert!(
-        matches!(err, DecodeError::Unsupported(msg) if msg.contains("4:4:4")),
-        "expected 4:4:4 unsupported, got {err:?}"
+        matches!(err, DecodeError::Unsupported(msg) if msg.contains("4:2:2")),
+        "expected 4:2:2 unsupported, got {err:?}"
     );
 }
 
