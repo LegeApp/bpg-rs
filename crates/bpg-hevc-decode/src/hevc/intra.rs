@@ -11,6 +11,23 @@ use super::slice::IntraPredMode;
 /// Maximum block size for intra prediction (HEVC max intra TU = 32)
 const MAX_INTRA_PRED_BLOCK_SIZE: usize = 32;
 
+/// HEVC Table 8-3: chroma intra prediction mode mapping for `ChromaArrayType == 2`
+/// (4:2:2). The chroma plane is horizontally subsampled but not vertically, so
+/// angular modes are remapped to compensate for the 2:1 sample aspect. Indexed
+/// by the derived `IntraPredModeC` (0..=34); Planar(0)/DC(1) are unchanged.
+pub static CHROMA_MODE_MAP_422: [u8; 35] = [
+    0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25,
+    26, 27, 27, 28, 28, 29, 29, 30, 31,
+];
+
+/// Apply the 4:2:2 chroma intra mode remap (Table 8-3) to a mode value.
+pub fn map_chroma_mode_422(mode: u8) -> u8 {
+    CHROMA_MODE_MAP_422
+        .get(mode as usize)
+        .copied()
+        .unwrap_or(mode)
+}
+
 /// Intra prediction angle table (H.265 Table 8-4)
 /// Index 0-1 are placeholders, modes 2-34 have actual angles
 pub static INTRA_PRED_ANGLE: [i16; 35] = [

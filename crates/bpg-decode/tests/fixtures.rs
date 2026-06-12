@@ -75,17 +75,20 @@ fn yuv444_decodes() {
 }
 
 #[test]
-fn yuv422_is_unsupported() {
-    // 4:2:2 is not yet implemented in the Rust decoder; it must be rejected
-    // rather than decoded to garbage. (The encoder still produces valid 4:2:2.)
+fn yuv422_decodes() {
+    // 4:2:2 is supported (two vertically-stacked chroma TBs per luma TU).
+    // Fixture is a 64x64 solid teal from stock bpgenc -f 422.
     let data = local_fixture("solid422.bpg");
-    let err = DecoderConfig::new()
+    let info = ImageInfo::from_bytes(&data).expect("probe solid422");
+    assert!(matches!(
+        info.pixel_format,
+        bpg_format::PixelFormat::Yuv422
+    ));
+    let out = DecoderConfig::new()
         .decode(&data, PixelLayout::Rgb8)
-        .expect_err("4:2:2 must be rejected");
-    assert!(
-        matches!(err, DecodeError::Unsupported(msg) if msg.contains("4:2:2")),
-        "expected 4:2:2 unsupported, got {err:?}"
-    );
+        .expect("4:2:2 must decode");
+    assert_eq!((out.width, out.height), (64, 64));
+    assert_eq!(out.data.len(), 64 * 64 * 3);
 }
 
 #[test]

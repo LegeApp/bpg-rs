@@ -93,23 +93,32 @@ libbpg, but this is the decoder's pre-existing fidelity, unchanged by
 vendoring). A full self-contained round trip — `bpg-tools encode --backend x265`
 then `bpg-decode` — succeeds.
 
-#### Phase 1 follow-up: vendored decoder is 4:2:0-only
+#### Phase 1 follow-up COMPLETE: decoder now supports 4:2:0, 4:2:2, 4:4:4
 
-The Phase 2 oracle immediately surfaced that the vendored decoder only
-reconstructs **4:2:0** (and monochrome) correctly. Its transform-tree /
-residual / intra path was built and tested for 4:2:0 (the dominant HEIC case);
-**4:2:2 and 4:4:4 decode to garbage** (~5–8 dB PSNR vs stock bpgdec — even a
-flat DC-only image decodes to the wrong color). Proper support is real HEVC
-work (chroma transform-tree recursion, the stacked-block 4:2:2 layout, 4:4:4
-chroma intra modes) and is deferred.
+The Phase 2 oracle surfaced that the vendored decoder was **4:2:0-only** —
+4:2:2/4:4:4 decoded to ~5–8 dB garbage (its transform-tree/residual/intra path
+was written and tested only for 4:2:0, the dominant HEIC case). This has now
+been fixed; the decoder reconstructs all three chroma formats, validated
+against stock `bpgdec`:
 
-Because the *encoder* produces correct 4:2:2/4:4:4 BPG (verified byte-identical
-to the C reference, and confirmed again by the oracle's bpgdec-vs-source PSNR),
-`bpg-decode` now **rejects 4:2:2/4:4:4 as `Unsupported`** rather than emitting a
-plausible-but-wrong image (repo convention: no silent incorrect behavior). Use
-stock `bpgdec` to decode those until the Rust decoder gains real chroma support.
-Tracked as a decoder TODO; does not block the Phase 3 encoder port (validated
-against bpgdec).
+- **4:4:4** (`ChromaArrayType==3`): chroma transform tree mirrors luma — cbf_cb/
+  cbf_cr decoded at 4x4 too, chroma TBs at luma size/position decoded at every
+  leaf, per-PU chroma modes for NxN, and the log2==3 directional chroma scan.
+- **4:2:2** (`ChromaArrayType==2`): two vertically-stacked chroma TBs per luma
+  TU, each with its own cbf (second cbf decoded per spec 7.3.8.8), and the
+  Table 8-3 chroma intra mode remap.
+- **Non-CU-aligned sizes** (all formats): BPG codes `pic_width/height` at the
+  display size, so edge min-CUs straddle the picture boundary. The planes are
+  now allocated at the CU-aligned coded size and cropped on output — this also
+  fixed pre-existing 4:2:0 odd-size corruption (~26 dB → ~49 dB).
+
+Results vs bpgdec (oracle `rust_psnr`): 4:4:4 49–99 dB, 4:2:2 30–99 dB, all
+high (residual differences are the final YCbCr→RGB rounding / chroma-upsampling
+choice, not reconstruction error). Odd 131×97: 4:2:0 49 dB, 4:2:2 51 dB, 4:4:4
+70 dB (4:4:4 was previously a panic). `bpg-decode` no longer rejects any chroma
+format. **Known remaining decoder gaps**: alpha plane, MPEG2 chroma siting
+(`c_h_phase==0`), RGB/YCgCo color spaces, `separate_colour_plane_flag` — all
+still `Unsupported`.
 
 ### Phase 2 COMPLETE — x265 oracle harness + regression corpus
 

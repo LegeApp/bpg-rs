@@ -1024,29 +1024,42 @@ impl<'a> SliceContext<'a> {
         // (log2_size == 2), where it is otherwise inherited from the parent.
         let cat = self.sps.chroma_array_type();
         let decode_chroma_cbf = (log2_size > 2 && cat != 0) || cat == 3;
-        let (cbf_cb, cbf_cr) = if decode_chroma_cbf {
-            // Decode cbf_cb if trafo_depth == 0 (always) or parent had cbf_cb
+        // 4:2:2 carries a second chroma TB stacked below the first; its cbf is
+        // decoded (right after the first) wherever the chroma residual is coded
+        // at this level: a leaf (!split) or an 8x8 splitting to 4x4 (log2==3).
+        let decode_second_cbf = cat == 2 && (!split_transform || log2_size == 3);
+        let (cbf_cb, cbf_cb1, cbf_cr, cbf_cr1) = if decode_chroma_cbf {
+            let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
+            let decode = |s: &mut Self| -> Result<bool> {
+                let val = s.cabac.decode_bin(&mut s.ctx[ctx_idx])? != 0;
+                se_trace("cbf_chroma", val as i64, &s.cabac);
+                Ok(val)
+            };
+            // cbf_cb[0], then cbf_cb[1] (4:2:2), then cbf_cr[0], then cbf_cr[1].
             let cb = if trafo_depth == 0 || cbf_cb_parent {
-                let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
-                let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
-                se_trace("cbf_cb", val as i64, &self.cabac);
-                val
+                decode(self)?
             } else {
                 false
             };
-            // Decode cbf_cr if trafo_depth == 0 (always) or parent had cbf_cr
+            let cb1 = if decode_second_cbf && (trafo_depth == 0 || cbf_cb_parent) {
+                decode(self)?
+            } else {
+                false
+            };
             let cr = if trafo_depth == 0 || cbf_cr_parent {
-                let ctx_idx = context::CBF_CBCR + trafo_depth as usize;
-                let val = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
-                se_trace("cbf_cr", val as i64, &self.cabac);
-                val
+                decode(self)?
             } else {
                 false
             };
-            (cb, cr)
+            let cr1 = if decode_second_cbf && (trafo_depth == 0 || cbf_cr_parent) {
+                decode(self)?
+            } else {
+                false
+            };
+            (cb, cb1, cr, cr1)
         } else {
             // log2_size == 2: inherit from parent (chroma decoded at parent level)
-            (cbf_cb_parent, cbf_cr_parent)
+            (cbf_cb_parent, false, cbf_cr_parent, false)
         };
 
         if split_transform {
@@ -1103,26 +1116,13 @@ impl<'a> SliceContext<'a> {
                 frame,
             )?;
 
-            // For 4:2:0 (and 4:2:2), if we split from 8x8 to 4x4, the children
-            // are 4x4 luma TUs that can't carry chroma, so the single chroma TB
-            // for the 8x8 region is predicted + decoded now at the parent level.
-            // 4:4:4 does NOT do this — its 4x4 children each carry their own
-            // chroma TUs (handled in the leaf), so skip when ChromaArrayType==3.
+            // If we split from 8x8 to 4x4, the children are 4x4 luma TUs that
+            // can't carry chroma, so the chroma TB(s) for the 8x8 region are
+            // predicted + decoded now at the parent level. 4:2:0 has one 4x4
+            // chroma TB; 4:2:2 has two stacked 4x4 TBs. 4:4:4 does NOT do this
+            // (its 4x4 children carry their own chroma — handled in the leaf).
             if log2_size == 3 && cat != 3 {
-                let sis = self.sps.strong_intra_smoothing_enabled_flag;
-                let scan_order = residual::get_scan_order(2, intra_chroma_mode.as_u8(), 1, cat);
-
-                // Predict and apply Cb
-                intra::predict_intra(frame, x0 / 2, y0 / 2, 2, intra_chroma_mode, 1, sis);
-                if cbf_cb {
-                    self.decode_and_apply_residual(x0 / 2, y0 / 2, 2, 1, scan_order, frame)?;
-                }
-
-                // Predict and apply Cr
-                intra::predict_intra(frame, x0 / 2, y0 / 2, 2, intra_chroma_mode, 2, sis);
-                if cbf_cr {
-                    self.decode_and_apply_residual(x0 / 2, y0 / 2, 2, 2, scan_order, frame)?;
-                }
+                self.decode_chroma_tus(x0, y0, 2, intra_chroma_mode, cbf_cb, cbf_cb1, cbf_cr, cbf_cr1, frame)?;
             }
         } else {
             // Decode transform unit (leaf node)
@@ -1134,11 +1134,75 @@ impl<'a> SliceContext<'a> {
                 intra_luma_mode,
                 intra_chroma_mode,
                 cbf_cb,
+                cbf_cb1,
                 cbf_cr,
+                cbf_cr1,
                 frame,
             )?;
         }
 
+        Ok(())
+    }
+
+    /// Predict + (optionally) reconstruct the chroma transform block(s) for a
+    /// luma region, dispatching on chroma format.
+    ///
+    /// `cx_luma`/`cy_luma` are the *luma* coordinates and `chroma_log2` the
+    /// chroma TB log2 size. 4:2:0 has a single TB at (x/2, y/2); 4:2:2 has two
+    /// TBs stacked vertically at (x/2, y) and (x/2, y + size) with the Table 8-3
+    /// remapped mode; 4:4:4 is handled inline in the leaf (full-size, at luma
+    /// coords), not here.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_chroma_tus(
+        &mut self,
+        cx_luma: u32,
+        cy_luma: u32,
+        chroma_log2: u8,
+        chroma_mode: IntraPredMode,
+        cbf_cb0: bool,
+        cbf_cb1: bool,
+        cbf_cr0: bool,
+        cbf_cr1: bool,
+        frame: &mut DecodedFrame,
+    ) -> Result<()> {
+        let cat = self.sps.chroma_array_type();
+        let size = 1u32 << chroma_log2;
+        if cat == 2 {
+            // 4:2:2: chroma x is halved, y is full; two square TBs stacked.
+            let cx = cx_luma / 2;
+            let mode = IntraPredMode::from_u8(intra::map_chroma_mode_422(chroma_mode.as_u8()))
+                .unwrap_or(chroma_mode);
+            self.predict_apply_chroma(cx, cy_luma, chroma_log2, 1, mode, cbf_cb0, frame)?;
+            self.predict_apply_chroma(cx, cy_luma + size, chroma_log2, 1, mode, cbf_cb1, frame)?;
+            self.predict_apply_chroma(cx, cy_luma, chroma_log2, 2, mode, cbf_cr0, frame)?;
+            self.predict_apply_chroma(cx, cy_luma + size, chroma_log2, 2, mode, cbf_cr1, frame)?;
+        } else {
+            // 4:2:0: single chroma TB at (x/2, y/2).
+            let (cx, cy) = (cx_luma / 2, cy_luma / 2);
+            self.predict_apply_chroma(cx, cy, chroma_log2, 1, chroma_mode, cbf_cb0, frame)?;
+            self.predict_apply_chroma(cx, cy, chroma_log2, 2, chroma_mode, cbf_cr0, frame)?;
+        }
+        Ok(())
+    }
+
+    /// Predict one chroma TB and, if `cbf` is set, decode+add its residual.
+    fn predict_apply_chroma(
+        &mut self,
+        cx: u32,
+        cy: u32,
+        log2_size: u8,
+        c_idx: u8,
+        mode: IntraPredMode,
+        cbf: bool,
+        frame: &mut DecodedFrame,
+    ) -> Result<()> {
+        let sis = self.sps.strong_intra_smoothing_enabled_flag;
+        intra::predict_intra(frame, cx, cy, log2_size, mode, c_idx, sis);
+        if cbf {
+            let cat = self.sps.chroma_array_type();
+            let scan = residual::get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
+            self.decode_and_apply_residual(cx, cy, log2_size, c_idx, scan, frame)?;
+        }
         Ok(())
     }
 
@@ -1158,7 +1222,9 @@ impl<'a> SliceContext<'a> {
         _intra_luma_mode: IntraPredMode,
         intra_chroma_mode: IntraPredMode,
         cbf_cb: bool,
+        cbf_cb1: bool,
         cbf_cr: bool,
+        cbf_cr1: bool,
         frame: &mut DecodedFrame,
     ) -> Result<()> {
         let debug_tt = self.debug_ctu;
@@ -1246,54 +1312,20 @@ impl<'a> SliceContext<'a> {
                 self.decode_and_apply_residual(x0, y0, log2_size, 2, chroma_scan_order, frame)?;
             }
         } else if log2_size >= 3 {
-            // 4:2:0 / 4:2:2: chroma is half-width; a single chroma TB at
-            // (x0/2, y0/2) of size log2_size-1 covers this luma TU. (4x4 luma
-            // TUs carry no chroma — handled by the parent 8x8 split above.)
-            let chroma_log2_size = log2_size - 1;
-            let chroma_scan_order =
-                residual::get_scan_order(chroma_log2_size, intra_chroma_mode.as_u8(), 1, cat);
-
-            // Predict and apply Cb
-            intra::predict_intra(
-                frame,
-                x0 / 2,
-                y0 / 2,
-                chroma_log2_size,
+            // 4:2:0 / 4:2:2: chroma TBs are half-width (log2_size-1). 4:2:0 has a
+            // single TB; 4:2:2 has two stacked TBs (see decode_chroma_tus). (4x4
+            // luma TUs carry no chroma — handled by the parent 8x8 split above.)
+            self.decode_chroma_tus(
+                x0,
+                y0,
+                log2_size - 1,
                 intra_chroma_mode,
-                1,
-                sis,
-            );
-            if cbf_cb {
-                self.decode_and_apply_residual(
-                    x0 / 2,
-                    y0 / 2,
-                    chroma_log2_size,
-                    1,
-                    chroma_scan_order,
-                    frame,
-                )?;
-            }
-
-            // Predict and apply Cr
-            intra::predict_intra(
+                cbf_cb,
+                cbf_cb1,
+                cbf_cr,
+                cbf_cr1,
                 frame,
-                x0 / 2,
-                y0 / 2,
-                chroma_log2_size,
-                intra_chroma_mode,
-                2,
-                sis,
-            );
-            if cbf_cr {
-                self.decode_and_apply_residual(
-                    x0 / 2,
-                    y0 / 2,
-                    chroma_log2_size,
-                    2,
-                    chroma_scan_order,
-                    frame,
-                )?;
-            }
+            )?;
         }
         // Note: if log2_size < 3 (and not 4:4:4), chroma was predicted+decoded
         // by the parent when splitting from 8x8.
