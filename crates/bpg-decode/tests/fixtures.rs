@@ -58,6 +58,32 @@ fn clock_animation_is_unsupported() {
 }
 
 #[test]
+fn non_420_chroma_is_unsupported() {
+    // The vendored decoder only reconstructs 4:2:0 correctly; 4:2:2 and 4:4:4
+    // must be rejected rather than decoded to garbage. The encoder still
+    // produces valid 4:2:2/4:4:4 BPG (these fixtures came from stock bpgenc).
+    for name in ["solid422.bpg", "solid444.bpg"] {
+        let data = local_fixture(name);
+        let err = DecoderConfig::new()
+            .decode(&data, PixelLayout::Rgb8)
+            .expect_err(&format!("{name} must be rejected, not decoded"));
+        assert!(matches!(err, DecodeError::Unsupported(_)), "got {err:?}");
+    }
+}
+
+#[test]
+fn non_420_chroma_error_message() {
+    let data = local_fixture("solid444.bpg");
+    let err = DecoderConfig::new()
+        .decode(&data, PixelLayout::Rgb8)
+        .expect_err("4:4:4 must be rejected");
+    assert!(
+        matches!(err, DecodeError::Unsupported(msg) if msg.contains("4:4:4")),
+        "expected 4:4:4 unsupported, got {err:?}"
+    );
+}
+
+#[test]
 fn alpha_image_is_unsupported() {
     let data = local_fixture("alpha64.bpg");
 
