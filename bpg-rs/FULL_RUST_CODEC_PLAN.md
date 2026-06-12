@@ -93,8 +93,54 @@ libbpg, but this is the decoder's pre-existing fidelity, unchanged by
 vendoring). A full self-contained round trip — `bpg-tools encode --backend x265`
 then `bpg-decode` — succeeds.
 
-**Next:** Phase 2 (x265 oracle harness/corpus) or Phase 3 (`bpg-still-hevc`
-syntax skeleton).
+#### Phase 1 follow-up: vendored decoder is 4:2:0-only
+
+The Phase 2 oracle immediately surfaced that the vendored decoder only
+reconstructs **4:2:0** (and monochrome) correctly. Its transform-tree /
+residual / intra path was built and tested for 4:2:0 (the dominant HEIC case);
+**4:2:2 and 4:4:4 decode to garbage** (~5–8 dB PSNR vs stock bpgdec — even a
+flat DC-only image decodes to the wrong color). Proper support is real HEVC
+work (chroma transform-tree recursion, the stacked-block 4:2:2 layout, 4:4:4
+chroma intra modes) and is deferred.
+
+Because the *encoder* produces correct 4:2:2/4:4:4 BPG (verified byte-identical
+to the C reference, and confirmed again by the oracle's bpgdec-vs-source PSNR),
+`bpg-decode` now **rejects 4:2:2/4:4:4 as `Unsupported`** rather than emitting a
+plausible-but-wrong image (repo convention: no silent incorrect behavior). Use
+stock `bpgdec` to decode those until the Rust decoder gains real chroma support.
+Tracked as a decoder TODO; does not block the Phase 3 encoder port (validated
+against bpgdec).
+
+### Phase 2 COMPLETE — x265 oracle harness + regression corpus
+
+New `crates/bpg-oracle` binary (`gen` / `check`):
+
+- **Deterministic corpus** (`corpus.rs`): flat, gradient, checkerboard, line
+  art, seeded noise, a 16-bit HDR gradient, and a center crop of `dusk.png`
+  (8-bit + 16-bit) — the content classes the tuning roadmap targets. Generated
+  from code with fixed seeds, so the corpus and manifest are reproducible.
+- **Config matrix**: 8-bit × {4:2:0, 4:2:2, 4:4:4} × {qp 24, 32}; 16-bit ×
+  {4:2:0, 4:4:4} × {qp 28} (exercises the linked 10-bit lib). 40 encodes / 8
+  images.
+- **Locked still-image settings** asserted by `bpg-x265` (intra-only, CQP,
+  `bRepeatHeaders`, AMP, BT.601, JPEG siting) — written to `oracle/SETTINGS.md`
+  by `gen`.
+- For each encode it records: bpg bytes, rebuilt Annex-B (`*.hevc`), the
+  ground-truth **stock-bpgdec** reference decode (`*.decoded.png`), and two
+  metric axes — **encode-quality PSNR** (bpgdec vs source) and the **Rust
+  decoder status/fidelity** (`ok`/`unsupported`/`fail` + PSNR vs bpgdec).
+- `manifest.csv` + `SETTINGS.md` are committed; `corpus/` and `out/` are
+  `.gitignore`d (regenerable). `check` regenerates and diffs `bpg_bytes` (exact)
+  and encode-quality PSNR (±0.01 dB) against the committed manifest, assuming
+  the same vendored x265 build (ENABLE_ASSEMBLY=OFF) and bpgdec.
+
+Result: encode-quality PSNR is high (36–99 dB) across **all** chroma formats,
+confirming the encoder is sound and giving the Phase 3 Rust encoder a concrete,
+regenerable comparison baseline. 4 oracle unit tests (corpus determinism +
+PSNR) run under `cargo test`.
+
+**Next:** Phase 3 (`bpg-still-hevc` syntax skeleton) — the corpus + manifest are
+the baseline its output will be measured against.
 
 ## Phase 1: Vendor The HEIC HEVC Decoder
 

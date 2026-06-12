@@ -268,6 +268,27 @@ fn reject_unsupported(file: &bpg_format::BpgFile<'_>) -> Result<(), DecodeError>
     if file.chroma_phase != ChromaPhase::Jpeg {
         return Err(DecodeError::Unsupported("MPEG2 chroma siting"));
     }
+    // The vendored HEVC decoder only reconstructs 4:2:0 (and monochrome)
+    // correctly. Its transform-tree / residual path was built and tested for
+    // 4:2:0 (the dominant HEIC/BPG case); 4:2:2 and 4:4:4 decode to garbage
+    // (the oracle measures ~5-8 dB PSNR vs stock bpgdec). Reject them rather
+    // than emit a plausible-looking-but-wrong image — the encoder still
+    // produces correct 4:2:2/4:4:4 BPG (verified byte-identical to the C
+    // reference), so use stock bpgdec to decode those until the Rust decoder
+    // gains real chroma support. See FULL_RUST_CODEC_PLAN.md (Phase 1 follow-up).
+    match file.header.pixel_format {
+        PixelFormat::Gray | PixelFormat::Yuv420 | PixelFormat::Yuv420Video => {}
+        PixelFormat::Yuv422 | PixelFormat::Yuv422Video => {
+            return Err(DecodeError::Unsupported(
+                "4:2:2 decode (Rust decoder supports 4:2:0 only)",
+            ))
+        }
+        PixelFormat::Yuv444 => {
+            return Err(DecodeError::Unsupported(
+                "4:4:4 decode (Rust decoder supports 4:2:0 only)",
+            ))
+        }
+    }
     match file.header.color_space {
         ColorSpaceCode::YCbCr | ColorSpaceCode::YCbCrBt709 | ColorSpaceCode::YCbCrBt2020 => {}
         ColorSpaceCode::Rgb => return Err(DecodeError::Unsupported("RGB color space")),
