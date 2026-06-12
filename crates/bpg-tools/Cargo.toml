@@ -14,5 +14,6 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 bpg-image = { path = "../bpg-image" }
 bpg-format = { path = "../bpg-format" }
 bpg-hevc = { path = "../bpg-hevc" }
+bpg-decode = { path = "../bpg-decode" }
 bpg-encode = { path = "../bpg-encode" }
 bpg-x265 = { path = "../bpg-x265" }

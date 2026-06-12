@@ -63,7 +63,12 @@ impl Image {
     /// Convert an 8-bit RGB image to a 4:4:4 YCbCr `Image`, optionally
     /// scaling up to a higher `bit_depth` (10/12-bit) during color
     /// conversion.
-    pub fn from_rgb8(rgb: &image::RgbImage, color_space: ColorSpace, limited_range: bool, bit_depth: u8) -> Self {
+    pub fn from_rgb8(
+        rgb: &image::RgbImage,
+        color_space: ColorSpace,
+        limited_range: bool,
+        bit_depth: u8,
+    ) -> Self {
         let cvt = ColorConvertState::new(8, bit_depth as u32, color_space, limited_range);
         Self::from_rgb_pixels(
             rgb.width(),
@@ -140,7 +145,11 @@ impl Image {
     /// half way between luma samples") is implemented, which is the value
     /// `bpgenc` uses when 4:2:0 is the preferred chroma format.
     pub fn subsample_to_420(&mut self, h_phase: u8) {
-        assert_eq!(self.chroma_format, ChromaFormat::Yuv444, "subsample_to_420 requires a 4:4:4 image");
+        assert_eq!(
+            self.chroma_format,
+            ChromaFormat::Yuv444,
+            "subsample_to_420 requires a 4:4:4 image"
+        );
         assert_eq!(h_phase, 1, "only h_phase == 1 is implemented");
 
         self.planes[1] = chroma::decimate_to_420(&self.planes[1], self.bit_depth as u32);
@@ -153,7 +162,11 @@ impl Image {
     /// half way between luma samples") is implemented, which is the value
     /// `bpgenc` uses when 4:2:2 is the preferred chroma format.
     pub fn subsample_to_422(&mut self, h_phase: u8) {
-        assert_eq!(self.chroma_format, ChromaFormat::Yuv444, "subsample_to_422 requires a 4:4:4 image");
+        assert_eq!(
+            self.chroma_format,
+            ChromaFormat::Yuv444,
+            "subsample_to_422 requires a 4:4:4 image"
+        );
         assert_eq!(h_phase, 1, "only h_phase == 1 is implemented");
 
         self.planes[1] = chroma::decimate_to_422(&self.planes[1], self.bit_depth as u32);

@@ -1,13 +1,14 @@
 //! `bpg-tools` — command-line front-end for the bpg-rs encoder.
 //!
-//! M1 supports a single `encode` subcommand: 8-bit PNG in, BPG out, x265
-//! backend, lossy CQP, YCbCr, 4:2:0 or 4:4:4. See `bpg-rs/PLAN.md`.
+//! M1 supports `encode` and still-image `decode` subcommands. See
+//! `bpg-rs/PLAN.md`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
+use bpg_decode::{DecoderConfig, PixelLayout};
 use bpg_encode::{encode_still_image, EncoderTuning};
 use bpg_image::{ColorSpace, Image};
 use bpg_x265::X265Encoder;
@@ -23,6 +24,8 @@ struct Cli {
 enum Command {
     /// Encode a PNG image to BPG.
     Encode(EncodeArgs),
+    /// Decode a still-image BPG to PNG.
+    Decode(DecodeArgs),
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -45,6 +48,14 @@ enum CsArg {
     Ycbcr,
     Bt709,
     Bt2020,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DecodeFormat {
+    Rgb,
+    Rgba,
+    Bgr,
+    Bgra,
 }
 
 #[derive(clap::Args)]
@@ -84,6 +95,20 @@ struct EncodeArgs {
     /// Use limited (TV) range instead of full range.
     #[arg(long)]
     limited_range: bool,
+}
+
+#[derive(clap::Args)]
+struct DecodeArgs {
+    /// Input BPG file.
+    input: PathBuf,
+
+    /// Output PNG file.
+    #[arg(short = 'o', long = "output")]
+    output: PathBuf,
+
+    /// Decoded pixel layout before PNG encoding.
+    #[arg(long = "format", value_enum, default_value_t = DecodeFormat::Rgba)]
+    format: DecodeFormat,
 }
 
 fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -134,10 +159,56 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     std::fs::write(&args.output, &bpg)?;
+    eprintln!("wrote {} ({} bytes)", args.output.display(), bpg.len());
+    Ok(())
+}
+
+fn run_decode(args: &DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let data = std::fs::read(&args.input)?;
+    let layout = match args.format {
+        DecodeFormat::Rgb => PixelLayout::Rgb8,
+        DecodeFormat::Rgba => PixelLayout::Rgba8,
+        DecodeFormat::Bgr => PixelLayout::Bgr8,
+        DecodeFormat::Bgra => PixelLayout::Bgra8,
+    };
+    let decoded = DecoderConfig::new().decode(&data, layout)?;
+
+    match decoded.layout {
+        PixelLayout::Rgb8 => {
+            let img = image::RgbImage::from_raw(decoded.width, decoded.height, decoded.data)
+                .ok_or("decoded RGB buffer has invalid length")?;
+            img.save(&args.output)?;
+        }
+        PixelLayout::Rgba8 => {
+            let img = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.data)
+                .ok_or("decoded RGBA buffer has invalid length")?;
+            img.save(&args.output)?;
+        }
+        PixelLayout::Bgr8 => {
+            let mut data = decoded.data;
+            for px in data.chunks_exact_mut(3) {
+                px.swap(0, 2);
+            }
+            let img = image::RgbImage::from_raw(decoded.width, decoded.height, data)
+                .ok_or("decoded BGR buffer has invalid length")?;
+            img.save(&args.output)?;
+        }
+        PixelLayout::Bgra8 => {
+            let mut data = decoded.data;
+            for px in data.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            let img = image::RgbaImage::from_raw(decoded.width, decoded.height, data)
+                .ok_or("decoded BGRA buffer has invalid length")?;
+            img.save(&args.output)?;
+        }
+    }
+
     eprintln!(
-        "wrote {} ({} bytes)",
+        "wrote {} ({}x{})",
         args.output.display(),
-        bpg.len()
+        decoded.width,
+        decoded.height
     );
     Ok(())
 }
@@ -146,6 +217,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match &cli.command {
         Command::Encode(args) => run_encode(args),
+        Command::Decode(args) => run_decode(args),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

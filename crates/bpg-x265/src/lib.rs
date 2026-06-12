@@ -67,12 +67,13 @@ impl HevcEncoder for X265Encoder {
     }
 }
 
-unsafe fn encode_impl(
-    image: &Image,
-    params: &HevcEncodeParams,
-) -> Result<Vec<u8>, EncodeError> {
+unsafe fn encode_impl(image: &Image, params: &HevcEncodeParams) -> Result<Vec<u8>, EncodeError> {
     let mut err: c_int = 0;
-    let api = sys::x265_api_query(params.bit_depth as c_int, sys::X265_BUILD as c_int, &mut err);
+    let api = sys::x265_api_query(
+        params.bit_depth as c_int,
+        sys::X265_BUILD as c_int,
+        &mut err,
+    );
     if api.is_null() {
         return Err(EncodeError::Backend(format!(
             "x265_api_query failed (bit_depth={}, err={})",
@@ -83,17 +84,31 @@ unsafe fn encode_impl(
 
     let macro_err = |s: &str| EncodeError::Backend(s.to_string());
 
-    let param_alloc = api.param_alloc.ok_or_else(|| macro_err("param_alloc null"))?;
+    let param_alloc = api
+        .param_alloc
+        .ok_or_else(|| macro_err("param_alloc null"))?;
     let param_free = api.param_free.ok_or_else(|| macro_err("param_free null"))?;
     let param_default_preset = api
         .param_default_preset
         .ok_or_else(|| macro_err("param_default_preset null"))?;
-    let picture_alloc = api.picture_alloc.ok_or_else(|| macro_err("picture_alloc null"))?;
-    let picture_init = api.picture_init.ok_or_else(|| macro_err("picture_init null"))?;
-    let picture_free = api.picture_free.ok_or_else(|| macro_err("picture_free null"))?;
-    let encoder_open = api.encoder_open.ok_or_else(|| macro_err("encoder_open null"))?;
-    let encoder_encode = api.encoder_encode.ok_or_else(|| macro_err("encoder_encode null"))?;
-    let encoder_close = api.encoder_close.ok_or_else(|| macro_err("encoder_close null"))?;
+    let picture_alloc = api
+        .picture_alloc
+        .ok_or_else(|| macro_err("picture_alloc null"))?;
+    let picture_init = api
+        .picture_init
+        .ok_or_else(|| macro_err("picture_init null"))?;
+    let picture_free = api
+        .picture_free
+        .ok_or_else(|| macro_err("picture_free null"))?;
+    let encoder_open = api
+        .encoder_open
+        .ok_or_else(|| macro_err("encoder_open null"))?;
+    let encoder_encode = api
+        .encoder_encode
+        .ok_or_else(|| macro_err("encoder_encode null"))?;
+    let encoder_close = api
+        .encoder_close
+        .ok_or_else(|| macro_err("encoder_close null"))?;
 
     let p = param_alloc();
     if p.is_null() {
@@ -233,7 +248,13 @@ unsafe fn encode_impl(
 
     // Flush any buffered output.
     loop {
-        let ret = encoder_encode(enc, &mut p_nal, &mut nal_count, ptr::null_mut(), ptr::null_mut());
+        let ret = encoder_encode(
+            enc,
+            &mut p_nal,
+            &mut nal_count,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        );
         if ret <= 0 {
             break;
         }

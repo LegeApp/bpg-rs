@@ -40,6 +40,34 @@ pub enum HevcError {
     UnsupportedFeature { what: &'static str },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BpgHevcInfo {
+    pub width: u32,
+    pub height: u32,
+    /// HEVC chroma_format_idc: 0=gray, 1=4:2:0, 2=4:2:2, 3=4:4:4.
+    pub chroma_format_idc: u8,
+    pub bit_depth: u8,
+    pub limited_range: bool,
+    /// HEVC matrix_coefficients value: 6=BT.601, 1=BT.709, 9=BT.2020.
+    pub matrix_coefficients: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModifiedSpsFields {
+    log2_min_luma_coding_block_size_minus3: u32,
+    log2_diff_max_min_luma_coding_block_size: u32,
+    log2_min_luma_transform_block_size_minus2: u32,
+    log2_diff_max_min_luma_transform_block_size: u32,
+    max_transform_hierarchy_depth_intra: u32,
+    sample_adaptive_offset_enabled_flag: u32,
+    pcm_enabled_flag: u32,
+    pcm: Option<(u32, u32, u32, u32, u32)>,
+    strong_intra_smoothing_enabled_flag: u32,
+    sps_extension_flag: u32,
+    sps_range_extension_flag: u32,
+    sps_range_extension_flags: u32,
+}
+
 /// Locate the end of the Annex-B NAL at the start of `buf`.
 ///
 /// Returns the index one past the last byte of the NAL (i.e. the start of the
@@ -161,7 +189,9 @@ impl ModifiedSps {
         gb.skip_bits(16); /* nal header */
         let vps_id = gb.read_bits(4);
         if vps_id != 0 {
-            return Err(HevcError::UnsupportedFeature { what: "vps_id != 0" });
+            return Err(HevcError::UnsupportedFeature {
+                what: "vps_id != 0",
+            });
         }
         let max_sub_layers = gb.read_bits(3);
         if max_sub_layers != 0 {
@@ -186,7 +216,9 @@ impl ModifiedSps {
 
         let sps_id = ue(&mut gb)?;
         if sps_id != 0 {
-            return Err(HevcError::UnsupportedFeature { what: "sps_id != 0" });
+            return Err(HevcError::UnsupportedFeature {
+                what: "sps_id != 0",
+            });
         }
         let chroma_format_idc = ue(&mut gb)?;
         if chroma_format_idc == 3 {
@@ -428,6 +460,218 @@ pub fn build_modified_hevc(cbuf: &[u8]) -> Result<Vec<u8>, HevcError> {
         first_nal = false;
     }
     Ok(out)
+}
+
+/// Convert a BPG modified-HEVC payload back into an Annex-B stream consumable
+/// by an ordinary HEVC decoder. This is the decode-side counterpart of
+/// [`build_modified_hevc`] and is ported from `build_msps` plus
+/// `hevc_decode_frame_internal` in `libbpg.c`.
+///
+/// M1 scope: color still image only. The caller is responsible for rejecting
+/// alpha/animation before calling this function.
+pub fn rebuild_annexb_from_bpg_payload(
+    payload: &[u8],
+    info: BpgHevcInfo,
+) -> Result<Vec<u8>, HevcError> {
+    let mut pos = 0usize;
+    let msps_len = bpg_bitstream::read_ue7(payload, &mut pos).ok_or(HevcError::Truncated)? as usize;
+    let msps_end = pos.checked_add(msps_len).ok_or(HevcError::Truncated)?;
+    if msps_end > payload.len() {
+        return Err(HevcError::Truncated);
+    }
+    if payload.len() == msps_end {
+        return Err(HevcError::Truncated);
+    }
+
+    let fields = parse_modified_sps_fields(&payload[pos..msps_end])?;
+    let sps_payload = build_sps_payload(&fields, info);
+    let sps_nal = make_nal(33, &sps_payload);
+
+    let mut out = Vec::with_capacity(payload.len() + sps_nal.len() + 16);
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out.extend_from_slice(&sps_nal);
+    out.extend_from_slice(&[0, 0, 1]);
+    out.extend_from_slice(&payload[msps_end..]);
+    Ok(out)
+}
+
+fn parse_modified_sps_fields(msps: &[u8]) -> Result<ModifiedSpsFields, HevcError> {
+    let mut r = BitReader::new(msps);
+    let ue = |r: &mut BitReader| r.read_ue_golomb().ok_or(HevcError::Truncated);
+    let log2_min_luma_coding_block_size_minus3 = ue(&mut r)?;
+    let log2_diff_max_min_luma_coding_block_size = ue(&mut r)?;
+    let log2_min_luma_transform_block_size_minus2 = ue(&mut r)?;
+    let log2_diff_max_min_luma_transform_block_size = ue(&mut r)?;
+    let max_transform_hierarchy_depth_intra = ue(&mut r)?;
+    let sample_adaptive_offset_enabled_flag = r.read_bits(1);
+    let pcm_enabled_flag = r.read_bits(1);
+    let pcm = if pcm_enabled_flag != 0 {
+        Some((
+            r.read_bits(4),
+            r.read_bits(4),
+            ue(&mut r)?,
+            ue(&mut r)?,
+            r.read_bits(1),
+        ))
+    } else {
+        None
+    };
+    let strong_intra_smoothing_enabled_flag = r.read_bits(1);
+    let sps_extension_flag = r.read_bits(1);
+    let mut sps_range_extension_flag = 0;
+    let mut sps_range_extension_flags = 0;
+    if sps_extension_flag != 0 {
+        sps_range_extension_flag = r.read_bits(1);
+        let sps_extension_7bits = r.read_bits(7);
+        if sps_extension_7bits != 0 {
+            return Err(HevcError::UnsupportedFeature {
+                what: "sps_extension_7bits != 0",
+            });
+        }
+        if sps_range_extension_flag != 0 {
+            sps_range_extension_flags = r.read_bits(9);
+        }
+    }
+
+    Ok(ModifiedSpsFields {
+        log2_min_luma_coding_block_size_minus3,
+        log2_diff_max_min_luma_coding_block_size,
+        log2_min_luma_transform_block_size_minus2,
+        log2_diff_max_min_luma_transform_block_size,
+        max_transform_hierarchy_depth_intra,
+        sample_adaptive_offset_enabled_flag,
+        pcm_enabled_flag,
+        pcm,
+        strong_intra_smoothing_enabled_flag,
+        sps_extension_flag,
+        sps_range_extension_flag,
+        sps_range_extension_flags,
+    })
+}
+
+fn build_sps_payload(fields: &ModifiedSpsFields, info: BpgHevcInfo) -> Vec<u8> {
+    let mut w = BitWriter::new();
+
+    w.write_bits(4, 0); // sps_video_parameter_set_id
+    w.write_bits(3, 0); // sps_max_sub_layers_minus1
+    w.write_bits(1, 1); // sps_temporal_id_nesting_flag
+    write_profile_tier_level(&mut w);
+
+    w.write_ue_golomb(0); // sps_seq_parameter_set_id
+    w.write_ue_golomb(info.chroma_format_idc as u32);
+    if info.chroma_format_idc == 3 {
+        w.write_bits(1, 0); // separate_colour_plane_flag
+    }
+    w.write_ue_golomb(info.width);
+    w.write_ue_golomb(info.height);
+    w.write_bits(1, 0); // conformance_window_flag
+    w.write_ue_golomb((info.bit_depth - 8) as u32);
+    w.write_ue_golomb((info.bit_depth - 8) as u32);
+    w.write_ue_golomb(4); // log2_max_pic_order_cnt_lsb_minus4
+    w.write_bits(1, 0); // sps_sub_layer_ordering_info_present_flag
+    w.write_ue_golomb(0); // sps_max_dec_pic_buffering_minus1
+    w.write_ue_golomb(0); // sps_max_num_reorder_pics
+    w.write_ue_golomb(0); // sps_max_latency_increase_plus1
+
+    w.write_ue_golomb(fields.log2_min_luma_coding_block_size_minus3);
+    w.write_ue_golomb(fields.log2_diff_max_min_luma_coding_block_size);
+    w.write_ue_golomb(fields.log2_min_luma_transform_block_size_minus2);
+    w.write_ue_golomb(fields.log2_diff_max_min_luma_transform_block_size);
+    w.write_ue_golomb(fields.max_transform_hierarchy_depth_intra);
+    w.write_ue_golomb(fields.max_transform_hierarchy_depth_intra);
+    w.write_bits(1, 0); // scaling_list_enabled_flag
+    w.write_bits(1, 1); // amp_enabled_flag
+    w.write_bits(1, fields.sample_adaptive_offset_enabled_flag);
+    w.write_bits(1, fields.pcm_enabled_flag);
+    if let Some((luma_m1, chroma_m1, log2_min_m3, log2_diff_max, loop_filter)) = fields.pcm {
+        w.write_bits(4, luma_m1);
+        w.write_bits(4, chroma_m1);
+        w.write_ue_golomb(log2_min_m3);
+        w.write_ue_golomb(log2_diff_max);
+        w.write_bits(1, loop_filter);
+    }
+    w.write_ue_golomb(0); // num_short_term_ref_pic_sets
+    w.write_bits(1, 0); // long_term_ref_pics_present_flag
+    w.write_bits(1, 1); // sps_temporal_mvp_enabled_flag
+    w.write_bits(1, fields.strong_intra_smoothing_enabled_flag);
+
+    // VUI carries the BPG container color metadata for the reused HEVC frame
+    // conversion code.
+    w.write_bits(1, 1); // vui_parameters_present_flag
+    w.write_bits(1, 0); // aspect_ratio_info_present_flag
+    w.write_bits(1, 0); // overscan_info_present_flag
+    w.write_bits(1, 1); // video_signal_type_present_flag
+    w.write_bits(3, 5); // video_format = unspecified
+    w.write_bits(1, (!info.limited_range) as u32);
+    w.write_bits(1, 1); // colour_description_present_flag
+    let colour_primaries = match info.matrix_coefficients {
+        1 => 1,
+        9 => 9,
+        _ => 6,
+    };
+    w.write_bits(8, colour_primaries);
+    w.write_bits(8, colour_primaries);
+    w.write_bits(8, info.matrix_coefficients as u32);
+    w.write_bits(1, 0); // chroma_loc_info_present_flag
+    w.write_bits(1, 0); // neutral_chroma_indication_flag
+    w.write_bits(1, 0); // field_seq_flag
+    w.write_bits(1, 0); // frame_field_info_present_flag
+    w.write_bits(1, 0); // default_display_window_flag
+    w.write_bits(1, 0); // vui_timing_info_present_flag
+    w.write_bits(1, 0); // bitstream_restriction_flag
+
+    w.write_bits(1, fields.sps_extension_flag);
+    if fields.sps_extension_flag != 0 {
+        w.write_bits(1, fields.sps_range_extension_flag);
+        w.write_bits(7, 0);
+        if fields.sps_range_extension_flag != 0 {
+            w.write_bits(9, fields.sps_range_extension_flags);
+        }
+    }
+    write_rbsp_trailing_bits(&mut w);
+    w.into_bytes()
+}
+
+fn write_profile_tier_level(w: &mut BitWriter) {
+    w.write_bits(2, 0); // general_profile_space
+    w.write_bits(1, 0); // general_tier_flag
+    w.write_bits(5, 1); // general_profile_idc = Main
+    w.write_bits(32, 0); // general_profile_compatibility_flags
+    w.write_bits(1, 1); // progressive_source_flag
+    w.write_bits(1, 0); // interlaced_source_flag
+    w.write_bits(1, 0); // non_packed_constraint_flag
+    w.write_bits(1, 1); // frame_only_constraint_flag
+    w.write_bits(32, 0);
+    w.write_bits(12, 0);
+    w.write_bits(8, 120); // general_level_idc
+}
+
+fn write_rbsp_trailing_bits(w: &mut BitWriter) {
+    w.write_bits(1, 1);
+    w.byte_align();
+}
+
+fn make_nal(nal_unit_type: u8, payload: &[u8]) -> Vec<u8> {
+    let mut rbsp = Vec::with_capacity(payload.len() + 2);
+    rbsp.push(nal_unit_type << 1);
+    rbsp.push(1);
+    rbsp.extend_from_slice(payload);
+
+    let mut out = Vec::with_capacity(rbsp.len() + 8);
+    let mut zeros = 0usize;
+    for b in rbsp {
+        if zeros >= 2 && b <= 0x03 {
+            out.push(0x03);
+            zeros = 0;
+        }
+        out.push(b);
+        if b == 0 {
+            zeros += 1;
+        } else {
+            zeros = 0;
+        }
+    }
+    out
 }
 
 #[cfg(test)]

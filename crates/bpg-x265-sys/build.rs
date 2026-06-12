@@ -38,13 +38,22 @@
 use std::env;
 use std::path::{Path, PathBuf};
 
+fn configure_mingw_toolchain(cfg: &mut cmake::Config) -> &mut cmake::Config {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        cfg.define("CMAKE_C_COMPILER", "C:/msys64/mingw64/bin/gcc.exe")
+            .define("CMAKE_CXX_COMPILER", "C:/msys64/mingw64/bin/g++.exe");
+    }
+    cfg
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     // crates/bpg-x265-sys -> crates -> bpg-rs -> repo root -> x265_4.1/source
-    let x265_src = manifest_dir
-        .join("../../../x265_4.1/source")
-        .canonicalize()
-        .expect("vendored x265 source not found at ../../../x265_4.1/source");
+    let x265_src = manifest_dir.join("../../../x265_4.1/source");
+    assert!(
+        x265_src.exists(),
+        "vendored x265 source not found at ../../../x265_4.1/source"
+    );
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     println!("cargo:rerun-if-changed=build.rs");
@@ -58,7 +67,8 @@ fn main() {
     // --- Optionally build the 10-bit lib first (EXPORT_C_API=0, namespace
     // x265_10bit), so its archive can be linked into the main 8-bit build. ---
     let main10_lib_dir = if !skip_10bit {
-        let dst10 = cmake::Config::new(&x265_src)
+        let mut cfg10 = cmake::Config::new(&x265_src);
+        let dst10 = configure_mingw_toolchain(&mut cfg10)
             .out_dir(out_dir.join("x265-10bit"))
             .define("ENABLE_SHARED", "OFF")
             .define("ENABLE_CLI", "OFF")
@@ -70,6 +80,7 @@ fn main() {
             // BPG encodes one intra frame, so NUMA thread pools are moot.
             .define("ENABLE_LIBNUMA", "OFF")
             .define("CMAKE_BUILD_TYPE", "Release")
+            .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
             .define("HIGH_BIT_DEPTH", "ON")
             .define("MAIN12", "OFF")
             .define("EXPORT_C_API", "OFF")
@@ -92,7 +103,7 @@ fn main() {
     // --- Build the main x265 lib (8-bit, EXPORT_C_API=1, no CLI) via cmake,
     // linking in the 10-bit lib if present. ---
     let mut main_cfg = cmake::Config::new(&x265_src);
-    main_cfg
+    configure_mingw_toolchain(&mut main_cfg)
         .define("ENABLE_SHARED", "OFF")
         .define("ENABLE_CLI", "OFF")
         .define("ENABLE_ASSEMBLY", if enable_asm { "ON" } else { "OFF" })
@@ -101,6 +112,7 @@ fn main() {
         // libnuma-independent build.
         .define("ENABLE_LIBNUMA", "OFF")
         .define("CMAKE_BUILD_TYPE", "Release")
+        .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
         .build_target("x265-static");
     if let Some(main10_lib_dir) = &main10_lib_dir {
         main_cfg
@@ -121,14 +133,19 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", build_dir.display());
     println!("cargo:rustc-link-lib=static=x265");
     if let Some(main10_lib_dir) = &main10_lib_dir {
-        println!("cargo:rustc-link-search=native={}", main10_lib_dir.display());
+        println!(
+            "cargo:rustc-link-search=native={}",
+            main10_lib_dir.display()
+        );
         println!("cargo:rustc-link-lib=static=x265_main10");
     }
-    // x265 is C++ and uses pthreads / libm / libdl.
+    // x265 is C++ and uses pthreads / libm. libdl is Unix-only.
     println!("cargo:rustc-link-lib=dylib=stdc++");
     println!("cargo:rustc-link-lib=dylib=pthread");
     println!("cargo:rustc-link-lib=dylib=m");
-    println!("cargo:rustc-link-lib=dylib=dl");
+    if !cfg!(target_os = "windows") {
+        println!("cargo:rustc-link-lib=dylib=dl");
+    }
 
     // --- Generate FFI bindings against x265.h. ---
     let bindings = bindgen::Builder::default()

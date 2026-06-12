@@ -28,7 +28,12 @@ impl ColorConvertState {
     /// `in_bit_depth`/`out_bit_depth`: 8 for the M1 (8-bit PNG -> 8-bit BPG)
     /// path. `color_space` selects the (k_r, k_b) luma coefficients for the
     /// `YCbCr*` family; `Rgb`/`YCgCo` are not yet ported.
-    pub fn new(in_bit_depth: u32, out_bit_depth: u32, color_space: ColorSpace, limited_range: bool) -> Self {
+    pub fn new(
+        in_bit_depth: u32,
+        out_bit_depth: u32,
+        color_space: ColorSpace,
+        limited_range: bool,
+    ) -> Self {
         let (k_r, k_b) = match color_space {
             ColorSpace::YCbCr => (0.299, 0.114),
             ColorSpace::YCbCrBt709 => (0.2126, 0.0722),
@@ -43,8 +48,10 @@ impl ColorConvertState {
         let out_pixel_max = (1u64 << out_bit_depth) - 1;
         let mult = out_pixel_max as f64 * (1u64 << c_shift) as f64 / in_pixel_max;
         let (mult_y, mult_c) = if limited_range {
-            let mult_y = (219u64 << (out_bit_depth - 8)) as f64 * (1u64 << c_shift) as f64 / in_pixel_max;
-            let mult_c = (224u64 << (out_bit_depth - 8)) as f64 * (1u64 << c_shift) as f64 / in_pixel_max;
+            let mult_y =
+                (219u64 << (out_bit_depth - 8)) as f64 * (1u64 << c_shift) as f64 / in_pixel_max;
+            let mult_c =
+                (224u64 << (out_bit_depth - 8)) as f64 * (1u64 << c_shift) as f64 / in_pixel_max;
             (mult_y, mult_c)
         } else {
             (mult, mult)
@@ -73,7 +80,10 @@ impl ColorConvertState {
         let c_one = lrint(mult);
         let c_rnd = 1i64 << (c_shift - 1);
         let (y_offset, _y_one) = if limited_range {
-            (c_rnd + (16i64 << (c_shift + out_bit_depth - 8)), lrint(mult_y))
+            (
+                c_rnd + (16i64 << (c_shift + out_bit_depth - 8)),
+                lrint(mult_y),
+            )
         } else {
             (c_rnd, c_one)
         };
@@ -95,9 +105,18 @@ impl ColorConvertState {
         let (r, g, b) = (r.into(), g.into(), b.into());
         let [c0, c1, c2, c3, c4, c5, c6, c7, c8] = self.coeffs;
         let shift = self.c_shift;
-        let y = clamp_pix((c0 * r + c1 * g + c2 * b + self.y_offset) >> shift, self.pixel_max);
-        let cb = clamp_pix(((c3 * r + c4 * g + c5 * b + self.c_rnd) >> shift) + self.c_center, self.pixel_max);
-        let cr = clamp_pix(((c6 * r + c7 * g + c8 * b + self.c_rnd) >> shift) + self.c_center, self.pixel_max);
+        let y = clamp_pix(
+            (c0 * r + c1 * g + c2 * b + self.y_offset) >> shift,
+            self.pixel_max,
+        );
+        let cb = clamp_pix(
+            ((c3 * r + c4 * g + c5 * b + self.c_rnd) >> shift) + self.c_center,
+            self.pixel_max,
+        );
+        let cr = clamp_pix(
+            ((c6 * r + c7 * g + c8 * b + self.c_rnd) >> shift) + self.c_center,
+            self.pixel_max,
+        );
         (y as u16, cb as u16, cr as u16)
     }
 }

@@ -301,6 +301,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bpg-still-hevc"
+version = "0.1.0"
+dependencies = [
+ "bpg-bitstream",
+ "bpg-hevc-decode",
+ "bpg-image",
+]
+
+[[package]]
 name = "bpg-tools"
 version = "0.1.0"
 dependencies = [

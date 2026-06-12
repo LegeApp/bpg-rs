@@ -151,6 +151,65 @@ PSNR) run under `cargo test`.
 **Next:** Phase 3 (`bpg-still-hevc` syntax skeleton) — the corpus + manifest are
 the baseline its output will be measured against.
 
+### Phase 3 COMPLETE — `bpg-still-hevc` syntax skeleton
+
+New `crates/bpg-still-hevc`:
+
+- `bpg-bitstream` gained `read_se_golomb`/`write_se_golomb` (signed Exp-Golomb
+  `se(v)`, H.265 9.2.2 codeNum mapping 0,1,-1,2,-2 <-> 0,1,2,3,4).
+- `nal.rs`: Annex-B NAL writer (`write_annexb_nal`) — start code + 2-byte NAL
+  header + emulation-prevention `00 00 03` insertion, generalized from
+  `bpg-hevc`'s `make_nal`.
+- `params.rs`: `write_vps`/`write_sps`/`write_pps` + a shared
+  `write_profile_tier_level` helper (Main profile, level 4.0 ==
+  `general_level_idc=120`, `max_sub_layers_minus1=0` only). Field order/
+  presence mirrors `bpg-hevc-decode`'s `parse_vps`/`parse_sps`/`parse_pps`
+  exactly; constants anchored to a real x265 BPG-still encode
+  (`oracle/out/checkerboard__420_8bit_qp24.hevc`, dumped via
+  `tests/dump_oracle_params.rs`). Two simplifications vs. that oracle stream
+  (chosen to keep the slice-header writer simple):
+  `sample_adaptive_offset_enabled_flag=false` and
+  `entropy_coding_sync_enabled_flag=false`. The SPS `vui_parameters()` is
+  written through to its end (not just the fields `parse_sps` reads), so a
+  conformant decoder (stock `bpgdec`/libde265, used for Phase 5 verification)
+  doesn't misread `rbsp_trailing_bits()` as further VUI flags.
+- `slice.rs`: `write_slice_segment_header` for a single first-slice IDR
+  I-slice — `slice_type=I`, `slice_qp_delta` (derived from `config.qp`),
+  `slice_loop_filter_across_slices_enabled_flag`, then `byte_alignment()`.
+  Field order mirrors `SliceHeader::parse`.
+- `cabac.rs`: full CABAC encoder shell ported from x265's `Entropy` class
+  (`entropy.cpp`) — `ContextModel::new` (`sbacInit`), `encode_bin`,
+  `encode_bin_ep`/`encode_bins_ep`/`encode_bin_trm`, `finish`, using the same
+  `g_lpsTable`/state-transition tables as the decoder's CABAC. Not yet wired
+  into slice-data emission (no slice data is written in the skeleton).
+  `tests/cabac_roundtrip.rs` round-trips a sequence of regular, bypass, and
+  terminate bins through `bpg-hevc-decode`'s `CabacDecoder`, checking
+  bin-for-bin output and context (state, mps) evolution match — the
+  arithmetic-coder/state-table port is validated independently of residual
+  syntax.
+- Public API (`lib.rs`): `StillHevcEncoder::syntax_skeleton`,
+  `StillHevcConfig` (incl. `width`/`height`, added beyond the literal struct
+  in this plan since SPS needs picture dimensions), `Effort`, `SaoMode`,
+  `DeblockMode`.
+- `tests/skeleton_roundtrip.rs`: feeds `syntax_skeleton`'s output through
+  `bpg-hevc-decode`'s `parse_vps`/`parse_sps`/`parse_pps`/`SliceHeader::parse`
+  — all parse successfully, `slice_qp_y` matches `config.qp`, and
+  `data_offset` consumes the whole (empty) slice payload, i.e. the header is
+  well-formed and rejected only for lack of slice data, not malformed syntax.
+  A second test, `syntax_skeleton_decode_fails_on_missing_slice_data`, runs
+  the full `bpg_hevc_decode::hevc::decode` on the skeleton and confirms it
+  returns `HevcError::CabacError("...short...")` from `SliceContext::new`
+  (slice-data CABAC init needs >= 2 bytes and gets zero) — i.e. the failure
+  is in slice-data decode, not parameter-set or slice-header parsing,
+  satisfying the Phase 3 acceptance criterion in full.
+
+Motion, lookahead, rate control, B/P frames, and DPB are not implemented (no
+stubs needed — the skeleton is IDR-I-frame-only by construction).
+
+**Next:** Phase 4 (assembly primitive boundary) or Phase 5 (port the still
+intra encoder / CABAC slice-data emission), per the implementation order
+below.
+
 ## Phase 1: Vendor The HEIC HEVC Decoder
 
 1. Create `crates/bpg-hevc-decode`.
