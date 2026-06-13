@@ -1,8 +1,7 @@
 //! [`bpg_encode::HevcEncoder`] implementation backed by this crate's
 //! Rust-native still-picture HEVC encoder ([`crate::encoder::encode`]).
 //!
-//! This is the Rust-backend analogue of `bpg-x265::X265Encoder`: it converts
-//! a CTU-padded [`Image`] into [`Source`] slices, builds a
+//! It converts a CTU-padded [`Image`] into [`Source`] slices, builds a
 //! [`StillHevcConfig`], and returns the resulting Annex-B stream for
 //! `bpg_encode::encode_still_image` to pipe through
 //! `bpg_hevc::build_modified_hevc`.

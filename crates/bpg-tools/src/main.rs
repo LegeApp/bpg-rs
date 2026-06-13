@@ -13,8 +13,6 @@ use bpg_encode::{encode_still_image, EncoderTuning};
 use bpg_image::{ColorSpace, Image};
 use still265::backend::RustStillHevcEncoder;
 use still265::Effort;
-#[cfg(feature = "oracle-x265")]
-use bpg_x265::X265Encoder;
 
 #[derive(Parser)]
 #[command(name = "bpg-tools", about = "Rust BPG encoder")]
@@ -31,14 +29,7 @@ enum Command {
     Decode(DecodeArgs),
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-enum Backend {
-    Rust,
-    #[cfg(feature = "oracle-x265")]
-    X265,
-}
-
-/// CLI mirror of `still265::Effort`, for the `rust` backend.
+/// CLI mirror of `still265::Effort`.
 #[derive(Clone, Copy, ValueEnum)]
 enum EffortArg {
     Fast,
@@ -90,10 +81,6 @@ struct EncodeArgs {
     #[arg(short = 'o', long = "output")]
     output: PathBuf,
 
-    /// HEVC backend.
-    #[arg(long, value_enum, default_value_t = Backend::Rust)]
-    backend: Backend,
-
     /// Quantizer parameter (0-51).
     #[arg(short = 'q', long, default_value_t = 28)]
     qp: u8,
@@ -107,12 +94,12 @@ struct EncodeArgs {
     #[arg(short = 'f', long, value_enum, default_value_t = Format::Yuv420)]
     format: Format,
 
-    /// Compression level / x265 preset (1 = fast .. 9 = slowest). Ignored by
-    /// `--backend rust` (use `--effort` instead).
+    /// Compression level / x265 preset (1 = fast .. 9 = slowest). Ignored
+    /// (use `--effort` instead).
     #[arg(short = 'm', long = "compress-level", default_value_t = 8)]
     compress_level: u8,
 
-    /// RD-search effort for `--backend rust` (ignored by `--backend x265`).
+    /// RD-search effort.
     #[arg(long, value_enum, default_value_t = EffortArg::Balanced)]
     effort: EffortArg,
 
@@ -176,34 +163,15 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         Format::Yuv444 => {}
     }
 
-    let bpg = match args.backend {
-        Backend::Rust => {
-            let backend =
-                RustStillHevcEncoder::new(args.effort.into()).with_debug_stats(args.debug_stats);
-            encode_still_image(
-                image,
-                &backend,
-                args.qp,
-                args.compress_level,
-                EncoderTuning::neutral(),
-            )?
-        }
-        #[cfg(feature = "oracle-x265")]
-        Backend::X265 => {
-            let backend = X265Encoder::new();
-            // M1 CLI uses the neutral tune (x265 --tune ssim, no overrides),
-            // which reproduces the byte-for-byte-identical-to-C-reference
-            // output. The tuning system (bpg-tune) will supply a richer
-            // EncoderTuning here later.
-            encode_still_image(
-                image,
-                &backend,
-                args.qp,
-                args.compress_level,
-                EncoderTuning::neutral(),
-            )?
-        }
-    };
+    let backend =
+        RustStillHevcEncoder::new(args.effort.into()).with_debug_stats(args.debug_stats);
+    let bpg = encode_still_image(
+        image,
+        &backend,
+        args.qp,
+        args.compress_level,
+        EncoderTuning::neutral(),
+    )?;
 
     std::fs::write(&args.output, &bpg)?;
     eprintln!("wrote {} ({} bytes)", args.output.display(), bpg.len());

@@ -54,8 +54,7 @@ pub struct HevcEncodeParams {
     pub height: u32,
     /// HEVC chroma_format_idc (0=gray,1=420,2=422,3=444).
     pub chroma_format: ChromaFormat,
-    /// 8, 10, or 12. The backend must select an x265 build supporting this
-    /// depth (see `bpg-x265-sys`'s multilib build for 10/12-bit).
+    /// 8, 10, or 12. The backend must support encoding at this depth.
     pub bit_depth: u8,
     /// Quantizer, 0-51 (CQP rate-control mode).
     pub qp: u8,
@@ -71,7 +70,7 @@ pub struct HevcEncodeParams {
 }
 
 /// A HEVC backend that encodes a single intra still frame and returns its raw
-/// Annex-B elementary stream. Implemented by `bpg-x265` over x265.
+/// Annex-B elementary stream. Implemented by `still265`.
 ///
 /// This is the Rust analogue of the C `HEVCEncoder` vtable
 /// (`open`/`encode`/`close`) collapsed into one call, since the M1 path

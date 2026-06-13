@@ -8,10 +8,7 @@ members = [
     "crates/bpg-hevc-decode",
     "crates/bpg-decode",
     "crates/bpg-encode",
-    "crates/bpg-x265-sys",
-    "crates/bpg-x265",
     "crates/still265",
-    "crates/bpg-oracle",
     "crates/bpg-tools",
 ]
 
