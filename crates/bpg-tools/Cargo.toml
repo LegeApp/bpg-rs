@@ -17,11 +17,11 @@ bpg-hevc = { path = "../bpg-hevc" }
 bpg-decode = { path = "../bpg-decode" }
 bpg-encode = { path = "../bpg-encode" }
 bpg-x265 = { path = "../bpg-x265", optional = true }
-bpg-still-hevc = { path = "../bpg-still-hevc" }
+still265 = { path = "../still265" }
 
 [features]
 default = []
 oracle-x265 = ["dep:bpg-x265"]
 # Marker feature for profiling runs, intended for:
 # cargo flamegraph --profile profiling -p bpg-tools --features flamegraph -- ...
-flamegraph = ["bpg-still-hevc/flamegraph"]
+flamegraph = ["still265/flamegraph"]

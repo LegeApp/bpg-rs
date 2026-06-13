@@ -14,7 +14,7 @@
 //!
 //! `gen` writes the whole tree + `manifest.csv`. `check` regenerates into a temp
 //! dir and diffs the metrics against a committed `manifest.csv`, so the corpus
-//! is a regression baseline: when the future Rust encoder (`bpg-still-hevc`)
+//! is a regression baseline: when the future Rust encoder (`still265`)
 //! lands, its output is compared against these same rows. See
 //! `FULL_RUST_CODEC_PLAN.md` Phase 2.
 

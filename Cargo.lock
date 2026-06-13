@@ -301,17 +301,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bpg-still-hevc"
-version = "0.1.0"
-dependencies = [
- "bpg-bitstream",
- "bpg-encode",
- "bpg-hevc",
- "bpg-hevc-decode",
- "bpg-image",
-]
-
-[[package]]
 name = "bpg-tools"
 version = "0.1.0"
 dependencies = [
@@ -320,10 +309,10 @@ dependencies = [
  "bpg-format",
  "bpg-hevc",
  "bpg-image",
- "bpg-still-hevc",
  "bpg-x265",
  "clap",
  "image",
+ "still265",
 ]
 
 [[package]]
@@ -1199,6 +1188,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
+name = "still265"
+version = "0.1.0"
+dependencies = [
+ "bpg-bitstream",
+ "bpg-encode",
+ "bpg-hevc",
+ "bpg-hevc-decode",
+ "bpg-image",
+]
+
+[[package]]
 name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1352,20 +1352,6 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
-name = "x265-primitives"
-version = "0.1.0"
-dependencies = [
- "x265-primitives-sys",
-]
-
-[[package]]
-name = "x265-primitives-sys"
-version = "0.1.0"
-dependencies = [
- "cc",
-]
 
 [[package]]
 name = "y4m"

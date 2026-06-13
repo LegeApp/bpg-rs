@@ -11,8 +11,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 use bpg_decode::{DecoderConfig, PixelLayout};
 use bpg_encode::{encode_still_image, EncoderTuning};
 use bpg_image::{ColorSpace, Image};
-use bpg_still_hevc::backend::RustStillHevcEncoder;
-use bpg_still_hevc::Effort;
+use still265::backend::RustStillHevcEncoder;
+use still265::Effort;
 #[cfg(feature = "oracle-x265")]
 use bpg_x265::X265Encoder;
 
@@ -38,7 +38,7 @@ enum Backend {
     X265,
 }
 
-/// CLI mirror of `bpg_still_hevc::Effort`, for the `rust` backend.
+/// CLI mirror of `still265::Effort`, for the `rust` backend.
 #[derive(Clone, Copy, ValueEnum)]
 enum EffortArg {
     Fast,

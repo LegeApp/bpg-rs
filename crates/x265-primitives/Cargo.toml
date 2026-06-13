@@ -1,8 +1,0 @@
-[package]
-name = "x265-primitives"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-
-[dependencies]
-x265-primitives-sys = { path = "../x265-primitives-sys" }
