@@ -5,12 +5,6 @@
 
 use bpg_decode::{DecodeError, DecoderConfig, ImageInfo, PixelLayout};
 
-/// Repo-root `html/` BPG demo fixtures (shared with the upstream libbpg demo).
-fn html_fixture(name: &str) -> Vec<u8> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../html/");
-    std::fs::read(format!("{path}{name}")).unwrap_or_else(|e| panic!("read {name}: {e}"))
-}
-
 /// Crate-local fixtures generated for these tests.
 fn local_fixture(name: &str) -> Vec<u8> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
@@ -19,7 +13,7 @@ fn local_fixture(name: &str) -> Vec<u8> {
 
 #[test]
 fn lena_decodes_to_rgba() {
-    let data = html_fixture("lena512color.bpg");
+    let data = local_fixture("lena512color.bpg");
 
     let info = ImageInfo::from_bytes(&data).expect("probe lena");
     assert_eq!((info.width, info.height), (512, 512));
@@ -38,7 +32,7 @@ fn lena_decodes_to_rgba() {
 
 #[test]
 fn lena_decodes_to_rgb() {
-    let data = html_fixture("lena512color.bpg");
+    let data = local_fixture("lena512color.bpg");
     let out = DecoderConfig::new()
         .decode(&data, PixelLayout::Rgb8)
         .expect("decode lena rgb");
@@ -47,7 +41,7 @@ fn lena_decodes_to_rgb() {
 
 #[test]
 fn clock_animation_is_unsupported() {
-    let data = html_fixture("clock.bpg");
+    let data = local_fixture("clock.bpg");
     let err = DecoderConfig::new()
         .decode(&data, PixelLayout::Rgba8)
         .expect_err("clock is animated and must be rejected");
