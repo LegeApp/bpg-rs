@@ -63,10 +63,7 @@ fn yuv444_decodes() {
     // teal from stock bpgenc -f 444.
     let data = local_fixture("solid444.bpg");
     let info = ImageInfo::from_bytes(&data).expect("probe solid444");
-    assert!(matches!(
-        info.pixel_format,
-        bpg_format::PixelFormat::Yuv444
-    ));
+    assert!(matches!(info.pixel_format, bpg_format::PixelFormat::Yuv444));
     let out = DecoderConfig::new()
         .decode(&data, PixelLayout::Rgb8)
         .expect("4:4:4 must decode");
@@ -80,10 +77,7 @@ fn yuv422_decodes() {
     // Fixture is a 64x64 solid teal from stock bpgenc -f 422.
     let data = local_fixture("solid422.bpg");
     let info = ImageInfo::from_bytes(&data).expect("probe solid422");
-    assert!(matches!(
-        info.pixel_format,
-        bpg_format::PixelFormat::Yuv422
-    ));
+    assert!(matches!(info.pixel_format, bpg_format::PixelFormat::Yuv422));
     let out = DecoderConfig::new()
         .decode(&data, PixelLayout::Rgb8)
         .expect("4:2:2 must decode");

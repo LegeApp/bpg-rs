@@ -55,6 +55,27 @@ static STATE_TRANS_LPS: [u8; 64] = [
     34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63,
 ];
 
+/// x265 `g_entropyBits`: fixed-point CABAC entropy costs in 1/32768 bits.
+#[rustfmt::skip]
+static ENTROPY_BITS: [u32; 128] = [
+    0x07b23, 0x085f9, 0x074a0, 0x08cbc, 0x06ee4, 0x09354, 0x067f4, 0x09c1b,
+    0x060b0, 0x0a62a, 0x05a9c, 0x0af5b, 0x0548d, 0x0b955, 0x04f56, 0x0c2a9,
+    0x04a87, 0x0cbf7, 0x045d6, 0x0d5c3, 0x04144, 0x0e01b, 0x03d88, 0x0e937,
+    0x039e0, 0x0f2cd, 0x03663, 0x0fc9e, 0x03347, 0x10600, 0x03050, 0x10f95,
+    0x02d4d, 0x11a02, 0x02ad3, 0x12333, 0x0286e, 0x12cad, 0x02604, 0x136df,
+    0x02425, 0x13f48, 0x021f4, 0x149c4, 0x0203e, 0x1527b, 0x01e4d, 0x15d00,
+    0x01c99, 0x166de, 0x01b18, 0x17017, 0x019a5, 0x17988, 0x01841, 0x18327,
+    0x016df, 0x18d50, 0x015d9, 0x19547, 0x0147c, 0x1a083, 0x0138e, 0x1a8a3,
+    0x01251, 0x1b418, 0x01166, 0x1bd27, 0x01068, 0x1c77b, 0x00f7f, 0x1d18e,
+    0x00eda, 0x1d91a, 0x00e19, 0x1e254, 0x00d4f, 0x1ec9a, 0x00c90, 0x1f6e0,
+    0x00c01, 0x1fef8, 0x00b5f, 0x208b1, 0x00ab6, 0x21362, 0x00a15, 0x21e46,
+    0x00988, 0x2285d, 0x00934, 0x22ea8, 0x008a8, 0x239b2, 0x0081d, 0x24577,
+    0x007c9, 0x24ce6, 0x00763, 0x25663, 0x00710, 0x25e8f, 0x006a0, 0x26a26,
+    0x00672, 0x26f23, 0x005e8, 0x27ef8, 0x005ba, 0x284b5, 0x0055e, 0x29057,
+    0x0050c, 0x29bab, 0x004c1, 0x2a674, 0x004a7, 0x2aa5e, 0x0046f, 0x2b32f,
+    0x0041f, 0x2c0ad, 0x003e7, 0x2ca8d, 0x003ba, 0x2d323, 0x0010c, 0x3bfbb,
+];
+
 /// A single CABAC context model: state index (0..=63) and most-probable-symbol.
 #[derive(Clone, Copy, Debug)]
 pub struct ContextModel {
@@ -74,9 +95,15 @@ impl ContextModel {
         let qp = slice_qp.clamp(0, 51);
         let pre_ctx_state = (((m * qp) >> 4) + n).clamp(1, 126);
         if pre_ctx_state >= 64 {
-            Self { state: (pre_ctx_state - 64) as u8, mps: 1 }
+            Self {
+                state: (pre_ctx_state - 64) as u8,
+                mps: 1,
+            }
         } else {
-            Self { state: (63 - pre_ctx_state) as u8, mps: 0 }
+            Self {
+                state: (63 - pre_ctx_state) as u8,
+                mps: 0,
+            }
         }
     }
 
@@ -84,6 +111,66 @@ impl ContextModel {
     /// decoder-side `bpg_hevc_decode::hevc::cabac::ContextModel`.
     pub fn get_state(&self) -> (u8, u8) {
         (self.state, self.mps)
+    }
+
+    /// Estimated cost for coding `bin_value`, in x265's 1/32768-bit units.
+    pub fn entropy_bits(&self, bin_value: u8) -> u32 {
+        let packed = (self.state << 1) | self.mps;
+        ENTROPY_BITS[(packed ^ bin_value) as usize]
+    }
+
+    /// Apply the same state transition as `encode_bin`, without arithmetic
+    /// coding output.
+    pub fn update(&mut self, bin_value: u8) {
+        if bin_value != self.mps {
+            if self.state == 0 {
+                self.mps = 1 - self.mps;
+            }
+            self.state = STATE_TRANS_LPS[self.state as usize];
+        } else {
+            self.state = STATE_TRANS_MPS[self.state as usize];
+        }
+    }
+}
+
+/// CABAC fractional-bit estimator. It mirrors x265's no-bitstream entropy
+/// path: context-coded bins use `g_entropyBits`; bypass and termination bins
+/// are counted in fixed-point bit units.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CabacEstimator {
+    frac_bits: u64,
+}
+
+impl CabacEstimator {
+    pub const SCALE: u64 = 32768;
+
+    pub fn new() -> Self {
+        Self { frac_bits: 0 }
+    }
+
+    pub fn encode_bin(&mut self, bin_value: u8, ctx: &mut ContextModel) {
+        self.frac_bits += ctx.entropy_bits(bin_value) as u64;
+        ctx.update(bin_value);
+    }
+
+    pub fn encode_bin_ep(&mut self, _bin_value: u8) {
+        self.frac_bits += Self::SCALE;
+    }
+
+    pub fn encode_bins_ep(&mut self, _bin_values: u32, num_bins: u32) {
+        self.frac_bits += Self::SCALE * num_bins as u64;
+    }
+
+    pub fn encode_bin_trm(&mut self, bin_value: u8) {
+        self.frac_bits += ENTROPY_BITS[(126 ^ bin_value) as usize] as u64;
+    }
+
+    pub fn add_frac_bits(&mut self, frac_bits: u64) {
+        self.frac_bits += frac_bits;
+    }
+
+    pub fn frac_bits(&self) -> u64 {
+        self.frac_bits
     }
 }
 

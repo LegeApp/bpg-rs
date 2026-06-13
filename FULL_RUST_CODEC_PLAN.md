@@ -8,8 +8,9 @@ Short term: vendor the Rust HEVC decoder currently referenced from
 `heic-decoder-rs` and remove the external path dependency.
 
 Long term: replace the current x265 FFI backend with a Rust still-picture HEVC
-intra encoder derived from x265, while keeping only x265's original assembly
-primitive codecs behind thin ABI wrappers.
+intra encoder derived from x265. The Rust encoder becomes the production
+backend; upstream x265 remains only as an oracle/dev dependency for regression
+comparison, quality benchmarking, syntax checks, and phase-gate validation.
 
 ## Current State
 
@@ -47,13 +48,64 @@ bpg-rs/
     bpg-hevc-decode      # vendored/adapted HEIC HEVC decoder
     bpg-decode           # BPG decode API using bpg-hevc-decode
     bpg-encode           # stable BPG encode orchestration
-    bpg-x265             # temporary oracle/backend, eventually optional
-    bpg-x265-sys         # temporary oracle/backend, eventually optional
+    bpg-x265             # oracle/dev backend only once Rust backend is wired
+    bpg-x265-sys         # oracle/dev backend only once Rust backend is wired
     bpg-still-hevc       # Rust x265-derived still encoder
     x265-primitives
-    x265-primitives-sys  # original asm + C ABI shims only
+    x265-primitives-sys  # temporary x265 primitive oracle/shim; not production
+    bpg-hevc-core        # future shared HEVC math/syntax helpers
     bpg-tools
 ```
+
+## Roadmap Correction: Correctness First, Then RD Analysis
+
+The Rust still encoder is now a valid intra encoder skeleton with expanding
+coverage, not yet an x265-class encoder. SAO, deblocking, and 4:2:2 are the
+remaining easy correctness/completeness items, but they are not the center of
+compression efficiency. The hard part is the x265-style analysis loop:
+SATD-based rough mode pruning, full RD mode decisions, recursive CU/TU split
+search, chroma mode decision, RDOQ/sign hiding, and eventually hot-path
+allocation removal plus Rust/SIMD primitive replacement.
+
+The corrected order is:
+
+1. Wire `bpg-still-hevc` into `bpg-encode::HevcEncoder` and `bpg-tools` as
+   `--backend rust`; make Rust the default once it can emit BPGs that stock
+   `bpgdec` and `bpg-decode` accept. Keep `--backend x265` as oracle/dev.
+2. Fix the Rust backend source-geometry boundary before adding new chroma
+   formats: visible dimensions, coded dimensions, per-plane width/height,
+   stride, bit depth, and chroma format must be explicit instead of inferred
+   from a single padded image width.
+3. Complete Rust-still-encoder 4:2:2 correctness.
+4. Add deblocking, using the existing decoder filter path at first.
+5. Add SAO syntax with every CTB/component signalling SAO-off, then add real
+   SAO RD search as a separate step.
+6. Replace the temporary x265 C++ primitive shim with scalar Rust primitives,
+   then `std::arch` SIMD, then narrow hand-written assembly only where profiling
+   proves it is needed.
+7. Port x265-like intra analysis/RD: rough SATD mode decision, CABAC bit
+   estimation, full RD mode decision, CU split recursion, TU split recursion,
+   chroma mode decision, RDOQ, sign hiding, and scratch-buffer reuse.
+8. Only after the Rust backend meets explicit quality/size/speed gates, remove
+   upstream x265 from normal builds and keep it only in oracle tooling.
+
+Definition of materially complete:
+
+- Rust backend encodes BPG without x265 in the production path.
+- 8-bit and 10-bit 4:2:0, 4:2:2, and 4:4:4 pass exact
+  encoder-reconstruction-vs-decoder-output tests, including odd dimensions.
+- Deblock and SAO can be enabled and decode exactly.
+- Upstream x265 is not required for normal builds.
+- Rust output is within the chosen size/quality band against x265 on the oracle
+  corpus, initially 5-15% file size at similar quality and tightened later.
+- Production primitive dispatch has no C++ x265 dependency.
+- Unsupported BPG features fail explicitly.
+
+Current reproducibility issue: `bpg-rs/x265_4.1` is a symlink to an absolute
+local path (`/mnt/Samsung980_1TB/isolated-dev/BPG/x265_4.1`). Before claiming
+the repo is self-contained, replace this with a real vendored tree, a git
+submodule, a documented oracle setup step, or remove upstream x265 from normal
+builds.
 
 ## Progress
 
@@ -206,9 +258,123 @@ New `crates/bpg-still-hevc`:
 Motion, lookahead, rate control, B/P frames, and DPB are not implemented (no
 stubs needed — the skeleton is IDR-I-frame-only by construction).
 
-**Next:** Phase 4 (assembly primitive boundary) or Phase 5 (port the still
-intra encoder / CABAC slice-data emission), per the implementation order
-below.
+**Next:** Phase 5 (port the still intra encoder / CABAC slice-data emission),
+per the implementation order below. (Phase 4, the assembly primitive boundary,
+is now complete across 8-bit and 10-bit — see its progress section.)
+
+### Phase 5 progress (in flight)
+
+Foundations for the still intra encoder, each validated bit-exactly against
+`bpg-hevc-decode` (the decoder is the oracle — the encoder's job is to emit a
+stream the decoder reconstructs to the same samples the encoder reconstructed):
+
+- **`contexts.rs`**: the full 170-entry CABAC context store (indices +
+  `INIT_VALUES`) mirrored from the decoder's `cabac::context`/`INIT_VALUES`,
+  initialized per H.265 9.3.2.2 from the slice QP.
+- **`residual.rs`**: `encode_residual` — the complete `residual_coding()`
+  CABAC writer, the exact inverse of `decode_residual` (last-sig prefix/suffix,
+  coded_sub_block_flag, sig_coeff_flag context derivation, greater1/greater2
+  context evolution, sign bits + sign data hiding, Golomb-Rice/EGk
+  coeff_abs_level_remaining with adaptive Rice). `tests/residual_roundtrip.rs`
+  round-trips coefficient blocks (4x4..32x32, all scan orders, luma+chroma,
+  SDH) through the decoder's `decode_residual` — all exact.
+- **`transform.rs`**: forward DCT/DST + x265 quantizer (forward), and a
+  dequant + inverse DCT/DST reconstruction path that is **bit-identical** to
+  the decoder's `transform::dequantize` + `inverse_transform`
+  (`tests/transform_recon.rs`: equal across 4x4..32x32, every QP, and DST-4x4).
+  This guarantees encoder-reconstructed neighbours match the decoder's.
+
+- **`encoder.rs`**: the slice-data coding-tree writer + reconstruction engine.
+  Walks the coding tree exactly as the decoder's `ctu` parses it
+  (`split_cu_flag`, `coding_unit` with MPM-based intra-mode signalling,
+  `transform_tree` forced 64->32 split + cbf hierarchy, `cbf_luma`,
+  `residual_coding`, per-CTU `end_of_slice`), reconstructing each TB into a
+  `DecodedFrame` via the decoder's `predict_intra` + the verified inverse
+  path. Assembles VPS/SPS/PPS + slice into an Annex-B IDR access unit.
+
+Decoder visibility-only changes (no logic edits) to support the above:
+`hevc::{intra, residual, transform}` made `pub`; `bpg-hevc-decode` is now a
+normal (not dev) dependency of `bpg-still-hevc` for the reconstruction engine.
+
+#### Phase 5 milestones 1 & 2 COMPLETE — encode one CTU and a full image (8-bit 4:2:0)
+
+`tests/encode_roundtrip.rs`: the encoder emits an IDR access unit that
+`bpg_hevc_decode::hevc::decode` decodes to **exactly** the encoder's
+reconstruction (luma + Cb + Cr planes bit-identical), across QPs 18/27/32/40
+and a 192x128 (3x2-CTU) image. Luma PSNR vs source is 56 dB (qp18) down to
+41 dB (qp40); the multi-CTU image is 38.6 dB at qp30. PPS now disables the
+in-loop deblocking filter (control-present + disabled), so the slice header
+omits `slice_loop_filter_across_slices_enabled_flag`, and SDH is off
+(`sign_data_hiding_enabled_flag = 0`) — both matching milestone-1 scope.
+
+Milestone-1/2 simplifications still open: fixed Planar luma + DM chroma (no
+real mode decision yet), one 64x64 CU per CTB (no `split_cu_flag` recursion),
+and 64-aligned dimensions only (no boundary CU splits).
+
+#### Phase 5 milestone 4 COMPLETE — 10-bit
+
+`transform.rs` dispatches forward/inverse DCT/DST to the `x265-primitives`
+8-bit or `bitdepth10` primitives by `bit_depth`; the encoder threads the
+bit-depth QP offset (dequant QP = SliceQpY + 6*(bd-8), CABAC contexts still
+init from SliceQpY) and builds a 10-bit `DecodedFrame`.
+`tests/encode_roundtrip.rs::ten_bit_round_trip` round-trips 10-bit pictures
+through the decoder exactly (PSNR 56.7 dB @ qp22 .. 45 dB @ qp38).
+
+#### Phase 5 milestones 3 & 5 COMPLETE for the Phase-6 integration scope — 4:4:4, luma mode decision, and boundary CU splits
+
+The encoder now supports 4:4:4 (`ChromaArrayType == 3`) in addition to 4:2:0:
+chroma transform blocks mirror luma position/size, chroma cbf syntax is coded
+for 4x4 leaves as required, and `tests/encode_roundtrip.rs::yuv444_round_trip`
+round-trips both 8-bit and 10-bit 4:4:4 pictures through the decoder with
+bit-exact reconstruction.
+
+The encoder also picks each CU's luma mode by lowest prediction SSE over all 35
+modes (evaluated on the CU's top-left TB against the source), instead of fixed
+Planar. Decode stays exact, quality improves and size drops (192x128 8-bit:
+38.6 dB/1263 B -> 39.1 dB/1039 B; 128x128 10-bit: 40.5 dB/643 B -> 41.4 dB/
+476 B), and the angular intra + per-mode-scan-order paths are exercised
+end-to-end through `encode_residual` and verified against the decoder.
+
+Boundary CU splitting is now implemented for non-64-aligned pictures. The
+encoder mirrors H.265 `coding_quadtree()`/the decoder's decision tree:
+`split_cu_flag` is coded only for fully-inside CUs, CUs that straddle the
+picture boundary are force-split down to the 8x8 minimum coding-block size,
+and the split-flag context increment is derived from left/above neighbour CU
+depths. Internally, reconstruction uses min-CU-aligned coded planes while the
+SPS keeps display dimensions; source reads at the padded edge are replicated.
+`tests/encode_roundtrip.rs::non_ctu_aligned_boundary_splits` round-trips a
+131x97 4:2:0 picture exactly against the encoder reconstruction.
+
+SAO and deblocking remain intentionally signalled off (`sao_enabled_flag = 0`,
+PPS deblocking filter disabled). This is conformant, but the corrected roadmap
+now treats the easy filters as near-term work before the hard analysis/RD
+phase. 4:2:2 in the Rust still encoder is likewise near-term correctness work;
+the production x265-backed BPG path already supports 4:2:2, but the Rust
+backend must support it before it can be called production-complete.
+
+#### Phase 5 verification / standard cross-check
+
+The important Phase 5 syntax and reconstruction pieces have been checked
+against the local H.265 markdown:
+
+- Table 6-1 chroma geometry: 4:2:0 uses `SubWidthC=2, SubHeightC=2`; 4:4:4
+  uses `SubWidthC=1, SubHeightC=1`; odd-size 4:2:0 fixtures use ceil chroma
+  dimensions.
+- Clause 7.3.8 coding-tree syntax: boundary CUs are force-split without
+  coding `split_cu_flag`; fully-inside split flags use neighbour-depth context
+  derivation.
+- Clause 8.4 intra prediction: luma mode signalling uses MPM derivation, and
+  chroma uses DM in the supported path.
+- Clause 8.6 transform/reconstruction: forward quantization plus inverse
+  dequant/transform is tested bit-exactly against the decoder reconstruction.
+- Clause 9.3 CABAC: context initialization uses `SliceQpY` (not the bit-depth
+  adjusted transform QP), residual syntax round-trips through the decoder, and
+  terminate bins mark CTU slice completion.
+
+Verification run: `cargo test --workspace` passes; `cargo run -p bpg-oracle --
+check` passes all 40 x265-backed oracle encodes. The oracle command validates
+the existing x265 backend corpus; Rust-still-encoder quality parity against
+x265 remains Phase 6/7 quality work after integration.
 
 ## Phase 1: Vendor The HEIC HEVC Decoder
 
@@ -326,6 +492,77 @@ incomplete, not because headers are malformed.
 Acceptance: primitive tests match x265 for fixed vectors across supported bit
 depths.
 
+### Phase 4 scope decisions
+
+Phase 4 intentionally starts with the intra still-image encode path, not the
+full x265 `EncoderPrimitives` table. The first vertical slice is:
+
+- forward/inverse DCT for 4x4, 8x8, 16x16, and 32x32 transform blocks
+- SAD/SATD for square luma blocks used by intra mode decision cost
+- DC and Planar intra prediction
+
+The follow-up intra families are quant/dequant, residual/reconstruction helpers
+(`sub_ps`, `add_ps`), pixel copy/fill helpers, variance/SSE where the RDO path
+needs them, then optional SAO/deblock kernels.
+
+Motion-estimation and motion-compensation primitives are out of Phase 4's still
+encoder scope: `PU` inter search helpers (`sad_x3`/`sad_x4`, `ads`),
+interpolation filters (`luma_hpp`/`hps`/`vpp`), `pixelavg`, and `addAvg` are
+video inter-path machinery and are deliberately omitted unless a later oracle
+test proves an intra still-image path needs one.
+
+Bit-depth scope is staged. The first implementation and tests are 8-bit only
+(`HIGH_BIT_DEPTH=0`, `X265_DEPTH=8`) to match Phase 5 milestone 1. A 10-bit
+build must be added before Phase 4 is considered complete across supported BPG
+bit depths; pixel-typed primitives need the same dual-compile pattern as the
+existing x265 backend.
+
+### Phase 4 COMPLETE — assembly primitive boundary (8-bit + 10-bit)
+
+The Phase 4 intra primitive slice is linked and tested end-to-end through
+`x265-primitives-sys` and `x265-primitives` across **both** supported BPG bit
+depths (8-bit and 10-bit; 12-bit remains deferred — its x265 lib is not built):
+
+- `x265-primitives-sys` builds an independent scalar x265 primitive archive
+  from `common/constants.cpp`, `common/dct.cpp`, `common/pixel.cpp`, and
+  `common/intrapred.cpp`, plus the local C ABI shim. It does not link the full
+  `bpg-x265-sys` multilib. The same source subset is dual-compiled under
+  `HIGH_BIT_DEPTH=1`, `X265_DEPTH=10`, `X265_NS=x265_10bit` for the 10-bit
+  surface, following x265's own multilib namespace split.
+- The C ABI bodies live in one shared, prefix-parameterized header
+  (`shim/wrapper_impl.h`); `shim/wrapper.cpp` includes it with `BPG_PREFIX
+  bpgprim_` (8-bit), `shim/wrapper10.cpp` with `BPG_PREFIX bpgprim10_`
+  (10-bit). The two depths therefore emit the *identical* function set with no
+  per-function duplication and cannot drift. `bpgprim10_*` now mirrors the full
+  `bpgprim_*` surface (previously only a narrow DCT4x4/SAD/SATD/DC/add_ps
+  probe).
+- The safe wrapper exposes, **for each of 8-bit and 10-bit**,
+  4x4/8x8/16x16/32x32 DCT/IDCT, 4x4 DST/IDST, square luma SAD/SATD/SA8D,
+  DC/Planar/angular intra prediction plus intra reference filtering, residual
+  subtraction (`sub_ps`), reconstruction (`add_ps`), block copy helpers
+  (`copy_pp`, `copy_ps`, `copy_sp`, `copy_ss`), shift-copy helpers, transpose,
+  block fill, variance/SSE/SSD, scalar quant/nquant, normal/scaling dequant,
+  count-nonzero, and copy-count helpers. The 8-bit surface is the crate-root
+  `dct`/`pixel`/`intra`/`recon`/`quant` modules (`pixel == u8`); the 10-bit
+  surface is the identically-shaped `bitdepth10::{dct,pixel,intra,recon,quant}`
+  submodules (`pixel == u16`, reconstruction/`copy_sp` clip ceiling 1023). Both
+  depths are generated from the same crate-level macros, so they stay in lock
+  step.
+- Tests include absolute fixed-vector checks for DCT DC-only output, SAD/SATD
+  constant differences, uniform intra prediction, residual/reconstruction,
+  clipping, copy helpers, SSE, variance/SA8D/SSD, shift-copy/transpose,
+  quant/dequant, count-nonzero, and copy-count, plus DCT/IDCT round trips — at
+  8-bit, and a mirror set across the 10-bit surface (DCT DC scaling,
+  near-lossless 32x32 round trip, intra prediction, residual/reconstruction
+  with 10-bit clipping, copy/distortion, and quant/count helpers). Phase 4's
+  acceptance criterion (primitive tests match x265 for fixed vectors across
+  supported bit depths) is met. 21 tests across the two crates.
+
+Deferred (not blocking Phase 4): any additional RDO helper primitives Phase 5
+proves it needs (added on demand once the encoder exists), optional SAO/deblock
+kernels, and the 12-bit surface (gated on building a `MAIN12` x265 lib, which
+the project defers to much later alongside lossless).
+
 ## Phase 5: Port The Still Intra Encoder
 
 Port only intra-relevant x265 logic:
@@ -338,7 +575,7 @@ Port only intra-relevant x265 logic:
 - residual coding
 - CABAC syntax
 - CU split/mode decision
-- optional deblock/SAO
+- deblock/SAO filter syntax and reconstruction
 
 Split x265's mixed video files into Rust modules:
 
@@ -362,12 +599,47 @@ Acceptance milestones:
 2. Encode a full image, 8-bit 4:2:0.
 3. Add 4:4:4.
 4. Add 10-bit.
-5. Add SAO/deblock.
-6. Compare against the x265 oracle for decode validity, size, and PSNR/SSIM.
+5. Add non-64-aligned boundary CU splitting.
+6. Add 4:2:2, including the two vertically-stacked chroma transform blocks
+   required for 4:2:2 and odd-dimension tests.
+7. Add deblocking with config-driven PPS/slice syntax and encoder-side
+   post-reconstruction filtering.
+8. Add SAO syntax with all CTBs/components off, then real SAO RD search.
+9. Compare against the x265 oracle for decode validity, size, PSNR/SSIM, and
+   speed.
+
+Phase 5 is correctness-first. It may produce valid but inefficient streams.
+Do not treat Phase 5 as x265-quality parity; that belongs to the later analysis
+phase.
 
 ## Phase 6: Integrate The Rust Encoder Into BPG
 
 1. Implement `bpg_encode::HevcEncoder` for `bpg-still-hevc`.
+2. Make source geometry explicit at the backend boundary:
+
+   ```rust
+   pub struct PlaneRef<'a> {
+       pub data: &'a [u16],
+       pub width: usize,
+       pub height: usize,
+       pub stride: usize,
+   }
+
+   pub struct Source<'a> {
+       pub width: usize,
+       pub height: usize,
+       pub coded_width: usize,
+       pub coded_height: usize,
+       pub bit_depth: u8,
+       pub chroma_format: ChromaFormat,
+       pub y: PlaneRef<'a>,
+       pub cb: Option<PlaneRef<'a>>,
+       pub cr: Option<PlaneRef<'a>>,
+   }
+   ```
+
+   BPG stores visible dimensions while HEVC coding may use padded/coded planes;
+   do not infer all plane geometry from a single padded luma width.
 2. Add CLI backend selection:
 
    ```text
@@ -375,8 +647,9 @@ Acceptance milestones:
    bpg-tools encode input.png -o out.bpg --backend x265
    ```
 
-3. Keep the x265 backend as an oracle until the Rust backend reaches parity.
-4. Once stable, make the x265 backend an optional feature:
+3. Make `--backend rust` the default once it produces BPG files accepted by
+   `bpg-decode` and stock `bpgdec`.
+4. Keep the x265 backend as an oracle/dev feature only:
 
    ```toml
    default = ["rust-encoder"]
@@ -386,7 +659,80 @@ Acceptance milestones:
 Acceptance: `--backend rust` produces BPG files decoded by `bpg-decode` and
 stock `bpgdec`.
 
-## Phase 7: Remove Video Baggage
+## Phase 7: Easy Filters And Remaining Format Correctness
+
+Implement the remaining syntax/format features before deep RD analysis:
+
+1. Rust-still 4:2:2:
+   - `chroma_format_idc == 2`
+   - chroma plane geometry = half width, full height
+   - two vertically stacked chroma transform blocks where required
+   - 8-bit/10-bit round-trip tests, odd sizes, and BPG container encode/decode
+2. Deblocking:
+   - parameterize PPS and slice loop-filter syntax
+   - record TU boundaries and QP maps during encode
+   - apply the existing decoder deblock implementation to encoder
+     reconstruction initially
+   - exact decoder-vs-encoder reconstruction tests
+3. SAO stage 1:
+   - set `sample_adaptive_offset_enabled_flag = 1`
+   - write slice SAO flags
+   - emit per-CTB SAO type index 0 for all components
+   - confirm output is identical to SAO-off
+4. SAO stage 2:
+   - BO and EO candidate search per CTB/component
+   - RD cost = distortion after SAO + lambda * estimated SAO bits
+   - merge-left/up decisions after independent candidates work
+   - allow RD to choose off freely for line art/text-like content
+
+## Phase 8: Intra Analysis And RD Parity
+
+This is the main compression-efficiency phase. Filters and 4:2:2 do not make
+the Rust encoder x265-class by themselves.
+
+Port or reimplement the x265 intra analysis path:
+
+- SATD/Hadamard rough intra mode decision over Planar, DC, angular modes, and
+  MPMs.
+- CABAC bit estimation for analysis, separate from final writing.
+- Full RD mode decision:
+
+  ```text
+  rd_cost = distortion + lambda * estimated_bits
+  ```
+
+- Recursive CU split search: evaluate leaf vs four children down to min CU.
+- Recursive TU split search: evaluate unsplit vs split transform tree.
+- Chroma mode decision over DM, Planar, DC, horizontal/vertical/angular
+  candidates where legal.
+- RDOQ, last-significant-position decisions, sign hiding, and later transform
+  skip if needed.
+- Hot-path allocation removal: per-CTU scratch buffers, fixed-size stack arrays
+  where practical, and no allocation inside block loops.
+
+Acceptance: Rust output is decode-valid on the full corpus, exact
+decoder-vs-encoder reconstruction holds, and size/quality is within the
+current parity gate against x265.
+
+## Phase 9: Primitive Replacement
+
+The current `x265-primitives-sys` compiles upstream scalar C++ primitive files
+with assembly off. That is acceptable as an oracle/bring-up shim, but it
+conflicts with the production goal.
+
+Replacement path:
+
+1. Define a Rust primitive trait/table for the subset the encoder needs.
+2. Implement scalar Rust primitives first.
+3. Add `std::arch` SIMD for x86_64/aarch64 hot paths.
+4. Add narrow handwritten assembly only where profiling proves `std::arch` is
+   insufficient.
+5. Keep upstream x265 primitive wrappers only in oracle/benchmark builds.
+
+Prioritize SAD/SATD, intra prediction, DCT/IDCT/DST, quant/dequant,
+residual/reconstruction, copy/fill, pixel SSE/SSD, then SAO/deblock.
+
+## Phase 10: Remove Video Baggage
 
 After parity, explicitly do not port or remove:
 
@@ -417,9 +763,14 @@ Replace rate control with still-image controls:
 5. Create `x265-primitives-sys` and `x265-primitives`.
 6. Port single-CTU intra encode.
 7. Port full-image intra encode.
-8. Add filters and bit-depth/chroma variants.
-9. Wire the Rust encoder as a `HevcEncoder`.
-10. Make the x265 backend an optional oracle.
+8. Wire the Rust encoder as a `HevcEncoder` and add `--backend rust`.
+9. Fix explicit source/coded plane geometry at the backend boundary.
+10. Add Rust-still 4:2:2.
+11. Add deblocking.
+12. Add SAO syntax-off, then SAO RD search.
+13. Port x265-style intra analysis/RD decisions.
+14. Replace x265 C++ primitive shims with Rust scalar/SIMD primitives.
+15. Make x265 optional oracle/dev only, then remove it from normal builds.
 
 ## Key Risks
 
@@ -428,13 +779,150 @@ Replace rate control with still-image controls:
 - Assembly ABI: isolate unsafe code to primitive wrapper crates.
 - Bit-depth specialization: prefer separate monomorphized paths or const
   generics over pervasive runtime branching.
+- Analysis quality: valid syntax is not enough; x265-class compression depends
+  on SATD/RD mode decisions, CU/TU split search, chroma decisions, and RDOQ.
+- Primitive dependency drift: upstream C++ primitive shims are useful oracles
+  but must not remain in the production path.
+- Reproducibility: `x265_4.1` must not remain an absolute symlink if x265 is
+  required by normal builds.
 - Licensing: x265-derived Rust code and retained assembly inherit x265
   licensing constraints.
 
 ## Recommended Next Step
 
-Start with Phase 1 only: create `bpg-hevc-decode`, copy the HEVC module from
-`heic-decoder-rs`, remove the external path dependency, and make current decode
-tests pass.
+Current next step: integrate the Rust still encoder as a real `HevcEncoder`
+backend and make the source geometry explicit. Then do the easy filters and
+format coverage in order: Rust 4:2:2, deblock, SAO syntax-off, SAO RD search.
+After that, start the hard intra-analysis/RD phase.
+Here is the consolidated, non-redundant project plan for `bpg-rs`. It merges the historical context, architectural decisions, completed work, and remaining roadmap into a single source of truth.
 
-That makes the repo self-contained before the larger x265 port begins.
+---
+
+# `bpg-rs`: Rust BPG Codec Master Plan
+
+## 1. Project Vision & Goal
+Turn `bpg-rs` into a self-contained, high-performance, Rust-native BPG image encoder and decoder. 
+
+**The core strategy: Extract an x265-derived *still-picture intra encoder*, and delete the video baggage.** 
+We are not porting all of x265. We are building a dedicated BPG/HEVC still-image intra encoder that retains x265's proven RDO (Rate-Distortion Optimization), CABAC, and primitive logic, while discarding motion estimation, P/B frames, rate control over time, and threading complexities irrelevant to still images.
+
+**Philosophy:**
+*   **Correctness First:** Achieve bit-exact decode validity and syntax correctness before optimizing for compression efficiency.
+*   **Archival & Source-Aware, not Metric-Chasing:** Avoid destructive preprocessing just to boost PSNR/SSIM. Use a conservative "tuning" system based on image character (e.g., film grain, line art, photo) rather than blind parameter searches.
+*   **Upstream x265 as an Oracle:** Stock x265 is used strictly as an oracle/dev dependency to validate Rust outputs (syntax, file size, quality) via regression testing. Once the Rust backend achieves parity, x265 will be removed from standard builds.
+
+---
+
+## 2. Current State: What is Done
+A massive amount of the foundation and intermediate integration is complete. 
+
+### Core Infrastructure & BPG Container
+*   **`bpg-bitstream`:** Fully implemented bit-level I/O (`ue7`, `ue(v)`, signed Exp-Golomb).
+*   **`bpg-image`:** Color conversion (BT.601/709/2020), chroma subsampling (4:2:0, 4:2:2, 4:4:4), and padding implemented. 8-bit and 10-bit pipelines are fully supported.
+*   **`bpg-format`:** BPG container header read/write complete.
+*   **`bpg-hevc`:** NAL extraction and HEVC/SPS stream rewriting/modification for BPG payload rules is done.
+*   **CLI & Orchestration:** `bpg-tools` (CLI) and `bpg-encode` (orchestrator) are fully functional.
+
+### Decoder Integration
+*   **Vendored Decoder (`bpg-hevc-decode`):** The external HEIC HEVC decoder was successfully vendored. External path dependencies are gone.
+*   **Format Support:** Decodes 8-bit and 10-bit across 4:2:0, 4:2:2, and 4:4:4 chroma formats. Odd-dimension geometry issues are fixed.
+
+### The x265 Oracle & Testing
+*   **`bpg-x265-sys` / `bpg-x265`:** C/C++ FFI wrappers are built. Can dynamically link and dual-compile 8-bit and 10-bit x265 static libraries via `build.rs`.
+*   **Oracle Harness (`bpg-oracle`):** Deterministic test corpus generator in place. Automatically encodes, decodes, and records metrics (PSNR, file size, syntax validity) against stock x265.
+
+### Rust Still Encoder Scaffolding (`bpg-still-hevc`)
+*   **Syntax Skeleton:** NAL NAL, VPS/SPS/PPS, slice headers, and CABAC context initialization are ported and generate decoder-valid bitstreams.
+*   **Assembly Primitive Boundary (`x265-primitives`):** Safe Rust wrappers over x265 C++ ASM kernels for both 8-bit and 10-bit (DCT/IDCT, SATD, SAD, intra prediction, pixel copy, quant/dequant).
+*   **Intra Foundations:** `contexts`, `residual`, `transform`, and slice-data coding tree writers are implemented. 
+*   **Milestones Met:** The Rust encoder can currently encode single and multi-CTU images (8-bit and 10-bit, 4:2:0 and 4:4:4) with luma mode decision and boundary CU splits. **Reconstruction is bit-exact against the decoder.**
+
+---
+
+## 3. Target Architecture & Crate Layout
+```text
+bpg-rs/
+  crates/
+    bpg-bitstream/       # Varints and bit-level I/O
+    bpg-image/           # RGB <-> YCbCr, subsampling, geometry
+    bpg-format/          # BPG container header parsing/writing
+    bpg-hevc/            # BPG payload to Annex-B conversions
+    bpg-hevc-decode/     # Vendored, pure-Rust HEVC decoder
+    bpg-decode/          # High-level BPG decode API
+    bpg-encode/          # Orchestration and HevcEncoder trait
+    bpg-still-hevc/      # PRODUCTION: Pure Rust x265-derived intra encoder
+    x265-primitives/     # Safe Rust primitive dispatch
+    x265-primitives-sys/ # Temporary ASM shim for primitive kernels
+    bpg-analyze/         # FUTURE: Image feature extraction
+    bpg-tune/            # FUTURE: Source-aware parameter resolution
+    bpg-tools/           # CLI binary
+    
+    # DEV / ORACLE ONLY:
+    bpg-x265/            # FFI binding to upstream x265
+    bpg-x265-sys/        # Upstream x265 CMake build
+    bpg-oracle/          # Regression testing and benchmarking
+```
+
+---
+
+## 4. Engineering Rules: What to Keep vs. Drop from x265
+
+### KEEP (Port to Rust)
+*   **HEVC Coding Machinery:** CTU/CU/TU structures, recursive partitioning, Intra prediction, DCT/DST, Quantization, RDO/RDOQ, and CABAC.
+*   **Assembly Primitives:** The core speed of x265. Kept behind a clean Rust FFI, to be gradually replaced by `std::arch` SIMD later.
+*   **10-bit Path:** Crucial for high-quality gradients.
+
+### DROP (Do Not Port)
+*   **Inter-Prediction & Motion:** Motion estimation, references, DPB, B/P frames, temporal MVP, weighted prediction.
+*   **Video Rate Control:** ABR, VBV, 2-pass, Cutree, Lookahead, Scenecut. (Replaced with CQP and Target-Size search).
+*   **Extraneous Systems:** Frame threading, video/HDR SEIs, dynamic HDR10, CLI parser, VMAF/CSV logging. 
+*   *Note: Alpha channel and animation are officially dropped from the bpg-rs roadmap to focus on core archival photography.*
+
+---
+
+## 5. The Roadmap: What is Left to Do
+
+The project is currently transitioning out of the foundational syntax/scaffolding phase and entering the integration and compression-efficiency phase.
+
+### Phase A: Rust Encoder Integration & Correctness
+1. **Wire the Backend:** Implement `HevcEncoder` for `bpg-still-hevc`. Make `--backend rust` the default CLI choice once it successfully emits standard BPG files. Keep `--backend x265` as an oracle flag.
+2. **Explicit Source Geometry:** Fix the backend boundary so visible dimensions, coded dimensions, per-plane width/height, stride, and chroma format are explicitly passed, rather than inferred from a padded luma width.
+3. **Rust 4:2:2 Support:** Port 4:2:2 vertical-stack transform geometry to the Rust encoder (already works in the Oracle/Decoder, needs to be written into the Rust encoder).
+4. **Deblocking:** Add deblocking, utilizing the existing decoder filter path applied to encoder reconstruction.
+5. **SAO (Sample Adaptive Offset):** 
+   * *Stage 1:* Add SAO syntax with every CTB signalling SAO-off.
+   * *Stage 2:* Add actual SAO RD (Rate-Distortion) search for Edge/Band offsets.
+
+### Phase B: Intra Analysis & RD Parity (The Hard Part)
+*Syntax correctness does not equal compression efficiency. This phase brings the Rust encoder to x265-level quality/size ratios.*
+1. **Rough Mode Decision:** Implement SATD/Hadamard rough intra mode decision over Planar, DC, angular modes, and MPMs.
+2. **Bit Estimation:** Port CABAC bit estimation for RD analysis (separate from final writing).
+3. **Full RD Mode Decision:** Calculate `rd_cost = distortion + lambda * estimated_bits`.
+4. **Recursion Searches:** Implement recursive CU split search (evaluate leaf vs. 4 children) and TU split search.
+5. **Chroma & Residuals:** Implement Chroma mode decision, RDOQ (Rate-Distortion Optimized Quantization), and sign data hiding.
+6. **Allocation Purge:** Remove per-block `Vec` allocations. Use hot-path scratch buffers and fixed stack arrays.
+
+### Phase C: Primitive Replacement & Decoupling
+1. Define a pure Rust primitive trait/table.
+2. Write scalar Rust fallbacks for all needed primitives (DCT, SATD, Intra pred, etc.).
+3. Implement `std::arch` SIMD for x86_64/aarch64 hot paths.
+4. Keep the C++ `x265-primitives-sys` shim *only* for oracle comparisons. Make it completely optional.
+
+### Phase D: The Tuning System (Replacing Rate Control)
+*Replaces traditional x265 CLI flags with an archival-first policy system.*
+1. **`bpg-analyze`:** Build feature extraction (edge density, noise/grain estimates, flat-region fractions).
+2. **`bpg-tune`:** Map features to a `Tune` (e.g., `Neutral`, `Photo`, `FilmGrain`, `Slide`, `LineArt`, `Screenshot`).
+3. **`ArchivalPolicy`:** Enforce hard rules (e.g., "never strip ICC", "no destructive denoising", "allow 4:2:0 subsampling").
+
+### Phase E: Final Cleanup
+1. **Sever Upstream x265:** Remove the `bpg-x265` and `bpg-x265-sys` crates from standard builds. They become standalone dev-tools.
+2. Resolve any remaining absolute symlinks/paths to x265 source directories to ensure fully reproducible, clean public builds.
+
+---
+
+## 6. Deferred to "Much Later"
+*Features that the architecture supports adding eventually, but are zero-priority for 1.0:*
+*   **12-bit depth:** (Requires compiling a `MAIN12` x265 lib and adding `u16` paths).
+*   **Lossless mode:** (`bLossless=1` bypasses transforms/quantization).
+*   **RGB / YCgCo color spaces.**
+*   **MPEG2 Chroma Siting** (`c_h_phase==0`).

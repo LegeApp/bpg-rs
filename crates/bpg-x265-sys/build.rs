@@ -5,11 +5,11 @@
 //! (relative to this crate) and built via cmake rather than linking the
 //! system package, so the BPG port stays pinned to a known-good x265.
 //!
-//! The environment used to develop this port has no `nasm`/`yasm`, so the
-//! build disables x265 assembly (`ENABLE_ASSEMBLY=OFF`). This produces a
-//! correct but slower encoder, which is fine for M1 (correctness, not speed).
-//! Set `BPG_X265_ENABLE_ASM=1` to re-enable assembly where an assembler is
-//! available.
+//! By default the build disables x265 assembly (`ENABLE_ASSEMBLY=OFF`),
+//! producing a correct but slower scalar encoder. This is kept as the default
+//! for deterministic, assembler-version-independent output (M1 is about
+//! correctness, not speed). `nasm` (2.16.03) IS installed in this dev
+//! environment, so set `BPG_X265_ENABLE_ASM=1` to build the SIMD kernels.
 //!
 //! ## 10-bit support (multilib build)
 //!

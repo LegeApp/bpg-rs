@@ -322,7 +322,15 @@ mod tests {
     #[test]
     fn se_golomb_known_values() {
         // se(v) <-> codeNum: 0<->0, 1<->1, -1<->2, 2<->3, -2<->4 (H.265 Table 9-3).
-        for (v, code_num) in [(0i32, 0u32), (1, 1), (-1, 2), (2, 3), (-2, 4), (3, 5), (-3, 6)] {
+        for (v, code_num) in [
+            (0i32, 0u32),
+            (1, 1),
+            (-1, 2),
+            (2, 3),
+            (-2, 4),
+            (3, 5),
+            (-3, 6),
+        ] {
             let mut w = BitWriter::new();
             w.write_se_golomb(v);
             let mut ue = BitWriter::new();

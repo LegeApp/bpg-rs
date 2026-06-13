@@ -86,7 +86,11 @@ fn checkerboard() -> CorpusImage {
     let mut img = RgbImage::new(SIZE, SIZE);
     for (x, y, p) in img.enumerate_pixels_mut() {
         let on = ((x / 8) + (y / 8)) % 2 == 0;
-        *p = if on { Rgb([255, 255, 255]) } else { Rgb([0, 0, 0]) };
+        *p = if on {
+            Rgb([255, 255, 255])
+        } else {
+            Rgb([0, 0, 0])
+        };
     }
     eight("checkerboard", "high-frequency", img)
 }

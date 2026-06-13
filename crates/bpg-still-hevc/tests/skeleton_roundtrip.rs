@@ -6,7 +6,9 @@
 use bpg_hevc_decode::hevc::bitstream::{parse_nal_units, NalType};
 use bpg_hevc_decode::hevc::params::{parse_pps, parse_sps, parse_vps};
 use bpg_hevc_decode::hevc::slice::SliceHeader;
-use bpg_still_hevc::{ChromaFormat, DeblockMode, Effort, SaoMode, StillHevcConfig, StillHevcEncoder};
+use bpg_still_hevc::{
+    ChromaFormat, DeblockMode, Effort, SaoMode, StillHevcConfig, StillHevcEncoder,
+};
 
 #[test]
 fn syntax_skeleton_headers_parse() {

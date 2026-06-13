@@ -10,6 +10,8 @@ members = [
     "crates/bpg-encode",
     "crates/bpg-x265-sys",
     "crates/bpg-x265",
+    "crates/x265-primitives-sys",
+    "crates/x265-primitives",
     "crates/bpg-still-hevc",
     "crates/bpg-oracle",
     "crates/bpg-tools",
@@ -21,4 +23,20 @@ edition = "2021"
 license = "MIT"
 
 [profile.release]
+debug = "line-tables-only"
+lto = false
+strip = false
+
+[profile.profiling]
+inherits = "release"
 debug = true
+lto = false
+strip = false
+codegen-units = 16
+
+[profile.release-lto]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+strip = false

@@ -1122,7 +1122,17 @@ impl<'a> SliceContext<'a> {
             // chroma TB; 4:2:2 has two stacked 4x4 TBs. 4:4:4 does NOT do this
             // (its 4x4 children carry their own chroma — handled in the leaf).
             if log2_size == 3 && cat != 3 {
-                self.decode_chroma_tus(x0, y0, 2, intra_chroma_mode, cbf_cb, cbf_cb1, cbf_cr, cbf_cr1, frame)?;
+                self.decode_chroma_tus(
+                    x0,
+                    y0,
+                    2,
+                    intra_chroma_mode,
+                    cbf_cb,
+                    cbf_cb1,
+                    cbf_cr,
+                    cbf_cr1,
+                    frame,
+                )?;
             }
         } else {
             // Decode transform unit (leaf node)

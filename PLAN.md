@@ -253,8 +253,9 @@ byte-for-byte identical decode against the C reference.**
   case. Errors are returned as `HevcError` rather than `fprintf`+`-1`.
 - `bpg-x265-sys` (step 6): `build.rs` builds the vendored x265 at
   `../../../x265_4.1/source` via the `cmake` crate (static lib, 8-bit,
-  `ENABLE_CLI=OFF`, `ENABLE_ASSEMBLY=OFF` — the dev environment has no
-  `nasm`/`yasm`; set `BPG_X265_ENABLE_ASM=1` where an assembler is present),
+  `ENABLE_CLI=OFF`, `ENABLE_ASSEMBLY=OFF` by default for a deterministic
+  scalar build; `nasm` 2.16.03 IS available in this dev env, so set
+  `BPG_X265_ENABLE_ASM=1` to build the SIMD kernels),
   then bindgens `x265.h`. **Simplification vs. the original plan:** instead of
   codegen-ing the build-number-versioned `x265_api_get_215` symbol, the safe
   wrapper calls the non-versioned `x265_api_query(bitDepth, X265_BUILD, &err)`
@@ -292,7 +293,9 @@ encoded from the RGBA `dusk.png`, whereas M1 drops alpha by design.
 
 **Build/test:** `cargo test` → 25 unit tests pass across the workspace. The
 x265 static build runs from `bpg-x265-sys/build.rs` on first `cargo build`
-(requires `cmake` + a C/C++ toolchain; no assembler needed).
+(requires `cmake` + a C/C++ toolchain; no assembler needed for the default
+scalar build. `nasm` 2.16.03 is available, so `BPG_X265_ENABLE_ASM=1` enables
+the SIMD kernels).
 
 **Open items / next milestones (superseded, see later sections):** alpha-plane
 support (interleaved MSPS + `build_modified_hevc` alpha branch), >8-bit,
@@ -592,3 +595,270 @@ with QP28 4:2:2. The existing 8-bit 4:2:0 acceptance test (`dusk.png`,
 `c_h_phase==0` (MPEG2 chroma siting), RGB/YCgCo color spaces, and the
 tuning system (`bpg-analyze`/`bpg-tune`). 12-bit and lossless remain deferred
 to much later.
+
+## Roadmap update (Rust backend correction)
+
+This file began as the x265-backed BPG encoder plan. That milestone remains
+valid, but it is no longer the long-term production architecture. The corrected
+direction is:
+
+1. The Rust still-HEVC encoder becomes the production backend.
+2. Upstream x265 remains only as an oracle/dev tool for regression comparison,
+   syntax checks, file-size/quality benchmarking, and phase-gate validation.
+3. `bpg-x265`/`bpg-x265-sys` should become optional `oracle-x265` features once
+   the Rust backend can encode BPG files accepted by `bpg-decode` and stock
+   `bpgdec`.
+4. Do not delete x265 yet; it is still the only reliable external comparator
+   while the Rust encoder is being completed.
+
+Immediate order:
+
+- Implement `RustStillHevcEncoder` for `bpg_encode::HevcEncoder`, add
+  `--backend rust`, then make Rust the default once decode-valid.
+- Fix the backend source-geometry boundary before adding more format support:
+  visible width/height, coded width/height, plane width/height/stride, bit
+  depth, and chroma format must be explicit.
+- Finish Rust-still 4:2:2 correctness.
+- Add deblocking.
+- Add SAO in two stages: syntax enabled with every CTB/component off, then real
+  RD-selected SAO candidates.
+- After those easy correctness items, focus on the hard compression work:
+  SATD rough intra analysis, CABAC bit estimation, full RD mode decision,
+  recursive CU/TU split search, chroma mode decision, RDOQ/sign hiding,
+  primitive replacement, and hot-path allocation removal.
+
+Material completion is not "SAO/deblock/4:2:2 exist." Completion means the Rust
+backend is production default, x265 is oracle-only, 8-bit/10-bit 4:2:0/4:2:2/
+4:4:4 round-trip exactly against encoder reconstruction including odd sizes,
+deblock/SAO can be enabled and decoded exactly, unsupported BPG features fail
+explicitly, and the Rust encoder is within the chosen x265 size/quality band on
+the oracle corpus.
+
+Reproducibility issue to fix: `bpg-rs/x265_4.1` is currently a symlink to an
+absolute local path. If x265 is still required for any normal build, replace it
+with a real vendored source tree, a git submodule, a build/setup script, or move
+it fully behind documented oracle-only setup.
+
+• Made concrete progress toward the active goal:
+
+  Implemented a first-pass RDOQ path in crates/bpg-still-hevc/src/encoder.rs:444. After the plain x265-style quantizer, each nonzero coefficient is refined with candidate levels using dequantized transform-domain distortion plus the existing CABAC
+  residual bit estimator. Zero-block candidates are handled explicitly so RDOQ can legally clear a block.
+
+  Also improved roundtrip assertion diagnostics in crates/bpg-still-hevc/tests/encode_roundtrip.rs:97, and updated quantization comments in crates/bpg-still-hevc/src/transform.rs:1.
+
+  I also localized the 4:2:0 TU split issue: optional 32x32-to-16x16 splitting can select plausible RD splits, but chroma recon diverges around the split block. I kept that gated to preserve correctness.
+
+  Verified:
+
+  cargo fmt
+  cargo test -p bpg-still-hevc
+
+  Remaining for the full goal: fix and enable 4:2:0 and 10-bit TU split RD, implement full CU split RD, and harden RDOQ beyond this first greedy coefficient-level pass.
+
+## Progress update (4:2:0/10-bit TU split RD + full CU split RD)
+
+• Made concrete progress toward the active goal:
+
+  Root-caused the 4:2:0/10-bit TU split RD gating: `choose_luma_mode` and
+  `choose_chroma_mode` call `predict_intra` for every SATD-search candidate
+  mode, writing real sample values into `self.frame` without restoring it
+  afterward. This corrupted `UNINIT_SAMPLE` sentinels (see
+  `bpg-hevc-decode/src/hevc/picture.rs`) that later split/leaf RD trials in
+  `build_tt` depend on for H.265 intra reference-sample availability rules.
+  Fixed by snapshotting `self.frame` before each mode-search loop and
+  restoring it after, in both functions
+  (crates/bpg-still-hevc/src/encoder.rs).
+
+  With that fix, `can_split_tt` no longer needs the bit-depth-8 gate or the
+  log2_size restriction: it is now simply
+  `log2_size <= MAX_TB_LOG2 && log2_size > MIN_TB_LOG2 && trafo_depth <
+  MAX_INTRA_TT_DEPTH && !(cat == 1 && log2_size == 3)`. The remaining
+  exclusion is 4:2:0's 8x8->4x4 luma split, where chroma is coded once at the
+  8x8 parent node (`build_parent_chroma_tu`) and that path is not yet
+  validated against decoder recon.
+
+  Implemented full in-picture CU split RD (previously hardcoded
+  `split = false` except at forced picture-boundary splits). New types
+  `CuLeaf`/`CuNode` (encoder.rs) mirror the existing `Tt` split/leaf pattern
+  at the coding-quadtree level. New `Encoder` methods `build_cu_leaf`,
+  `build_cu_kids`, `build_cu` perform the split-vs-leaf RD comparison
+  (snapshotting/restoring `self.frame`, `self.mode_map`, and
+  `self.ct_depth_map` per trial). New free functions
+  `estimate_split_cu_flag_bits`, `estimate_cu_leaf_bits`,
+  `estimate_cu_node_bits`, `estimate_cu_kids_bits` mirror the `estimate_tt_*`
+  bit-estimation helpers. New `write_cu` emits `split_cu_flag` plus the
+  recursive CU syntax. `write_coding_quadtree` is now a thin two-call wrapper
+  (`build_cu` then `write_cu`).
+
+  Verified:
+
+  cargo fmt -p bpg-still-hevc
+  cargo test -p bpg-still-hevc --test encode_roundtrip -- --test-threads=1  (8/8 pass)
+  cargo test  (full workspace, 33 test groups, 0 failures)
+
+  Remaining for the full goal: harden RDOQ beyond the first greedy
+  coefficient-level pass (`refine_levels_rdoq`).
+
+## Progress update (RDOQ multi-pass hardening)
+
+• Made concrete progress toward the active goal:
+
+  Hardened `refine_levels_rdoq` (crates/bpg-still-hevc/src/encoder.rs) beyond
+  its original single greedy coefficient-level pass: the per-coefficient
+  {level, 0, level-1, level+1} candidate search now repeats (capped at 4
+  passes) until a pass makes no level changes. This lets a level change for
+  one coefficient (which shifts the significant_coeff_flag/last-position
+  CABAC context for its neighbours) unlock a better choice for another
+  coefficient on a subsequent pass, including the whole block converging to
+  all-zero (cbf == 0) when warranted.
+
+  Verified:
+
+  cargo fmt -p bpg-still-hevc
+  cargo test -p bpg-still-hevc --test encode_roundtrip -- --test-threads=1  (8/8 pass)
+  cargo test  (full workspace, 0 failures)
+
+  This completes all four items of the active goal: (a) 4:2:0 TU split RD,
+  (b) 10-bit TU split RD, (c) full CU split RD, (d) multi-pass RDOQ
+  hardening.
+
+## Progress update (SATD-shortlist + full-RD luma mode decision, preset-controlled)
+
+• Made concrete progress toward further x265 intra parity:
+
+  Previously `choose_luma_mode` picked a single luma intra mode by SATD +
+  estimated mode-signaling bits alone, and only that one mode ever reached
+  full TU-split RD. x265 instead SATD-shortlists a handful of candidate modes
+  and runs full RD (transform/RDOQ/CABAC cost) on each before committing.
+
+  `choose_luma_mode` is now `choose_luma_mode_candidates`
+  (crates/bpg-still-hevc/src/encoder.rs): it scores all 35 modes by SATD +
+  mode bits as before, then returns the best `N` by that rough cost
+  (ascending), where `N = luma_rd_candidates(effort)`:
+  `Effort::Fast` -> 1, `Effort::Balanced` -> 2, `Effort::Best` -> 3 — mirroring
+  x265 presets' candidate-count tradeoff (faster presets commit to the
+  best-SATD mode immediately; slower presets spend extra full-RD trials on
+  next-best SATD candidates).
+
+  `build_cu_leaf` now loops over the shortlist: for each candidate luma mode
+  it runs `choose_chroma_mode` + full `build_tt` (TU-split RD), computes the
+  CU-level RD cost via `estimate_cu_leaf_bits` + `distortion_tt_region`, and
+  keeps the lowest-cost candidate — snapshotting/restoring `self.frame` and
+  `self.mode_map` between trials (same pattern as `build_cu`'s split-vs-leaf
+  comparison). `Effort::Fast` shortlists one candidate, so this degenerates to
+  the previous single-trial behavior.
+
+  `Encoder` gained an `effort: Effort` field, set from
+  `StillHevcConfig::effort` in `encode()`.
+
+  Verified:
+
+  cargo build -p bpg-still-hevc
+  cargo fmt -p bpg-still-hevc
+  cargo test -p bpg-still-hevc --test encode_roundtrip -- --test-threads=1  (8/8 pass; default
+  `Effort::Balanced` shows small bytes/PSNR shifts vs. the single-candidate
+  baseline, e.g. full_image_multi_ctu 624->613 bytes, single_ctu_qps qp=18
+  56.03->59.77 dB — confirming the extra candidate is doing useful RD work)
+  cargo test  (full workspace, 0 failures)
+
+  Remaining for further parity: chroma mode decision is still SATD-only (no
+  full RD per candidate); strong intra smoothing / reference-sample filtering
+  parity with x265's 32x32 bilinear path hasn't been audited; `bpg-tools`
+  doesn't yet expose `--effort` to pick `Fast`/`Balanced`/`Best` from the CLI.
+
+## Progress update (chroma mode full RD + strong-intra-smoothing audit)
+
+• Made concrete progress toward further x265 intra parity:
+
+  Audited strong intra smoothing: `bpg-still-hevc/src/params.rs` already
+  writes `strong_intra_smoothing_enabled_flag = 1` in the SPS (matching
+  x265's default), and every encoder call into
+  `bpg_hevc_decode::hevc::intra::predict_intra` already passes
+  `strong_intra_smoothing_enabled = true`, so the decoder's 32x32 bilinear
+  reference-sample path (`intra_prediction_sample_filtering` in
+  `bpg-hevc-decode/src/hevc/intra.rs`) is already exercised consistently by
+  both the encoder's trial predictions and its final reconstruction. No
+  change needed — this gap was already closed.
+
+  Extended chroma mode decision (`choose_chroma_mode`,
+  crates/bpg-still-hevc/src/encoder.rs) the same way as luma: all 5 H.265
+  Table 8-2 candidates (Planar/Vertical/Horizontal/DC/DM) are still scored by
+  SATD + mode bits first, but now the best `chroma_rd_candidates(effort)` of
+  those get a full RD trial via `code_block` (actual
+  transform/quantize/RDOQ on the CU-level chroma TB(s)), with RD cost =
+  `distortion + lambda * (residual_bits + mode_idx_bits)`. New
+  `chroma_rd_candidates`: `Effort::Fast` -> 1 (original SATD-only decision,
+  unchanged), `Effort::Balanced` -> 2, `Effort::Best` -> 5 (full search over
+  all candidates).
+
+  Verified:
+
+  cargo build -p bpg-still-hevc
+  cargo fmt -p bpg-still-hevc
+  cargo test -p bpg-still-hevc --test encode_roundtrip -- --test-threads=1  (8/8 pass; default
+  `Effort::Balanced` improves chroma quality at equal-or-smaller size, e.g.
+  yuv444_round_trip cb PSNR 56.31->58.41 dB while luma bytes drop 141->139)
+  cargo test  (full workspace, 0 failures; one x265-primitives test failure
+  on the first parallel run was a transient/flaky rerun issue, not
+  reproducible in isolation or on a clean re-run)
+
+  Remaining for further parity: `bpg-tools` doesn't expose `--effort`
+  (`Fast`/`Balanced`/`Best`) from the CLI — this is blocked on the
+  not-yet-done "Rust backend correction" roadmap item (`RustStillHevcEncoder`
+  for `bpg_encode::HevcEncoder`); `bpg-still-hevc::encoder::encode` currently
+  has no caller outside its own test suite.
+
+## Progress update (Rust backend wired into bpg-tools + stock-bpgdec decode-conformance fix)
+
+  Done. The Rust-native still encoder is now a first-class `bpg-tools`
+  backend and its output decodes with the **stock** `bpgdec` — the M1
+  acceptance bar (`CLAUDE.md`).
+
+  - **`RustStillHevcEncoder`** (`crates/bpg-still-hevc/src/backend.rs`)
+    implements `bpg_encode::HevcEncoder`: converts the CTU-padded `Image`
+    planes into a `Source`, builds a `StillHevcConfig` (SAO/deblock off),
+    calls `encoder::encode`, and returns the Annex-B for
+    `bpg_encode::encode_still_image` -> `bpg_hevc::build_modified_hevc`.
+    Rejects non-4:2:0/4:4:4 chroma and non-8/10-bit depth as
+    `EncodeError::Unsupported` (no panic).
+  - **CLI**: `bpg-tools encode ... --backend rust --effort {fast,balanced,best}`.
+  - **The blocking bug — `write_pps` was missing `pps_extension_present_flag`.**
+    Stock `bpgdec`'s bundled (patched-ffmpeg) `ff_hevc_decode_nal_pps` reads
+    `pps_extension_present_flag` immediately after
+    `slice_segment_header_extension_present_flag`; the vendored Rust decoder's
+    `parse_pps` stops one field earlier. Omitting the flag made `bpgdec`
+    misread `rbsp_stop_one_bit` as `pps_extension_present_flag = 1`, then
+    overread the PPS by a byte (`"Overread PPS by 8 bits"` -> `"PPS id out of
+    range"` -> `"Could not decode image"`). Because the encoder and the
+    vendored decoder *shared* the missing field, the internal roundtrip
+    passed and hid it — only the stock decoder caught it. Fixed by writing
+    `pps_extension_present_flag = 0` (`crates/bpg-still-hevc/src/params.rs`).
+    Also fixed earlier in this effort: `write_vps` was truncated after
+    `profile_tier_level` (made the *raw* Annex-B stream non-conformant for
+    strict demuxers); now writes the full H.265 7.3.2.1 VPS body.
+  - **How it was isolated**: built a debug `bpgdec` from `libbpg-0.9.8` with
+    `-DUSE_AV_LOG -DDEBUG` so the bundled decoder's `av_log` errors print —
+    that named the exact failing check. (Internal vendored-decoder roundtrips
+    and `ffmpeg -f hevc` on the VPS-stripped rebuilt stream are *not* valid
+    conformance checks for this; only the stock decoder is.)
+  - **Regression guard**: `params::tests::pps_rbsp_terminates_for_conformant_decoder`
+    parses `write_pps()` to completion *the way a conformant decoder does*
+    (through `pps_extension_present_flag`) and asserts clean
+    `rbsp_trailing_bits` termination — catching a missing/extra PPS field
+    that the shared-blind-spot roundtrip cannot.
+
+  Verification (all decode with stock `/usr/local/bin/bpgdec`, exit 0):
+  `{420,444} x {fast,balanced,best} x {8,10-bit}` on a 200x200 multi-CTU
+  crop of `dusk.png`, plus the 64x64 single-CTU crop. PSNR vs source is
+  sane (e.g. 64x64 qp32 420: rust 37.6 dB vs x265 39.0 dB; 200x200 qp30:
+  ~35 dB) — a valid, slightly-less-efficient encode, not garbage.
+  Constraint honored: only `bpg-still-hevc` (`params.rs`/`backend.rs`) was
+  changed; `bpg-hevc`'s `rewrite_sps`/`build_modified_hevc` were left
+  untouched — the encoder was fixed to match x265/the decoder, not the
+  reverse.
+
+  Commands:
+  cargo fmt
+  cargo test  (full workspace, 0 failures)
+  cargo run -p bpg-tools -- encode <png> -o out.bpg --backend rust \
+      --effort best --qp 30 --format 444 -b 10   # decodes with stock bpgdec

@@ -12,10 +12,17 @@
 //! here; [`StillHevcEncoder`] currently only assembles parameter-set NALs and
 //! a minimal slice header.
 
+pub mod backend;
 pub mod cabac;
+pub mod contexts;
+pub mod encoder;
 pub mod nal;
 pub mod params;
+mod primitives;
+mod rdoq;
+pub mod residual;
 pub mod slice;
+pub mod transform;
 
 pub use bpg_image::ChromaFormat;
 

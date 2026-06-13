@@ -36,7 +36,12 @@ pub enum ScanOrder {
 /// - For chroma (c_idx>0): directional scan at log2_size 2, plus log2_size 3
 ///   when `chroma_array_type == 3` (4:4:4, where chroma TBs reach 8x8). For
 ///   4:2:0/4:2:2 chroma only the 4x4 block uses a directional scan.
-pub fn get_scan_order(log2_size: u8, intra_mode: u8, c_idx: u8, chroma_array_type: u8) -> ScanOrder {
+pub fn get_scan_order(
+    log2_size: u8,
+    intra_mode: u8,
+    c_idx: u8,
+    chroma_array_type: u8,
+) -> ScanOrder {
     let use_directional = if c_idx == 0 {
         // Luma: 4x4 or 8x8
         log2_size == 2 || log2_size == 3

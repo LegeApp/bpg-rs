@@ -305,6 +305,8 @@ name = "bpg-still-hevc"
 version = "0.1.0"
 dependencies = [
  "bpg-bitstream",
+ "bpg-encode",
+ "bpg-hevc",
  "bpg-hevc-decode",
  "bpg-image",
 ]
@@ -318,6 +320,7 @@ dependencies = [
  "bpg-format",
  "bpg-hevc",
  "bpg-image",
+ "bpg-still-hevc",
  "bpg-x265",
  "clap",
  "image",
@@ -1349,6 +1352,20 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+
+[[package]]
+name = "x265-primitives"
+version = "0.1.0"
+dependencies = [
+ "x265-primitives-sys",
+]
+
+[[package]]
+name = "x265-primitives-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "y4m"

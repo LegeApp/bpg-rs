@@ -11,10 +11,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use bpg_decode::{DecoderConfig, PixelLayout};
 use bpg_encode::{encode_still_image, EncoderTuning};
 use bpg_image::{ColorSpace, Image};
+use bpg_still_hevc::backend::RustStillHevcEncoder;
+use bpg_still_hevc::Effort;
+#[cfg(feature = "oracle-x265")]
 use bpg_x265::X265Encoder;
 
 #[derive(Parser)]
-#[command(name = "bpg-tools", about = "Rust BPG encoder (x265 backend)")]
+#[command(name = "bpg-tools", about = "Rust BPG encoder")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -30,7 +33,27 @@ enum Command {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Backend {
+    Rust,
+    #[cfg(feature = "oracle-x265")]
     X265,
+}
+
+/// CLI mirror of `bpg_still_hevc::Effort`, for the `rust` backend.
+#[derive(Clone, Copy, ValueEnum)]
+enum EffortArg {
+    Fast,
+    Balanced,
+    Best,
+}
+
+impl From<EffortArg> for Effort {
+    fn from(e: EffortArg) -> Self {
+        match e {
+            EffortArg::Fast => Effort::Fast,
+            EffortArg::Balanced => Effort::Balanced,
+            EffortArg::Best => Effort::Best,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -68,7 +91,7 @@ struct EncodeArgs {
     output: PathBuf,
 
     /// HEVC backend.
-    #[arg(long, value_enum, default_value_t = Backend::X265)]
+    #[arg(long, value_enum, default_value_t = Backend::Rust)]
     backend: Backend,
 
     /// Quantizer parameter (0-51).
@@ -84,9 +107,18 @@ struct EncodeArgs {
     #[arg(short = 'f', long, value_enum, default_value_t = Format::Yuv420)]
     format: Format,
 
-    /// Compression level / x265 preset (1 = fast .. 9 = slowest).
+    /// Compression level / x265 preset (1 = fast .. 9 = slowest). Ignored by
+    /// `--backend rust` (use `--effort` instead).
     #[arg(short = 'm', long = "compress-level", default_value_t = 8)]
     compress_level: u8,
+
+    /// RD-search effort for `--backend rust` (ignored by `--backend x265`).
+    #[arg(long, value_enum, default_value_t = EffortArg::Balanced)]
+    effort: EffortArg,
+
+    /// Print Rust-backend analysis counters after encoding.
+    #[arg(long)]
+    debug_stats: bool,
 
     /// Color space.
     #[arg(long = "color-space", value_enum, default_value_t = CsArg::Ycbcr)]
@@ -112,8 +144,6 @@ struct DecodeArgs {
 }
 
 fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let Backend::X265 = args.backend;
-
     if ![8, 10, 12].contains(&args.bit_depth) {
         return Err(format!("--bit-depth must be 8, 10, or 12 (got {})", args.bit_depth).into());
     }
@@ -146,17 +176,34 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         Format::Yuv444 => {}
     }
 
-    let backend = X265Encoder::new();
-    // M1 CLI uses the neutral tune (x265 --tune ssim, no overrides), which
-    // reproduces the byte-for-byte-identical-to-C-reference output. The
-    // tuning system (bpg-tune) will supply a richer EncoderTuning here later.
-    let bpg = encode_still_image(
-        image,
-        &backend,
-        args.qp,
-        args.compress_level,
-        EncoderTuning::neutral(),
-    )?;
+    let bpg = match args.backend {
+        Backend::Rust => {
+            let backend =
+                RustStillHevcEncoder::new(args.effort.into()).with_debug_stats(args.debug_stats);
+            encode_still_image(
+                image,
+                &backend,
+                args.qp,
+                args.compress_level,
+                EncoderTuning::neutral(),
+            )?
+        }
+        #[cfg(feature = "oracle-x265")]
+        Backend::X265 => {
+            let backend = X265Encoder::new();
+            // M1 CLI uses the neutral tune (x265 --tune ssim, no overrides),
+            // which reproduces the byte-for-byte-identical-to-C-reference
+            // output. The tuning system (bpg-tune) will supply a richer
+            // EncoderTuning here later.
+            encode_still_image(
+                image,
+                &backend,
+                args.qp,
+                args.compress_level,
+                EncoderTuning::neutral(),
+            )?
+        }
+    };
 
     std::fs::write(&args.output, &bpg)?;
     eprintln!("wrote {} ({} bytes)", args.output.display(), bpg.len());

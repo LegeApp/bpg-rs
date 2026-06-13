@@ -7,7 +7,19 @@ description = "Rust-native still-picture HEVC intra encoder syntax skeleton (Pha
 
 [dependencies]
 bpg-bitstream = { path = "../bpg-bitstream" }
+bpg-encode = { path = "../bpg-encode" }
 bpg-image = { path = "../bpg-image" }
+# Reused for the encoder's reconstruction engine: the decoder's `predict_intra`
+# + `DecodedFrame` are the exact spec operations the encoder must invert, so
+# reusing them guarantees the decoder reproduces the encoder's reconstruction.
+# (Phase 5 interim; a self-contained intra_pred.rs port is a later refactor.)
+bpg-hevc-decode = { path = "../bpg-hevc-decode" }
+
+[features]
+default = []
+# Marker feature for profiling builds. Keep profiling-only instrumentation
+# behind this feature if it would perturb normal release measurements.
+flamegraph = []
 
 [dev-dependencies]
-bpg-hevc-decode = { path = "../bpg-hevc-decode" }
+bpg-hevc = { path = "../bpg-hevc" }

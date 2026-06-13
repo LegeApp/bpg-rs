@@ -9,13 +9,13 @@ mod color_convert;
 mod ctu;
 mod deblock;
 pub(crate) mod debug;
-mod intra;
+pub mod intra;
 pub mod params;
 mod picture;
-mod residual;
+pub mod residual;
 mod sao;
 pub mod slice;
-mod transform;
+pub mod transform;
 mod transform_simd;
 
 pub use picture::DecodedFrame;

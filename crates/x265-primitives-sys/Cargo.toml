@@ -1,0 +1,11 @@
+[package]
+name = "x265-primitives-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+links = "x265primitives"
+
+[dependencies]
+
+[build-dependencies]
+cc = "1"

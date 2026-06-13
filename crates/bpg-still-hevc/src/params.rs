@@ -3,9 +3,12 @@
 //! Field order and presence conditions are the mirror image of
 //! `parse_vps`/`parse_sps`/`parse_pps`/`parse_profile_tier_level` in
 //! `bpg-hevc-decode::hevc::params`. Constant choices (profile/level, AMP,
-//! VUI colour info, etc.) are anchored to a real x265 BPG-still-image
-//! encode, dumped via `tests/dump_oracle_params.rs` from
-//! `oracle/out/checkerboard__420_8bit_qp24.hevc`.
+//! etc.) are anchored to a real x265 BPG-still-image encode, dumped via
+//! `tests/dump_oracle_params.rs` from
+//! `oracle/out/checkerboard__420_8bit_qp24.hevc`. The SPS VUI omits
+//! `video_signal_type_present_flag` (colour info travels in the BPG
+//! container header instead), matching that oracle stream and satisfying
+//! `bpg_hevc::ModifiedSps::rewrite_sps`'s preconditions.
 //!
 //! Phase 3 simplifications relative to that oracle stream (each chosen so
 //! the slice-segment-header writer in `slice.rs` doesn't need to handle the
@@ -71,11 +74,12 @@ fn write_profile_tier_level(w: &mut BitWriter, max_sub_layers_minus1: u8) {
                           // reserved_zero_2bits padding loop.
 }
 
-/// `video_parameter_set_rbsp()` (H.265 7.3.2.1), trimmed to the fields
-/// `parse_vps` reads (id/layer/sub-layer counts, `vps_reserved_0xffff_16bits`,
-/// `profile_tier_level`) plus `rbsp_trailing_bits`. The remaining VPS syntax
-/// (operation points, HRD, extensions, ...) is not written; `parse_vps`
-/// doesn't read it and the decoder discards the parsed VPS entirely.
+/// `video_parameter_set_rbsp()` (H.265 7.3.2.1). BPG drops the VPS entirely
+/// (`build_modified_hevc` only checks its NAL type before discarding it), but
+/// `encode()`'s raw Annex-B output is still a complete, self-contained
+/// bitstream that conformant decoders parse in full — so the VPS body must be
+/// well-formed (not just `profile_tier_level` + `rbsp_trailing_bits`) or a
+/// strict decoder misaligns on everything that follows.
 pub fn write_vps() -> Vec<u8> {
     let mut w = BitWriter::new();
 
@@ -89,8 +93,85 @@ pub fn write_vps() -> Vec<u8> {
 
     write_profile_tier_level(&mut w, 0);
 
+    w.write_bit(1); // vps_sub_layer_ordering_info_present_flag
+    w.write_ue_golomb(0); // vps_max_dec_pic_buffering_minus1[0]
+    w.write_ue_golomb(0); // vps_max_num_reorder_pics[0]
+    w.write_ue_golomb(0); // vps_max_latency_increase_plus1[0]
+
+    w.write_bits(6, 0); // vps_max_layer_id
+    w.write_ue_golomb(0); // vps_num_layer_sets_minus1 (no layer_id_included_flag loop)
+
+    w.write_bit(0); // vps_timing_info_present_flag
+    w.write_bit(0); // vps_extension_flag
+
     write_rbsp_trailing_bits(&mut w);
     w.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bpg_bitstream::BitReader;
+
+    /// Parse `write_pps()`'s RBSP the way a *conformant* decoder does — through
+    /// `pps_extension_present_flag`, the field stock `bpgdec`'s bundled ffmpeg
+    /// reads but the vendored `parse_pps` stops short of — and assert the
+    /// stream terminates cleanly (`rbsp_stop_one_bit` then only zero padding to
+    /// the byte boundary). Guards against a missing/extra PPS field, which the
+    /// internal roundtrip cannot catch because the encoder and the vendored
+    /// decoder share the same field list.
+    #[test]
+    fn pps_rbsp_terminates_for_conformant_decoder() {
+        let pps = write_pps();
+        let mut r = BitReader::new(&pps);
+        let ue = |r: &mut BitReader| r.read_ue_golomb().unwrap();
+
+        ue(&mut r); // pps_pic_parameter_set_id
+        ue(&mut r); // pps_seq_parameter_set_id
+        r.read_bits(1); // dependent_slice_segments_enabled_flag
+        r.read_bits(1); // output_flag_present_flag
+        r.read_bits(3); // num_extra_slice_header_bits
+        r.read_bits(1); // sign_data_hiding_enabled_flag
+        r.read_bits(1); // cabac_init_present_flag
+        ue(&mut r); // num_ref_idx_l0_default_active_minus1
+        ue(&mut r); // num_ref_idx_l1_default_active_minus1
+        r.read_se_golomb().unwrap(); // init_qp_minus26
+        r.read_bits(1); // constrained_intra_pred_flag
+        r.read_bits(1); // transform_skip_enabled_flag
+        r.read_bits(1); // cu_qp_delta_enabled_flag
+        r.read_se_golomb().unwrap(); // pps_cb_qp_offset
+        r.read_se_golomb().unwrap(); // pps_cr_qp_offset
+        r.read_bits(1); // pps_slice_chroma_qp_offsets_present_flag
+        r.read_bits(1); // weighted_pred_flag
+        r.read_bits(1); // weighted_bipred_flag
+        r.read_bits(1); // transquant_bypass_enabled_flag
+        assert_eq!(r.read_bits(1), 0, "tiles_enabled_flag"); // no tile cols/rows loop
+        r.read_bits(1); // entropy_coding_sync_enabled_flag
+        r.read_bits(1); // pps_loop_filter_across_slices_enabled_flag
+        let deblock_ctrl = r.read_bits(1); // deblocking_filter_control_present_flag
+        if deblock_ctrl == 1 {
+            let override_enabled = r.read_bits(1); // deblocking_filter_override_enabled_flag
+            assert_eq!(override_enabled, 0, "override loop not written");
+            let disabled = r.read_bits(1); // pps_deblocking_filter_disabled_flag
+            if disabled == 0 {
+                r.read_se_golomb().unwrap(); // pps_beta_offset_div2
+                r.read_se_golomb().unwrap(); // pps_tc_offset_div2
+            }
+        }
+        assert_eq!(r.read_bits(1), 0, "pps_scaling_list_data_present_flag");
+        r.read_bits(1); // lists_modification_present_flag
+        ue(&mut r); // log2_parallel_merge_level_minus2
+        r.read_bits(1); // slice_segment_header_extension_present_flag
+        assert_eq!(r.read_bits(1), 0, "pps_extension_present_flag"); // no range-ext bits
+
+        // rbsp_trailing_bits(): stop bit then zero padding to the byte boundary.
+        assert_eq!(r.read_bits(1), 1, "rbsp_stop_one_bit");
+        let left = pps.len() * 8 - r.bit_pos();
+        assert!(left < 8, "more than a byte of padding left: {left} bits");
+        for _ in 0..left {
+            assert_eq!(r.read_bits(1), 0, "rbsp_alignment_zero_bit");
+        }
+    }
 }
 
 /// `chroma_format_idc` per H.265 Table 6-1.
@@ -135,8 +216,8 @@ pub fn write_sps(config: &StillHevcConfig) -> Vec<u8> {
     w.write_ue_golomb(4); // log2_max_pic_order_cnt_lsb_minus4
 
     w.write_bit(0); // sps_sub_layer_ordering_info_present_flag
-    // sub_layer_ordering_info_present_flag == 0 -> the loop still runs once
-    // (for i == sps_max_sub_layers_minus1 == 0).
+                    // sub_layer_ordering_info_present_flag == 0 -> the loop still runs once
+                    // (for i == sps_max_sub_layers_minus1 == 0).
     w.write_ue_golomb(0); // sps_max_dec_pic_buffering_minus1
     w.write_ue_golomb(0); // sps_max_num_reorder_pics
     w.write_ue_golomb(0); // sps_max_latency_increase_plus1
@@ -162,18 +243,13 @@ pub fn write_sps(config: &StillHevcConfig) -> Vec<u8> {
     w.write_bit(1); // sps_temporal_mvp_enabled_flag
     w.write_bit(1); // strong_intra_smoothing_enabled_flag
 
-    // VUI: signal full-range BT.601 (matrix_coeffs == 6), matching the BPG
-    // colour convention. Only the fields `parse_sps` reads are written.
+    // VUI: no video_signal_type (colour info travels in the BPG container
+    // header, not the SPS) — this matches x265's BPG-still-image SPS, which
+    // is the profile `bpg_hevc::ModifiedSps::rewrite_sps` accepts.
     w.write_bit(1); // vui_parameters_present_flag
     w.write_bit(0); // aspect_ratio_info_present_flag
     w.write_bit(0); // overscan_info_present_flag
-    w.write_bit(1); // video_signal_type_present_flag
-    w.write_bits(3, 5); // video_format (5 == Unspecified)
-    w.write_bit(1); // video_full_range_flag
-    w.write_bit(1); // colour_description_present_flag
-    w.write_bits(8, 2); // colour_primaries (2 == Unspecified)
-    w.write_bits(8, 2); // transfer_characteristics (2 == Unspecified)
-    w.write_bits(8, 6); // matrix_coefficients (6 == BT.601)
+    w.write_bit(0); // video_signal_type_present_flag
 
     // Close out vui_parameters() per H.265 E.2.1 so a conformant decoder
     // (e.g. stock `bpgdec`/libde265, which reads the full VUI rather than
@@ -186,6 +262,8 @@ pub fn write_sps(config: &StillHevcConfig) -> Vec<u8> {
     w.write_bit(0); // default_display_window_flag
     w.write_bit(0); // vui_timing_info_present_flag
     w.write_bit(0); // bitstream_restriction_flag
+
+    w.write_bit(0); // sps_extension_flag
 
     write_rbsp_trailing_bits(&mut w);
     w.into_bytes()
@@ -201,7 +279,7 @@ pub fn write_pps() -> Vec<u8> {
     w.write_bit(0); // dependent_slice_segments_enabled_flag
     w.write_bit(0); // output_flag_present_flag
     w.write_bits(3, 0); // num_extra_slice_header_bits
-    w.write_bit(1); // sign_data_hiding_enabled_flag
+    w.write_bit(0); // sign_data_hiding_enabled_flag (milestone 1: SDH not applied)
     w.write_bit(0); // cabac_init_present_flag
     w.write_ue_golomb(0); // num_ref_idx_l0_default_active_minus1
     w.write_ue_golomb(0); // num_ref_idx_l1_default_active_minus1
@@ -218,11 +296,25 @@ pub fn write_pps() -> Vec<u8> {
     w.write_bit(0); // tiles_enabled_flag
     w.write_bit(0); // entropy_coding_sync_enabled_flag (see module docs)
     w.write_bit(1); // pps_loop_filter_across_slices_enabled_flag
-    w.write_bit(0); // deblocking_filter_control_present_flag
+                    // Disable the in-loop deblocking filter (milestone 1: no deblock). With
+                    // control present + override disabled + filter disabled, the slice inherits
+                    // a disabled filter and omits the override/loop-filter-across fields.
+    w.write_bit(1); // deblocking_filter_control_present_flag
+    w.write_bit(0); // deblocking_filter_override_enabled_flag
+    w.write_bit(1); // pps_deblocking_filter_disabled_flag
     w.write_bit(0); // pps_scaling_list_data_present_flag
     w.write_bit(0); // lists_modification_present_flag
     w.write_ue_golomb(0); // log2_parallel_merge_level_minus2
     w.write_bit(0); // slice_segment_header_extension_present_flag
+
+    // `pps_extension_present_flag`: read by conformant decoders (stock
+    // `bpgdec`'s bundled ffmpeg `ff_hevc_decode_nal_pps`) immediately after
+    // `slice_segment_header_extension_present_flag`. `parse_pps` in the
+    // vendored Rust decoder stops one field earlier, so omitting this passed
+    // the internal roundtrip but made stock `bpgdec` misread
+    // `rbsp_trailing_bits()` as `pps_extension_present_flag = 1` and overread
+    // the PPS by a byte.
+    w.write_bit(0); // pps_extension_present_flag
 
     write_rbsp_trailing_bits(&mut w);
     w.into_bytes()

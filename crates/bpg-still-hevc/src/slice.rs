@@ -46,7 +46,9 @@ pub fn write_slice_segment_header(config: &StillHevcConfig) -> Vec<u8> {
     // slice_qp_delta: SliceQPY = 26 + pps.init_qp_minus26 (0) + slice_qp_delta
     w.write_se_golomb(config.qp as i32 - 26);
 
-    w.write_bit(1); // slice_loop_filter_across_slices_enabled_flag
+    // With SAO off and deblocking disabled in the PPS,
+    // slice_loop_filter_across_slices_enabled_flag is absent (its presence
+    // condition `slice_sao_* || !slice_deblocking_filter_disabled` is false).
 
     // byte_alignment()
     w.write_bit(1); // alignment_bit_equal_to_one

@@ -195,8 +195,9 @@ fn encode_one(
         ),
         Depth::Sixteen => {
             let buf = img.rgb16.as_ref().unwrap().clone();
-            let rgb16 = image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(img.width, img.height, buf)
-                .ok_or("rgb16 buffer size mismatch")?;
+            let rgb16 =
+                image::ImageBuffer::<image::Rgb<u16>, _>::from_raw(img.width, img.height, buf)
+                    .ok_or("rgb16 buffer size mismatch")?;
             Image::from_rgb16(&rgb16, ColorSpace::YCbCr, false, config.bit_depth)
         }
     };
@@ -208,7 +209,13 @@ fn encode_one(
     }
 
     let backend = X265Encoder::new();
-    let bpg = encode_still_image(image, &backend, config.qp, COMPRESS_LEVEL, EncoderTuning::neutral())?;
+    let bpg = encode_still_image(
+        image,
+        &backend,
+        config.qp,
+        COMPRESS_LEVEL,
+        EncoderTuning::neutral(),
+    )?;
 
     // Rebuild the Annex-B the decoder consumes (the Phase-3 comparison target).
     let file = BpgHeader::read(&bpg).map_err(|e| format!("BPG header read: {e:?}"))?;
@@ -266,7 +273,10 @@ fn encode_one(
 /// bpgdec is file-in/file-out.
 fn bpgdec_decode(bpgdec: &Path, bpg: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let tmp_bpg = std::env::temp_dir().join(format!("oracle_{nonce}.bpg"));
     let tmp_png = std::env::temp_dir().join(format!("oracle_{nonce}.png"));
     std::fs::write(&tmp_bpg, bpg)?;
@@ -359,7 +369,11 @@ fn run_gen(out: &Path, dusk: &Path, bpgdec: &Path) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-fn run_check(manifest: &Path, dusk: &Path, bpgdec: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn run_check(
+    manifest: &Path,
+    dusk: &Path,
+    bpgdec: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let want = std::fs::read_to_string(manifest)
         .map_err(|e| format!("read {}: {e}", manifest.display()))?;
     let rows = build_rows(dusk, bpgdec, None)?;
@@ -376,7 +390,10 @@ fn run_check(manifest: &Path, dusk: &Path, bpgdec: &Path) -> Result<(), Box<dyn 
     let mut problems = Vec::new();
     for r in &rows {
         let Some(exp_line) = expected.get(&(r.image.clone(), r.config.clone())) else {
-            problems.push(format!("{} [{}]: not in committed manifest", r.image, r.config));
+            problems.push(format!(
+                "{} [{}]: not in committed manifest",
+                r.image, r.config
+            ));
             continue;
         };
         let f: Vec<&str> = exp_line.split(',').collect();
@@ -398,7 +415,11 @@ fn run_check(manifest: &Path, dusk: &Path, bpgdec: &Path) -> Result<(), Box<dyn 
     }
 
     if problems.is_empty() {
-        println!("check OK: {} encodes match {}", rows.len(), manifest.display());
+        println!(
+            "check OK: {} encodes match {}",
+            rows.len(),
+            manifest.display()
+        );
         Ok(())
     } else {
         for p in &problems {
@@ -411,7 +432,10 @@ fn run_check(manifest: &Path, dusk: &Path, bpgdec: &Path) -> Result<(), Box<dyn 
 fn save_source(dir: &Path, img: &CorpusImage) -> Result<(), Box<dyn std::error::Error>> {
     match img.depth {
         Depth::Eight => {
-            img.rgb8.as_ref().unwrap().save(dir.join(format!("{}.png", img.name)))?;
+            img.rgb8
+                .as_ref()
+                .unwrap()
+                .save(dir.join(format!("{}.png", img.name)))?;
         }
         Depth::Sixteen => {
             let buf = img.rgb16.as_ref().unwrap().clone();

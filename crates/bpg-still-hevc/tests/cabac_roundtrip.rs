@@ -7,7 +7,7 @@
 
 use bpg_bitstream::BitWriter;
 use bpg_hevc_decode::hevc::cabac::{CabacDecoder, ContextModel as DecCtx};
-use bpg_still_hevc::cabac::{CabacEncoder, ContextModel as EncCtx};
+use bpg_still_hevc::cabac::{CabacEncoder, CabacEstimator, ContextModel as EncCtx};
 
 const INIT_VALUE: u8 = 154; // SAO_MERGE_FLAG init value, H.265 Table 9-31
 const SLICE_QP: i32 = 28;
@@ -69,5 +69,50 @@ fn regular_and_bypass_bins_round_trip() {
     }
 
     let end_of_slice = dec.decode_terminate().expect("decode_terminate");
-    assert_eq!(end_of_slice, 1, "encode_bin_trm(1) must decode as terminate");
+    assert_eq!(
+        end_of_slice, 1,
+        "encode_bin_trm(1) must decode as terminate"
+    );
+}
+
+#[test]
+fn cabac_estimator_matches_x265_entropy_bits_and_context_updates() {
+    let bins = [1u8, 0, 1, 1, 0, 0, 1, 1];
+    let expected_costs = [
+        0x07b23u64, 0x08cbcu64, 0x07b23u64, 0x074a0u64, 0x09354u64, 0x08cbcu64, 0x07b23u64,
+        0x074a0u64,
+    ];
+
+    let mut est = CabacEstimator::new();
+    let mut est_ctx = EncCtx::new(INIT_VALUE, SLICE_QP);
+    let mut writer_ctx = EncCtx::new(INIT_VALUE, SLICE_QP);
+    let mut expected_total = 0u64;
+
+    for (i, (&bin, &cost)) in bins.iter().zip(expected_costs.iter()).enumerate() {
+        expected_total += cost;
+        est.encode_bin(bin, &mut est_ctx);
+
+        let mut w = BitWriter::new();
+        let mut enc = CabacEncoder::new();
+        enc.encode_bin(&mut w, bin, &mut writer_ctx);
+
+        assert_eq!(
+            est.frac_bits(),
+            expected_total,
+            "estimated cost mismatch after bin {i}"
+        );
+        assert_eq!(
+            est_ctx.get_state(),
+            writer_ctx.get_state(),
+            "estimated context state mismatch after bin {i}"
+        );
+    }
+
+    est.encode_bin_ep(0);
+    est.encode_bins_ep(0b101, 3);
+    assert_eq!(
+        est.frac_bits(),
+        expected_total + CabacEstimator::SCALE * 4,
+        "bypass bins must cost exactly one fixed-point bit each"
+    );
 }

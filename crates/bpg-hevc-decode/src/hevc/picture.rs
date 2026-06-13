@@ -16,7 +16,7 @@ pub const DEBLOCK_FLAG_VERT: u8 = 1;
 pub const DEBLOCK_FLAG_HORIZ: u8 = 2;
 
 /// Decoded video frame
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DecodedFrame {
     /// Width in pixels (full frame, before cropping)
     pub width: u32,
