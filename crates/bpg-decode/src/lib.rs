@@ -270,11 +270,6 @@ fn reject_unsupported(file: &bpg_format::BpgFile<'_>) -> Result<(), DecodeError>
     }
     // All BPG chroma formats (4:2:0, 4:2:2, 4:4:4) and monochrome are
     // supported by the vendored HEVC decoder.
-    match file.header.color_space {
-        ColorSpaceCode::YCbCr | ColorSpaceCode::YCbCrBt709 | ColorSpaceCode::YCbCrBt2020 => {}
-        ColorSpaceCode::Rgb => return Err(DecodeError::Unsupported("RGB color space")),
-        ColorSpaceCode::YCgCo => return Err(DecodeError::Unsupported("YCgCo color space")),
-    }
     Ok(())
 }
 
@@ -292,7 +287,7 @@ fn matrix_coefficients(color_space: ColorSpaceCode) -> Result<u8, DecodeError> {
         ColorSpaceCode::YCbCr => Ok(6),
         ColorSpaceCode::YCbCrBt709 => Ok(1),
         ColorSpaceCode::YCbCrBt2020 => Ok(9),
-        ColorSpaceCode::Rgb => Err(DecodeError::Unsupported("RGB color space")),
-        ColorSpaceCode::YCgCo => Err(DecodeError::Unsupported("YCgCo color space")),
+        ColorSpaceCode::Rgb => Ok(0),
+        ColorSpaceCode::YCgCo => Ok(8),
     }
 }

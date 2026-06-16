@@ -9,7 +9,7 @@ use alloc::vec::Vec;
 use super::picture::DecodedFrame;
 
 /// SAO parameters for one CTB
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SaoInfo {
     /// SAO type per component: 0=off, 1=band offset, 2=edge offset
     /// [0]=Y, [1]=Cb, [2]=Cr

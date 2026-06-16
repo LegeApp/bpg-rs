@@ -11,8 +11,9 @@
 //! It reuses the *same* RD framework as the greedy path — coefficient-domain
 //! SSE distortion, the same `lambda`, the same 1/32768-bit rate units — so its
 //! decisions are directly comparable. Selected per [`Effort`] tier
-//! (`Best` keeps exact greedy; `Balanced`/`Fast` use this) and overridable via
-//! `BPG_RDOQ_SINGLESCAN`. It is *not* byte-identical to the greedy path.
+//! (`Placebo`/`Reference` keep exact greedy; the practical tiers use this) and
+//! overridable via `BPG_RDOQ_SINGLESCAN`. It is *not* byte-identical to the
+//! greedy path.
 //!
 //! Stages implemented:
 //! - **(a)** per-coefficient level decision (reverse scan, local RD).
@@ -20,8 +21,11 @@
 //!   level decision, choose the scan position to terminate coding at (zeroing
 //!   the higher-frequency tail, or the whole block) by minimizing total RD —
 //!   this is what recovers the low-bitrate efficiency stage (a) left behind.
-//!
-//! Still TODO **(c)**: per-sub-block `coded_sub_block_flag` all-zero forcing.
+//! - **(c)** per-sub-block `coded_sub_block_flag` all-zero forcing: for each
+//!   middle sub-block (explicit-CSBF, i.e. strictly between the DC and the
+//!   last-significant sub-block), zero the whole sub-block when CSBF=0 + the
+//!   dropped-coefficient distortion beats coding it. Net RD win on the test
+//!   corpus (occasional sub-1% local loss from the frozen-context estimate).
 
 use crate::cabac::CabacEstimator;
 use crate::contexts::{ctx, Contexts};
@@ -38,7 +42,7 @@ const BYPASS_BITS: u64 = CabacEstimator::SCALE;
 
 /// Number of `coeff_abs_level_remaining` bins for `value` at Rice parameter
 /// `rice` (truncated-Rice prefix + EGk), matching `encode_coeff_abs_level_remaining`.
-fn rice_bins(value: u32, rice: u32) -> u32 {
+pub(crate) fn rice_bins(value: u32, rice: u32) -> u32 {
     if value < (4u32 << rice) {
         (value >> rice) + 1 + rice
     } else {
@@ -94,7 +98,14 @@ fn last_axis_bits(ctxs: &Contexts, value: u32, log2_size: u8, c_idx: u8, is_x: b
 }
 
 /// Total estimated `last_sig_coeff_x/y` bits for a last position at `(x, y)`.
-fn last_pos_bits(ctxs: &Contexts, x: u32, y: u32, log2_size: u8, c_idx: u8, scan: ScanOrder) -> u64 {
+fn last_pos_bits(
+    ctxs: &Contexts,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    c_idx: u8,
+    scan: ScanOrder,
+) -> u64 {
     let (raw_x, raw_y) = if scan == ScanOrder::Vertical {
         (y, x)
     } else {
@@ -111,9 +122,9 @@ struct CoeffRec {
     idx: usize, // row-major coefficient index
     x: u32,
     y: u32,
-    level: i16,   // chosen signed level (0 if quantized away)
-    dist0: f64,   // distortion if zeroed
-    dist_l: f64,  // distortion at chosen level
+    level: i16,     // chosen signed level (0 if quantized away)
+    dist0: f64,     // distortion if zeroed
+    dist_l: f64,    // distortion at chosen level
     rd_normal: f64, // RD cost coded as a normal coefficient (sig flag + level)
     rd_last: f64,   // RD cost coded as the last significant coeff (no sig flag)
 }
@@ -153,7 +164,8 @@ pub fn rdoq_single_scan(
     // Frozen representative greater1/greater2 contexts (greater1_ctx = 1, first
     // significant coefficient; prev_subblock_had_gt1 = 0).
     let ctx_set = if c_idx > 0 { 0usize } else { 2 };
-    let gt1_ci = ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + if c_idx > 0 { 16 } else { 0 } + ctx_set * 4 + 1;
+    let gt1_ci =
+        ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + if c_idx > 0 { 16 } else { 0 } + ctx_set * 4 + 1;
     let gt2_ci = ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + if c_idx > 0 { 4 } else { 0 } + ctx_set;
     // coeff_abs_level bits (greater1 + greater2 + remaining + sign) for abs level l>=1.
     let magnitude_bits = |l: u32| -> u64 {
@@ -272,11 +284,89 @@ pub fn rdoq_single_scan(
         if recs[p].level == 0 {
             continue;
         }
-        let lp = lam * last_pos_bits(ctxs, recs[p].x, recs[p].y, log2_size, c_idx, scan_order) as f64;
+        let lp =
+            lam * last_pos_bits(ctxs, recs[p].x, recs[p].y, log2_size, c_idx, scan_order) as f64;
         let cost = pref_normal[p] + recs[p].rd_last + suff_zero[p + 1] + lp;
         if cost < best_cost {
             best_cost = cost;
             best_last = p as isize;
+        }
+    }
+
+    // --- Stage (c): middle sub-block `coded_sub_block_flag` all-zero forcing. ---
+    // For each sub-block coded with an explicit CSBF (strictly between the DC
+    // sub-block and the last-significant sub-block, in forward scan order),
+    // compare keeping it (CSBF=1: pay each coefficient's sig/level bits) against
+    // zeroing it (CSBF=0: pay only the flag, take the distortion of dropping
+    // every coefficient). Zeroing is always a bitstream-valid choice — the
+    // residual encoder re-derives CSBF from the levels — so this can only change
+    // RD, never validity. Sub-blocks are visited high->low frequency so a
+    // neighbour's final coded state is known when its CSBF context is priced.
+    if best_last >= 0 {
+        let last = best_last as usize;
+        let last_sbx = recs[last].x as usize / 4;
+        let last_sby = recs[last].y as usize / 4;
+        let last_sb_scan = scan_sub
+            .iter()
+            .position(|&(sx, sy)| sx as usize == last_sbx && sy as usize == last_sby)
+            .unwrap_or(0);
+
+        // Final coded-sub-block state from the post-stage-(b) levels.
+        let mut coded = [[false; 8]; 8];
+        for rec in recs.iter().take(last + 1) {
+            if rec.level != 0 {
+                coded[rec.y as usize / 4][rec.x as usize / 4] = true;
+            }
+        }
+
+        for sb_scan in (1..last_sb_scan).rev() {
+            let (sbx, sby) = scan_sub[sb_scan];
+            let (sbx, sby) = (sbx as usize, sby as usize);
+            if !coded[sby][sbx] {
+                continue; // already empty: CSBF=0 either way
+            }
+            let right = sbx + 1 < sb_width && coded[sby][sbx + 1];
+            let below = sby + 1 < sb_width && coded[sby + 1][sbx];
+            let csbf_neighbors = (right as u8) | ((below as u8) << 1);
+            let csbf_ci = ctx::CODED_SUB_BLOCK_FLAG
+                + (csbf_neighbors != 0) as usize
+                + if c_idx > 0 { 2 } else { 0 };
+
+            let mut keep = lam * bits(csbf_ci, 1) as f64;
+            let mut zero = lam * bits(csbf_ci, 0) as f64;
+            for &(px, py) in scan_pos.iter() {
+                let x = sbx * 4 + px as usize;
+                let y = sby * 4 + py as usize;
+                if x >= size || y >= size {
+                    continue;
+                }
+                let rank = rank_of[y * size + x];
+                if rank == usize::MAX || rank > last {
+                    continue;
+                }
+                keep += recs[rank].rd_normal;
+                zero += recs[rank].dist0;
+            }
+
+            // Keep/zero uses frozen contexts and ignores the prev_csbf context
+            // shift zeroing imposes on lower-frequency neighbours, so this
+            // greedy decision (like HM/x265's sub-block RDOQ) is a net RD win
+            // but can lose a fraction of a percent on the odd block. A slack
+            // margin was tried and made it worse (it blocked genuine wins
+            // without fixing the directional misestimates), so decide bare.
+            if zero < keep {
+                for &(px, py) in scan_pos.iter() {
+                    let x = sbx * 4 + px as usize;
+                    let y = sby * 4 + py as usize;
+                    if x < size && y < size {
+                        let rank = rank_of[y * size + x];
+                        if rank != usize::MAX && rank <= last {
+                            recs[rank].level = 0;
+                        }
+                    }
+                }
+                coded[sby][sbx] = false;
+            }
         }
     }
 

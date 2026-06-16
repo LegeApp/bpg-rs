@@ -14,12 +14,20 @@ bpg-image = { path = "../bpg-image" }
 # reusing them guarantees the decoder reproduces the encoder's reconstruction.
 # (Phase 5 interim; a self-contained intra_pred.rs port is a later refactor.)
 bpg-hevc-decode = { path = "../bpg-hevc-decode" }
+# Optional portable-SIMD backend for the hot primitive kernels (SSD, residual
+# subtraction, forward DCT). `wide` is pure Rust (no C/asm), so the default
+# build stays portable; enabling `wide-simd` only swaps in vectorized kernels
+# that are bit-identical to the scalar reference. See `src/primitives/`.
+wide = { version = "1.3", optional = true }
 
 [features]
 default = []
 # Marker feature for profiling builds. Keep profiling-only instrumentation
 # behind this feature if it would perturb normal release measurements.
 flamegraph = []
+# Route the dispatchable hot kernels through `wide`-based portable-SIMD
+# implementations (still selectable at runtime via `BPG_PRIMITIVES`).
+wide-simd = ["dep:wide"]
 
 [dev-dependencies]
 bpg-hevc = { path = "../bpg-hevc" }

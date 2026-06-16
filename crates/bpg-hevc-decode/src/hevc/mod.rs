@@ -7,13 +7,13 @@ pub mod bitstream;
 pub mod cabac;
 mod color_convert;
 mod ctu;
-mod deblock;
+pub mod deblock;
 pub(crate) mod debug;
 pub mod intra;
 pub mod params;
 mod picture;
 pub mod residual;
-mod sao;
+pub mod sao;
 pub mod slice;
 pub mod transform;
 mod transform_simd;
@@ -94,10 +94,16 @@ fn decode_nal_units(nal_units: &[bitstream::NalUnit<'_>]) -> Result<DecodedFrame
     let sps = sps.ok_or(HevcError::MissingParameterSet("SPS"))?;
     let pps = pps.ok_or(HevcError::MissingParameterSet("PPS"))?;
 
-    // Sanity-check dimensions before allocating (prevent OOM from malicious SPS)
+    // Sanity-check dimensions before allocating (prevent OOM from a malicious
+    // SPS). The per-dimension bound is generous on purpose: BPG is a still-image
+    // format routinely used for very large pictures (e.g. 18432x9216 game
+    // heightmaps, gigapixel panoramas/scans) that exceed any standard HEVC
+    // level. The hard correctness guard is the `checked_mul` below (the sample
+    // count must fit u32, which keeps every `y * stride + x` index in range);
+    // callers that need a tighter memory bound use `bpg_decode::Limits`.
     let w = sps.pic_width_in_luma_samples;
     let h = sps.pic_height_in_luma_samples;
-    if w == 0 || h == 0 || w > 16384 || h > 16384 {
+    if w == 0 || h == 0 || w > 32768 || h > 32768 {
         return Err(HevcError::InvalidParameterSet {
             kind: "SPS",
             msg: alloc::format!("invalid dimensions {}x{}", w, h),

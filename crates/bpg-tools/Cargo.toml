@@ -23,3 +23,6 @@ default = []
 # Marker feature for profiling runs, intended for:
 # cargo flamegraph --profile profiling -p bpg-tools --features flamegraph -- ...
 flamegraph = ["still265/flamegraph"]
+# Build the `still265` encoder with its portable-SIMD (`wide`) hot kernels.
+# Selectable at runtime via `BPG_PRIMITIVES`; bit-identical output either way.
+wide-simd = ["still265/wide-simd"]

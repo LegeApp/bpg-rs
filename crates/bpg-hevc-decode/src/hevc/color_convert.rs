@@ -10,6 +10,104 @@ use archmage::prelude::*;
 #[cfg(target_arch = "x86_64")]
 use safe_unaligned_simd::x86_64::{_mm_loadu_si64, _mm_loadu_si128, _mm256_storeu_si256};
 
+fn lrint(x: f64) -> i32 {
+    x.round_ties_even() as i32
+}
+
+#[inline]
+fn scale_component_to_u8(v: i32, bit_depth: u8, full_range: bool) -> u8 {
+    if bit_depth == 8 && full_range {
+        return v.clamp(0, 255) as u8;
+    }
+    let out_pixel_max = 255.0;
+    let c_shift = 30 - 8;
+    let mult = out_pixel_max * (1u32 << c_shift) as f64 / ((1u32 << bit_depth) - 1) as f64;
+    let (y_one, y_offset) = if full_range {
+        (lrint(mult), 1 << (c_shift - 1))
+    } else {
+        let mult_y = out_pixel_max * (1u32 << c_shift) as f64 / (219u32 << (bit_depth - 8)) as f64;
+        (
+            lrint(mult_y),
+            -(16i32 << (bit_depth - 8)) * lrint(mult_y) + (1 << (c_shift - 1)),
+        )
+    };
+    ((v * y_one + y_offset) >> c_shift).clamp(0, 255) as u8
+}
+
+/// Convert one decoded BPG pixel to RGB.
+///
+/// `matrix_coeffs` follows BPG/HEVC semantics: 0 = RGB stored as G/B/R planes,
+/// 8 = YCgCo, 1/6/9 = YCbCr matrices.
+pub fn pixel_to_rgb(
+    y_val: i32,
+    cb_val: i32,
+    cr_val: i32,
+    bit_depth: u8,
+    full_range: bool,
+    matrix_coeffs: u8,
+) -> (u8, u8, u8) {
+    match matrix_coeffs {
+        0 => (
+            scale_component_to_u8(cr_val, bit_depth, full_range),
+            scale_component_to_u8(y_val, bit_depth, full_range),
+            scale_component_to_u8(cb_val, bit_depth, full_range),
+        ),
+        8 => {
+            let center = 1i32 << (bit_depth - 1);
+            let cg = cb_val - center;
+            let co = cr_val - center;
+            (
+                scale_component_to_u8(y_val - cg + co, bit_depth, full_range),
+                scale_component_to_u8(y_val + cg, bit_depth, full_range),
+                scale_component_to_u8(y_val - cg - co, bit_depth, full_range),
+            )
+        }
+        _ => ycbcr_pixel_to_rgb(y_val, cb_val, cr_val, full_range, matrix_coeffs),
+    }
+}
+
+#[inline(always)]
+pub fn ycbcr_pixel_to_rgb(
+    y_val: i32,
+    cb_val: i32,
+    cr_val: i32,
+    full_range: bool,
+    matrix_coeffs: u8,
+) -> (u8, u8, u8) {
+    let cb = cb_val - 128;
+    let cr = cr_val - 128;
+    if full_range {
+        let (cr_r, cb_g, cr_g, cb_b) = match matrix_coeffs {
+            1 => (403, -48, -120, 475),
+            9 => (377, -42, -146, 482),
+            _ => (359, -88, -183, 454),
+        };
+        let r = y_val + ((cr_r * cr + 128) >> 8);
+        let g = y_val + ((cb_g * cb + cr_g * cr + 128) >> 8);
+        let b = y_val + ((cb_b * cb + 128) >> 8);
+        (
+            r.clamp(0, 255) as u8,
+            g.clamp(0, 255) as u8,
+            b.clamp(0, 255) as u8,
+        )
+    } else {
+        let (cr_r, cb_g, cr_g, cb_b) = match matrix_coeffs {
+            1 => (14744, -1754, -4383, 17373),
+            9 => (13806, -1541, -5349, 17615),
+            _ => (13126, -3222, -6686, 16591),
+        };
+        let yv = (y_val - 16) * 9576;
+        let r = (yv + cr_r * cr + 4096) >> 13;
+        let g = (yv + cb_g * cb + cr_g * cr + 4096) >> 13;
+        let b = (yv + cb_b * cb + 4096) >> 13;
+        (
+            r.clamp(0, 255) as u8,
+            g.clamp(0, 255) as u8,
+            b.clamp(0, 255) as u8,
+        )
+    }
+}
+
 /// Get color matrix coefficients for YCbCr→RGB conversion.
 ///
 /// Returns (cr_r, cb_g, cr_g, cb_b, y_bias, y_scale, rounding, shift_bits).

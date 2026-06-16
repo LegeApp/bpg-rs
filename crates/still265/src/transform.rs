@@ -42,6 +42,20 @@ pub fn forward_transform(
     primitives::forward_transform(residual, log2_size, is_intra_4x4_luma, bit_depth)
 }
 
+/// Forward transform into caller-owned buffers. `out` receives the coefficient
+/// block and `tmp` is used only for the intermediate DCT transpose, allowing the
+/// encoder to pool both allocations across transform blocks.
+pub fn forward_transform_into(
+    residual: &[i16],
+    log2_size: u8,
+    is_intra_4x4_luma: bool,
+    bit_depth: u8,
+    out: &mut Vec<i16>,
+    tmp: &mut Vec<i16>,
+) {
+    primitives::forward_transform_into(residual, log2_size, is_intra_4x4_luma, bit_depth, out, tmp);
+}
+
 /// Quantize transform coefficients to initial levels using x265's plain
 /// quantizer. The encoder may refine these levels with CABAC-estimated RDOQ
 /// before reconstruction. Returns `(levels, num_nonzero)`; `levels` is
@@ -108,7 +122,11 @@ impl DequantParams {
         let combined = LEVEL_SCALE[rem] * (1 << per);
         let shift = bit_depth as i32 - 9 + log2_size as i32;
         let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
-        Self { combined, shift, add }
+        Self {
+            combined,
+            shift,
+            add,
+        }
     }
 
     /// Dequantize a single level, matching [`dequantize`]'s clamp.

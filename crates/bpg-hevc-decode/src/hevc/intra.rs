@@ -69,14 +69,92 @@ pub fn predict_intra(
     c_idx: u8, // 0=Y, 1=Cb, 2=Cr
     strong_intra_smoothing_enabled: bool,
 ) {
+    let (border, border_center, size, bit_depth) = collect_prediction_border(
+        frame,
+        x,
+        y,
+        log2_size,
+        mode,
+        c_idx,
+        strong_intra_smoothing_enabled,
+    );
+    // Resolve plane once to avoid per-pixel match on c_idx
+    let (plane, stride) = frame.plane_mut(c_idx);
+    predict_intra_from_border(
+        plane,
+        stride,
+        x,
+        y,
+        log2_size,
+        mode,
+        c_idx,
+        size,
+        bit_depth,
+        &border,
+        border_center,
+    );
+}
+
+/// Perform intra prediction for a block into caller-owned storage.
+///
+/// Reference samples are read from `frame` at `(x, y)`, but predicted samples are
+/// written to `dst` with local block origin `(0, 0)` and row stride `dst_stride`.
+/// This is useful for analysis paths that need predictions without modifying the
+/// reconstructed frame.
+pub fn predict_intra_into(
+    frame: &DecodedFrame,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    mode: IntraPredMode,
+    c_idx: u8, // 0=Y, 1=Cb, 2=Cr
+    strong_intra_smoothing_enabled: bool,
+    dst: &mut [u16],
+    dst_stride: usize,
+) {
+    let size_usize = 1usize << log2_size;
+    assert!(dst_stride >= size_usize);
+    assert!(dst.len() >= (size_usize - 1) * dst_stride + size_usize);
+
+    let (border, border_center, size, bit_depth) = collect_prediction_border(
+        frame,
+        x,
+        y,
+        log2_size,
+        mode,
+        c_idx,
+        strong_intra_smoothing_enabled,
+    );
+    predict_intra_from_border(
+        dst,
+        dst_stride,
+        0,
+        0,
+        log2_size,
+        mode,
+        c_idx,
+        size,
+        bit_depth,
+        &border,
+        border_center,
+    );
+}
+
+fn collect_prediction_border(
+    frame: &DecodedFrame,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    mode: IntraPredMode,
+    c_idx: u8,
+    strong_intra_smoothing_enabled: bool,
+) -> ([i32; 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1], usize, u32, u8) {
     let size = 1u32 << log2_size;
     let bit_depth = frame.bit_depth;
     let chroma_format = frame.chroma_format;
 
-    // Get reference samples (border pixels)
     let mut border = [0i32; 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1];
     let border_center = 2 * MAX_INTRA_PRED_BLOCK_SIZE;
-
     fill_border_samples(frame, x, y, size, c_idx, &mut border, border_center);
 
     // Reference sample filtering (H.265 8.4.4.2.3)
@@ -93,8 +171,23 @@ pub fn predict_intra(
         );
     }
 
-    // Resolve plane once to avoid per-pixel match on c_idx
-    let (plane, stride) = frame.plane_mut(c_idx);
+    (border, border_center, size, bit_depth)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_intra_from_border(
+    plane: &mut [u16],
+    stride: usize,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    mode: IntraPredMode,
+    c_idx: u8,
+    size: u32,
+    bit_depth: u8,
+    border: &[i32],
+    border_center: usize,
+) {
     let max_val = (1i32 << bit_depth) - 1;
 
     // Apply prediction based on mode
@@ -822,6 +915,7 @@ pub fn fill_mpm_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     #[test]
     fn test_mpm_candidates_same_dc() {
@@ -849,5 +943,99 @@ mod tests {
         assert_eq!(INTRA_PRED_ANGLE[2], 32);
         // Mode 34 should have positive angle
         assert_eq!(INTRA_PRED_ANGLE[34], 32);
+    }
+
+    fn fill_test_frame(frame: &mut DecodedFrame) {
+        let max_val = (1u32 << frame.bit_depth) - 1;
+        for c_idx in 0..=2 {
+            let (width, height) = frame.component_dims(c_idx);
+            let (plane, stride) = frame.plane_mut(c_idx);
+            if stride == 0 {
+                continue;
+            }
+            for y in 0..height as usize {
+                for x in 0..width as usize {
+                    let idx = y * stride + x;
+                    let seed = x as u32 * 37 + y as u32 * 17 + c_idx as u32 * 101;
+                    plane[idx] = if (x as u32 * 3 + y as u32 * 5 + c_idx as u32 * 7) % 13 == 0 {
+                        UNINIT_SAMPLE
+                    } else {
+                        (seed % (max_val + 1)) as u16
+                    };
+                }
+            }
+        }
+    }
+
+    fn assert_predict_into_matches_frame_write(
+        bit_depth: u8,
+        chroma_format: u8,
+        c_idx: u8,
+        x: u32,
+        y: u32,
+        log2_size: u8,
+        mode: IntraPredMode,
+    ) {
+        let mut frame = DecodedFrame::with_params(96, 96, bit_depth, chroma_format);
+        fill_test_frame(&mut frame);
+        let original = frame.clone();
+        let mut written = frame.clone();
+        let size = 1usize << log2_size;
+        let mut pred = Vec::new();
+        pred.resize(size * size, 0);
+
+        predict_intra_into(&frame, x, y, log2_size, mode, c_idx, true, &mut pred, size);
+        predict_intra(&mut written, x, y, log2_size, mode, c_idx, true);
+
+        let (plane, stride) = written.plane(c_idx);
+        for row in 0..size {
+            let start = (y as usize + row) * stride + x as usize;
+            assert_eq!(
+                &pred[row * size..row * size + size],
+                &plane[start..start + size],
+                "mismatch for bit_depth={bit_depth}, chroma_format={chroma_format}, c_idx={c_idx}, pos=({x},{y}), log2_size={log2_size}, mode={:?}",
+                mode
+            );
+        }
+
+        assert_eq!(frame.y_plane, original.y_plane);
+        assert_eq!(frame.cb_plane, original.cb_plane);
+        assert_eq!(frame.cr_plane, original.cr_plane);
+    }
+
+    #[test]
+    fn predict_into_matches_frame_write_across_modes_sizes_and_formats() {
+        let modes = [
+            IntraPredMode::Planar,
+            IntraPredMode::Dc,
+            IntraPredMode::Angular2,
+            IntraPredMode::Angular10,
+            IntraPredMode::Angular18,
+            IntraPredMode::Angular26,
+            IntraPredMode::Angular34,
+        ];
+        let positions = [(0, 0), (8, 0), (0, 8), (8, 8)];
+
+        for bit_depth in [8, 10] {
+            for chroma_format in [1, 2, 3] {
+                for c_idx in [0, 1, 2] {
+                    for log2_size in [2, 3, 4, 5] {
+                        for mode in modes {
+                            for (x, y) in positions {
+                                assert_predict_into_matches_frame_write(
+                                    bit_depth,
+                                    chroma_format,
+                                    c_idx,
+                                    x,
+                                    y,
+                                    log2_size,
+                                    mode,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

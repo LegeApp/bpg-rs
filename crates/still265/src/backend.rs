@@ -6,16 +6,28 @@
 //! `bpg_encode::encode_still_image` to pipe through
 //! `bpg_hevc::build_modified_hevc`.
 
-use bpg_encode::{EncodeError, HevcEncodeParams, HevcEncoder};
+use bpg_encode::{EncodeError, HevcBackendCaps, HevcEncodeParams, HevcEncoder};
 use bpg_image::{ChromaFormat, Image};
 
-use crate::encoder::{encode_with_stats, Source};
+use crate::effort::describe_effort;
+use crate::encoder::{encode_with_stats, EncodeStats, Source};
 use crate::{DeblockMode, Effort, SaoMode, StillHevcConfig};
+use std::sync::Mutex;
+
+/// Counters captured from the most recent [`RustStillHevcEncoder`] encode.
+#[derive(Debug, Clone)]
+pub struct LastEncodeStats {
+    pub annexb_bytes: usize,
+    pub stats: EncodeStats,
+}
 
 /// The Rust-native still-picture HEVC backend.
 pub struct RustStillHevcEncoder {
     effort: Effort,
     debug_stats: bool,
+    sao: SaoMode,
+    deblock: DeblockMode,
+    last_stats: Mutex<Option<LastEncodeStats>>,
 }
 
 impl RustStillHevcEncoder {
@@ -23,12 +35,37 @@ impl RustStillHevcEncoder {
         Self {
             effort,
             debug_stats: false,
+            sao: SaoMode::Off,
+            deblock: DeblockMode::On,
+            last_stats: Mutex::new(None),
         }
     }
 
     pub fn with_debug_stats(mut self, debug_stats: bool) -> Self {
         self.debug_stats = debug_stats;
         self
+    }
+
+    /// Enable the conservative SAO encoder (see `still265::sao`). Off by default.
+    pub fn with_sao(mut self, sao: SaoMode) -> Self {
+        self.sao = sao;
+        self
+    }
+
+    /// Toggle the in-loop deblocking filter (on by default).
+    pub fn with_deblock(mut self, deblock: DeblockMode) -> Self {
+        self.deblock = deblock;
+        self
+    }
+
+    /// Return the counters captured from the most recent encode through this
+    /// backend. The value is primarily used by `bpg-tools --debug-stats-csv`,
+    /// where the final BPG container size is only known outside this backend.
+    pub fn last_encode_stats(&self) -> Option<LastEncodeStats> {
+        self.last_stats
+            .lock()
+            .expect("still265 last-stats mutex poisoned")
+            .clone()
     }
 }
 
@@ -38,23 +75,45 @@ impl Default for RustStillHevcEncoder {
     }
 }
 
+/// `still265`'s declared capabilities (see [`HevcBackendCaps`]).
+/// Encoder-side lossless/alpha are not yet implemented; the decoder
+/// (`bpg-hevc-decode`) can still decode third-party streams that use them.
+/// Deblocking is implemented and enabled by default (see
+/// [`crate::DeblockMode`]). SAO is implemented as a conservative
+/// band-offset/edge-offset encoder (see [`crate::sao`]), off by default
+/// ([`RustStillHevcEncoder::with_sao`]).
+const CAPS: HevcBackendCaps = HevcBackendCaps {
+    bit_depths: &[8, 10, 12],
+    chroma_formats: &[
+        ChromaFormat::Gray,
+        ChromaFormat::Yuv420,
+        ChromaFormat::Yuv422,
+        ChromaFormat::Yuv444,
+    ],
+    supports_sao: true,
+    supports_deblock: true,
+    supports_lossless: false,
+    supports_alpha: false,
+};
+
 impl HevcEncoder for RustStillHevcEncoder {
+    fn caps(&self) -> HevcBackendCaps {
+        CAPS
+    }
+
     fn encode_still(
         &self,
         image: &Image,
         params: &HevcEncodeParams,
     ) -> Result<Vec<u8>, EncodeError> {
-        if !matches!(
-            params.chroma_format,
-            ChromaFormat::Yuv420 | ChromaFormat::Yuv444
-        ) {
+        if !CAPS.supports_chroma_format(params.chroma_format) {
             return Err(EncodeError::Unsupported(
                 "still265 backend supports only 4:2:0/4:4:4 chroma",
             ));
         }
-        if params.bit_depth != 8 && params.bit_depth != 10 {
+        if !CAPS.supports_bit_depth(params.bit_depth) {
             return Err(EncodeError::Unsupported(
-                "still265 backend supports only 8/10-bit",
+                "still265 backend supports only 8/10/12-bit",
             ));
         }
 
@@ -65,19 +124,31 @@ impl HevcEncoder for RustStillHevcEncoder {
             chroma: params.chroma_format,
             qp: params.qp,
             effort: self.effort,
-            sao: SaoMode::Off,
-            deblock: DeblockMode::Off,
+            sao: self.sao,
+            deblock: self.deblock,
         };
 
         let src = Source {
             y: &image.planes[0].data,
-            cb: &image.planes[1].data,
-            cr: &image.planes[2].data,
+            cb: image.planes.get(1).map_or(&[][..], |p| p.data.as_slice()),
+            cr: image.planes.get(2).map_or(&[][..], |p| p.data.as_slice()),
         };
 
         let (annexb, _decoded, stats) = encode_with_stats(&config, src);
+        *self
+            .last_stats
+            .lock()
+            .expect("still265 last-stats mutex poisoned") = Some(LastEncodeStats {
+            annexb_bytes: annexb.len(),
+            stats: stats.clone(),
+        });
         if self.debug_stats {
+            eprintln!("{}", describe_effort(self.effort, params.qp as i32));
             eprintln!("{stats}");
+            eprintln!(
+                "  primitive_backend: {}",
+                crate::primitives::PRIMITIVES.backend
+            );
         }
         Ok(annexb)
     }

@@ -1,4 +1,4 @@
-//! Image types, RGB->YCbCr color conversion, chroma subsampling and CTU
+//! Image types, RGB->BPG color conversion, chroma subsampling and CTU
 //! padding for the bpg-rs encoder pipeline. Ported from the `Image`
 //! handling in `libbpg-0.9.8/bpgenc.c`.
 
@@ -29,9 +29,7 @@ pub enum ChromaFormat {
     Yuv444,
 }
 
-/// Output color space. Only the `YCbCr*` family is implemented in M1; `Rgb`
-/// and `YCgCo` are accepted by the type but `ColorConvertState::new` will
-/// panic if selected.
+/// Output color space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorSpace {
     YCbCr,
@@ -60,6 +58,83 @@ pub struct Image {
 }
 
 impl Image {
+    /// Build a monochrome image from 8-bit luma samples, optionally scaling up
+    /// to a higher output bit depth.
+    pub fn from_luma8(
+        gray: &image::GrayImage,
+        color_space: ColorSpace,
+        limited_range: bool,
+        bit_depth: u8,
+    ) -> Self {
+        Self::from_luma_pixels(
+            gray.width(),
+            gray.height(),
+            gray.pixels().map(|px| px[0] as u16),
+            8,
+            color_space,
+            limited_range,
+            bit_depth,
+        )
+    }
+
+    /// Build a monochrome image from 16-bit luma samples, converting to the
+    /// requested output bit depth.
+    pub fn from_luma16(
+        gray: &image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
+        color_space: ColorSpace,
+        limited_range: bool,
+        bit_depth: u8,
+    ) -> Self {
+        Self::from_luma_pixels(
+            gray.width(),
+            gray.height(),
+            gray.pixels().map(|px| px[0]),
+            16,
+            color_space,
+            limited_range,
+            bit_depth,
+        )
+    }
+
+    fn from_luma_pixels(
+        width: u32,
+        height: u32,
+        pixels: impl Iterator<Item = u16>,
+        in_bit_depth: u8,
+        color_space: ColorSpace,
+        limited_range: bool,
+        bit_depth: u8,
+    ) -> Self {
+        assert!(
+            matches!(
+                color_space,
+                ColorSpace::YCbCr | ColorSpace::YCbCrBt709 | ColorSpace::YCbCrBt2020
+            ),
+            "gray BPG images use a YCbCr-family color space"
+        );
+        let in_max = (1u32 << in_bit_depth) - 1;
+        let out_max = (1u32 << bit_depth) - 1;
+        let y_data = pixels
+            .map(|v| ((v as u32 * out_max + in_max / 2) / in_max) as u16)
+            .collect();
+
+        Image {
+            width,
+            height,
+            bit_depth,
+            chroma_format: ChromaFormat::Gray,
+            color_space,
+            limited_range,
+            planes: vec![Plane {
+                data: y_data,
+                width,
+                height,
+                stride: width as usize,
+            }],
+            has_alpha: false,
+        }
+    }
+
     /// Convert an 8-bit RGB image to a 4:4:4 YCbCr `Image`, optionally
     /// scaling up to a higher `bit_depth` (10/12-bit) during color
     /// conversion.
@@ -115,7 +190,7 @@ impl Image {
         let mut cr_data = Vec::with_capacity((width * height) as usize);
 
         for (r, g, b) in pixels {
-            let (y, cb, cr) = cvt.rgb_to_ycc(r, g, b);
+            let (y, cb, cr) = cvt.rgb_to_planes(r, g, b);
             y_data.push(y);
             cb_data.push(cb);
             cr_data.push(cr);

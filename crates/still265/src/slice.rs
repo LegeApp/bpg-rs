@@ -9,15 +9,22 @@
 //!   == false`, `sps.separate_colour_plane_flag == false`.
 //! - NAL type is IDR (`IdrWRadl`/`IdrNLp`), so POC LSB and ref-pic-set
 //!   syntax are absent.
-//! - `sps.sample_adaptive_offset_enabled_flag == false`, so
-//!   `slice_sao_luma_flag`/`slice_sao_chroma_flag` are absent.
+//! - `sps.sample_adaptive_offset_enabled_flag` follows `config.sao` (see
+//!   `params.rs`): with `SaoMode::Off` (default),
+//!   `slice_sao_luma_flag`/`slice_sao_chroma_flag` are absent; with
+//!   `SaoMode::On` both are present and written as 1 (per-CTU SAO syntax —
+//!   see `crate::sao` — then determines whether SAO is actually applied).
 //! - `pps.pps_slice_chroma_qp_offsets_present_flag == false` and
 //!   `pps.deblocking_filter_override_enabled_flag == false`, so the chroma
 //!   QP offset and deblocking-override fields are absent.
-//! - `pps.pps_loop_filter_across_slices_enabled_flag == true` and
-//!   `slice_deblocking_filter_disabled_flag == false` (inherited from
-//!   `pps_deblocking_filter_disabled_flag == false`), so
-//!   `slice_loop_filter_across_slices_enabled_flag` IS present.
+//! - `pps.pps_loop_filter_across_slices_enabled_flag == true`. With
+//!   `config.deblock == DeblockMode::On`, `pps_deblocking_filter_disabled_flag
+//!   == false`, so `slice_loop_filter_across_slices_enabled_flag` IS present
+//!   (written as 1). With `DeblockMode::Off` (default),
+//!   `pps_deblocking_filter_disabled_flag == true`, so the presence condition
+//!   `slice_sao_* || !slice_deblocking_filter_disabled` reduces to
+//!   `slice_sao_*` — present (and written as 1) iff `config.sao !=
+//!   SaoMode::Off`.
 //! - `pps.tiles_enabled_flag == false` and
 //!   `pps.entropy_coding_sync_enabled_flag == false`, so
 //!   `num_entry_point_offsets` is absent (implicitly 0).
@@ -29,7 +36,7 @@
 
 use bpg_bitstream::BitWriter;
 
-use crate::StillHevcConfig;
+use crate::{ChromaFormat, StillHevcConfig};
 
 /// `slice_segment_header()` (H.265 7.3.6.1) for a single first-slice IDR
 /// I-slice, ending with `byte_alignment()`. The returned bytes are the
@@ -43,12 +50,36 @@ pub fn write_slice_segment_header(config: &StillHevcConfig) -> Vec<u8> {
 
     w.write_ue_golomb(2); // slice_type (2 == I)
 
+    // SAO flags (H.265 7.3.6.1), present iff
+    // sps.sample_adaptive_offset_enabled_flag (== `config.sao !=
+    // SaoMode::Off`, see params.rs). For monochrome, `slice_sao_chroma_flag`
+    // is absent because `chroma_array_type() == 0`.
+    let sao_enabled = config.sao != crate::SaoMode::Off;
+    if sao_enabled {
+        w.write_bit(1); // slice_sao_luma_flag
+        if config.chroma != ChromaFormat::Gray {
+            w.write_bit(1); // slice_sao_chroma_flag
+        }
+    }
+
     // slice_qp_delta: SliceQPY = 26 + pps.init_qp_minus26 (0) + slice_qp_delta
     w.write_se_golomb(config.qp as i32 - 26);
 
-    // With SAO off and deblocking disabled in the PPS,
-    // slice_loop_filter_across_slices_enabled_flag is absent (its presence
-    // condition `slice_sao_* || !slice_deblocking_filter_disabled` is false).
+    if sao_enabled || config.deblock == crate::DeblockMode::On {
+        // pps_deblocking_filter_disabled_flag == false (deblocking enabled),
+        // deblocking_filter_override_enabled_flag == false, so
+        // deblocking_filter_override_flag/slice_deblocking_filter_disabled_flag
+        // are absent and inherited as false/false. The presence condition for
+        // slice_loop_filter_across_slices_enabled_flag (`slice_sao_* ||
+        // !slice_deblocking_filter_disabled`) is then true whenever SAO is on
+        // (regardless of deblocking) or deblocking is on; write 1, matching
+        // `pps_loop_filter_across_slices_enabled_flag`.
+        w.write_bit(1); // slice_loop_filter_across_slices_enabled_flag
+    }
+    // With SAO off and DeblockMode::Off, deblocking is disabled in the PPS,
+    // so slice_loop_filter_across_slices_enabled_flag is absent (its
+    // presence condition `slice_sao_* || !slice_deblocking_filter_disabled`
+    // is false).
 
     // byte_alignment()
     w.write_bit(1); // alignment_bit_equal_to_one

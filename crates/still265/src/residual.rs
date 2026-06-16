@@ -337,7 +337,15 @@ fn residual_syntax<S: CabacSyntax>(
 
     let (last_sb_idx, last_pos_in_sb) = find_last_sig(coeffs, size, scan_sub, scan_pos);
     encode_last_position(
-        sink, ctxs, scan_order, scan_sub, scan_pos, last_sb_idx, last_pos_in_sb, log2_size, c_idx,
+        sink,
+        ctxs,
+        scan_order,
+        scan_sub,
+        scan_pos,
+        last_sb_idx,
+        last_pos_in_sb,
+        log2_size,
+        c_idx,
     );
 
     let cfg = SubBlockCfg {
@@ -701,7 +709,10 @@ fn build_coeff_locs(log2_size: u8, scan_order: ScanOrder) -> Vec<CoeffLoc> {
             let x = sbx as usize * 4 + px as usize;
             let y = sby as usize * 4 + py as usize;
             if x < size && y < size {
-                locs[y * size + x] = CoeffLoc { sb_idx, pos_in_sb: pos };
+                locs[y * size + x] = CoeffLoc {
+                    sb_idx,
+                    pos_in_sb: pos,
+                };
             }
         }
     }
@@ -763,8 +774,15 @@ impl ResidualEstimateCache {
         let mut sink = CabacEstimator::new();
         let mut ctxs = base_ctxs.clone();
         encode_last_position(
-            &mut sink, &mut ctxs, scan_order, scan_sub, scan_pos, last_sb_idx, last_pos_in_sb,
-            log2_size, c_idx,
+            &mut sink,
+            &mut ctxs,
+            scan_order,
+            scan_sub,
+            scan_pos,
+            last_sb_idx,
+            last_pos_in_sb,
+            log2_size,
+            c_idx,
         );
 
         let cfg = SubBlockCfg {
@@ -901,7 +919,8 @@ impl ResidualEstimateCache {
             return None;
         }
         let loc = self.coeff_locs[changed_idx];
-        if new_level == 0 && loc.sb_idx == self.last_sb_idx && loc.pos_in_sb == self.last_pos_in_sb {
+        if new_level == 0 && loc.sb_idx == self.last_sb_idx && loc.pos_in_sb == self.last_pos_in_sb
+        {
             return None;
         }
         let boundary = self.boundaries[loc.sb_idx].as_ref()?;

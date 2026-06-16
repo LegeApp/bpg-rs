@@ -69,6 +69,44 @@ pub struct HevcEncodeParams {
     pub tuning: EncoderTuning,
 }
 
+/// Declared capabilities of a [`HevcEncoder`] backend, used by callers (e.g.
+/// `bpg-tools`) to validate a request *before* doing any expensive work
+/// (image loading, color conversion, CTU padding) and to keep CLI help/README
+/// claims honest. A backend must not silently downgrade or ignore an
+/// unsupported request: [`HevcEncoder::encode_still`] still returns
+/// [`EncodeError::Unsupported`] for anything outside these bounds, but
+/// `caps()` lets callers fail fast with a clear message.
+#[derive(Debug, Clone, Copy)]
+pub struct HevcBackendCaps {
+    /// Sample bit depths this backend can encode (e.g. `&[8, 10, 12]`).
+    pub bit_depths: &'static [u8],
+    /// Chroma subsampling formats this backend can encode.
+    pub chroma_formats: &'static [ChromaFormat],
+    /// Whether the backend can apply Sample Adaptive Offset for extra RD
+    /// gain (the decoder can always *decode* SAO; this is about the encoder
+    /// choosing to use it).
+    pub supports_sao: bool,
+    /// Whether the backend can apply in-loop deblocking for extra RD gain.
+    pub supports_deblock: bool,
+    /// Whether the backend can produce a lossless (transquant-bypass)
+    /// bitstream.
+    pub supports_lossless: bool,
+    /// Whether the backend can encode an alpha plane.
+    pub supports_alpha: bool,
+}
+
+impl HevcBackendCaps {
+    /// Whether `bit_depth` is one of [`Self::bit_depths`].
+    pub fn supports_bit_depth(&self, bit_depth: u8) -> bool {
+        self.bit_depths.contains(&bit_depth)
+    }
+
+    /// Whether `chroma_format` is one of [`Self::chroma_formats`].
+    pub fn supports_chroma_format(&self, chroma_format: ChromaFormat) -> bool {
+        self.chroma_formats.contains(&chroma_format)
+    }
+}
+
 /// A HEVC backend that encodes a single intra still frame and returns its raw
 /// Annex-B elementary stream. Implemented by `still265`.
 ///
@@ -84,6 +122,11 @@ pub trait HevcEncoder {
         image: &Image,
         params: &HevcEncodeParams,
     ) -> Result<Vec<u8>, EncodeError>;
+
+    /// Report this backend's capabilities (supported bit depths, chroma
+    /// formats, and in-loop filter / lossless / alpha support), so callers
+    /// can validate a request before doing expensive work.
+    fn caps(&self) -> HevcBackendCaps;
 }
 
 /// Errors from the encode pipeline.

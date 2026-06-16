@@ -867,7 +867,9 @@ impl<'a> SliceContext<'a> {
                 // Chroma modes. Per H.265 7.3.8.5, intra_chroma_pred_mode is
                 // signaled once per PU only when ChromaArrayType == 3 (4:4:4);
                 // for 4:2:0/4:2:2 a single chroma mode covers the whole CU.
-                let chroma_mode = if self.sps.chroma_array_type() == 3 {
+                let chroma_mode = if self.sps.chroma_array_type() == 0 {
+                    IntraPredMode::Dc
+                } else if self.sps.chroma_array_type() == 3 {
                     let half = cb_size / 2;
                     let cm0 = self.decode_intra_chroma_mode(luma_mode_0)?;
                     self.store_intra_chroma_mode(x0, y0, log2_pu_size, cm0);
@@ -1121,7 +1123,7 @@ impl<'a> SliceContext<'a> {
             // predicted + decoded now at the parent level. 4:2:0 has one 4x4
             // chroma TB; 4:2:2 has two stacked 4x4 TBs. 4:4:4 does NOT do this
             // (its 4x4 children carry their own chroma — handled in the leaf).
-            if log2_size == 3 && cat != 3 {
+            if log2_size == 3 && cat != 0 && cat != 3 {
                 self.decode_chroma_tus(
                     x0,
                     y0,
@@ -1250,7 +1252,7 @@ impl<'a> SliceContext<'a> {
 
         // Per H.265 7.3.8.11: decode cu_qp_delta before residuals
         // Condition: (cbf_luma || cbf_cb || cbf_cr) && cu_qp_delta_enabled_flag && !IsCuQpDeltaCoded
-        if (cbf_luma || cbf_cb || cbf_cr)
+        if (cbf_luma || cbf_cb || cbf_cb1 || cbf_cr || cbf_cr1)
             && self.pps.cu_qp_delta_enabled_flag
             && !self.is_cu_qp_delta_coded
         {
@@ -1321,7 +1323,7 @@ impl<'a> SliceContext<'a> {
             if cbf_cr {
                 self.decode_and_apply_residual(x0, y0, log2_size, 2, chroma_scan_order, frame)?;
             }
-        } else if log2_size >= 3 {
+        } else if cat != 0 && log2_size >= 3 {
             // 4:2:0 / 4:2:2: chroma TBs are half-width (log2_size-1). 4:2:0 has a
             // single TB; 4:2:2 has two stacked TBs (see decode_chroma_tus). (4x4
             // luma TUs carry no chroma — handled by the parent 8x8 split above.)
@@ -1647,7 +1649,11 @@ impl<'a> SliceContext<'a> {
             );
         }
 
-        let intra_chroma_mode = self.decode_intra_chroma_mode(intra_luma_mode)?;
+        let intra_chroma_mode = if self.sps.chroma_array_type() == 0 {
+            IntraPredMode::Dc
+        } else {
+            self.decode_intra_chroma_mode(intra_luma_mode)?
+        };
 
         Ok((intra_luma_mode, intra_chroma_mode))
     }

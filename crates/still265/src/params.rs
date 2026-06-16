@@ -13,9 +13,11 @@
 //! Phase 3 simplifications relative to that oracle stream (each chosen so
 //! the slice-segment-header writer in `slice.rs` doesn't need to handle the
 //! corresponding optional fields):
-//! - `sample_adaptive_offset_enabled_flag = false` (oracle: true) — matches
-//!   `StillHevcConfig::sao` defaulting to `SaoMode::Off`; avoids
+//! - `sample_adaptive_offset_enabled_flag = false` (oracle: true) when
+//!   `StillHevcConfig::sao == SaoMode::Off` (the default) — avoids
 //!   `slice_sao_luma_flag`/`slice_sao_chroma_flag` in the slice header.
+//!   `SaoMode::On` sets this flag, and `slice.rs` writes those two flags
+//!   (see `crate::sao` for the per-CTU SAO syntax this then requires).
 //! - `entropy_coding_sync_enabled_flag = false` (oracle: true) — avoids
 //!   `num_entry_point_offsets` parsing in the slice header.
 //! - `deblocking_filter_control_present_flag = false` — avoids
@@ -30,6 +32,13 @@
 use bpg_bitstream::BitWriter;
 
 use crate::{ChromaFormat, StillHevcConfig};
+
+/// `diff_cu_qp_delta_depth` written in the PPS when adaptive quantization is
+/// active. `1` ⇒ `Log2MinCuQpDeltaSize = CtbLog2SizeY(6) − 1 = 5`, i.e. a 32x32
+/// quantization group, aligned 1:1 with the 32x32 preanalysis cell grid. The
+/// adaptive-QP writer in `encoder.rs` reads the same constant so the PPS and the
+/// per-CU QP plan agree on the QG size.
+pub const AQ_DIFF_CU_QP_DELTA_DEPTH: u32 = 1;
 
 /// `rbsp_trailing_bits()`: `rbsp_stop_one_bit` (1) followed by zero
 /// `rbsp_alignment_zero_bit`s up to the next byte boundary.
@@ -113,6 +122,19 @@ mod tests {
     use super::*;
     use bpg_bitstream::BitReader;
 
+    fn test_config(deblock: crate::DeblockMode) -> StillHevcConfig {
+        StillHevcConfig {
+            width: 64,
+            height: 64,
+            bit_depth: 8,
+            chroma: ChromaFormat::Yuv420,
+            qp: 28,
+            effort: crate::Effort::Balanced,
+            sao: crate::SaoMode::Off,
+            deblock,
+        }
+    }
+
     /// Parse `write_pps()`'s RBSP the way a *conformant* decoder does — through
     /// `pps_extension_present_flag`, the field stock `bpgdec`'s bundled ffmpeg
     /// reads but the vendored `parse_pps` stops short of — and assert the
@@ -120,9 +142,12 @@ mod tests {
     /// the byte boundary). Guards against a missing/extra PPS field, which the
     /// internal roundtrip cannot catch because the encoder and the vendored
     /// decoder share the same field list.
-    #[test]
-    fn pps_rbsp_terminates_for_conformant_decoder() {
-        let pps = write_pps();
+    fn check_pps_rbsp_terminates(deblock: crate::DeblockMode) {
+        check_pps_rbsp_terminates_config(&test_config(deblock));
+    }
+
+    fn check_pps_rbsp_terminates_config(config: &StillHevcConfig) {
+        let pps = write_pps(config);
         let mut r = BitReader::new(&pps);
         let ue = |r: &mut BitReader| r.read_ue_golomb().unwrap();
 
@@ -138,7 +163,12 @@ mod tests {
         r.read_se_golomb().unwrap(); // init_qp_minus26
         r.read_bits(1); // constrained_intra_pred_flag
         r.read_bits(1); // transform_skip_enabled_flag
-        r.read_bits(1); // cu_qp_delta_enabled_flag
+        let cu_qp_delta_enabled = r.read_bits(1); // cu_qp_delta_enabled_flag
+        assert_eq!(cu_qp_delta_enabled, crate::aq_active(config) as u32);
+        if cu_qp_delta_enabled == 1 {
+            // diff_cu_qp_delta_depth — present only when the flag is set.
+            assert_eq!(ue(&mut r), AQ_DIFF_CU_QP_DELTA_DEPTH);
+        }
         r.read_se_golomb().unwrap(); // pps_cb_qp_offset
         r.read_se_golomb().unwrap(); // pps_cr_qp_offset
         r.read_bits(1); // pps_slice_chroma_qp_offsets_present_flag
@@ -170,6 +200,66 @@ mod tests {
         assert!(left < 8, "more than a byte of padding left: {left} bits");
         for _ in 0..left {
             assert_eq!(r.read_bits(1), 0, "rbsp_alignment_zero_bit");
+        }
+    }
+
+    #[test]
+    fn pps_rbsp_terminates_for_conformant_decoder_deblock_off() {
+        check_pps_rbsp_terminates(crate::DeblockMode::Off);
+    }
+
+    #[test]
+    fn pps_rbsp_terminates_for_conformant_decoder_deblock_on() {
+        check_pps_rbsp_terminates(crate::DeblockMode::On);
+    }
+
+    /// With adaptive QP active (any non-reference tier, every chroma format), the
+    /// PPS must set `cu_qp_delta_enabled_flag = 1`, emit `diff_cu_qp_delta_depth`,
+    /// and still terminate cleanly for a conformant decoder.
+    #[test]
+    fn pps_aq_active_emits_cu_qp_delta_depth_and_terminates() {
+        for chroma in [
+            ChromaFormat::Yuv420,
+            ChromaFormat::Yuv422,
+            ChromaFormat::Yuv444,
+        ] {
+            for deblock in [crate::DeblockMode::Off, crate::DeblockMode::On] {
+                let mut config = test_config(deblock); // Balanced ⇒ AQ active
+                config.chroma = chroma;
+                assert!(
+                    crate::aq_active(&config),
+                    "AQ should be active for {chroma:?}"
+                );
+                check_pps_rbsp_terminates_config(&config);
+            }
+        }
+    }
+
+    /// Monochrome is excluded from adaptive QP (see [`crate::aq_active`]), so its
+    /// PPS carries `cu_qp_delta_enabled_flag = 0` and still terminates cleanly.
+    #[test]
+    fn pps_aq_off_for_monochrome() {
+        let mut config = test_config(crate::DeblockMode::On); // Balanced
+        config.chroma = ChromaFormat::Gray;
+        assert!(!crate::aq_active(&config));
+        check_pps_rbsp_terminates_config(&config);
+    }
+
+    /// The high-quality uniform-QP tiers never enable adaptive QP, so their PPS
+    /// carries `cu_qp_delta_enabled_flag = 0`.
+    #[test]
+    fn pps_aq_off_for_high_quality_tiers() {
+        for effort in [
+            crate::Effort::Best,
+            crate::Effort::Placebo,
+            crate::Effort::Reference,
+        ] {
+            let mut config = test_config(crate::DeblockMode::On);
+            config.effort = effort;
+            assert!(!crate::aq_active(&config));
+            // `check_pps_rbsp_terminates_config` asserts the flag matches
+            // `aq_active` (i.e. 0 here) and the RBSP still terminates cleanly.
+            check_pps_rbsp_terminates_config(&config);
         }
     }
 }
@@ -232,7 +322,11 @@ pub fn write_sps(config: &StillHevcConfig) -> Vec<u8> {
     w.write_bit(0); // scaling_list_enabled_flag
 
     w.write_bit(1); // amp_enabled_flag
-    w.write_bit(0); // sample_adaptive_offset_enabled_flag (see module docs)
+                    // sample_adaptive_offset_enabled_flag: SaoMode::Off (default) keeps the
+                    // Phase 3 simplification documented in the module docs (no
+                    // slice_sao_luma_flag/slice_sao_chroma_flag in the slice header).
+                    // SaoMode::On enables it; slice.rs then writes those two flags.
+    w.write_bit((config.sao != crate::SaoMode::Off) as u32);
 
     w.write_bit(0); // pcm_enabled_flag
 
@@ -271,7 +365,14 @@ pub fn write_sps(config: &StillHevcConfig) -> Vec<u8> {
 
 /// `pic_parameter_set_rbsp()` (H.265 7.3.2.3), no tiles / scaling lists /
 /// deblocking overrides. Field order mirrors `parse_pps` exactly.
-pub fn write_pps() -> Vec<u8> {
+///
+/// `pps_deblocking_filter_disabled_flag` follows `config.deblock`:
+/// `DeblockMode::Off` (default) disables the in-loop filter, matching the
+/// slice-header simplifications documented in the module docs above (no
+/// `slice_loop_filter_across_slices_enabled_flag`). `DeblockMode::On` enables
+/// it; `slice.rs` then writes the now-present
+/// `slice_loop_filter_across_slices_enabled_flag` bit.
+pub fn write_pps(config: &StillHevcConfig) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     w.write_ue_golomb(0); // pps_pic_parameter_set_id
@@ -286,7 +387,18 @@ pub fn write_pps() -> Vec<u8> {
     w.write_se_golomb(0); // init_qp_minus26
     w.write_bit(0); // constrained_intra_pred_flag
     w.write_bit(0); // transform_skip_enabled_flag
-    w.write_bit(0); // cu_qp_delta_enabled_flag
+                    // Adaptive quantization (per-CU QP) is gated by [`crate::aq_active`] (the
+                    // single gate the encoder also consults, so the flag and the per-CU QP plan
+                    // can't disagree). It is `0` (and the stream is the exact reference bitstream)
+                    // only on the high-quality uniform-QP tiers. `diff_cu_qp_delta_depth = 1` ⇒
+                    // Log2MinCuQpDeltaSize = CtbLog2(6) − 1 = 5, i.e. a 32x32 quantization group
+                    // aligned 1:1 with the preanalysis cell grid (H.265 7.3.2.3; decoder
+                    // `bpg-hevc-decode::hevc::ctu::decode_quantization_parameters`).
+    let aq_active = crate::aq_active(config);
+    w.write_bit(aq_active as u32); // cu_qp_delta_enabled_flag
+    if aq_active {
+        w.write_ue_golomb(AQ_DIFF_CU_QP_DELTA_DEPTH); // diff_cu_qp_delta_depth (QG = 32x32)
+    }
     w.write_se_golomb(0); // pps_cb_qp_offset
     w.write_se_golomb(0); // pps_cr_qp_offset
     w.write_bit(0); // pps_slice_chroma_qp_offsets_present_flag
@@ -296,12 +408,20 @@ pub fn write_pps() -> Vec<u8> {
     w.write_bit(0); // tiles_enabled_flag
     w.write_bit(0); // entropy_coding_sync_enabled_flag (see module docs)
     w.write_bit(1); // pps_loop_filter_across_slices_enabled_flag
-                    // Disable the in-loop deblocking filter (milestone 1: no deblock). With
-                    // control present + override disabled + filter disabled, the slice inherits
-                    // a disabled filter and omits the override/loop-filter-across fields.
+    let deblock_enabled = config.deblock == crate::DeblockMode::On;
+    // control present + override disabled. With the filter disabled
+    // (`DeblockMode::Off`), the slice inherits a disabled filter and omits
+    // the override/loop-filter-across fields. With the filter enabled
+    // (`DeblockMode::On`), `pps_beta_offset_div2`/`pps_tc_offset_div2` (both
+    // 0, i.e. no slice-level offset) become present, and the slice header
+    // gains `slice_loop_filter_across_slices_enabled_flag`.
     w.write_bit(1); // deblocking_filter_control_present_flag
     w.write_bit(0); // deblocking_filter_override_enabled_flag
-    w.write_bit(1); // pps_deblocking_filter_disabled_flag
+    w.write_bit((!deblock_enabled) as u32); // pps_deblocking_filter_disabled_flag
+    if deblock_enabled {
+        w.write_se_golomb(0); // pps_beta_offset_div2
+        w.write_se_golomb(0); // pps_tc_offset_div2
+    }
     w.write_bit(0); // pps_scaling_list_data_present_flag
     w.write_bit(0); // lists_modification_present_flag
     w.write_ue_golomb(0); // log2_parallel_merge_level_minus2

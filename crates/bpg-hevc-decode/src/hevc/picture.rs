@@ -242,44 +242,14 @@ impl DecodedFrame {
     /// Full-range: ×256, limited-range: ×2048 with combined Y/C scale factors.
     #[inline(always)]
     fn ycbcr_to_rgb(&self, y_val: i32, cb_val: i32, cr_val: i32) -> (u8, u8, u8) {
-        let cb = cb_val - 128;
-        let cr = cr_val - 128;
-
-        if self.full_range {
-            // Full-range: ×256 fixed-point, matches libheif Op_YCbCr420_to_RGB24.
-            let (cr_r, cb_g, cr_g, cb_b) = match self.matrix_coeffs {
-                1 => (403, -48, -120, 475), // BT.709
-                9 => (377, -42, -146, 482), // BT.2020
-                _ => (359, -88, -183, 454), // BT.601 (default/unspecified)
-            };
-            let r = y_val + ((cr_r * cr + 128) >> 8);
-            let g = y_val + ((cb_g * cb + cr_g * cr + 128) >> 8);
-            let b = y_val + ((cb_b * cb + 128) >> 8);
-            (
-                r.clamp(0, 255) as u8,
-                g.clamp(0, 255) as u8,
-                b.clamp(0, 255) as u8,
-            )
-        } else {
-            // Limited-range: ×8192 fixed-point with pre-combined scale factors.
-            // Y_scale = 256/219 ≈ 1.1689, C_scale = 256/224 ≈ 1.1429
-            // Combined coefficients = round(matrix_coeff * C_scale * 8192)
-            let (cr_r, cb_g, cr_g, cb_b) = match self.matrix_coeffs {
-                1 => (14744, -1754, -4383, 17373), // BT.709
-                9 => (13806, -1541, -5349, 17615), // BT.2020
-                _ => (13126, -3222, -6686, 16591), // BT.601 (default/unspecified)
-            };
-            // Y_coeff = round(1.1689 * 8192) = 9576
-            let yv = (y_val - 16) * 9576;
-            let r = (yv + cr_r * cr + 4096) >> 13;
-            let g = (yv + cb_g * cb + cr_g * cr + 4096) >> 13;
-            let b = (yv + cb_b * cb + 4096) >> 13;
-            (
-                r.clamp(0, 255) as u8,
-                g.clamp(0, 255) as u8,
-                b.clamp(0, 255) as u8,
-            )
-        }
+        color_convert::pixel_to_rgb(
+            y_val,
+            cb_val,
+            cr_val,
+            self.bit_depth,
+            self.full_range,
+            self.matrix_coeffs,
+        )
     }
 
     /// Convert YCbCr to RGB with conformance window cropping
@@ -298,7 +268,7 @@ impl DecodedFrame {
 
         let mut out_idx = 0;
 
-        if self.chroma_format == 1 {
+        if self.chroma_format == 1 && !matches!(self.matrix_coeffs, 0 | 8) {
             // SIMD-accelerated 4:2:0 path (AVX2 when available, scalar fallback)
             let c_stride = self.c_stride();
             color_convert::convert_420_to_rgb(
@@ -421,7 +391,7 @@ impl DecodedFrame {
         let w = self.width as usize;
 
         let mut offset = 0;
-        if self.chroma_format == 1 {
+        if self.chroma_format == 1 && !matches!(self.matrix_coeffs, 0 | 8) {
             // SIMD-accelerated 4:2:0 path
             let c_stride = self.c_stride();
             let needed = (out_width * out_height * 3) as usize;
