@@ -58,6 +58,36 @@ pub(crate) fn rice_bins(value: u32, rice: u32) -> u32 {
     }
 }
 
+/// Magnitude (`coeff_abs_level_greater1/2` + `coeff_abs_level_remaining`) bits
+/// for an absolute `level >= 1`, given the *tracked* coding-group state. Faithful
+/// port of x265 `getICRateCost` (common/quant.cpp): `gt1`/`gt2` are the
+/// greater1/greater2 flag entropy bits (`[0]`/`[1]`) for the current
+/// `4*ctxSet+c1` / `ctxSet+c2` contexts, `c1c2idx` selects the `{1,2,1,3}`
+/// `base_level`, and `go_rice` is the adapted Rice parameter. Excludes the sign
+/// bypass bit (the caller adds it).
+#[inline]
+fn ic_level_bits(
+    level: u32,
+    base_level: u32,
+    gt1: [u64; 2],
+    gt2: [u64; 2],
+    c1c2idx: u32,
+    go_rice: u32,
+) -> u64 {
+    let diff = level as i64 - base_level as i64;
+    if diff < 0 {
+        // level is 1 or 2 (below base_level): just the greater1 flag, plus the
+        // greater2 flag when level == 2.
+        gt1[(level == 2) as usize] + if level == 2 { gt2[0] } else { 0 }
+    } else {
+        // level >= base_level: greater1/greater2 "=1" flags (when still within
+        // their per-group budgets) plus the remaining truncated-Rice/EGk code.
+        let c1c2_rate =
+            (if c1c2idx & 1 != 0 { gt1[1] } else { 0 }) + (if c1c2idx == 3 { gt2[1] } else { 0 });
+        rice_bins(diff as u32, go_rice) as u64 * BYPASS_BITS + c1c2_rate
+    }
+}
+
 /// Estimated bits for one axis of `last_sig_coeff_{x,y}` (context-coded
 /// truncated-unary prefix + bypass suffix), mirroring `encode_last_prefix` /
 /// `encode_bypass_bits` but counting entropy bits instead of coding.
@@ -142,6 +172,7 @@ pub fn rdoq_single_scan(
     bit_depth: u8,
     scan_order: ScanOrder,
     lambda: f64,
+    level2: bool,
 ) -> (Vec<i16>, u32) {
     let size = 1usize << log2_size;
     let scan_sub = get_scan_sub_block(log2_size, scan_order);
@@ -162,7 +193,8 @@ pub fn rdoq_single_scan(
     let bits = |ci: usize, bin: u8| -> u64 { ctxs.models[ci].entropy_bits(bin) as u64 };
 
     // Frozen representative greater1/greater2 contexts (greater1_ctx = 1, first
-    // significant coefficient; prev_subblock_had_gt1 = 0).
+    // significant coefficient; prev_subblock_had_gt1 = 0). Used when `level2` is
+    // off (the legacy single-scan rate model).
     let ctx_set = if c_idx > 0 { 0usize } else { 2 };
     let gt1_ci =
         ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + if c_idx > 0 { 16 } else { 0 } + ctx_set * 4 + 1;
@@ -176,6 +208,12 @@ pub fn rdoq_single_scan(
         };
         mag + BYPASS_BITS // sign
     };
+
+    // `level2` (x265 `rdoqQuant`) greater1/greater2 context banks. Per-coefficient
+    // indices are `gt1_base + 4*ctxSet + c1` and `gt2_base + ctxSet` (the `+c2`
+    // term in x265 is only read when c2 == 0, so it folds into `ctxSet`).
+    let gt1_base = ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + if c_idx > 0 { 16 } else { 0 };
+    let gt2_base = ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + if c_idx > 0 { 4 } else { 0 };
 
     // Forward combined scan rank for every in-bounds position.
     let mut recs: Vec<CoeffRec> = Vec::with_capacity(size * size);
@@ -198,12 +236,32 @@ pub fn rdoq_single_scan(
 
     // --- Stage (a): per-coefficient level decision, reverse sub-block scan. ---
     let mut coded_sb_flags = [[false; 8]; 8];
+    // `level2` coding-group state carried across groups (x265 `rdoqQuant`):
+    // `prev_cg_c1` is the previous coded group's final greater1 context, used to
+    // bump `ctxSet` for the next group.
+    let mut prev_cg_c1 = 1u32;
     for &(sbx, sby) in scan_sub.iter().rev() {
         let sbx = sbx as usize;
         let sby = sby as usize;
         let right = sbx + 1 < sb_width && coded_sb_flags[sby][sbx + 1];
         let below = sby + 1 < sb_width && coded_sb_flags[sby + 1][sbx];
         let prev_csbf = (right as u8) | ((below as u8) << 1);
+
+        // Per-group greater1/greater2 state (x265 quant.cpp:778-866). `ctx_set`
+        // is 2 for non-DC luma groups, 0 otherwise, +1 if the previous group
+        // ended with c1 == 0. The greater1/greater2 flag budgets (`c1_idx < 8`,
+        // `c2_idx == 0`) and the adapted Rice parameter (`go_rice`) reset here.
+        let cg_is_not_dc = !(sbx == 0 && sby == 0);
+        let mut ctx_set2 = if cg_is_not_dc && c_idx == 0 { 2u32 } else { 0 };
+        if prev_cg_c1 == 0 {
+            ctx_set2 += 1;
+        }
+        let mut c1 = 1u32;
+        let mut c2 = 0u32;
+        let mut go_rice = 0u32;
+        let mut level_threshold = 3u32;
+        let mut c1_idx = 0u32;
+        let mut c2_idx = 0u32;
 
         let mut sb_has_sig = false;
         for pos in (0..16).rev() {
@@ -223,6 +281,31 @@ pub fn rdoq_single_scan(
             let sig0 = bits(sig_ci, 0);
             let sig1 = bits(sig_ci, 1);
 
+            // Per-coefficient `level2` rate parameters from the tracked state.
+            let (base_level, gt1, gt2, c1c2idx) = if level2 {
+                let c1c2idx =
+                    (if c1_idx < 8 { 1u32 } else { 0 }) + (if c2_idx == 0 { 2 } else { 0 });
+                let base_level = if c1_idx < 8 {
+                    if c2_idx == 0 {
+                        3
+                    } else {
+                        2
+                    }
+                } else {
+                    1
+                };
+                let gt1_ci = gt1_base + 4 * ctx_set2 as usize + c1 as usize;
+                let gt2_ci = gt2_base + ctx_set2 as usize;
+                (
+                    base_level,
+                    [bits(gt1_ci, 0), bits(gt1_ci, 1)],
+                    [bits(gt2_ci, 0), bits(gt2_ci, 1)],
+                    c1c2idx,
+                )
+            } else {
+                (0, [0, 0], [0, 0], 0)
+            };
+
             let dist0 = (abs * abs) as f64;
             let mut best_l = 0i64;
             let mut best_levbits = 0u64;
@@ -231,7 +314,11 @@ pub fn rdoq_single_scan(
             for l in (q - 1).max(1)..=(q + 1) {
                 let dl = abs - dq.apply(l as i16) as i64;
                 let dist = (dl * dl) as f64;
-                let mb = magnitude_bits(l as u32);
+                let mb = if level2 {
+                    ic_level_bits(l as u32, base_level, gt1, gt2, c1c2idx, go_rice) + BYPASS_BITS
+                } else {
+                    magnitude_bits(l as u32)
+                };
                 let cost = dist + lam * (sig1 + mb) as f64;
                 if cost < best_cost {
                     best_cost = cost;
@@ -254,6 +341,33 @@ pub fn rdoq_single_scan(
                 rec.rd_normal = dist0 + lam * sig0 as f64;
                 rec.rd_last = f64::INFINITY; // a zero coeff can never be the last
             }
+
+            // Advance the `level2` greater1/greater2/Rice state (x265 quant.cpp:1074-1091).
+            if level2 {
+                let l = best_l as u32; // chosen absolute level (0 if zeroed)
+                if l >= base_level && go_rice < 4 && l > level_threshold {
+                    go_rice += 1;
+                    level_threshold <<= 1;
+                }
+                if best_l != 0 {
+                    c1_idx += 1;
+                }
+                if l > 1 {
+                    c1 = 0;
+                    if c2 < 2 {
+                        c2 += 1;
+                    }
+                    c2_idx += 1;
+                } else if (c1 == 1 || c1 == 2) && best_l != 0 {
+                    c1 += 1;
+                }
+            }
+        }
+        // Carry this group's final greater1 context only when it coded a
+        // coefficient (empty groups leave c1 == 1 and don't shift the next
+        // group's ctxSet), matching x265 skipping all-zero groups.
+        if level2 && sb_has_sig {
+            prev_cg_c1 = c1;
         }
         if sb_has_sig {
             coded_sb_flags[sby][sbx] = true;

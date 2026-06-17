@@ -19,7 +19,8 @@ bpg-encode = { path = "../bpg-encode" }
 still265 = { path = "../still265" }
 
 [features]
-default = []
+# Normal `bpg-tools` builds include the bit-identical portable-SIMD hot kernels.
+default = ["wide-simd"]
 # Marker feature for profiling runs, intended for:
 # cargo flamegraph --profile profiling -p bpg-tools --features flamegraph -- ...
 flamegraph = ["still265/flamegraph"]

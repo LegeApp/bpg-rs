@@ -100,4 +100,8 @@ pub struct CuLeafPlan {
     pub chroma_mode_idx: u8,
     pub chroma_mode: u8,
     pub tt: TtPlan,
+    /// `Some([m0,m1,m2,m3])` when this 8x8 CU is `PartNxN`: the four 4x4-PU luma
+    /// modes (z-order). Final coding re-derives each PU's MPM from neighbours and
+    /// rebuilds the forced-split TT; `luma_mode` mirrors PU0.
+    pub nxn: Option<[u8; 4]>,
 }

@@ -19,6 +19,7 @@ fn syntax_skeleton_headers_parse() {
         effort: Effort::Balanced,
         sao: SaoMode::Off,
         deblock: DeblockMode::Off,
+        adaptive_qp: false,
     };
 
     let bytes = StillHevcEncoder::syntax_skeleton(&config);
@@ -75,6 +76,7 @@ fn syntax_skeleton_decode_fails_on_missing_slice_data() {
         effort: Effort::Balanced,
         sao: SaoMode::Off,
         deblock: DeblockMode::Off,
+        adaptive_qp: false,
     };
 
     let bytes = StillHevcEncoder::syntax_skeleton(&config);

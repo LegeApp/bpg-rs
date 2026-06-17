@@ -125,9 +125,14 @@ struct EncodeArgs {
     #[arg(long = "debug-stats-csv")]
     debug_stats_csv: Option<PathBuf>,
 
-    /// Enable Sample Adaptive Offset (conservative BO/EO encoder). Off by default.
-    #[arg(long)]
+    /// Force-enable Sample Adaptive Offset (on by default for all efforts; the
+    /// single-pass replay path makes it ~free). Kept for explicitness.
+    #[arg(long, conflicts_with = "no_sao")]
     sao: bool,
+
+    /// Disable Sample Adaptive Offset (SAO is on by default for every effort).
+    #[arg(long = "no-sao", conflicts_with = "sao")]
+    no_sao: bool,
 
     /// Disable the in-loop deblocking filter (on by default).
     #[arg(long = "no-deblock")]
@@ -173,7 +178,9 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("--bit-depth must be 8, 10, or 12 (got {})", args.bit_depth).into());
     }
 
-    let sao = if args.sao { SaoMode::On } else { SaoMode::Off };
+    // SAO is on by default for every effort (the single-pass replay path makes
+    // it ~free); --no-sao opts out.
+    let sao = if args.no_sao { SaoMode::Off } else { SaoMode::On };
     let deblock = if args.no_deblock {
         DeblockMode::Off
     } else {

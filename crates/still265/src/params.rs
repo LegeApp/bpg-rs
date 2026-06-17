@@ -132,6 +132,7 @@ mod tests {
             effort: crate::Effort::Balanced,
             sao: crate::SaoMode::Off,
             deblock,
+            adaptive_qp: false,
         }
     }
 
@@ -224,8 +225,9 @@ mod tests {
             ChromaFormat::Yuv444,
         ] {
             for deblock in [crate::DeblockMode::Off, crate::DeblockMode::On] {
-                let mut config = test_config(deblock); // Balanced ⇒ AQ active
+                let mut config = test_config(deblock); // Balanced
                 config.chroma = chroma;
+                config.adaptive_qp = true; // opt into AQ (uniform-QP is the default)
                 assert!(
                     crate::aq_active(&config),
                     "AQ should be active for {chroma:?}"
@@ -241,6 +243,7 @@ mod tests {
     fn pps_aq_off_for_monochrome() {
         let mut config = test_config(crate::DeblockMode::On); // Balanced
         config.chroma = ChromaFormat::Gray;
+        config.adaptive_qp = true; // even opted-in, monochrome stays uniform-QP
         assert!(!crate::aq_active(&config));
         check_pps_rbsp_terminates_config(&config);
     }
@@ -380,7 +383,7 @@ pub fn write_pps(config: &StillHevcConfig) -> Vec<u8> {
     w.write_bit(0); // dependent_slice_segments_enabled_flag
     w.write_bit(0); // output_flag_present_flag
     w.write_bits(3, 0); // num_extra_slice_header_bits
-    w.write_bit(0); // sign_data_hiding_enabled_flag (milestone 1: SDH not applied)
+    w.write_bit(crate::sdh_active(config) as u32); // sign_data_hiding_enabled_flag
     w.write_bit(0); // cabac_init_present_flag
     w.write_ue_golomb(0); // num_ref_idx_l0_default_active_minus1
     w.write_ue_golomb(0); // num_ref_idx_l1_default_active_minus1

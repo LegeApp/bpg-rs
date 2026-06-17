@@ -6,7 +6,7 @@
 
 use std::mem::size_of;
 
-use super::types::{CodedBlock, FrameSnapshot, MapSnapshot, PlaneSnapshot, chroma_tb_geom};
+use super::types::{chroma_tb_geom, CodedBlock, FrameSnapshot, MapSnapshot, PlaneSnapshot};
 use super::Encoder;
 
 pub(super) fn snapshot_map(
@@ -112,7 +112,12 @@ impl<'a> Encoder<'a> {
         }
     }
 
-    pub(super) fn snapshot_frame_region(&mut self, x0: u32, y0: u32, log2_size: u8) -> FrameSnapshot {
+    pub(super) fn snapshot_frame_region(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+    ) -> FrameSnapshot {
         let t = self.prof.on.then(std::time::Instant::now);
         let size = 1usize << log2_size;
         let mut planes = Vec::with_capacity(3);
@@ -186,7 +191,12 @@ impl<'a> Encoder<'a> {
         restore_map(&mut self.mode_map, snapshot);
     }
 
-    pub(super) fn snapshot_ct_depth_region(&mut self, x0: u32, y0: u32, log2_size: u8) -> MapSnapshot {
+    pub(super) fn snapshot_ct_depth_region(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+    ) -> MapSnapshot {
         let x = (x0 / 8) as usize;
         let y = (y0 / 8) as usize;
         let width = (1u32 << log2_size).div_ceil(8) as usize;
@@ -209,7 +219,12 @@ impl<'a> Encoder<'a> {
         restore_map(&mut self.ct_depth_map, snapshot);
     }
 
-    pub(super) fn snapshot_tu_depth_region(&mut self, x0: u32, y0: u32, log2_size: u8) -> MapSnapshot {
+    pub(super) fn snapshot_tu_depth_region(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+    ) -> MapSnapshot {
         let x = (x0 / 4) as usize;
         let y = (y0 / 4) as usize;
         let width = ((1u32 << log2_size) / 4) as usize;

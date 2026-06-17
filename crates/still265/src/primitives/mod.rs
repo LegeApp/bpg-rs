@@ -14,6 +14,8 @@
 use bpg_hevc_decode::hevc::transform as dec_transform;
 use std::sync::LazyLock;
 
+pub mod intra_angs;
+
 #[cfg(target_arch = "x86_64")]
 mod simd_x86;
 
@@ -302,6 +304,89 @@ pub fn sub_residual_scalar(
     }
 }
 
+/// Inverse quantization (H.265 8.6.3, flat scaling list) of a coefficient
+/// block in place: `level = clip((level * combined + add) >> shift)`, where
+/// `add = 1 << (shift-1)` for `shift > 0`. Dispatched through [`PRIMITIVES`];
+/// byte-identical to [`dequantize_scalar`]. Maps to x265's `dequant_normal`
+/// (`quant-a.asm`) — an RDO/reconstruction hot path (every TU trial + final).
+pub fn dequantize(levels: &mut [i16], combined: i32, shift: i32) {
+    (PRIMITIVES.dequantize)(levels, combined, shift)
+}
+
+/// Canonical scalar inverse quantization. Reference for all optimized backends;
+/// kept bit-identical to `bpg-hevc-decode`'s decoder dequant.
+pub fn dequantize_scalar(levels: &mut [i16], combined: i32, shift: i32) {
+    if shift >= 0 {
+        let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
+        for v in levels.iter_mut() {
+            let value = (*v as i32 * combined + add) >> shift;
+            *v = value.clamp(-32768, 32767) as i16;
+        }
+    } else {
+        let neg = -shift;
+        for v in levels.iter_mut() {
+            *v = ((*v as i32 * combined) << neg).clamp(-32768, 32767) as i16;
+        }
+    }
+}
+
+/// Sample-Adaptive-Offset horizontal edge-offset (`eo_class == 0`) statistics
+/// over an interior region whose every pixel has valid left/right neighbours
+/// and an unclamped co-located source sample. Accumulates `sum[edgeIdx] +=
+/// src - rec` and `count[edgeIdx] += 1` for `edgeIdx` in `0,1,3,4` (the "no
+/// edge" category 2 is skipped). Dispatched through [`PRIMITIVES`];
+/// byte-identical to [`sao_stats_e0_scalar`]. Maps to x265's `saoCuStatsE0`
+/// (`loopfilter.asm`).
+#[allow(clippy::too_many_arguments)]
+pub fn sao_stats_e0(
+    rec: &[u16],
+    rec_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    sum: &mut [i64; 5],
+    count: &mut [u32; 5],
+) {
+    (PRIMITIVES.sao_stats_e0)(rec, rec_stride, src, src_stride, x0, y0, w, h, sum, count)
+}
+
+/// Canonical scalar SAO horizontal-EO stats. Reference for the SIMD backend;
+/// matches the per-pixel logic in the encoder's `sao_eo_stats` for `eo_class 0`
+/// over a region with valid neighbours (no plane-edge / source clamping).
+#[allow(clippy::too_many_arguments)]
+pub fn sao_stats_e0_scalar(
+    rec: &[u16],
+    rec_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    sum: &mut [i64; 5],
+    count: &mut [u32; 5],
+) {
+    for y in y0..y0 + h {
+        let rrow = y as usize * rec_stride;
+        let srow = y as usize * src_stride;
+        for x in x0..x0 + w {
+            let xi = x as usize;
+            let r = rec[rrow + xi] as i32;
+            let left = rec[rrow + xi - 1] as i32;
+            let right = rec[rrow + xi + 1] as i32;
+            let edge = (2 + (r - left).signum() + (r - right).signum()) as usize;
+            if edge == 2 {
+                continue;
+            }
+            sum[edge] += src[srow + xi] as i64 - r as i64;
+            count[edge] += 1;
+        }
+    }
+}
+
 /// Function-pointer table of the dispatchable hot kernels. Selected once,
 /// lazily, by [`select_primitives`] from the CPU features and the
 /// `BPG_PRIMITIVES` environment variable.
@@ -310,9 +395,32 @@ pub struct Primitives {
     pub satd_u16: fn(&[u16], usize, &[u16], usize, usize) -> u32,
     pub ssd_u16: fn(&[u16], usize, &[u16], usize, usize) -> u64,
     pub sub_residual: fn(&[u16], usize, &[u16], usize, &mut [i16], usize),
+    pub dequantize: fn(&mut [i16], i32, i32),
+    #[allow(clippy::type_complexity)]
+    pub sao_stats_e0:
+        fn(&[u16], usize, &[u16], usize, u32, u32, u32, u32, &mut [i64; 5], &mut [u32; 5]),
     pub forward_dct_1d: fn(&[i16], &mut [i16], &[i32], usize, i32),
+    /// Batched angular intra prediction (modes 2..=34) for the luma rough search.
+    /// `(dst, unfiltered_border, filtered_border, center, log2_size, c_idx, bit_depth)`.
+    pub intra_pred_allangs: fn(&mut [u16], &[i32], &[i32], usize, u8, u8, u8),
     /// Human-readable name of the selected backend, for `--debug-stats`.
     pub backend: &'static str,
+}
+
+/// Batched angular intra prediction, dispatched through [`PRIMITIVES`].
+/// Byte-identical to per-mode `predict_intra_into` for modes 2..=34.
+pub fn intra_pred_allangs(
+    dst: &mut [u16],
+    unfiltered: &[i32],
+    filtered: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    (PRIMITIVES.intra_pred_allangs)(
+        dst, unfiltered, filtered, center, log2_size, c_idx, bit_depth,
+    )
 }
 
 /// The active primitive backend, chosen once on first use.
@@ -344,7 +452,10 @@ fn select_primitives() -> Primitives {
         satd_u16: satd_u16_scalar,
         ssd_u16: ssd_u16_scalar,
         sub_residual: sub_residual_scalar,
+        dequantize: dequantize_scalar,
+        sao_stats_e0: sao_stats_e0_scalar,
         forward_dct_1d,
+        intra_pred_allangs: intra_angs::intra_pred_allangs_scalar,
         backend: "scalar",
     };
 
@@ -361,7 +472,10 @@ fn select_primitives() -> Primitives {
         p.satd_u16 = wide_simd::satd_u16;
         p.ssd_u16 = wide_simd::ssd_u16;
         p.sub_residual = wide_simd::sub_residual;
+        p.dequantize = wide_simd::dequantize;
+        p.sao_stats_e0 = wide_simd::sao_stats_e0;
         p.forward_dct_1d = wide_simd::forward_dct_1d;
+        p.intra_pred_allangs = wide_simd::intra_pred_allangs;
         p.backend = if p.backend == "sse2" {
             "sse2+wide"
         } else {

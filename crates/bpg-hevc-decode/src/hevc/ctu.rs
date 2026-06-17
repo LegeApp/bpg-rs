@@ -44,6 +44,20 @@ type Result<T> = core::result::Result<T, HevcError>;
 pub static SE_COUNTER: AtomicU32 = AtomicU32::new(0);
 pub const SE_TRACE_LIMIT: u32 = 0;
 
+/// Diagnostic CU-partition stats (env `BPG_PARTNXN_STATS=1`), used to count how
+/// often a decoded stream uses 8x8 `PartNxN`. Indexed by `log2_cb_size`
+/// (3..=6 => 8/16/32/64). Cheap relaxed atomics; printed at end of decode.
+pub static CU_COUNT_BY_LOG2: [AtomicU32; 7] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+pub static NXN_8X8_COUNT: AtomicU32 = AtomicU32::new(0);
+
 /// Log a syntax element decode for differential testing.
 /// Set SE_TRACE_LIMIT > 0 to enable tracing.
 #[allow(clippy::absurd_extreme_comparisons)]
@@ -378,6 +392,25 @@ impl<'a> SliceContext<'a> {
         if DEBUG_TRACE {
             debug::print_tracker_summary();
         }
+
+        #[cfg(feature = "std")]
+        if std::env::var("BPG_PARTNXN_STATS").is_ok() {
+            let c8 = CU_COUNT_BY_LOG2[3].load(Ordering::Relaxed);
+            let c16 = CU_COUNT_BY_LOG2[4].load(Ordering::Relaxed);
+            let c32 = CU_COUNT_BY_LOG2[5].load(Ordering::Relaxed);
+            let c64 = CU_COUNT_BY_LOG2[6].load(Ordering::Relaxed);
+            let nxn = NXN_8X8_COUNT.load(Ordering::Relaxed);
+            let pct = if c8 > 0 {
+                100.0 * nxn as f64 / c8 as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "PARTNXN_STATS cu8={c8} cu16={c16} cu32={c32} cu64={c64} \
+                 partnxn_8x8={nxn} ({pct:.1}% of 8x8 CUs)"
+            );
+        }
+
         Ok(())
     }
 
@@ -816,6 +849,13 @@ impl<'a> SliceContext<'a> {
             }
             PartMode::Part2Nx2N
         };
+
+        // Diagnostic: count CU sizes and 8x8 PartNxN usage (env-gated print at
+        // slice end). Relaxed atomics, negligible cost.
+        CU_COUNT_BY_LOG2[(log2_cb_size as usize).min(6)].fetch_add(1, Ordering::Relaxed);
+        if part_mode == PartMode::PartNxN {
+            NXN_8X8_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
 
         // Decode prediction info and get intra modes for scan order
         let (intra_luma_mode, intra_chroma_mode) = match part_mode {

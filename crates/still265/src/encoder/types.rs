@@ -40,7 +40,12 @@ pub(super) fn chroma_array_type(chroma: ChromaFormat) -> u8 {
 ///   at every leaf including `log2_size == 2` (H.265 7.3.8.8: chroma cbf and
 ///   transform_unit chroma blocks are present whenever `ChromaArrayType ==
 ///   3`, regardless of `log2_size`).
-pub(super) fn chroma_tb_geom(cat: u8, x0: u32, y0: u32, log2_size: u8) -> Option<(u32, u32, u8, u8)> {
+pub(super) fn chroma_tb_geom(
+    cat: u8,
+    x0: u32,
+    y0: u32,
+    log2_size: u8,
+) -> Option<(u32, u32, u8, u8)> {
     match cat {
         0 => None,
         1 if log2_size >= 3 => Some((x0 / 2, y0 / 2, log2_size - 1, 1)),
@@ -216,6 +221,18 @@ pub(super) fn cu_leaf_has_residual(leaf: &CuLeaf) -> bool {
     tt_has_residual(&leaf.tt)
 }
 
+/// Per-PU data for an 8x8 CU coded as `PartNxN` (four 4x4 luma prediction
+/// units, each with its own intra mode). Mirrors the decoder's
+/// `decode_coding_unit` `PartNxN` branch. PU order is z-scan (TL, TR, BL, BR).
+pub(super) struct NxnInfo {
+    /// The four 4x4-PU luma intra modes (z-order).
+    pub(super) luma_modes: [u8; 4],
+    /// The MPM candidate list used to code each PU's luma mode, derived during
+    /// build with each prior PU's mode already stored (so PU1/PU2/PU3 see their
+    /// sibling neighbours, exactly like the decoder).
+    pub(super) mpms: [[IntraPredMode; 3]; 4],
+}
+
 /// A coding unit, fully coded (intra mode + transform tree).
 pub(super) struct CuLeaf {
     pub(super) mpm: [IntraPredMode; 3],
@@ -223,6 +240,11 @@ pub(super) struct CuLeaf {
     pub(super) chroma_mode_idx: u8,
     pub(super) confidence: DecisionConfidence,
     pub(super) tt: Tt,
+    /// `Some` when this 8x8 CU is coded as `PartNxN`. `luma_mode`/`mpm` then
+    /// describe PU0 (used for chroma DM and as this CU's neighbour mode for
+    /// later CUs); the four per-PU modes live in [`NxnInfo`]. `None` is the
+    /// normal single-PU `Part2Nx2N` CU.
+    pub(super) nxn: Option<NxnInfo>,
 }
 
 /// A coding quadtree node: either a coded leaf CU, or a `split_cu_flag`

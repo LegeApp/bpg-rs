@@ -250,6 +250,7 @@ fn cfg_chroma(w: u32, h: u32, qp: u8, bd: u8, chroma: ChromaFormat) -> StillHevc
         effort: Effort::Balanced,
         sao: SaoMode::Off,
         deblock: DeblockMode::Off,
+        adaptive_qp: false,
     }
 }
 
@@ -666,9 +667,11 @@ fn gray_non_ctu_aligned() {
 #[test]
 fn all_effort_tiers_round_trip() {
     // Every tier of the seven-step effort ladder must produce a stream the
-    // decoder accepts and reconstructs bit-exactly.
+    // decoder accepts and reconstructs bit-exactly. Textured 4:2:0 so 8x8
+    // PartNxN actually fires on the tiers that enable it (Fast..Best), exercising
+    // both the winner-direct (Best) and plan/final-code (Fast/Balanced/Good) paths.
     let (w, h, qp, bd) = (96u32, 80, 30, 8);
-    let (y, cb, cr) = make_source(w as usize, h as usize, bd);
+    let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, bd);
     for effort in [
         Effort::Fastest,
         Effort::Fast,
@@ -731,6 +734,90 @@ fn textured_yuv420_round_trip() {
 }
 
 #[test]
+fn best_sao_replay_round_trip() {
+    // Best 4:2:0 with SAO uses the single-pass build + replay-write path
+    // (docs/sao.md): build trees once (parallel), deblock, decide SAO, then
+    // replay the cached trees with SAO syntax. The decoder must reconstruct the
+    // encoder's post-deblock-post-SAO samples bit-exactly.
+    for (w, h, qp) in [(128u32, 128u32, 30u8), (96, 96, 34)] {
+        let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, 8);
+        let config = StillHevcConfig {
+            effort: Effort::Best,
+            ..cfg_sao(w, h, qp, 8, ChromaFormat::Yuv420)
+        };
+        let (bytes, recon) = encode(
+            &config,
+            Source {
+                y: &y,
+                cb: &cb,
+                cr: &cr,
+            },
+        );
+        let decoded = decode(&bytes).expect("decoder must accept Best+SAO replay stream");
+        assert_plane_eq(
+            &decoded.y_plane,
+            &recon.y_plane,
+            decoded.width as usize,
+            &format!("Best+SAO luma recon ({w}x{h} qp{qp})"),
+        );
+        assert_plane_eq(
+            &decoded.cb_plane,
+            &recon.cb_plane,
+            decoded.width.div_ceil(2) as usize,
+            &format!("Best+SAO cb recon ({w}x{h} qp{qp})"),
+        );
+        assert_plane_eq(
+            &decoded.cr_plane,
+            &recon.cr_plane,
+            decoded.width.div_ceil(2) as usize,
+            &format!("Best+SAO cr recon ({w}x{h} qp{qp})"),
+        );
+    }
+}
+
+#[test]
+fn best_partnxn_round_trip() {
+    // 8x8 PartNxN (four independent 4x4 luma PUs) is default-on for Best 4:2:0.
+    // A textured source forces 8x8 CUs where PartNxN wins the RD trial; the
+    // decoder must reconstruct the encoder's samples bit-exactly (the four-PU
+    // mode syntax + forced-split transform tree all match the decode path).
+    for (w, h, qp) in [(128u32, 128u32, 30u8), (96, 96, 34)] {
+        let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, 8);
+        let config = StillHevcConfig {
+            effort: Effort::Best,
+            ..cfg(w, h, qp, 8)
+        };
+        let (bytes, recon) = encode(
+            &config,
+            Source {
+                y: &y,
+                cb: &cb,
+                cr: &cr,
+            },
+        );
+        let decoded = decode(&bytes).expect("decoder must accept Best PartNxN stream");
+        assert_plane_eq(
+            &decoded.y_plane,
+            &recon.y_plane,
+            decoded.width as usize,
+            &format!("Best PartNxN luma recon ({w}x{h} qp{qp})"),
+        );
+        assert_plane_eq(
+            &decoded.cb_plane,
+            &recon.cb_plane,
+            decoded.width.div_ceil(2) as usize,
+            &format!("Best PartNxN cb recon ({w}x{h} qp{qp})"),
+        );
+        assert_plane_eq(
+            &decoded.cr_plane,
+            &recon.cr_plane,
+            decoded.width.div_ceil(2) as usize,
+            &format!("Best PartNxN cr recon ({w}x{h} qp{qp})"),
+        );
+    }
+}
+
+#[test]
 fn ten_bit_round_trip() {
     for qp in [22, 30, 38] {
         run_bd(64, 64, qp, 10);
@@ -770,17 +857,20 @@ fn textured_yuv422_round_trip() {
     run_textured_422(96, 80, 32, 10);
 }
 
-/// Adaptive QP (default-on for the non-reference tiers) must round-trip on the
-/// 4:2:2 stacked-chroma-TB geometry — the per-CU `cu_qp_delta` resolves, on the
-/// decoder, back to the exact QP the encoder quantized with, including the
-/// second Cb/Cr blocks.
+/// Adaptive QP (opt-in via `BPG_LADDER_AQ` now that the ladder is uniform-QP)
+/// must still round-trip on the 4:2:2 stacked-chroma-TB geometry — the per-CU
+/// `cu_qp_delta` resolves, on the decoder, back to the exact QP the encoder
+/// quantized with, including the second Cb/Cr blocks.
 #[test]
 fn yuv422_adaptive_qp_round_trip() {
     let w = 96u32;
     let h = 64u32;
     let bd = 8u8;
     let (y, cb, cr) = make_textured_source_422(w as usize, h as usize, bd);
-    let config = cfg_chroma(w, h, 34, bd, ChromaFormat::Yuv422); // Balanced ⇒ AQ on
+    let config = StillHevcConfig {
+        adaptive_qp: true, // opt into per-CU AQ (uniform-QP is now the default)
+        ..cfg_chroma(w, h, 34, bd, ChromaFormat::Yuv422)
+    };
     assert!(still265::aq_active(&config));
 
     let (bytes, recon) = encode(
