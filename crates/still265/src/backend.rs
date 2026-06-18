@@ -27,6 +27,7 @@ pub struct RustStillHevcEncoder {
     debug_stats: bool,
     sao: SaoMode,
     deblock: DeblockMode,
+    adaptive_qp: bool,
     last_stats: Mutex<Option<LastEncodeStats>>,
 }
 
@@ -37,8 +38,16 @@ impl RustStillHevcEncoder {
             debug_stats: false,
             sao: SaoMode::Off,
             deblock: DeblockMode::On,
+            adaptive_qp: false,
             last_stats: Mutex::new(None),
         }
+    }
+
+    /// Enable per-CU adaptive quantization on the speed tiers (off by default;
+    /// the ladder is uniform-QP). No effect on `Best`/reference tiers.
+    pub fn with_adaptive_qp(mut self, adaptive_qp: bool) -> Self {
+        self.adaptive_qp = adaptive_qp;
+        self
     }
 
     pub fn with_debug_stats(mut self, debug_stats: bool) -> Self {
@@ -126,6 +135,7 @@ impl HevcEncoder for RustStillHevcEncoder {
             effort: self.effort,
             sao: self.sao,
             deblock: self.deblock,
+            adaptive_qp: self.adaptive_qp,
         };
 
         let src = Source {

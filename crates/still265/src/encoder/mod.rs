@@ -20,11 +20,11 @@
 //! [`Encoder::decide_sao_map`]) are implemented. Full RDO CU/TU splitting
 //! comes in a later milestone.
 
-mod types;
 mod aq;
-mod snapshot;
-mod write;
 mod rdo;
+mod snapshot;
+mod types;
+mod write;
 
 use bpg_hevc_decode::hevc::sao::{apply_sao, SaoMap};
 use bpg_hevc_decode::hevc::slice::IntraPredMode;
@@ -35,14 +35,15 @@ use crate::contexts::Contexts;
 use crate::effort::{BlockDesc, BlockSearchBudget, EffortTemplate};
 use crate::plan::DecisionConfidence;
 use crate::sao;
-use crate::{
-    nal, params, slice, DeblockMode, Effort, SaoMode, StillHevcConfig,
-};
+use crate::{nal, params, slice, DeblockMode, Effort, SaoMode, StillHevcConfig};
 
 use self::aq::AqState;
 use self::types::*;
 pub use self::types::{EncodeStats, Source};
-use self::write::{encode_slice_data, encode_slice_data_parallel};
+use self::write::{
+    build_slice_trees_parallel, build_slice_trees_serial, encode_slice_data,
+    encode_slice_data_parallel, write_slice_from_trees,
+};
 
 struct Encoder<'a> {
     display_width: u32,
@@ -52,7 +53,7 @@ struct Encoder<'a> {
     qp_c: i32,
     bit_depth: u8,
     effort: Effort,
-    effort_template: &'static EffortTemplate,
+    effort_template: EffortTemplate,
     src: Source<'a>,
     frame: DecodedFrame,
     mode_map: Vec<u8>,
@@ -70,6 +71,8 @@ struct Encoder<'a> {
     scratch_pred: Vec<u16>,
     scratch_pred8: Vec<u8>,
     scratch_scored: Vec<(u64, u8)>,
+    /// Batch buffer for `intra_pred_allangs` (33 angular slots), pooled per CU.
+    scratch_allangs: Vec<u16>,
     analysis: std::sync::Arc<crate::preanalysis::AnalysisMaps>,
     analysis_cache: AnalysisCache,
     cur_policy: Option<crate::preanalysis::SearchPolicy>,
@@ -80,11 +83,21 @@ struct Encoder<'a> {
     best2_chroma_protect: bool,
     best2_luma_fastrd: bool,
     best2_rough_lambda: bool,
+    best2_rd_lambda: bool,
+    best2_rdoq2: bool,
+    sign_data_hiding: bool,
     best2_wpp: bool,
     best_luma_leaf_screen: bool,
     best_tu_neighbor_limit: bool,
+    /// `Some((perceptual, strength))` when the experimental bidirectional
+    /// variance AQ is active for `Best` (drives [`Encoder::aq_qg_target`]).
+    best_aq: Option<(bool, f32)>,
     best2_tt_reuse: bool,
     best2_cu_reuse: bool,
+    /// Experimental: evaluate 8x8 `PartNxN` (four 4x4 luma PUs) against the
+    /// normal `Part2Nx2N` CU and pick the RD winner. Env-gated (`BPG_PARTNXN`);
+    /// only effective on the winner-direct `best2_cu_reuse` path.
+    partnxn: bool,
     aq: AqState,
     prof: Profiler,
     trace: crate::trace::SearchTrace,
@@ -167,6 +180,36 @@ impl<'a> Encoder<'a> {
     ) -> sao::EoStats {
         let (plane, stride) = self.frame.plane(c_idx);
         let (plane_w, plane_h) = self.frame.component_dims(c_idx);
+
+        // Horizontal EO over an interior region (left/right neighbours valid and
+        // the source unclamped) uses the dispatched SIMD kernel. Plane-edge /
+        // source-padding CTBs fall through to the generic scalar loop below.
+        if eo_class == 0 {
+            let (src_plane, src_stride, sw, sh) = self.src_plane(c_idx);
+            if x_start >= 1
+                && x_end > x_start
+                && x_end + 1 <= plane_w
+                && x_end <= sw
+                && y_end <= plane_h
+                && y_end <= sh
+            {
+                let mut stats = sao::EoStats::default();
+                crate::primitives::sao_stats_e0(
+                    plane,
+                    stride,
+                    src_plane,
+                    src_stride,
+                    x_start,
+                    y_start,
+                    x_end - x_start,
+                    y_end - y_start,
+                    &mut stats.sum,
+                    &mut stats.count,
+                );
+                return stats;
+            }
+        }
+
         let (dx0, dy0, dx1, dy1) = sao::EO_OFFSETS[eo_class as usize & 3];
 
         let mut stats = sao::EoStats::default();
@@ -382,6 +425,7 @@ impl<'a> Encoder<'a> {
             scratch_pred: Vec::new(),
             scratch_pred8: Vec::new(),
             scratch_scored: Vec::new(),
+            scratch_allangs: Vec::new(),
             analysis: self.analysis.clone(),
             analysis_cache: self.analysis_cache.empty_like(),
             cur_policy: self.cur_policy,
@@ -392,11 +436,16 @@ impl<'a> Encoder<'a> {
             best2_chroma_protect: self.best2_chroma_protect,
             best2_luma_fastrd: self.best2_luma_fastrd,
             best2_rough_lambda: self.best2_rough_lambda,
+            best2_rd_lambda: self.best2_rd_lambda,
+            best2_rdoq2: self.best2_rdoq2,
+            sign_data_hiding: self.sign_data_hiding,
             best2_wpp: self.best2_wpp,
             best_luma_leaf_screen: self.best_luma_leaf_screen,
             best_tu_neighbor_limit: self.best_tu_neighbor_limit,
+            best_aq: self.best_aq,
             best2_tt_reuse: self.best2_tt_reuse,
             best2_cu_reuse: self.best2_cu_reuse,
+            partnxn: self.partnxn,
             aq: AqState::inert(),
             prof: Profiler {
                 on: self.prof.on,
@@ -823,23 +872,36 @@ pub fn encode_with_stats(
     // accepted as Best's default operating point. `BPG_BEST2_PARALLEL=0` reverts
     // to the serial running-context path (the higher-efficiency comparison
     // anchor). Determinism oracle (`BPG_ENC_THREADS=1`) holds.
-    let best2_parallel = config.effort == Effort::Best
-        && std::env::var("BPG_BEST2_PARALLEL")
-            .ok()
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true);
-    let effort_template = if best2_parallel {
-        &crate::effort::BEST_PARALLEL
+    // The frozen-slice-init WPP path was built for uniform-QP `Best`; its
+    // per-worker frozen context does not carry the per-QG QP-prediction state
+    // across worker boundaries, so it is incompatible with adaptive QP. When the
+    // experimental variance AQ opts `Best` in, fall back to the serial path
+    // (same rationale as `Placebo` + `--sao`).
+    let parallel_enabled = std::env::var("BPG_BEST2_PARALLEL")
+        .ok()
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true);
+    // The whole non-reference ladder now runs the CTU-wavefront-parallel path
+    // (each tier is a pruned `Best`, all uniform-QP), so wall-clock scales
+    // monotonically with effort. Gated off when AQ is opted back in
+    // (`BPG_LADDER_AQ`/`BPG_BEST_AQ`), since the frozen-slice worker context does
+    // not carry per-QG QP prediction across worker boundaries. `Placebo` keeps
+    // its own static parallel (frozen, no WPP) reference template; `Reference`
+    // stays serial.
+    let best2_parallel = !crate::is_reference_tier(config.effort) && !aq_active && parallel_enabled;
+    let mut effort_template = if config.effort == Effort::Best && best2_parallel {
+        crate::effort::BEST_PARALLEL
     } else {
-        crate::effort::template(config.effort)
+        *crate::effort::template(config.effort)
     };
-    // WPP-style analysis context propagation for parallel `Best`: price each CTU
-    // against a context propagated along the wavefront (raster-within-row, seeded
-    // from the row above's 2nd CTU) instead of one cold slice-init frozen
-    // context. Recovers essentially all of the parallel frozen-vs-running drift
-    // (parallel `Best` reaches serial-`Best` quality at ~3x speed), so it is
-    // intrinsic to the parallel path — no env gate. Never enabled for `Placebo`
-    // (keeps it byte-identical to its frozen-slice reference).
+    if best2_parallel {
+        effort_template.parallel_analysis = true;
+    }
+    // WPP-style analysis context propagation for the parallel ladder: price each
+    // CTU against a context propagated along the wavefront (raster-within-row,
+    // seeded from the row above's 2nd CTU) instead of one cold frozen context.
+    // Recovers essentially all of the parallel frozen-vs-running drift. Never
+    // enabled for `Placebo` (keeps it byte-identical to its frozen reference).
     let best2_wpp = best2_parallel;
     let best2_luma_fastrd = config.effort == Effort::Best
         && !aq_active
@@ -854,6 +916,29 @@ pub fn encode_with_stats(
             .ok()
             .map(|v| v.trim() != "0")
             .unwrap_or(true);
+    // x265-parity SSE-domain RD/RDOQ lambda. The legacy HM intra factor (0.57)
+    // under-penalizes bits ~16-24% vs `x265_lambda2_tab` at the same QP, pushing
+    // still265 to a higher-rate/higher-quality operating point than x265 placebo
+    // at equal QP. Default-on for `Best` (the x265-parity comparison tier);
+    // `BPG_BEST2_RD_LAMBDA=0` reverts to the legacy formula for A/B.
+    let best2_rd_lambda = config.effort == Effort::Best
+        && std::env::var("BPG_BEST2_RD_LAMBDA")
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+    // x265-parity RDOQ level-2 rate model (greater1/greater2 context tracking +
+    // adapted Rice in `rdoq_single_scan`). Default-on for `Best`
+    // (`BPG_BEST2_RDOQ2=0` reverts to the frozen-context single-scan model).
+    let best2_rdoq2 = config.effort == Effort::Best
+        && std::env::var("BPG_BEST2_RDOQ2")
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true);
+    // AQ-gated: under the experimental variance AQ, `Best` falls back to the
+    // same coding path the lower AQ tiers use. The leaf-screen / TU-neighbour /
+    // TT-reuse fast paths bypass `final_code_tt`'s per-CU QP bookkeeping, which
+    // the decoder's QG-QP prediction mirror depends on, so they must stay off
+    // when QP varies per quantization group.
     let best_luma_leaf_screen = config.effort == Effort::Best && !aq_active;
     let best_tu_neighbor_limit = config.effort == Effort::Best && !aq_active;
     // Phase 2 chroma rough-margin gate: validated quality-neutral and promoted
@@ -931,6 +1016,7 @@ pub fn encode_with_stats(
         scratch_pred: Vec::new(),
         scratch_pred8: Vec::new(),
         scratch_scored: Vec::new(),
+        scratch_allangs: Vec::new(),
         analysis: analysis.clone(),
         analysis_cache,
         cur_policy: None,
@@ -956,11 +1042,26 @@ pub fn encode_with_stats(
             .unwrap_or(true),
         best2_luma_fastrd,
         best2_rough_lambda,
+        best2_rd_lambda,
+        best2_rdoq2,
+        sign_data_hiding: crate::sdh_active(config),
         best2_wpp,
         best_luma_leaf_screen,
         best_tu_neighbor_limit,
-        best2_tt_reuse: config.effort == Effort::Best && !best2_luma_fastrd,
+        best_aq: if config.effort == Effort::Best {
+            crate::best_aq_params()
+        } else {
+            None
+        },
+        best2_tt_reuse: config.effort == Effort::Best && !aq_active && !best2_luma_fastrd,
         best2_cu_reuse: config.effort == Effort::Best && !aq_active && !best2_luma_fastrd,
+        // PartNxN is a real coding tool, so it belongs on every quality-leaning
+        // tier (each prunes the per-PU search via its own RD budget) — Best down
+        // to Fast. Off for Fastest (speed floor) and the exact reference tiers.
+        partnxn: std::env::var("BPG_PARTNXN").map(|v| v != "0").unwrap_or(matches!(
+            config.effort,
+            Effort::Best | Effort::Good | Effort::Balanced | Effort::Fast
+        )),
         prof: Profiler {
             on: std::env::var_os("BPG_PROFILE").is_some(),
             ..Default::default()
@@ -987,26 +1088,22 @@ pub fn encode_with_stats(
     let ctb = 1u32 << CTB_LOG2;
 
     let slice_data = if config.sao == SaoMode::On {
-        let _ = encode_slice_data(&mut state, None, slice_qp_y);
+        // Production SAO (docs/sao.md): build every CTU tree once (reconstructing
+        // the frame), deblock, decide SAO on the deblocked frame, then *replay*
+        // the cached trees with SAO syntax — no second RDO pass. Parallel tiers
+        // build via the wavefront; serial tiers build interleaved (the throwaway
+        // bitstream only evolves the running context their RD pricing needs).
+        let trees = if state.effort_template.parallel_analysis {
+            build_slice_trees_parallel(&mut state, slice_qp_y)
+        } else {
+            build_slice_trees_serial(&mut state, slice_qp_y)
+        };
         if state.deblock {
             bpg_hevc_decode::hevc::deblock::apply_deblocking_filter(&mut state.frame, 0, 0, 0, 0);
         }
         let sao_map = state.decide_sao_map(ctb);
-
-        state.frame = DecodedFrame::with_params(coded_width, coded_height, bd, cat);
-        if state.deblock {
-            state.frame.qp_map.fill(qp_y as i8);
-        }
-        state.mode_map.fill(1u8);
-        state.ct_depth_map.fill(0xFF);
-        state.tu_depth_map.fill(0xFF);
-        state.analysis_cache.clear();
-        state.stats = EncodeStats::default();
-
-        let bytes = encode_slice_data(&mut state, Some(&sao_map), slice_qp_y);
-        if state.deblock {
-            bpg_hevc_decode::hevc::deblock::apply_deblocking_filter(&mut state.frame, 0, 0, 0, 0);
-        }
+        let bytes = write_slice_from_trees(&mut state, &trees, Some(&sao_map), slice_qp_y);
+        // The frame is already deblocked; SAO is the final in-loop step.
         apply_sao(&mut state.frame, &sao_map, ctb);
         bytes
     } else {

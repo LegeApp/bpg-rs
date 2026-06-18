@@ -103,6 +103,11 @@ pub struct AnalysisMaps {
     cells_x: u32,
     cells_y: u32,
     cells: Vec<CellAnalysis>,
+    /// Picture mean of `log2(1 + cell.variance)`. The reference point for the
+    /// bidirectional variance AQ ([`aq_qp_offset_variance`]): a cell's QP offset
+    /// is proportional to how its log-variance deviates from this mean. 0 when
+    /// the map is empty / the analysis pass didn't run.
+    frame_mean_log2var: f32,
 }
 
 /// Encoder-side search-budget steering derived from a cell's [`RegionClass`].
@@ -207,10 +212,21 @@ pub fn analyze(width: u32, height: u32, bit_depth: u8, cat: u8, src: Source<'_>)
 
     fill_contextual_features(&mut cells, cells_x, cells_y);
 
+    let frame_mean_log2var = if cells.is_empty() {
+        0.0
+    } else {
+        let sum: f32 = cells
+            .iter()
+            .map(|c| ((1 + c.variance) as f32).log2())
+            .sum();
+        sum / cells.len() as f32
+    };
+
     AnalysisMaps {
         cells_x,
         cells_y,
         cells,
+        frame_mean_log2var,
     }
 }
 
@@ -304,6 +320,39 @@ pub fn aq_qp_offset(importance_q8: u16) -> i32 {
     // `t` in 0..=1: 1 for fully important cells, 0 for flat/noisy.
     let t = (importance_q8.min(256) as f64) / 256.0;
     (1.0 + (1.0 - t) * 7.0).round() as i32 // +1..+8
+}
+
+/// Maximum magnitude (in QP steps) of the bidirectional variance AQ offset.
+const VAR_AQ_CLAMP: f32 = 8.0;
+
+/// Bidirectional, rate-neutral variance AQ QP offset (x265 `aq-mode`-style),
+/// the alternative to the one-directional perceptual [`aq_qp_offset`]. The
+/// offset is proportional to how a cell's `log2(1 + variance)` deviates from the
+/// picture mean (`frame_mean_log2var`), so it both *raises* and *lowers* QP
+/// around the slice QP (net roughly rate-neutral) instead of only shrinking.
+///
+/// - `perceptual = true` (x265 aq-mode 2 direction): high-variance/texture cells
+///   get **higher** QP (masking hides the loss), flat cells get **lower** QP
+///   (anti-banding). Optimizes perceived quality / SSIM.
+/// - `perceptual = false` (PSNR/SSE-leaning): the opposite sign — high-variance
+///   cells get **lower** QP (that is where reducing SSE costs the fewest bits).
+///   Optimizes PSNR-at-equal-size.
+///
+/// `strength` scales the deviation (x265's `--aq-strength`, ~1.0 nominal); the
+/// result is clamped to ±[`VAR_AQ_CLAMP`] QP steps. Caller adds this to the
+/// slice QP and clamps to the valid `[0, 51]` range.
+pub fn aq_qp_offset_variance(
+    variance: u32,
+    frame_mean_log2var: f32,
+    strength: f32,
+    perceptual: bool,
+) -> i32 {
+    let log2var = ((1 + variance) as f32).log2();
+    let mut adj = strength * (log2var - frame_mean_log2var);
+    if !perceptual {
+        adj = -adj;
+    }
+    adj.round().clamp(-VAR_AQ_CLAMP, VAR_AQ_CLAMP) as i32
 }
 
 fn compute_importance(c: &CellAnalysis) -> u16 {
@@ -530,6 +579,7 @@ impl AnalysisMaps {
             cells_x: 0,
             cells_y: 0,
             cells: Vec::new(),
+            frame_mean_log2var: 0.0,
         }
     }
 
@@ -596,6 +646,23 @@ impl AnalysisMaps {
     /// request context gets a no-op.
     pub fn importance_at(&self, x0: u32, y0: u32, log2_size: u8) -> u16 {
         self.fold_cells(x0, y0, log2_size, 0u16, |best, c| best.max(c.importance_q8))
+    }
+
+    /// Spatial luma variance of the cell covering `(x0, y0)` — the raw local
+    /// complexity signal the bidirectional variance AQ steers on (independent of
+    /// the importance/classification machinery). 0 when the map is empty.
+    pub fn variance_at(&self, x0: u32, y0: u32) -> u32 {
+        if self.cells.is_empty() {
+            return 0;
+        }
+        let cx = (x0 / CELL).min(self.cells_x - 1);
+        let cy = (y0 / CELL).min(self.cells_y - 1);
+        self.cells[(cy * self.cells_x + cx) as usize].variance
+    }
+
+    /// Picture mean of `log2(1 + variance)` — the AQ reference point.
+    pub fn frame_mean_log2var(&self) -> f32 {
+        self.frame_mean_log2var
     }
 
     /// Per-class cell counts, for `--debug-stats` (image-global; not per-worker).

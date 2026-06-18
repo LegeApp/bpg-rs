@@ -1,1 +1,15 @@
 /target
+
+# CodeGraph MCP index (per-checkout, regenerated)
+/.codegraph
+
+# Local benchmark / scratch data (large, not source)
+/saliency
+/test-set
+/bpg-rs.zip
+
+# Vendored external tool binaries used only for local benchmarking
+*.exe
+
+# Python harness caches
+__pycache__/

@@ -82,6 +82,18 @@ pub fn quantize(coeffs: &[i16], log2_size: u8, qp: i32, bit_depth: u8) -> (Vec<i
     (levels, nnz)
 }
 
+/// Forward-quantizer scale and `qbits` shift for `(log2_size, qp, bit_depth)`,
+/// matching [`quantize`]. Exposed so the sign-data-hiding pass can recompute
+/// each coefficient's rounding remainder (x265 `deltaU`) from the pre-quant
+/// coefficient and its level: `deltaU = (|coeff|*scale - (|level|<<qbits)) >> (qbits-8)`.
+pub fn quant_params(log2_size: u8, qp: i32, bit_depth: u8) -> (i64, i32) {
+    let per = qp / 6;
+    let rem = (qp % 6) as usize;
+    let transform_shift = MAX_TR_DYNAMIC_RANGE - bit_depth as i32 - log2_size as i32;
+    let qbits = QUANT_SHIFT + per + transform_shift;
+    (QUANT_SCALE[rem] as i64, qbits)
+}
+
 /// Dequantize levels in place (flat scaling list), bit-identical to
 /// `bpg-hevc-decode::hevc::transform::dequantize` (H.265 8.6.3).
 pub fn dequantize(levels: &mut [i16], log2_size: u8, qp: i32, bit_depth: u8) {
@@ -89,18 +101,8 @@ pub fn dequantize(levels: &mut [i16], log2_size: u8, qp: i32, bit_depth: u8) {
     let rem = (qp % 6) as usize;
     let combined = LEVEL_SCALE[rem] * (1 << per);
     let shift = bit_depth as i32 - 9 + log2_size as i32;
-    if shift >= 0 {
-        let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
-        for v in levels.iter_mut() {
-            let value = (*v as i32 * combined + add) >> shift;
-            *v = value.clamp(-32768, 32767) as i16;
-        }
-    } else {
-        let neg = -shift;
-        for v in levels.iter_mut() {
-            *v = ((*v as i32 * combined) << neg).clamp(-32768, 32767) as i16;
-        }
-    }
+    // Dispatched (scalar or `wide`-SIMD) inverse-quant kernel; see [`primitives`].
+    primitives::dequantize(levels, combined, shift);
 }
 
 /// Per-block dequant constants (combined scale, right-shift, rounding add),

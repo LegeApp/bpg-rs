@@ -135,17 +135,16 @@ and non-CTU-aligned image sizes.
 - Primitives: hot kernels dispatch through a `still265::primitives::Primitives`
   function-pointer table chosen at startup from CPU features + `BPG_PRIMITIVES`.
   The scalar implementations are canonical. Optimized kernels: 8-bit SATD
-  (SSE2, `x86_64`, always built); and — behind the optional **`wide-simd`**
-  feature (the pure-Rust `wide` crate, portable across architectures) —
-  10/12-bit SATD, SSD (RD distortion), residual subtraction, and the forward
-  1-D DCT. Every optimized kernel is **bit-identical** to scalar (unit-tested,
-  and verified by byte-identical end-to-end encodes across 8/10/12-bit ×
-  4:2:0/4:2:2/4:4:4 × fast/balanced/best). The default build pulls in no
-  external C/C++/asm and stays pure Rust; `wide-simd` adds one pure-Rust
-  dependency. Build the CLI with it via
-  `cargo build -p bpg-tools --features wide-simd`. On the analysis-bound effort
-  tiers it measures ~8–20% faster (the 8-bit `best` tier is CABAC-bound, so it
-  moves little). Remaining kernels are listed in `docs/remaining-gaps.md`.
+  (SSE2, `x86_64`, always built); and, in normal `bpg-tools` builds through the
+  pure-Rust `wide-simd` feature, 10/12-bit SATD, SSD (RD distortion), residual
+  subtraction, and the forward 1-D DCT. Every optimized kernel is
+  **bit-identical** to scalar (unit-tested, and verified by byte-identical
+  end-to-end encodes across 8/10/12-bit × 4:2:0/4:2:2/4:4:4 ×
+  fast/balanced/best). The build remains pure Rust with no external C/C++/asm;
+  `BPG_PRIMITIVES=scalar` remains available for A/B testing. On the
+  analysis-bound effort tiers it measures ~8–20% faster (the 8-bit `best` tier
+  is CABAC-bound, so it moves little). Remaining kernels are listed in
+  `docs/remaining-gaps.md`.
 - `bpg_encode::HevcEncoder::caps()` reports a backend's supported bit depths,
   chroma formats, and in-loop-filter/lossless/alpha support; `bpg-tools`
   checks the request against this before doing any image I/O or encoding

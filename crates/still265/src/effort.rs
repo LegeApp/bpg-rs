@@ -368,7 +368,9 @@ impl EffortTemplate {
         let effective_template = template(effective);
         let rmd_mode_set = effective_template.rmd.mode_set;
         let base_luma = self.luma_rd_candidates_base(desc.log2_size, desc.qp);
-        let luma_rd_candidates = (base_luma as i8 + policy.luma_rd_bias).clamp(1, 4) as u8;
+        let luma_rd_cap = if self.name == Effort::Best { 9 } else { 4 };
+        let luma_rd_candidates =
+            (base_luma as i8 + policy.luma_rd_bias).clamp(1, luma_rd_cap) as u8;
         let base_chroma = self.chroma_rd_candidates_base(desc.qp);
         let chroma_min = if base_chroma == 0 { 0 } else { 1 };
         let chroma_rd_candidates =
@@ -711,7 +713,7 @@ static BEST: EffortTemplate = EffortTemplate {
     parallel_analysis: false,
     rmd: RmdTemplate {
         mode_set: RmdModeSet::Exhaustive,
-        max_luma_rd_candidates: 3,
+        max_luma_rd_candidates: 8,
     },
     luma: LumaSearchTemplate {
         trial_quality: TrialQuality::FullRd,
@@ -746,8 +748,9 @@ static BEST: EffortTemplate = EffortTemplate {
 /// (`encode_slice_data_parallel`). Identical search budget to `BEST`; only the
 /// entropy-context mode (frozen vs running) and `parallel_analysis` differ, so
 /// output drifts ~0.1% from serial `Best` (same rationale that lets `Placebo`
-/// differ from `Reference`). Selected for `Best` when `BPG_BEST2_PARALLEL` is
-/// set. Keeps `name: Effort::Best` so all `Best` search levers still apply.
+/// differ from `Reference`). Selected by default for `Best`
+/// (`BPG_BEST2_PARALLEL=0` reverts to serial). Keeps `name: Effort::Best` so
+/// all `Best` search levers still apply.
 pub(crate) static BEST_PARALLEL: EffortTemplate = EffortTemplate {
     name: Effort::Best,
     reference: false,
@@ -755,7 +758,7 @@ pub(crate) static BEST_PARALLEL: EffortTemplate = EffortTemplate {
     parallel_analysis: true,
     rmd: RmdTemplate {
         mode_set: RmdModeSet::Exhaustive,
-        max_luma_rd_candidates: 3,
+        max_luma_rd_candidates: 8,
     },
     luma: LumaSearchTemplate {
         trial_quality: TrialQuality::FullRd,

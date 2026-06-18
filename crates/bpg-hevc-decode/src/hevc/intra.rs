@@ -9,7 +9,12 @@ use super::picture::{DecodedFrame, UNINIT_SAMPLE};
 use super::slice::IntraPredMode;
 
 /// Maximum block size for intra prediction (HEVC max intra TU = 32)
-const MAX_INTRA_PRED_BLOCK_SIZE: usize = 32;
+pub const MAX_INTRA_PRED_BLOCK_SIZE: usize = 32;
+
+/// Length of the reference-border arrays used by the intra predictor, and the
+/// index of the top-left corner sample within them.
+pub const INTRA_BORDER_LEN: usize = 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1;
+pub const INTRA_BORDER_CENTER: usize = 2 * MAX_INTRA_PRED_BLOCK_SIZE;
 
 /// HEVC Table 8-3: chroma intra prediction mode mapping for `ChromaArrayType == 2`
 /// (4:2:2). The chroma plane is horizontally subsampled but not vertically, so
@@ -174,6 +179,47 @@ fn collect_prediction_border(
     (border, border_center, size, bit_depth)
 }
 
+/// Build both the unfiltered and the smoothed reference borders for a block in
+/// one neighbour scan, for an encoder-side batch predictor.
+///
+/// Returns `(unfiltered, filtered, center, bit_depth)`. The `filtered` border is
+/// the reference-smoothing result applied unconditionally (for luma / 4:4:4
+/// chroma, size > 4); callers select per mode via [`reference_filter_applies`]
+/// so each angular prediction sees exactly the border [`predict_intra_into`]
+/// would have built for that mode. For 4x4 (or chroma without smoothing)
+/// `filtered == unfiltered`.
+#[allow(clippy::type_complexity)]
+pub fn build_reference_borders(
+    frame: &DecodedFrame,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    c_idx: u8,
+    strong_intra_smoothing_enabled: bool,
+) -> ([i32; INTRA_BORDER_LEN], [i32; INTRA_BORDER_LEN], usize, u8) {
+    let size = 1u32 << log2_size;
+    let bit_depth = frame.bit_depth;
+    let chroma_format = frame.chroma_format;
+    let center = INTRA_BORDER_CENTER;
+
+    let mut unfiltered = [0i32; INTRA_BORDER_LEN];
+    fill_border_samples(frame, x, y, size, c_idx, &mut unfiltered, center);
+
+    let mut filtered = unfiltered;
+    if (c_idx == 0 || chroma_format == 3) && size > 4 {
+        apply_reference_filter(
+            &mut filtered,
+            center,
+            size as usize,
+            c_idx,
+            strong_intra_smoothing_enabled,
+            bit_depth as usize,
+        );
+    }
+
+    (unfiltered, filtered, center, bit_depth)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn predict_intra_from_border(
     plane: &mut [u16],
@@ -241,6 +287,27 @@ fn predict_intra_from_border(
 ///
 /// Applies [1,2,1]/4 low-pass filter to reference samples before prediction.
 /// For 32x32 luma blocks with strong_intra_smoothing, uses bilinear interpolation instead.
+/// H.265 8.4.4.2.3 `filterFlag`: whether reference smoothing applies for a given
+/// block size and intra mode (luma / 4:4:4-chroma reference). The *content* of
+/// the smoothed border is mode-independent, so a batch predictor can precompute
+/// one smoothed border and select it per mode via this predicate (mirrors x265's
+/// `g_intraFilterFlags[mode] & size`).
+pub fn reference_filter_applies(n_t: usize, intra_pred_mode: u8) -> bool {
+    if intra_pred_mode == 1 || n_t == 4 {
+        // DC mode or 4x4: no filtering
+        return false;
+    }
+    let min_dist_ver_hor = (intra_pred_mode as i32 - 26)
+        .abs()
+        .min((intra_pred_mode as i32 - 10).abs());
+    match n_t {
+        8 => min_dist_ver_hor > 7,
+        16 => min_dist_ver_hor > 1,
+        32 => min_dist_ver_hor > 0,
+        _ => false, // 64 or other sizes: no filtering
+    }
+}
+
 fn intra_prediction_sample_filtering(
     border: &mut [i32],
     center: usize,
@@ -250,27 +317,30 @@ fn intra_prediction_sample_filtering(
     strong_intra_smoothing_enabled: bool,
     bit_depth: usize,
 ) {
-    // Determine filterFlag
-    let filter_flag = if intra_pred_mode == 1 || n_t == 4 {
-        // DC mode or 4x4: no filtering
-        false
-    } else {
-        let min_dist_ver_hor = (intra_pred_mode as i32 - 26)
-            .abs()
-            .min((intra_pred_mode as i32 - 10).abs());
-
-        match n_t {
-            8 => min_dist_ver_hor > 7,
-            16 => min_dist_ver_hor > 1,
-            32 => min_dist_ver_hor > 0,
-            _ => false, // 64 or other sizes: no filtering
-        }
-    };
-
-    if !filter_flag {
+    if !reference_filter_applies(n_t, intra_pred_mode) {
         return;
     }
+    apply_reference_filter(
+        border,
+        center,
+        n_t,
+        c_idx,
+        strong_intra_smoothing_enabled,
+        bit_depth,
+    );
+}
 
+/// The mode-independent body of reference smoothing (assumes the caller has
+/// already decided it applies). Applies the [1,2,1]/4 low-pass filter, or
+/// bilinear interpolation for 32x32 luma with strong intra smoothing.
+pub fn apply_reference_filter(
+    border: &mut [i32],
+    center: usize,
+    n_t: usize,
+    c_idx: u8,
+    strong_intra_smoothing_enabled: bool,
+    bit_depth: usize,
+) {
     // Check for strong intra smoothing (bilinear interpolation for 32x32 luma)
     let bi_int_flag = strong_intra_smoothing_enabled
         && c_idx == 0
@@ -683,7 +753,13 @@ fn predict_dc(
 
 /// Angular prediction (modes 2-34) - H.265 8.4.4.2.6
 #[allow(clippy::too_many_arguments)]
-fn predict_angular(
+/// Angular intra prediction (modes 2..=34) into `plane` at `(x, y)`.
+///
+/// Exposed so an encoder-side batch predictor can reuse the exact decoder math
+/// (predicting into a `size`-stride slot at `(0, 0)`), guaranteeing bit-identity
+/// with [`predict_intra_into`]. `border` must already be the unfiltered /
+/// smoothed reference selected per [`reference_filter_applies`].
+pub fn predict_angular(
     plane: &mut [u16],
     stride: usize,
     x: u32,

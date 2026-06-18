@@ -24,7 +24,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Encode a PNG image to BPG.
+    /// Encode a PNG or JPEG image to BPG.
     Encode(EncodeArgs),
     /// Decode a still-image BPG to PNG.
     Decode(DecodeArgs),
@@ -87,7 +87,7 @@ enum DecodeFormat {
 
 #[derive(clap::Args)]
 struct EncodeArgs {
-    /// Input PNG file.
+    /// Input image file (PNG or JPEG).
     input: PathBuf,
 
     /// Output BPG file.
@@ -125,9 +125,14 @@ struct EncodeArgs {
     #[arg(long = "debug-stats-csv")]
     debug_stats_csv: Option<PathBuf>,
 
-    /// Enable Sample Adaptive Offset (conservative BO/EO encoder). Off by default.
-    #[arg(long)]
+    /// Force-enable Sample Adaptive Offset (on by default for all efforts; the
+    /// single-pass replay path makes it ~free). Kept for explicitness.
+    #[arg(long, conflicts_with = "no_sao")]
     sao: bool,
+
+    /// Disable Sample Adaptive Offset (SAO is on by default for every effort).
+    #[arg(long = "no-sao", conflicts_with = "sao")]
+    no_sao: bool,
 
     /// Disable the in-loop deblocking filter (on by default).
     #[arg(long = "no-deblock")]
@@ -168,12 +173,244 @@ struct DecodeArgs {
     format: DecodeFormat,
 }
 
+// ---------------------------------------------------------------------------
+// Image I/O
+// ---------------------------------------------------------------------------
+
+/// Pixel color type for decoded input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ColorType {
+    Gray,
+    GrayAlpha,
+    Rgb,
+    Rgba,
+}
+
+/// Raw decoded pixel data from any supported input format.
+struct LoadedImage {
+    width: u32,
+    height: u32,
+    color_type: ColorType,
+    bit_depth: u8,
+    pixels: Vec<u8>,
+}
+
+/// Read a PNG file using zune-png. Accepts Gray, GrayAlpha, RGB, RGBA at
+/// 8 or 16 bits. Indexed/palette PNGs are expanded automatically.
+fn open_png(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::Error>> {
+    let data = std::fs::read(path)?;
+    let mut decoder = zune_png::PngDecoder::new(&data);
+    let pixels = decoder
+        .decode_raw()
+        .map_err(|e| format!("PNG decode error: {e}"))?;
+
+    let (w, h) = decoder.get_dimensions().ok_or("PNG: missing dimensions")?;
+    let width = u32::try_from(w).map_err(|_| format!("PNG width {w} exceeds u32"))?;
+    let height = u32::try_from(h).map_err(|_| format!("PNG height {h} exceeds u32"))?;
+
+    let bit_depth = match decoder.get_depth().ok_or("PNG: missing bit depth")? {
+        zune_core::bit_depth::BitDepth::Eight => 8u8,
+        zune_core::bit_depth::BitDepth::Sixteen => 16u8,
+        _ => {
+            return Err("PNG bit depth is not supported; use 8 or 16-bit PNG".into())
+        }
+    };
+
+    let color_type = match decoder.get_colorspace().ok_or("PNG: missing colorspace")? {
+        zune_core::colorspace::ColorSpace::Luma => ColorType::Gray,
+        zune_core::colorspace::ColorSpace::LumaA => ColorType::GrayAlpha,
+        zune_core::colorspace::ColorSpace::RGB => ColorType::Rgb,
+        zune_core::colorspace::ColorSpace::RGBA => ColorType::Rgba,
+        other => {
+            return Err(format!(
+                "PNG color type {other:?} is not supported; use grayscale, RGB, or RGBA PNG",
+            )
+            .into())
+        }
+    };
+
+    Ok(LoadedImage { width, height, color_type, bit_depth, pixels })
+}
+
+/// Read a JPEG file using zune-jpeg. Always outputs 8-bit RGB.
+fn open_jpeg(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::Error>> {
+    let data = std::fs::read(path)?;
+    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
+        &data,
+        zune_core::options::DecoderOptions::default()
+            .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB),
+    );
+    let pixels = decoder
+        .decode()
+        .map_err(|e| format!("JPEG decode error: {e}"))?;
+    let (w, h) = decoder.dimensions().ok_or("JPEG: missing dimensions")?;
+    let width = u32::try_from(w).map_err(|_| format!("JPEG width {w} exceeds u32"))?;
+    let height = u32::try_from(h).map_err(|_| format!("JPEG height {h} exceeds u32"))?;
+
+    Ok(LoadedImage { width, height, color_type: ColorType::Rgb, bit_depth: 8, pixels })
+}
+
+/// BT.709 luma coefficients (same as the image crate's to_luma8/16).
+fn rgb_to_luma8(r: u8, g: u8, b: u8) -> u8 {
+    ((r as u32 * 2126 + g as u32 * 7152 + b as u32 * 722 + 5000) / 10000) as u8
+}
+
+fn rgb_to_luma16(r: u16, g: u16, b: u16) -> u16 {
+    ((r as u64 * 2126 + g as u64 * 7152 + b as u64 * 722 + 5000) / 10000) as u16
+}
+
+/// Returns true if all pixels appear achromatic (R==G==B).
+fn is_gray_image(img: &LoadedImage) -> bool {
+    match (img.color_type, img.bit_depth) {
+        (ColorType::Gray, _) | (ColorType::GrayAlpha, _) => true,
+        (ColorType::Rgb, 8) => img.pixels.chunks_exact(3).all(|p| p[0] == p[1] && p[1] == p[2]),
+        (ColorType::Rgba, 8) => img.pixels.chunks_exact(4).all(|p| p[0] == p[1] && p[1] == p[2]),
+        (ColorType::Rgb, _) => img.pixels.chunks_exact(6).all(|p| {
+            u16::from_be_bytes([p[0], p[1]]) == u16::from_be_bytes([p[2], p[3]])
+                && u16::from_be_bytes([p[2], p[3]]) == u16::from_be_bytes([p[4], p[5]])
+        }),
+        (ColorType::Rgba, _) => img.pixels.chunks_exact(8).all(|p| {
+            u16::from_be_bytes([p[0], p[1]]) == u16::from_be_bytes([p[2], p[3]])
+                && u16::from_be_bytes([p[2], p[3]]) == u16::from_be_bytes([p[4], p[5]])
+        }),
+    }
+}
+
+/// Extract gray 8-bit pixels regardless of source color type.
+/// 16-bit sources are downscaled by taking the high byte.
+fn extract_gray8(img: &LoadedImage) -> Vec<u8> {
+    match (img.color_type, img.bit_depth) {
+        (ColorType::Gray, 8) => img.pixels.clone(),
+        (ColorType::GrayAlpha, 8) => img.pixels.chunks_exact(2).map(|c| c[0]).collect(),
+        (ColorType::Gray, _) => img.pixels.chunks_exact(2).map(|c| c[0]).collect(),
+        (ColorType::GrayAlpha, _) => img.pixels.chunks_exact(4).map(|c| c[0]).collect(),
+        (ColorType::Rgb, 8) => img
+            .pixels
+            .chunks_exact(3)
+            .map(|p| rgb_to_luma8(p[0], p[1], p[2]))
+            .collect(),
+        (ColorType::Rgba, 8) => img
+            .pixels
+            .chunks_exact(4)
+            .map(|p| rgb_to_luma8(p[0], p[1], p[2]))
+            .collect(),
+        (ColorType::Rgb, _) => img
+            .pixels
+            .chunks_exact(6)
+            .map(|p| rgb_to_luma8(p[0], p[2], p[4]))
+            .collect(),
+        (ColorType::Rgba, _) => img
+            .pixels
+            .chunks_exact(8)
+            .map(|p| rgb_to_luma8(p[0], p[2], p[4]))
+            .collect(),
+    }
+}
+
+/// Extract gray 16-bit pixels (native endian) regardless of source color type.
+/// 8-bit sources are upscaled.
+fn extract_gray16(img: &LoadedImage) -> Vec<u16> {
+    let be16 = |a: u8, b: u8| u16::from_be_bytes([a, b]);
+    match (img.color_type, img.bit_depth) {
+        (ColorType::Gray, 16) => img.pixels.chunks_exact(2).map(|c| be16(c[0], c[1])).collect(),
+        (ColorType::GrayAlpha, 16) => img.pixels.chunks_exact(4).map(|c| be16(c[0], c[1])).collect(),
+        (ColorType::Rgb, 16) => img
+            .pixels
+            .chunks_exact(6)
+            .map(|p| rgb_to_luma16(be16(p[0], p[1]), be16(p[2], p[3]), be16(p[4], p[5])))
+            .collect(),
+        (ColorType::Rgba, 16) => img
+            .pixels
+            .chunks_exact(8)
+            .map(|p| rgb_to_luma16(be16(p[0], p[1]), be16(p[2], p[3]), be16(p[4], p[5])))
+            .collect(),
+        _ => extract_gray8(img)
+            .into_iter()
+            .map(|v| ((v as u32 * 65535 + 127) / 255) as u16)
+            .collect(),
+    }
+}
+
+/// Extract RGB 8-bit pixels (3 bytes per pixel). 16-bit sources use the high byte.
+fn extract_rgb8(img: &LoadedImage) -> Vec<u8> {
+    match (img.color_type, img.bit_depth) {
+        (ColorType::Rgb, 8) => img.pixels.clone(),
+        (ColorType::Rgba, 8) => img.pixels.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(),
+        (ColorType::Gray, 8) => img.pixels.iter().flat_map(|&v| [v, v, v]).collect(),
+        (ColorType::GrayAlpha, 8) => img.pixels.chunks_exact(2).flat_map(|c| [c[0], c[0], c[0]]).collect(),
+        (ColorType::Rgb, _) => img.pixels.chunks_exact(6).flat_map(|p| [p[0], p[2], p[4]]).collect(),
+        (ColorType::Rgba, _) => img.pixels.chunks_exact(8).flat_map(|p| [p[0], p[2], p[4]]).collect(),
+        (ColorType::Gray, _) => img.pixels.chunks_exact(2).flat_map(|c| [c[0], c[0], c[0]]).collect(),
+        (ColorType::GrayAlpha, _) => img.pixels.chunks_exact(4).flat_map(|c| [c[0], c[0], c[0]]).collect(),
+    }
+}
+
+/// Extract RGB 16-bit pixels (3 u16 per pixel, native endian). 8-bit sources
+/// are upscaled.
+fn extract_rgb16(img: &LoadedImage) -> Vec<u16> {
+    let be16 = |a: u8, b: u8| u16::from_be_bytes([a, b]);
+    match (img.color_type, img.bit_depth) {
+        (ColorType::Rgb, 16) => img
+            .pixels
+            .chunks_exact(6)
+            .flat_map(|p| [be16(p[0], p[1]), be16(p[2], p[3]), be16(p[4], p[5])])
+            .collect(),
+        (ColorType::Rgba, 16) => img
+            .pixels
+            .chunks_exact(8)
+            .flat_map(|p| [be16(p[0], p[1]), be16(p[2], p[3]), be16(p[4], p[5])])
+            .collect(),
+        (ColorType::Gray, 16) => img
+            .pixels
+            .chunks_exact(2)
+            .flat_map(|c| { let v = be16(c[0], c[1]); [v, v, v] })
+            .collect(),
+        (ColorType::GrayAlpha, 16) => img
+            .pixels
+            .chunks_exact(4)
+            .flat_map(|c| { let v = be16(c[0], c[1]); [v, v, v] })
+            .collect(),
+        _ => extract_rgb8(img)
+            .into_iter()
+            .map(|v| ((v as u32 * 65535 + 127) / 255) as u16)
+            .collect(),
+    }
+}
+
+/// Write raw pixels to a PNG file (8-bit, RGB or RGBA).
+fn save_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    color_type: ColorType,
+    data: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let png_color = match color_type {
+        ColorType::Rgb => png::ColorType::Rgb,
+        ColorType::Rgba => png::ColorType::Rgba,
+        _ => return Err("only RGB/RGBA output is supported for PNG saving".into()),
+    };
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png_color);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header()?;
+    writer.write_image_data(data)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Encode command
+// ---------------------------------------------------------------------------
+
 fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if ![8, 10, 12].contains(&args.bit_depth) {
         return Err(format!("--bit-depth must be 8, 10, or 12 (got {})", args.bit_depth).into());
     }
 
-    let sao = if args.sao { SaoMode::On } else { SaoMode::Off };
+    // SAO is on by default for every effort (the single-pass replay path makes
+    // it ~free); --no-sao opts out.
+    let sao = if args.no_sao { SaoMode::Off } else { SaoMode::On };
     let deblock = if args.no_deblock {
         DeblockMode::Off
     } else {
@@ -191,7 +428,15 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
-    let dyn_img = image::open(&args.input)?;
+
+    let ext = args.input.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    let img = match ext.as_str() {
+        "jpg" | "jpeg" => open_jpeg(&args.input)?,
+        _ => open_png(&args.input)?,
+    };
     let color_space = match args.color_space {
         CsArg::Ycbcr => ColorSpace::YCbCr,
         CsArg::Rgb => ColorSpace::Rgb,
@@ -199,7 +444,7 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         CsArg::Bt709 => ColorSpace::YCbCrBt709,
         CsArg::Bt2020 => ColorSpace::YCbCrBt2020,
     };
-    let auto_gray = args.format.is_none() && is_grayscale_input(&dyn_img);
+    let auto_gray = args.format.is_none() && is_gray_image(&img);
     let requested_format = args.format.unwrap_or(if auto_gray {
         Format::Gray
     } else if matches!(color_space, ColorSpace::Rgb | ColorSpace::YCgCo) {
@@ -241,30 +486,55 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    // 16-bit PNGs are read as Rgb16 to preserve full input precision; all
-    // other inputs go through the 8-bit path (and may be upscaled to a
-    // higher output bit_depth during color conversion).
+    let is_16bit = img.bit_depth == 16;
+
     let mut image = match requested_format {
-        Format::Gray => match dyn_img {
-            image::DynamicImage::ImageLuma16(_) | image::DynamicImage::ImageLumaA16(_) => {
-                let gray16 = dyn_img.to_luma16();
-                Image::from_luma16(&gray16, color_space, args.limited_range, args.bit_depth)
+        Format::Gray => {
+            if is_16bit {
+                let gray16 = extract_gray16(&img);
+                Image::from_luma16(
+                    &gray16,
+                    img.width,
+                    img.height,
+                    color_space,
+                    args.limited_range,
+                    args.bit_depth,
+                )
+            } else {
+                let gray8 = extract_gray8(&img);
+                Image::from_luma8(
+                    &gray8,
+                    img.width,
+                    img.height,
+                    color_space,
+                    args.limited_range,
+                    args.bit_depth,
+                )
             }
-            _ => {
-                let gray8 = dyn_img.to_luma8();
-                Image::from_luma8(&gray8, color_space, args.limited_range, args.bit_depth)
+        }
+        _ => {
+            if is_16bit {
+                let rgb16 = extract_rgb16(&img);
+                Image::from_rgb16(
+                    &rgb16,
+                    img.width,
+                    img.height,
+                    color_space,
+                    args.limited_range,
+                    args.bit_depth,
+                )
+            } else {
+                let rgb8 = extract_rgb8(&img);
+                Image::from_rgb8(
+                    &rgb8,
+                    img.width,
+                    img.height,
+                    color_space,
+                    args.limited_range,
+                    args.bit_depth,
+                )
             }
-        },
-        _ => match dyn_img {
-            image::DynamicImage::ImageRgb16(_) | image::DynamicImage::ImageRgba16(_) => {
-                let rgb16 = dyn_img.to_rgb16();
-                Image::from_rgb16(&rgb16, color_space, args.limited_range, args.bit_depth)
-            }
-            _ => {
-                let rgb = dyn_img.to_rgb8();
-                Image::from_rgb8(&rgb, color_space, args.limited_range, args.bit_depth)
-            }
-        },
+        }
     };
     match requested_format {
         Format::Gray => {}
@@ -393,6 +663,80 @@ fn encode_to_target(
     let bpg = encode_at(qp)?;
     Ok((bpg, qp))
 }
+
+// ---------------------------------------------------------------------------
+// Decode command
+// ---------------------------------------------------------------------------
+
+fn run_decode(args: &DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let data = std::fs::read(&args.input)?;
+    let layout = match args.format {
+        DecodeFormat::Rgb => PixelLayout::Rgb8,
+        DecodeFormat::Rgba => PixelLayout::Rgba8,
+        DecodeFormat::Bgr => PixelLayout::Bgr8,
+        DecodeFormat::Bgra => PixelLayout::Bgra8,
+    };
+    let decoded = DecoderConfig::new().decode(&data, layout)?;
+
+    match decoded.layout {
+        PixelLayout::Rgb8 => {
+            save_png(
+                &args.output,
+                decoded.width,
+                decoded.height,
+                ColorType::Rgb,
+                &decoded.data,
+            )?;
+        }
+        PixelLayout::Rgba8 => {
+            save_png(
+                &args.output,
+                decoded.width,
+                decoded.height,
+                ColorType::Rgba,
+                &decoded.data,
+            )?;
+        }
+        PixelLayout::Bgr8 => {
+            let mut data = decoded.data;
+            for px in data.chunks_exact_mut(3) {
+                px.swap(0, 2);
+            }
+            save_png(
+                &args.output,
+                decoded.width,
+                decoded.height,
+                ColorType::Rgb,
+                &data,
+            )?;
+        }
+        PixelLayout::Bgra8 => {
+            let mut data = decoded.data;
+            for px in data.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            save_png(
+                &args.output,
+                decoded.width,
+                decoded.height,
+                ColorType::Rgba,
+                &data,
+            )?;
+        }
+    }
+
+    eprintln!(
+        "wrote {} ({}x{})",
+        args.output.display(),
+        decoded.width,
+        decoded.height
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// CSV stats helpers
+// ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
 fn append_debug_stats_csv(
@@ -530,70 +874,6 @@ fn chroma_name(chroma: ChromaFormat) -> &'static str {
         ChromaFormat::Yuv422 => "422",
         ChromaFormat::Yuv444 => "444",
     }
-}
-
-fn is_grayscale_input(img: &image::DynamicImage) -> bool {
-    match img {
-        image::DynamicImage::ImageLuma8(_)
-        | image::DynamicImage::ImageLumaA8(_)
-        | image::DynamicImage::ImageLuma16(_)
-        | image::DynamicImage::ImageLumaA16(_) => true,
-        image::DynamicImage::ImageRgb16(_) | image::DynamicImage::ImageRgba16(_) => img
-            .to_rgb16()
-            .pixels()
-            .all(|p| p[0] == p[1] && p[1] == p[2]),
-        _ => img.to_rgb8().pixels().all(|p| p[0] == p[1] && p[1] == p[2]),
-    }
-}
-
-fn run_decode(args: &DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let data = std::fs::read(&args.input)?;
-    let layout = match args.format {
-        DecodeFormat::Rgb => PixelLayout::Rgb8,
-        DecodeFormat::Rgba => PixelLayout::Rgba8,
-        DecodeFormat::Bgr => PixelLayout::Bgr8,
-        DecodeFormat::Bgra => PixelLayout::Bgra8,
-    };
-    let decoded = DecoderConfig::new().decode(&data, layout)?;
-
-    match decoded.layout {
-        PixelLayout::Rgb8 => {
-            let img = image::RgbImage::from_raw(decoded.width, decoded.height, decoded.data)
-                .ok_or("decoded RGB buffer has invalid length")?;
-            img.save(&args.output)?;
-        }
-        PixelLayout::Rgba8 => {
-            let img = image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.data)
-                .ok_or("decoded RGBA buffer has invalid length")?;
-            img.save(&args.output)?;
-        }
-        PixelLayout::Bgr8 => {
-            let mut data = decoded.data;
-            for px in data.chunks_exact_mut(3) {
-                px.swap(0, 2);
-            }
-            let img = image::RgbImage::from_raw(decoded.width, decoded.height, data)
-                .ok_or("decoded BGR buffer has invalid length")?;
-            img.save(&args.output)?;
-        }
-        PixelLayout::Bgra8 => {
-            let mut data = decoded.data;
-            for px in data.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-            let img = image::RgbaImage::from_raw(decoded.width, decoded.height, data)
-                .ok_or("decoded BGRA buffer has invalid length")?;
-            img.save(&args.output)?;
-        }
-    }
-
-    eprintln!(
-        "wrote {} ({}x{})",
-        args.output.display(),
-        decoded.width,
-        decoded.height
-    );
-    Ok(())
 }
 
 fn main() -> ExitCode {

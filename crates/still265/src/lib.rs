@@ -14,6 +14,7 @@
 
 pub mod analysis_cache;
 pub mod backend;
+pub mod batch;
 pub mod cabac;
 pub mod contexts;
 pub mod effort;
@@ -139,10 +140,64 @@ pub fn is_reference_tier(effort: Effort) -> bool {
 /// monochrome QG-prediction path is reconciled with the decoder.
 #[inline]
 pub fn aq_active(config: &StillHevcConfig) -> bool {
-    !matches!(
-        config.effort,
-        Effort::Best | Effort::Placebo | Effort::Reference
-    ) && config.chroma != ChromaFormat::Gray
+    if config.chroma == ChromaFormat::Gray {
+        return false;
+    }
+    match config.effort {
+        // Byte-reproducible reference tiers never quantize adaptively.
+        Effort::Placebo | Effort::Reference => false,
+        // The whole ladder is now uniform-QP: each tier is a progressively
+        // pruned version of `Best` (same coding tools — PartNxN, SAO, uniform
+        // QP — with less search), so quality scales monotonically with effort.
+        // The previous per-CU variance AQ on the speed tiers diverged badly from
+        // `Best` (≈3 dB MS-SSIM and a scrambled quality ladder; see
+        // docs/effort-ladder-uniform-qp-2026-06-17.md), and the project's own
+        // measurements found the preanalysis AQ signal RD-neutral-to-negative.
+        // `Best` can still opt into the experimental variance AQ via
+        // [`best_aq_params`] (`BPG_BEST_AQ`).
+        Effort::Best => best_aq_params().is_some(),
+        // Speed tiers: opt-in via the config field (default off → uniform QP).
+        _ => config.adaptive_qp,
+    }
+}
+
+/// Experimental variance-AQ configuration for [`Effort::Best`], parsed from the
+/// environment. Returns `Some((perceptual, strength))` when enabled:
+/// `BPG_BEST_AQ=perceptual` (SSIM-leaning, x265 aq-mode-2 direction) or
+/// `BPG_BEST_AQ=psnr` (SSE-leaning, opposite sign; the default for any other
+/// non-empty value). `BPG_BEST_AQ_STRENGTH` scales the offset (default 1.0,
+/// x265 `--aq-strength`). Unset / `0` / empty ⇒ `None` (Best stays uniform-QP).
+pub fn best_aq_params() -> Option<(bool, f32)> {
+    let mode = std::env::var("BPG_BEST_AQ").ok()?;
+    let mode = mode.trim();
+    if mode.is_empty() || mode == "0" {
+        return None;
+    }
+    let perceptual = mode.eq_ignore_ascii_case("perceptual");
+    let strength = std::env::var("BPG_BEST_AQ_STRENGTH")
+        .ok()
+        .and_then(|s| s.trim().parse::<f32>().ok())
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .unwrap_or(1.0);
+    Some((perceptual, strength))
+}
+
+/// Whether HEVC sign-data-hiding is applied for a config. Single source of
+/// truth consulted by both the PPS writer ([`params::write_pps`], which emits
+/// `sign_data_hiding_enabled_flag`) and the encoder (which makes each coding
+/// group's hidden sign parity-consistent), so the flag and the coded levels
+/// can never disagree.
+///
+/// Scoped to [`Effort::Best`] (the x265-parity tier); the byte-reproducible
+/// reference tiers ([`Effort::Placebo`]/[`Effort::Reference`]) stay SDH-free so
+/// their output remains bit-stable. `BPG_BEST2_SDH=0` reverts for A/B testing.
+#[inline]
+pub fn sdh_active(config: &StillHevcConfig) -> bool {
+    config.effort == Effort::Best
+        && std::env::var("BPG_BEST2_SDH")
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
 }
 
 /// Still-picture HEVC encoder configuration.
@@ -156,6 +211,12 @@ pub struct StillHevcConfig {
     pub effort: Effort,
     pub sao: SaoMode,
     pub deblock: DeblockMode,
+    /// Per-CU adaptive quantization (`cu_qp_delta`) for the speed/size-oriented
+    /// tiers. **Off by default**: the effort ladder is uniform-QP (each tier a
+    /// pruned `Best`), which the project's measurements found beats the per-CU
+    /// variance AQ on photos. Opt in for size-at-equal-QP on flat content. No
+    /// effect on `Best` (use `BPG_BEST_AQ`) or the reference tiers.
+    pub adaptive_qp: bool,
 }
 
 /// Rust-native still-picture HEVC intra encoder.

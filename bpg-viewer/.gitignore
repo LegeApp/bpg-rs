@@ -1,0 +1,35 @@
+# Rust
+/target
+Cargo.lock
+**/*.rs.bk
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dll
+*.dylib
+*.exe
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+*.bpg
+*.png
+*.jpg
+thumb_output.*
+
+# Distribution
+/dist
+
+# Logs
+*.log

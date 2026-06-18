@@ -319,6 +319,159 @@ pub fn estimate_residual_bits(
     sink.frac_bits()
 }
 
+/// HEVC sign-data-hiding: make each qualifying coding group's first significant
+/// coefficient sign parity-consistent with the group's |level| sum, so the
+/// decoder can infer that sign from the parity instead of coding it. Faithful
+/// port of x265 `Quant::signBitHidingHDQ` (common/quant.cpp) operating on the
+/// final quantized `levels` in place. For every 4x4 group whose significant
+/// span is `>= 4`, if the first coeff's sign disagrees with `sum & 1`, the
+/// minimum-distortion +/-1 level change — ranked by each coefficient's
+/// quantization remainder `deltaU` (recomputed from `coeffs`, the pre-quant
+/// transform coefficients) — flips the group parity. The residual writer omits
+/// exactly the hidden signs this pass makes consistent. Returns the updated
+/// non-zero coefficient count.
+pub fn apply_sign_data_hiding(
+    levels: &mut [i16],
+    coeffs: &[i16],
+    log2_size: u8,
+    scan_order: ScanOrder,
+    scale: i64,
+    qbits: i32,
+    mut nnz: u32,
+) -> u32 {
+    const SBH_THRESHOLD: usize = 4;
+    let size = 1usize << log2_size;
+    let scan_sub = get_scan_sub_block(log2_size, scan_order);
+    let scan_pos = get_scan_4x4(scan_order);
+    let (last_sb_idx, last_pos_in_sb) = find_last_sig(levels, size, scan_sub, scan_pos);
+
+    let blk_pos = |sbx: usize, sby: usize, n: usize| -> Option<usize> {
+        let (px, py) = scan_pos[n];
+        let x = sbx * 4 + px as usize;
+        let y = sby * 4 + py as usize;
+        (x < size && y < size).then_some(y * size + x)
+    };
+    // x265 `deltaU`: signed rounding remainder at 8-bit fractional precision.
+    // > 0 means the coeff was truncated down (incrementing the level is cheap).
+    let delta_u = |levels: &[i16], blk: usize| -> i64 {
+        let tmp = (coeffs[blk].unsigned_abs() as i64) * scale;
+        let lvl = levels[blk].unsigned_abs() as i64;
+        (tmp - (lvl << qbits)) >> (qbits - 8)
+    };
+
+    for (sb_idx, &(sbx, sby)) in scan_sub.iter().enumerate() {
+        if sb_idx > last_sb_idx {
+            break;
+        }
+        let sbx = sbx as usize;
+        let sby = sby as usize;
+
+        let mut first_nz = None;
+        let mut last_nz = 0usize;
+        for n in 0..16 {
+            if let Some(blk) = blk_pos(sbx, sby, n) {
+                if levels[blk] != 0 {
+                    if first_nz.is_none() {
+                        first_nz = Some(n);
+                    }
+                    last_nz = n;
+                }
+            }
+        }
+        let first_nz = match first_nz {
+            Some(f) => f,
+            None => continue,
+        };
+        if last_nz - first_nz < SBH_THRESHOLD {
+            continue;
+        }
+
+        let first_blk = blk_pos(sbx, sby, first_nz).unwrap();
+        let signbit = if levels[first_blk] > 0 { 0u32 } else { 1 };
+        let mut abs_sum: i64 = 0;
+        for n in first_nz..=last_nz {
+            if let Some(blk) = blk_pos(sbx, sby, n) {
+                abs_sum += levels[blk].unsigned_abs() as i64;
+            }
+        }
+        if signbit == (abs_sum as u32 & 1) {
+            continue; // parity already encodes the hidden sign correctly
+        }
+
+        // Find the cheapest +/-1 level change that flips the group parity.
+        let cand_max = if sb_idx == last_sb_idx {
+            last_pos_in_sb
+        } else {
+            15
+        };
+        let mut min_cost = i64::MAX;
+        let mut final_change = 0i32;
+        let mut min_blk = usize::MAX;
+        for n in (0..=cand_max).rev() {
+            let blk = match blk_pos(sbx, sby, n) {
+                Some(b) => b,
+                None => continue,
+            };
+            let cur_sig = levels[blk] != 0;
+            let lower_sig = (0..n).any(|m| blk_pos(sbx, sby, m).is_some_and(|b| levels[b] != 0));
+            let du = delta_u(levels, blk);
+            let (cost, change) = if cur_sig {
+                if du > 0 {
+                    (-du, 1)
+                } else if !lower_sig && levels[blk].unsigned_abs() == 1 {
+                    // sole/first coeff: don't shrink it to zero (would move firstNZ)
+                    (i64::MAX, 0)
+                } else {
+                    (du, -1)
+                }
+            } else if !lower_sig {
+                // leading-zero region: a new coeff here becomes the first
+                // significant one, so only allow it if its sign matches signbit.
+                let this_sign = if coeffs[blk] >= 0 { 0u32 } else { 1 };
+                if this_sign != signbit {
+                    (i64::MAX, 0)
+                } else {
+                    (-du, 1)
+                }
+            } else {
+                (-du, 1)
+            };
+            if cost < min_cost {
+                min_cost = cost;
+                final_change = change;
+                min_blk = blk;
+            }
+        }
+        // Guaranteed fallback: incrementing the first coeff's magnitude always
+        // flips parity and preserves its sign (only reached if every ranked
+        // candidate was disallowed, which the >=4 span makes unreachable).
+        if min_blk == usize::MAX || final_change == 0 {
+            min_blk = first_blk;
+            final_change = 1;
+        }
+
+        // Honor the coeff clamp (mirror x265).
+        if levels[min_blk] == 32767 || levels[min_blk] == -32768 {
+            final_change = -1;
+        }
+
+        if levels[min_blk] == 0 {
+            nnz += 1;
+            levels[min_blk] = if coeffs[min_blk] >= 0 { 1 } else { -1 };
+        } else {
+            let sign = levels[min_blk].signum() as i32;
+            let new_abs = levels[min_blk].unsigned_abs() as i32 + final_change;
+            if new_abs == 0 {
+                nnz -= 1;
+                levels[min_blk] = 0;
+            } else {
+                levels[min_blk] = (sign * new_abs) as i16;
+            }
+        }
+    }
+    nnz
+}
+
 #[allow(clippy::too_many_arguments)]
 fn residual_syntax<S: CabacSyntax>(
     sink: &mut S,

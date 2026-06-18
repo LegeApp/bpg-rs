@@ -1,28 +1,24 @@
 //! Rate-distortion optimisation: transform/quant/RDOQ, TU/CU mode and split
 //! decision, CABAC bit estimation, and costing.
 
-use bpg_hevc_decode::hevc::intra::{
-    fill_mpm_candidates, predict_intra, predict_intra_into,
-};
+use bpg_hevc_decode::hevc::intra::{fill_mpm_candidates, predict_intra, predict_intra_into};
 use bpg_hevc_decode::hevc::slice::IntraPredMode;
 
 use crate::cabac::CabacEstimator;
 use crate::contexts::{ctx, Contexts};
-use crate::preanalysis::RegionClass;
-use crate::effort::{
-    BlockSearchBudget, ComponentKind, RmdModeSet, SplitSearch, TrialQuality,
-};
+use crate::effort::{BlockSearchBudget, ComponentKind, RmdModeSet, SplitSearch, TrialQuality};
 use crate::plan::{
     BlockEstimate, BlockPlan, ChromaModePlan, CuLeafPlan, CuPlan, DecisionConfidence, LumaModePlan,
     ParentChromaPlan, RdCost, TrialResult, TtPlan, WorkStage,
 };
+use crate::preanalysis::RegionClass;
 use crate::primitives;
 use crate::rdoq;
 use crate::residual::{estimate_residual_bits, get_scan_order, ResidualEstimateCache};
 use crate::transform;
 use crate::Effort;
 
-use super::snapshot::{ChromaLeafCache, ChromaDecision};
+use super::snapshot::{ChromaDecision, ChromaLeafCache};
 use super::types::*;
 use super::Encoder;
 
@@ -52,7 +48,12 @@ impl<'a> super::Encoder<'a> {
     /// and the MPM candidates remain). Uses the source-block variance as the
     /// structure signal (bit-depth normalized). `Fastest`/`Fast`/`Balanced`
     /// prune (at decreasing thresholds); `Good`/`Best` never do.
-    pub(super) fn prune_angular_modes(&self, src: &[u16], size: usize, budget: BlockSearchBudget) -> bool {
+    pub(super) fn prune_angular_modes(
+        &self,
+        src: &[u16],
+        size: usize,
+        budget: BlockSearchBudget,
+    ) -> bool {
         // Variance threshold in 8-bit² units, scaled to the working bit depth.
         let Some(th_8bit) = budget.angular_prune_var_threshold_8bit else {
             return false;
@@ -96,6 +97,25 @@ impl<'a> super::Encoder<'a> {
             pred,
             size,
         );
+        self.luma_rough_score_from_pred(pred, size, mode, ctxs, mpm, src, src8, pred8)
+    }
+
+    /// Score a luma mode from an already-predicted block (the post-prediction
+    /// half of [`Self::score_luma_rough_mode`]). Lets the batched
+    /// `intra_pred_allangs` path score angular modes from precomputed slots.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn luma_rough_score_from_pred(
+        &mut self,
+        pred: &[u16],
+        size: usize,
+        mode: u8,
+        ctxs: &Contexts,
+        mpm: [IntraPredMode; 3],
+        src: &[u16],
+        src8: Option<&[u8]>,
+        pred8: &mut Vec<u8>,
+    ) -> u64 {
+        self.stats.luma_rough_predictions += 1;
         let satd = self.satd_block_cost(src, src8, pred, size, pred8) as u64;
         let mode_bits = estimate_intra_luma_mode_bits(ctxs, mpm, mode);
         if self.effort == Effort::Best {
@@ -209,12 +229,64 @@ impl<'a> super::Encoder<'a> {
                 }
             }
         } else {
-            for m in budget.rough_luma_modes(mpm_u8, prune_angular) {
-                let src8_ref = has_src8.then_some(src8.as_slice());
-                let cost = self.score_luma_rough_mode(
-                    x0, y0, log2_size, m, ctxs, mpm, &src, src8_ref, &mut pred, &mut pred8,
+            let modes = budget.rough_luma_modes(mpm_u8, prune_angular);
+            let angular_count = modes.iter().filter(|&&m| (2..=34).contains(&m)).count();
+            // Full angular sweep (Best/reference tiers): build the reference
+            // borders once and predict all 33 angular modes in a single batch
+            // (x265 `intra_pred_allangs`), instead of rebuilding the border +
+            // smoothing per mode. Byte-identical to the per-mode path.
+            if !prune_angular && angular_count >= 16 {
+                let n = size * size;
+                let (uf, ft, center, _) = bpg_hevc_decode::hevc::intra::build_reference_borders(
+                    &self.frame,
+                    x0,
+                    y0,
+                    log2_size,
+                    0,
+                    true,
                 );
-                scored.push((cost, m));
+                let mut batch = std::mem::take(&mut self.scratch_allangs);
+                batch.clear();
+                batch.resize(crate::primitives::intra_angs::ANGULAR_MODES * n, 0);
+                crate::primitives::intra_pred_allangs(
+                    &mut batch,
+                    &uf,
+                    &ft,
+                    center,
+                    log2_size,
+                    0,
+                    self.bit_depth,
+                );
+                for m in modes {
+                    let src8_ref = has_src8.then_some(src8.as_slice());
+                    let cost = if (2..=34).contains(&m) {
+                        let off = crate::primitives::intra_angs::slot_offset(m, log2_size);
+                        self.luma_rough_score_from_pred(
+                            &batch[off..off + n],
+                            size,
+                            m,
+                            ctxs,
+                            mpm,
+                            &src,
+                            src8_ref,
+                            &mut pred8,
+                        )
+                    } else {
+                        self.score_luma_rough_mode(
+                            x0, y0, log2_size, m, ctxs, mpm, &src, src8_ref, &mut pred, &mut pred8,
+                        )
+                    };
+                    scored.push((cost, m));
+                }
+                self.scratch_allangs = batch;
+            } else {
+                for m in modes {
+                    let src8_ref = has_src8.then_some(src8.as_slice());
+                    let cost = self.score_luma_rough_mode(
+                        x0, y0, log2_size, m, ctxs, mpm, &src, src8_ref, &mut pred, &mut pred8,
+                    );
+                    scored.push((cost, m));
+                }
             }
         }
 
@@ -237,7 +309,10 @@ impl<'a> super::Encoder<'a> {
             _ => n,
         };
         let candidates = if self.best_luma_leaf_screen && !scored.is_empty() {
-            let max_cands = (5 + ((ct_depth as usize) >> 1)).min(8);
+            // x265 placebo uses rdLevel=6 here:
+            // maxCandCount = 2 + rdLevel + ((depth + initTuDepth) >> 1).
+            // This leaf-screen path corresponds to initTuDepth=0.
+            let max_cands = 2 + 6 + ((ct_depth as usize) >> 1);
             let best = scored[0].0;
             let padded_best = best.saturating_add(best >> 2);
             let mpm0 = mpm_u8[0];
@@ -624,7 +699,7 @@ impl<'a> super::Encoder<'a> {
         );
         self.scratch_residual = residual;
         let do_rdoq = Self::rdoq_enabled_for_block(stage, plan.quality, budget);
-        let (levels, nnz) = if self.single_scan_rdoq && do_rdoq {
+        let (mut levels, mut nnz) = if self.single_scan_rdoq && do_rdoq {
             if stage == WorkStage::FinalCode {
                 self.stats.final_rdoq_blocks += 1;
             } else {
@@ -641,6 +716,7 @@ impl<'a> super::Encoder<'a> {
                 self.bit_depth,
                 scan,
                 self.lambda(),
+                self.best2_rdoq2,
             );
             if let Some(tr) = tr {
                 self.prof.rdoq += tr.elapsed();
@@ -667,6 +743,17 @@ impl<'a> super::Encoder<'a> {
                 )
             }
         };
+        // Sign-data-hiding: make each coding group's hidden sign parity-consistent
+        // before reconstruction so encoder recon == decoder recon, and before the
+        // writer (which omits exactly those signs). Uses the pre-quant `coeffs`,
+        // so it must run before they return to scratch.
+        if self.sign_data_hiding && nnz > 0 {
+            let (scale, qbits) = transform::quant_params(log2_size, qp, self.bit_depth);
+            let scan = get_scan_order(log2_size, mode, c_idx, self.cat);
+            nnz = crate::residual::apply_sign_data_hiding(
+                &mut levels, &coeffs, log2_size, scan, scale, qbits, nnz,
+            );
+        }
         self.scratch_coeffs = coeffs;
         self.scratch_transform_tmp = transform_tmp;
         let cbf = nnz > 0;
@@ -826,7 +913,11 @@ impl<'a> super::Encoder<'a> {
     }
 
     #[inline]
-    pub(super) fn effective_trial_quality(&self, c_idx: u8, budget: BlockSearchBudget) -> TrialQuality {
+    pub(super) fn effective_trial_quality(
+        &self,
+        c_idx: u8,
+        budget: BlockSearchBudget,
+    ) -> TrialQuality {
         match c_idx {
             0 => self.luma_trial_quality(budget),
             _ => budget.chroma_trial_quality,
@@ -905,7 +996,13 @@ impl<'a> super::Encoder<'a> {
         sse
     }
 
-    pub(super) fn distortion_cu_node(&self, node: &CuNode, x0: u32, y0: u32, log2_cb_size: u8) -> u64 {
+    pub(super) fn distortion_cu_node(
+        &self,
+        node: &CuNode,
+        x0: u32,
+        y0: u32,
+        log2_cb_size: u8,
+    ) -> u64 {
         match node {
             CuNode::Leaf(_) => self.distortion_tt_region(x0, y0, log2_cb_size),
             CuNode::Split { kids } => {
@@ -953,7 +1050,22 @@ impl<'a> super::Encoder<'a> {
     }
 
     pub(super) fn lambda(&self) -> f64 {
-        0.57f64 * 2f64.powf((self.cur_qp_y as f64 - 12.0) / 3.0)
+        if self.best2_rd_lambda {
+            // x265-parity SSE-domain RD lambda: matches `x265_lambda2_tab`
+            // (`lambda2 = 0.038 * exp(0.234 * QP)`, common/constants.cpp), used
+            // directly by x265 `RDCost::calcRdCost`. Reproduces the table values
+            // (e.g. QP28 -> 26.62 vs the legacy 22.98). Used by `rd_cost` and the
+            // RDOQ level decisions (`refine_levels_rdoq`/`rdoq_single_scan`),
+            // which is where the coefficient-keeping / size effect lives.
+            0.038f64 * (0.234f64 * self.cur_qp_y as f64).exp()
+        } else {
+            Self::legacy_lambda(self.cur_qp_y)
+        }
+    }
+
+    #[inline]
+    fn legacy_lambda(qp: i32) -> f64 {
+        0.57f64 * 2f64.powf((qp as f64 - 12.0) / 3.0)
     }
 
     /// SAD/SATD-domain lambda for rough mode costing, ported from x265's
@@ -964,7 +1076,10 @@ impl<'a> super::Encoder<'a> {
     /// `lambda()` here is the HM SSE-domain formula, so the matching SAD-domain
     /// lambda is its square root.
     pub(super) fn lambda_sad(&self) -> f64 {
-        self.lambda().sqrt()
+        // Stay on the legacy SSE base so the A/B-verified `best2_rough_lambda`
+        // rough-cost behavior is unchanged by the `best2_rd_lambda` parity
+        // switch (this only feeds the rough SATD shortlist, not RD/RDOQ).
+        Self::legacy_lambda(self.cur_qp_y).sqrt()
     }
 
     /// Rough (SATD-domain) RD cost: `satd + lambda_sad * bits`, matching x265
@@ -989,7 +1104,14 @@ impl<'a> super::Encoder<'a> {
         let t = self.prof.on.then(std::time::Instant::now);
         let mut ctxs = ctxs.clone();
         let scan = get_scan_order(log2_size, mode, c_idx, self.cat);
-        let r = estimate_residual_bits(&mut ctxs, levels, log2_size, c_idx, scan, false);
+        let r = estimate_residual_bits(
+            &mut ctxs,
+            levels,
+            log2_size,
+            c_idx,
+            scan,
+            self.sign_data_hiding,
+        );
         if let Some(t) = t {
             self.prof.residual_bits += t.elapsed();
         }
@@ -2360,6 +2482,7 @@ impl<'a> super::Encoder<'a> {
                 chroma_mode_idx: chroma.plan.mode_idx,
                 confidence: DecisionConfidence::Clear,
                 tt,
+                nxn: None,
             };
         }
 
@@ -2396,6 +2519,7 @@ impl<'a> super::Encoder<'a> {
                 chroma_mode_idx: chroma.plan.mode_idx,
                 confidence: DecisionConfidence::Clear,
                 tt,
+                nxn: None,
             };
 
             let distortion = self.distortion_tt_region(x0, y0, log2_cb_size);
@@ -2433,6 +2557,209 @@ impl<'a> super::Encoder<'a> {
                 .expect("decide_luma_modes returns at least one candidate"),
         );
         best_leaf.expect("decide_luma_modes returns at least one candidate")
+    }
+
+    /// Build an 8x8 CU as `PartNxN`: four 4x4 luma prediction units, each with
+    /// its own RD-selected intra mode, reconstructed in z-order (TL, TR, BL,
+    /// BR) so each PU predicts from the prior PUs' reconstruction exactly like
+    /// the decoder. Chroma is one 4x4 TU at the 8x8 CU (4:2:0 only — gated by
+    /// the caller). Returns the coded leaf plus its RD distortion/bits.
+    ///
+    /// Experimental (`BPG_PARTNXN`); only used on the winner-direct
+    /// `best2_cu_reuse` path, so no plan/final-recode round-trip is needed.
+    pub(super) fn build_cu_leaf_nxn(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        ct_depth: u8,
+        ctxs: &Contexts,
+    ) -> (CuLeaf, u64, u64) {
+        self.set_ct_depth(x0, y0, 3, ct_depth);
+        let positions = [(x0, y0), (x0 + 4, y0), (x0, y0 + 4), (x0 + 4, y0 + 4)];
+        let mut luma_modes = [0u8; 4];
+        let mut mpms = [[IntraPredMode::Dc; 3]; 4];
+        let mut kids: Vec<Tt> = Vec::with_capacity(4);
+
+        for (i, &(px, py)) in positions.iter().enumerate() {
+            let cand_a = self.neighbor_left_mode(px, py);
+            let cand_b = self.neighbor_above_mode(px, py);
+            let mpm = fill_mpm_candidates(cand_a, cand_b);
+            let plan = self.decide_luma_modes(px, py, 2, ct_depth, ctxs);
+
+            let base = self.snapshot_frame_region(px, py, 2);
+            let mut best_mode = plan.candidates[0];
+            let mut best_cost = f64::MAX;
+            for &mode in &plan.candidates {
+                self.stats.cu_trials += 1;
+                self.restore_frame_region(&base);
+                self.store_mode(px, py, 2, mode);
+                let tt = self.build_luma_tt_leaf(px, py, 2, 1, mode, ctxs);
+                let Tt::Leaf(l) = &tt else {
+                    unreachable!("build_luma_tt_leaf returns a leaf")
+                };
+                let distortion = self.distortion_block(0, px, py, 2);
+                let mode_bits = estimate_intra_luma_mode_bits(ctxs, mpm, mode);
+                let mut cbf_m = ctxs.models[ctx::CBF_LUMA];
+                let mut est = CabacEstimator::new();
+                est.encode_bin(l.luma.cbf as u8, &mut cbf_m);
+                let mut luma_bits = est.frac_bits();
+                if l.luma.cbf {
+                    luma_bits += l.luma.frac_bits;
+                }
+                let cost = self.rd_cost(distortion, mode_bits + luma_bits);
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_mode = mode;
+                }
+            }
+
+            // Final-code the winning PU so the stored recon and coefficients are
+            // the exact ones the writer emits (winner-direct path).
+            self.restore_frame_region(&base);
+            self.store_mode(px, py, 2, best_mode);
+            let tt = self.final_code_tt_leaf(px, py, 2, 1, best_mode, best_mode, ctxs);
+            kids.push(tt);
+            luma_modes[i] = best_mode;
+            mpms[i] = mpm;
+        }
+
+        // One chroma mode for the whole 8x8 CU (4:2:0/4:2:2), DM-derived from PU0.
+        let chroma = self.decide_chroma_mode(x0, y0, 3, luma_modes[0], ctxs);
+        let parent_chroma =
+            self.build_parent_chroma_tu(x0, y0, 3, chroma.plan.mode, ctxs, WorkStage::FinalCode);
+        let cbf_cb = parent_chroma.as_ref().map(|c| c.cb.cbf).unwrap_or(false);
+        let cbf_cr = parent_chroma.as_ref().map(|c| c.cr.cbf).unwrap_or(false);
+
+        let tt = Tt::Split {
+            log2_size: 3,
+            trafo_depth: 0,
+            cbf_cb,
+            cbf_cr,
+            cbf_cb1: false,
+            cbf_cr1: false,
+            parent_chroma,
+            kids,
+        };
+
+        let leaf = CuLeaf {
+            mpm: mpms[0],
+            luma_mode: luma_modes[0],
+            chroma_mode_idx: chroma.plan.mode_idx,
+            confidence: DecisionConfidence::Clear,
+            tt,
+            nxn: Some(NxnInfo { luma_modes, mpms }),
+        };
+        let distortion = self.distortion_tt_region(x0, y0, 3);
+        let bits = estimate_cu_leaf_bits(ctxs, &leaf, 3, self.cat);
+        (leaf, distortion, bits)
+    }
+
+    /// Final-code an 8x8 `PartNxN` CU from its four chosen luma modes (the
+    /// plan/final-code replay path used by the non-`best2_cu_reuse` tiers). No
+    /// per-PU search — just reconstruct each PU in z-order with its recorded
+    /// mode and code one chroma TU, mirroring [`build_cu_leaf_nxn`] so the recon
+    /// is identical to the decision-time winner.
+    pub(super) fn final_code_cu_nxn(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        luma_modes: [u8; 4],
+        chroma_mode_idx: u8,
+        ct_depth: u8,
+        ctxs: &Contexts,
+    ) -> CuNode {
+        self.set_ct_depth(x0, y0, 3, ct_depth);
+        let positions = [(x0, y0), (x0 + 4, y0), (x0, y0 + 4), (x0 + 4, y0 + 4)];
+        let mut mpms = [[IntraPredMode::Dc; 3]; 4];
+        let mut kids: Vec<Tt> = Vec::with_capacity(4);
+        for (i, &(px, py)) in positions.iter().enumerate() {
+            let cand_a = self.neighbor_left_mode(px, py);
+            let cand_b = self.neighbor_above_mode(px, py);
+            mpms[i] = fill_mpm_candidates(cand_a, cand_b);
+            self.store_mode(px, py, 2, luma_modes[i]);
+            kids.push(self.final_code_tt_leaf(px, py, 2, 1, luma_modes[i], luma_modes[i], ctxs));
+        }
+        let chroma_mode = Self::chroma_mode_from_idx(luma_modes[0], chroma_mode_idx);
+        let parent_chroma =
+            self.build_parent_chroma_tu(x0, y0, 3, chroma_mode, ctxs, WorkStage::FinalCode);
+        let cbf_cb = parent_chroma.as_ref().map(|c| c.cb.cbf).unwrap_or(false);
+        let cbf_cr = parent_chroma.as_ref().map(|c| c.cr.cbf).unwrap_or(false);
+        let tt = Tt::Split {
+            log2_size: 3,
+            trafo_depth: 0,
+            cbf_cb,
+            cbf_cr,
+            cbf_cb1: false,
+            cbf_cr1: false,
+            parent_chroma,
+            kids,
+        };
+        CuNode::Leaf(CuLeaf {
+            mpm: mpms[0],
+            luma_mode: luma_modes[0],
+            chroma_mode_idx,
+            confidence: DecisionConfidence::Clear,
+            tt,
+            nxn: Some(NxnInfo { luma_modes, mpms }),
+        })
+    }
+
+    /// Decide an 8x8 CU's partition: RD-compare normal `Part2Nx2N` against
+    /// `PartNxN` and keep the cheaper. The returned plan carries the winner
+    /// (incl. PartNxN modes) so the final-code replay path can reproduce it.
+    pub(super) fn decide_cu_8x8_part(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        ct_depth: u8,
+        ctxs: &Contexts,
+    ) -> (TrialResult<CuPlan>, CuNode) {
+        let base_frame = self.snapshot_frame_region(x0, y0, 3);
+        let base_mode = self.snapshot_mode_region(x0, y0, 3);
+        let base_tu = self.snapshot_tu_depth_region(x0, y0, 3);
+
+        // Part2Nx2N
+        let leaf2 = self.build_cu_leaf(x0, y0, 3, ct_depth, ctxs);
+        let d2 = self.distortion_tt_region(x0, y0, 3);
+        let b2 = estimate_cu_leaf_bits(ctxs, &leaf2, 3, self.cat);
+        let c2 = self.rd_cost(d2, b2);
+        let frame2 = self.snapshot_frame_region(x0, y0, 3);
+        let mode2 = self.snapshot_mode_region(x0, y0, 3);
+        let tu2 = self.snapshot_tu_depth_region(x0, y0, 3);
+
+        // PartNxN
+        self.restore_frame_region(&base_frame);
+        self.restore_mode_region(&base_mode);
+        self.restore_tu_depth_region(&base_tu);
+        let (leafn, dn, bn) = self.build_cu_leaf_nxn(x0, y0, ct_depth, ctxs);
+        let cn = self.rd_cost(dn, bn);
+
+        if cn < c2 {
+            // PartNxN wins; its recon is already in the frame. The plan carries
+            // the four PU modes so the final-code replay path reproduces it.
+            let node = Self::cu_leaf_node(leafn, DecisionConfidence::Clear);
+            self.record_cu_winner(x0, y0, 3, false);
+            let plan = Self::cu_to_plan(&node);
+            let r = TrialResult {
+                plan,
+                cost: RdCost {
+                    distortion: dn,
+                    frac_bits: bn,
+                    cost: cn,
+                },
+                confidence: DecisionConfidence::Clear,
+            };
+            return (r, node);
+        }
+
+        // Part2Nx2N wins; restore its recon.
+        self.restore_frame_region(&frame2);
+        self.restore_mode_region(&mode2);
+        self.restore_tu_depth_region(&tu2);
+        let node = Self::cu_leaf_node(leaf2, DecisionConfidence::Clear);
+        self.record_cu_winner(x0, y0, 3, false);
+        let r = self.cu_trial_result(&node, x0, y0, 3, ct_depth, ctxs);
+        (r, node)
     }
 
     pub(super) fn escalate_luma_close_call(
@@ -2553,6 +2880,7 @@ impl<'a> super::Encoder<'a> {
                 chroma_mode_idx: leaf.chroma_mode_idx,
                 chroma_mode: Self::chroma_mode_from_idx(leaf.luma_mode, leaf.chroma_mode_idx),
                 tt: Self::tt_to_plan(&leaf.tt),
+                nxn: leaf.nxn.as_ref().map(|n| n.luma_modes),
             }),
             CuNode::Split { kids } => CuPlan::Split {
                 kids: kids.iter().map(Self::cu_to_plan).collect(),
@@ -2594,6 +2922,16 @@ impl<'a> super::Encoder<'a> {
     ) -> CuNode {
         match plan {
             CuPlan::Leaf(leaf) => {
+                if let Some(luma_modes) = leaf.nxn {
+                    return self.final_code_cu_nxn(
+                        x0,
+                        y0,
+                        luma_modes,
+                        leaf.chroma_mode_idx,
+                        ct_depth,
+                        ctxs,
+                    );
+                }
                 self.set_ct_depth(x0, y0, log2_cb_size, ct_depth);
                 self.store_mode(x0, y0, log2_cb_size, leaf.luma_mode);
                 let tt =
@@ -2604,6 +2942,7 @@ impl<'a> super::Encoder<'a> {
                     chroma_mode_idx: leaf.chroma_mode_idx,
                     confidence: DecisionConfidence::Clear,
                     tt,
+                    nxn: None,
                 })
             }
             CuPlan::Split { kids } => {
@@ -2669,6 +3008,13 @@ impl<'a> super::Encoder<'a> {
         let can_split = log2_cb_size > 3;
 
         if !can_split {
+            // 8x8 PartNxN (4:2:0): RD-compare four 4x4 luma PUs against the
+            // normal single-PU CU. Interior CUs only (avoids the cropped-padding
+            // recon edge case). Works on both the winner-direct (Best) and the
+            // plan/final-code (other tiers) paths.
+            if log2_cb_size == 3 && self.partnxn && self.cat == 1 && fully_inside {
+                return self.decide_cu_8x8_part(x0, y0, ct_depth, ctxs);
+            }
             let leaf = self.build_cu_leaf(x0, y0, log2_cb_size, ct_depth, ctxs);
             let node = Self::cu_leaf_node(leaf, DecisionConfidence::Clear);
             self.record_cu_winner(x0, y0, log2_cb_size, false);
@@ -3207,6 +3553,9 @@ fn estimate_split_cu_flag_bits(ctxs: &Contexts, ctx_inc: usize, value: bool) -> 
 }
 
 fn estimate_cu_leaf_bits(ctxs: &Contexts, leaf: &CuLeaf, log2_cb_size: u8, cat: u8) -> u64 {
+    if let Some(nxn) = &leaf.nxn {
+        return estimate_cu_leaf_nxn_bits(ctxs, leaf, nxn, cat);
+    }
     let mut bits = 0u64;
     if log2_cb_size == 3 {
         let mut m = ctxs.models[ctx::PART_MODE];
@@ -3219,6 +3568,54 @@ fn estimate_cu_leaf_bits(ctxs: &Contexts, leaf: &CuLeaf, log2_cb_size: u8, cat: 
         bits += estimate_intra_chroma_mode_bits(ctxs, leaf.chroma_mode_idx);
     }
     bits += estimate_tt_bits(ctxs, &leaf.tt, cat, false, true, true);
+    bits
+}
+
+/// Bit estimate for an 8x8 `PartNxN` leaf, matching the decoder's syntax order:
+/// `part_mode=0`, four `prev_intra_luma_pred_flag` (context bins, shared model),
+/// then four `mpm_idx`/`rem` (bypass), one chroma mode, and the forced-split
+/// transform tree (`intra_split_flag=true`).
+fn estimate_cu_leaf_nxn_bits(ctxs: &Contexts, leaf: &CuLeaf, nxn: &NxnInfo, cat: u8) -> u64 {
+    let mut est = CabacEstimator::new();
+    let mut part_m = ctxs.models[ctx::PART_MODE];
+    est.encode_bin(0, &mut part_m);
+
+    let mut flag_m = ctxs.models[ctx::PREV_INTRA_LUMA_PRED_FLAG];
+    let mut in_mpm = [None; 4];
+    for pu in 0..4 {
+        let mode = nxn.luma_modes[pu];
+        let mpm_u8 = [
+            nxn.mpms[pu][0].as_u8(),
+            nxn.mpms[pu][1].as_u8(),
+            nxn.mpms[pu][2].as_u8(),
+        ];
+        let idx = mpm_u8.iter().position(|&m| m == mode);
+        est.encode_bin(idx.is_some() as u8, &mut flag_m);
+        in_mpm[pu] = idx;
+    }
+    for &idx in &in_mpm {
+        match idx {
+            Some(0) => est.encode_bin_ep(0),
+            Some(1) => {
+                est.encode_bin_ep(1);
+                est.encode_bin_ep(0);
+            }
+            Some(_) => {
+                est.encode_bin_ep(1);
+                est.encode_bin_ep(1);
+            }
+            None => {
+                for _ in 0..5 {
+                    est.encode_bin_ep(0);
+                }
+            }
+        }
+    }
+    let mut bits = est.frac_bits();
+    if cat != 0 {
+        bits += estimate_intra_chroma_mode_bits(ctxs, leaf.chroma_mode_idx);
+    }
+    bits += estimate_tt_bits(ctxs, &leaf.tt, cat, true, true, true);
     bits
 }
 

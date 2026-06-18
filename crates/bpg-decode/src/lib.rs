@@ -1,13 +1,190 @@
-//! Pure Rust BPG still-image decode orchestration.
+//! Pure Rust BPG/HEIC still-image decode orchestration.
 //!
-//! This crate parses the BPG container, rebuilds a normal Annex-B HEVC stream
-//! from BPG's modified-HEVC payload, and decodes it with the Rust HEVC decoder
-//! used by `heic-decoder-rs`.
+//! * BPG: parses the BPG container, rebuilds an Annex-B HEVC stream from the
+//!   modified-HEVC payload, and decodes with `bpg-hevc-decode`.
+//! * HEIC/HEIF: full ISOBMFF container parser + same HEVC decoder.
+//!
+//! The HEIC path is exposed via the [`heic`] submodule.
+
+pub mod heic;
 
 use bpg_format::{BpgHeader, ChromaPhase, ColorSpaceCode, FormatError, PixelFormat};
 use bpg_hevc::{rebuild_annexb_from_bpg_payload, BpgHevcInfo};
+use std::path::Path;
 
 pub use bpg_hevc_decode::DecodedFrame;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ContainerKind {
+    Bpg,
+    Heif,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EstimateCompleteness {
+    Complete,
+    NeedsContainerMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerMemoryEstimate {
+    pub kind: ContainerKind,
+    pub completeness: EstimateCompleteness,
+    pub encoded_bytes: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub bit_depth: Option<u8>,
+    pub yuv_decode_bytes: Option<u64>,
+    pub rgba8_output_bytes: Option<u64>,
+    pub transient_bytes: Option<u64>,
+    pub peak_bytes: Option<u64>,
+}
+
+#[derive(Debug)]
+pub enum EstimateError {
+    Format(FormatError),
+    Io(std::io::Error),
+    Unsupported(&'static str),
+}
+
+impl From<FormatError> for EstimateError {
+    fn from(value: FormatError) -> Self {
+        Self::Format(value)
+    }
+}
+
+impl From<std::io::Error> for EstimateError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl std::fmt::Display for EstimateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Format(e) => write!(f, "BPG format error: {e:?}"),
+            Self::Io(e) => write!(f, "I/O error: {e}"),
+            Self::Unsupported(msg) => write!(f, "unsupported container estimate: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for EstimateError {}
+
+pub fn detect_container_kind(data: &[u8]) -> ContainerKind {
+    if data.len() >= 4 && &data[0..4] == b"BPG\xFB" {
+        return ContainerKind::Bpg;
+    }
+    if parse_ftyp_major_brand(data)
+        .is_some_and(is_heif_brand)
+    {
+        return ContainerKind::Heif;
+    }
+    ContainerKind::Unknown
+}
+
+pub fn estimate_container_memory_from_bytes(
+    data: &[u8],
+) -> Result<ContainerMemoryEstimate, EstimateError> {
+    match detect_container_kind(data) {
+        ContainerKind::Bpg => estimate_bpg_container_memory_from_bytes(data),
+        ContainerKind::Heif => Ok(estimate_heif_container_placeholder(data.len() as u64)),
+        ContainerKind::Unknown => Err(EstimateError::Unsupported(
+            "unknown container (expected BPG or HEIF-like ftyp brand)",
+        )),
+    }
+}
+
+pub fn estimate_container_memory_from_path(
+    path: &Path,
+) -> Result<ContainerMemoryEstimate, EstimateError> {
+    let data = std::fs::read(path)?;
+    estimate_container_memory_from_bytes(&data)
+}
+
+pub fn estimate_bpg_container_memory_from_bytes(
+    data: &[u8],
+) -> Result<ContainerMemoryEstimate, EstimateError> {
+    let file = BpgHeader::read(data)?;
+    let width = file.header.width;
+    let height = file.header.height;
+    let bit_depth = file.header.bit_depth_minus_8 + 8;
+    let px = u64::from(width) * u64::from(height);
+
+    let yuv_samples = bpg_plane_samples(width, height, file.header.pixel_format);
+    // Keep this conservative and aligned with the existing decoder-side limit model:
+    // use u16 plane storage regardless of nominal bit depth.
+    let yuv_decode_bytes = yuv_samples * 2;
+    let rgba8_output_bytes = px.saturating_mul(4);
+    let transient_bytes = px / 8;
+    let peak_bytes = yuv_decode_bytes
+        .saturating_add(rgba8_output_bytes)
+        .saturating_add(transient_bytes);
+
+    Ok(ContainerMemoryEstimate {
+        kind: ContainerKind::Bpg,
+        completeness: EstimateCompleteness::Complete,
+        encoded_bytes: data.len() as u64,
+        width: Some(width),
+        height: Some(height),
+        bit_depth: Some(bit_depth),
+        yuv_decode_bytes: Some(yuv_decode_bytes),
+        rgba8_output_bytes: Some(rgba8_output_bytes),
+        transient_bytes: Some(transient_bytes),
+        peak_bytes: Some(peak_bytes),
+    })
+}
+
+fn estimate_heif_container_placeholder(encoded_bytes: u64) -> ContainerMemoryEstimate {
+    ContainerMemoryEstimate {
+        kind: ContainerKind::Heif,
+        completeness: EstimateCompleteness::NeedsContainerMetadata,
+        encoded_bytes,
+        width: None,
+        height: None,
+        bit_depth: None,
+        yuv_decode_bytes: None,
+        rgba8_output_bytes: None,
+        transient_bytes: None,
+        peak_bytes: None,
+    }
+}
+
+fn parse_ftyp_major_brand(data: &[u8]) -> Option<[u8; 4]> {
+    if data.len() < 12 {
+        return None;
+    }
+    if &data[4..8] != b"ftyp" {
+        return None;
+    }
+    Some([data[8], data[9], data[10], data[11]])
+}
+
+fn is_heif_brand(brand: [u8; 4]) -> bool {
+    matches!(
+        &brand,
+        b"heic" | b"heix" | b"hevc" | b"hevx" | b"mif1" | b"msf1" | b"avif" | b"avis"
+    )
+}
+
+fn bpg_plane_samples(width: u32, height: u32, format: PixelFormat) -> u64 {
+    let y = u64::from(width) * u64::from(height);
+    match format {
+        PixelFormat::Gray => y,
+        PixelFormat::Yuv420 | PixelFormat::Yuv420Video => {
+            let cw = u64::from(width.div_ceil(2));
+            let ch = u64::from(height.div_ceil(2));
+            y + 2 * cw * ch
+        }
+        PixelFormat::Yuv422 | PixelFormat::Yuv422Video => {
+            let cw = u64::from(width.div_ceil(2));
+            let ch = u64::from(height);
+            y + 2 * cw * ch
+        }
+        PixelFormat::Yuv444 => y.saturating_mul(3),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PixelLayout {
@@ -99,6 +276,10 @@ pub enum DecodeError {
     Unsupported(&'static str),
     BufferTooSmall { required: usize, actual: usize },
     LimitExceeded(&'static str),
+    /// HEIF/ISOBMFF container parse error.
+    Container(&'static str),
+    /// Invalid data encountered during HEIC decode.
+    InvalidData(&'static str),
 }
 
 impl From<FormatError> for DecodeError {
@@ -130,6 +311,8 @@ impl std::fmt::Display for DecodeError {
                 write!(f, "buffer too small: need {required}, got {actual}")
             }
             Self::LimitExceeded(msg) => write!(f, "limit exceeded: {msg}"),
+            Self::Container(msg) => write!(f, "HEIF container error: {msg}"),
+            Self::InvalidData(msg) => write!(f, "invalid HEIC data: {msg}"),
         }
     }
 }
@@ -289,5 +472,79 @@ fn matrix_coefficients(color_space: ColorSpaceCode) -> Result<u8, DecodeError> {
         ColorSpaceCode::YCbCrBt2020 => Ok(9),
         ColorSpaceCode::Rgb => Ok(0),
         ColorSpaceCode::YCgCo => Ok(8),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_bpg_container() {
+        let mut bytes = Vec::new();
+        let hdr = bpg_format::BpgHeader {
+            pixel_format: bpg_format::PixelFormat::Yuv420,
+            alpha1_flag: false,
+            bit_depth_minus_8: 0,
+            color_space: bpg_format::ColorSpaceCode::YCbCr,
+            alpha2_flag: false,
+            limited_range: false,
+            animation_flag: false,
+            width: 16,
+            height: 8,
+        };
+        hdr.write(&mut bytes, 0, None);
+        bytes.extend_from_slice(&[0, 0, 0, 1]);
+
+        assert_eq!(detect_container_kind(&bytes), ContainerKind::Bpg);
+    }
+
+    #[test]
+    fn detects_heif_container_brand() {
+        let bytes: [u8; 24] = [
+            0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0, 0, 0, 0, b'm',
+            b'i', b'f', b'1', b'h', b'e', b'i', b'c',
+        ];
+        assert_eq!(detect_container_kind(&bytes), ContainerKind::Heif);
+    }
+
+    #[test]
+    fn estimates_bpg_memory_from_header() {
+        let mut bytes = Vec::new();
+        let hdr = bpg_format::BpgHeader {
+            pixel_format: bpg_format::PixelFormat::Yuv420,
+            alpha1_flag: false,
+            bit_depth_minus_8: 0,
+            color_space: bpg_format::ColorSpaceCode::YCbCr,
+            alpha2_flag: false,
+            limited_range: false,
+            animation_flag: false,
+            width: 64,
+            height: 32,
+        };
+        hdr.write(&mut bytes, 0, None);
+        bytes.extend_from_slice(&[0, 1, 2, 3, 4]);
+
+        let est = estimate_container_memory_from_bytes(&bytes).unwrap();
+        assert_eq!(est.kind, ContainerKind::Bpg);
+        assert_eq!(est.completeness, EstimateCompleteness::Complete);
+        assert_eq!(est.width, Some(64));
+        assert_eq!(est.height, Some(32));
+        assert!(est.peak_bytes.unwrap() > 0);
+    }
+
+    #[test]
+    fn heif_estimate_is_placeholder_for_future_item_parsing() {
+        let bytes: [u8; 24] = [
+            0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0, 0, 0, 0, b'm',
+            b'i', b'f', b'1', b'h', b'e', b'i', b'c',
+        ];
+        let est = estimate_container_memory_from_bytes(&bytes).unwrap();
+        assert_eq!(est.kind, ContainerKind::Heif);
+        assert_eq!(
+            est.completeness,
+            EstimateCompleteness::NeedsContainerMetadata
+        );
+        assert_eq!(est.peak_bytes, None);
     }
 }

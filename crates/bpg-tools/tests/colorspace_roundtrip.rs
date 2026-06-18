@@ -2,26 +2,20 @@ use bpg_decode::{DecoderConfig, ImageInfo, PixelLayout};
 use bpg_encode::{encode_still_image, EncoderTuning};
 use bpg_format::{ColorSpaceCode, PixelFormat};
 use bpg_image::{ColorSpace, Image};
-use image::{Rgb, RgbImage};
 use still265::backend::RustStillHevcEncoder;
 use still265::{DeblockMode, Effort, SaoMode};
 
-fn sample_rgb(w: u32, h: u32) -> RgbImage {
-    let mut img = RgbImage::new(w, h);
+fn sample_rgb(w: u32, h: u32) -> Vec<u8> {
+    let mut pixels = vec![0u8; (w * h * 3) as usize];
     for y in 0..h {
         for x in 0..w {
-            img.put_pixel(
-                x,
-                y,
-                Rgb([
-                    (20 + x * 3 + y * 2) as u8,
-                    (16 + x * 2 + y * 3) as u8,
-                    (30 + x + y * 2) as u8,
-                ]),
-            );
+            let base = ((y * w + x) * 3) as usize;
+            pixels[base] = (20 + x * 3 + y * 2) as u8;
+            pixels[base + 1] = (16 + x * 2 + y * 3) as u8;
+            pixels[base + 2] = (30 + x + y * 2) as u8;
         }
     }
-    img
+    pixels
 }
 
 fn psnr_rgb(a: &[u8], b: &[u8]) -> f64 {
@@ -42,7 +36,7 @@ fn psnr_rgb(a: &[u8], b: &[u8]) -> f64 {
 
 fn round_trip_color_space(color_space: ColorSpace, expected_code: ColorSpaceCode) {
     let rgb = sample_rgb(41, 35);
-    let image = Image::from_rgb8(&rgb, color_space, false, 8);
+    let image = Image::from_rgb8(&rgb, 41, 35, color_space, false, 8);
     let backend = RustStillHevcEncoder::new(Effort::Balanced)
         .with_deblock(DeblockMode::On)
         .with_sao(SaoMode::Off);
@@ -67,8 +61,8 @@ fn round_trip_color_space(color_space: ColorSpace, expected_code: ColorSpaceCode
     };
     assert_eq!(frame.matrix_coeffs, expected_matrix);
     assert!(frame.full_range);
-    assert_eq!((out.width, out.height), rgb.dimensions());
-    let psnr = psnr_rgb(rgb.as_raw(), &out.data);
+    assert_eq!((out.width, out.height), (41u32, 35u32));
+    let psnr = psnr_rgb(&rgb, &out.data);
     assert!(
         psnr > 20.0,
         "{color_space:?} RGB round-trip PSNR too low: {psnr:.2}"

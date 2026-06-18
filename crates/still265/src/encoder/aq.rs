@@ -5,9 +5,9 @@
 //! `aq_cu_begin`, `aq_take_cu_qp_delta`, `encode_cu_qp_delta`). The prediction
 //! mirror matches `bpg-hevc-decode::hevc::ctu::decode_quantization_parameters`.
 
-use bpg_bitstream::BitWriter;
 use crate::cabac::CabacEncoder;
 use crate::contexts::{ctx, Contexts};
+use bpg_bitstream::BitWriter;
 
 use super::types::{chroma_qp_from_luma, QG_LOG2};
 
@@ -121,9 +121,22 @@ impl<'a> super::Encoder<'a> {
         let mask = (1u32 << QG_LOG2) - 1;
         let (qx, qy) = ((x0 & !mask) as i32, (y0 & !mask) as i32);
         if (qx, qy) != self.aq.target_qg {
-            let imp = self.analysis.importance_at(qx as u32, qy as u32, QG_LOG2);
-            self.aq.target =
-                (self.aq.slice_qp_y + crate::preanalysis::aq_qp_offset(imp)).clamp(0, 51);
+            let offset = if let Some((perceptual, strength)) = self.best_aq {
+                // `Best` bidirectional variance AQ: steer on the cell's raw
+                // local complexity, around the picture mean (rate-neutral).
+                let var = self.analysis.variance_at(qx as u32, qy as u32);
+                crate::preanalysis::aq_qp_offset_variance(
+                    var,
+                    self.analysis.frame_mean_log2var(),
+                    strength,
+                    perceptual,
+                )
+            } else {
+                // Default tiers: one-directional perceptual importance offset.
+                let imp = self.analysis.importance_at(qx as u32, qy as u32, QG_LOG2);
+                crate::preanalysis::aq_qp_offset(imp)
+            };
+            self.aq.target = (self.aq.slice_qp_y + offset).clamp(0, 51);
             self.aq.target_qg = (qx, qy);
         }
         self.aq.target
@@ -244,7 +257,12 @@ impl<'a> super::Encoder<'a> {
 /// truncated-unary prefix (<=5 bins; ctx `CU_QP_DELTA_ABS` for bin 0, `+1` for
 /// the rest), an EGk(0) bypass suffix when the prefix saturates at 5, then one
 /// bypass sign bin when the magnitude is non-zero.
-pub(super) fn encode_cu_qp_delta(enc: &mut CabacEncoder, w: &mut BitWriter, ctxs: &mut Contexts, delta: i32) {
+pub(super) fn encode_cu_qp_delta(
+    enc: &mut CabacEncoder,
+    w: &mut BitWriter,
+    ctxs: &mut Contexts,
+    delta: i32,
+) {
     let abs = delta.unsigned_abs();
     let prefix = abs.min(5);
     enc.encode_bin(w, (prefix >= 1) as u8, ctxs.get(ctx::CU_QP_DELTA_ABS));

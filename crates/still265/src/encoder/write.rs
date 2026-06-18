@@ -16,7 +16,7 @@ use crate::sao;
 
 use super::aq::encode_cu_qp_delta;
 use super::types::{
-    chroma_pred_mode, decode_second_cbf, has_chroma_tb, CtuBuild, CuNode, Tt,
+    chroma_pred_mode, decode_second_cbf, has_chroma_tb, CtuBuild, CuLeaf, CuNode, NxnInfo, Tt,
     CHROMA_DM_IDX, CTB_LOG2, MAX_INTRA_TT_DEPTH, MAX_TB_LOG2, MIN_TB_LOG2,
 };
 use super::Encoder;
@@ -61,6 +61,79 @@ pub(super) fn write_intra_luma_mode(
             enc.encode_bin_ep(w, ((rem >> b) & 1) as u8);
         }
     }
+}
+
+/// Emit an 8x8 `PartNxN` CU: `part_mode=0`, four `prev_intra_luma_pred_flag`
+/// (all context bins first), then four `mpm_idx`/`rem` (bypass), one chroma
+/// mode, and the forced-split transform tree. Mirrors the decoder's
+/// `decode_coding_unit` `PartNxN` branch exactly.
+#[allow(clippy::too_many_arguments)]
+fn write_cu_nxn(
+    state: &mut Encoder<'_>,
+    enc: &mut CabacEncoder,
+    w: &mut BitWriter,
+    ctxs: &mut Contexts,
+    leaf: &CuLeaf,
+    nxn: &NxnInfo,
+    x0: u32,
+    y0: u32,
+) {
+    enc.encode_bin(w, 0, ctxs.get(ctx::PART_MODE));
+
+    // First pass: four prev_intra_luma_pred_flag (context-coded).
+    let mut in_mpm = [None; 4];
+    for pu in 0..4 {
+        let mode = nxn.luma_modes[pu];
+        let mpm_u8 = [
+            nxn.mpms[pu][0].as_u8(),
+            nxn.mpms[pu][1].as_u8(),
+            nxn.mpms[pu][2].as_u8(),
+        ];
+        let idx = mpm_u8.iter().position(|&m| m == mode);
+        enc.encode_bin(w, idx.is_some() as u8, ctxs.get(ctx::PREV_INTRA_LUMA_PRED_FLAG));
+        in_mpm[pu] = idx;
+    }
+    // Second pass: mpm_idx (1-2 bypass) or rem_intra_luma_pred_mode (5 bypass).
+    for pu in 0..4 {
+        let mode = nxn.luma_modes[pu];
+        match in_mpm[pu] {
+            Some(0) => enc.encode_bin_ep(w, 0),
+            Some(1) => {
+                enc.encode_bin_ep(w, 1);
+                enc.encode_bin_ep(w, 0);
+            }
+            Some(_) => {
+                enc.encode_bin_ep(w, 1);
+                enc.encode_bin_ep(w, 1);
+            }
+            None => {
+                let mut sorted = [
+                    nxn.mpms[pu][0].as_u8(),
+                    nxn.mpms[pu][1].as_u8(),
+                    nxn.mpms[pu][2].as_u8(),
+                ];
+                sorted.sort_unstable();
+                let mut rem = mode as i32;
+                for &v in sorted.iter().rev() {
+                    if rem >= v as i32 {
+                        rem -= 1;
+                    }
+                }
+                for b in (0..5).rev() {
+                    enc.encode_bin_ep(w, ((rem >> b) & 1) as u8);
+                }
+            }
+        }
+    }
+
+    if state.cat != 0 {
+        write_intra_chroma_mode(enc, w, ctxs, leaf.chroma_mode_idx);
+    }
+    let cat = state.cat;
+    if state.aq.active {
+        state.aq_cu_begin(x0, y0);
+    }
+    write_tt(state, enc, w, ctxs, &leaf.tt, x0, y0, cat, true, true, true);
 }
 
 /// Emit `intra_chroma_pred_mode` for H.265 Table 8-2 mode indexes:
@@ -116,6 +189,7 @@ pub(super) fn write_tt(
         enc.encode_bin(w, is_split as u8, ctxs.get(ci));
     }
 
+    let sdh = state.sign_data_hiding;
     let decode_chroma_cbf = cat != 0 && (log2_size > 2 || cat == 3);
     let (cbf_cb, cbf_cr) = (node.cbf_cb(), node.cbf_cr());
     let second_cbf = decode_second_cbf(cat, log2_size, is_split);
@@ -147,18 +221,27 @@ pub(super) fn write_tt(
                 let kx = x0 + (i as u32 & 1) * half;
                 let ky = y0 + (i as u32 >> 1) * half;
                 write_tt(
-                    state, enc, w, ctxs, kid, kx, ky, cat,
-                    intra_split_flag, cbf_cb, cbf_cr,
+                    state,
+                    enc,
+                    w,
+                    ctxs,
+                    kid,
+                    kx,
+                    ky,
+                    cat,
+                    intra_split_flag,
+                    cbf_cb,
+                    cbf_cr,
                 );
             }
             if let Some(c) = parent_chroma {
                 if c.cb.cbf {
                     let scan = get_scan_order(c.log2_size, c.chroma_mode, 1, cat);
-                    encode_residual(enc, w, ctxs, &c.cb.levels, c.log2_size, 1, scan, false);
+                    encode_residual(enc, w, ctxs, &c.cb.levels, c.log2_size, 1, scan, sdh);
                 }
                 if c.cr.cbf {
                     let scan = get_scan_order(c.log2_size, c.chroma_mode, 2, cat);
-                    encode_residual(enc, w, ctxs, &c.cr.levels, c.log2_size, 2, scan, false);
+                    encode_residual(enc, w, ctxs, &c.cr.levels, c.log2_size, 2, scan, sdh);
                 }
             }
         }
@@ -195,26 +278,26 @@ pub(super) fn write_tt(
 
             if l.luma.cbf {
                 let scan = get_scan_order(l.log2_size, l.luma_mode, 0, cat);
-                encode_residual(enc, w, ctxs, &l.luma.levels, l.log2_size, 0, scan, false);
+                encode_residual(enc, w, ctxs, &l.luma.levels, l.log2_size, 0, scan, sdh);
             }
             if has_chroma_tb(cat, l.log2_size) {
                 let clog2 = l.chroma_log2;
                 let cmode = chroma_pred_mode(cat, l.chroma_mode);
                 if eff_cbf_cb {
                     let scan = get_scan_order(clog2, cmode, 1, cat);
-                    encode_residual(enc, w, ctxs, &l.cb.levels, clog2, 1, scan, false);
+                    encode_residual(enc, w, ctxs, &l.cb.levels, clog2, 1, scan, sdh);
                 }
                 if eff_cbf_cb1 {
                     let scan = get_scan_order(clog2, cmode, 1, cat);
-                    encode_residual(enc, w, ctxs, &l.cb1.levels, clog2, 1, scan, false);
+                    encode_residual(enc, w, ctxs, &l.cb1.levels, clog2, 1, scan, sdh);
                 }
                 if eff_cbf_cr {
                     let scan = get_scan_order(clog2, cmode, 2, cat);
-                    encode_residual(enc, w, ctxs, &l.cr.levels, clog2, 2, scan, false);
+                    encode_residual(enc, w, ctxs, &l.cr.levels, clog2, 2, scan, sdh);
                 }
                 if eff_cbf_cr1 {
                     let scan = get_scan_order(clog2, cmode, 2, cat);
-                    encode_residual(enc, w, ctxs, &l.cr1.levels, clog2, 2, scan, false);
+                    encode_residual(enc, w, ctxs, &l.cr1.levels, clog2, 2, scan, sdh);
                 }
             }
         }
@@ -257,18 +340,62 @@ pub(super) fn write_cu(
             let y1 = y0 + half;
             let mut kids = kids.iter();
 
-            write_cu(state, enc, w, ctxs, kids.next().unwrap(), x0, y0, log2_cb_size - 1, ct_depth + 1);
+            write_cu(
+                state,
+                enc,
+                w,
+                ctxs,
+                kids.next().unwrap(),
+                x0,
+                y0,
+                log2_cb_size - 1,
+                ct_depth + 1,
+            );
             if x1 < state.display_width {
-                write_cu(state, enc, w, ctxs, kids.next().unwrap(), x1, y0, log2_cb_size - 1, ct_depth + 1);
+                write_cu(
+                    state,
+                    enc,
+                    w,
+                    ctxs,
+                    kids.next().unwrap(),
+                    x1,
+                    y0,
+                    log2_cb_size - 1,
+                    ct_depth + 1,
+                );
             }
             if y1 < state.display_height {
-                write_cu(state, enc, w, ctxs, kids.next().unwrap(), x0, y1, log2_cb_size - 1, ct_depth + 1);
+                write_cu(
+                    state,
+                    enc,
+                    w,
+                    ctxs,
+                    kids.next().unwrap(),
+                    x0,
+                    y1,
+                    log2_cb_size - 1,
+                    ct_depth + 1,
+                );
             }
             if x1 < state.display_width && y1 < state.display_height {
-                write_cu(state, enc, w, ctxs, kids.next().unwrap(), x1, y1, log2_cb_size - 1, ct_depth + 1);
+                write_cu(
+                    state,
+                    enc,
+                    w,
+                    ctxs,
+                    kids.next().unwrap(),
+                    x1,
+                    y1,
+                    log2_cb_size - 1,
+                    ct_depth + 1,
+                );
             }
         }
         CuNode::Leaf(leaf) => {
+            if let Some(nxn) = &leaf.nxn {
+                write_cu_nxn(state, enc, w, ctxs, leaf, nxn, x0, y0);
+                return;
+            }
             if log2_cb_size == 3 {
                 enc.encode_bin(w, 1, ctxs.get(ctx::PART_MODE));
             }
@@ -280,7 +407,9 @@ pub(super) fn write_cu(
             if state.aq.active {
                 state.aq_cu_begin(x0, y0);
             }
-            write_tt(state, enc, w, ctxs, &leaf.tt, x0, y0, cat, false, true, true);
+            write_tt(
+                state, enc, w, ctxs, &leaf.tt, x0, y0, cat, false, true, true,
+            );
         }
     }
 }
@@ -296,7 +425,7 @@ pub(super) fn write_coding_quadtree(
     y0: u32,
     log2_cb_size: u8,
     ct_depth: u8,
-) {
+) -> CuNode {
     let cu = state.build_cu(x0, y0, log2_cb_size, ct_depth, ctxs);
     state.record_analysis_cache_cu_node(&cu, x0, y0, log2_cb_size, ct_depth);
     if state.deblock {
@@ -312,6 +441,7 @@ pub(super) fn write_coding_quadtree(
         );
     }
     write_cu(state, enc, w, ctxs, &cu, x0, y0, log2_cb_size, ct_depth);
+    cu
 }
 
 /// Mark the deblocking-filter edge flags (`DecodedFrame::mark_tu_boundary`)
@@ -333,15 +463,47 @@ pub(super) fn mark_cu_deblock(
             let mut kids = kids.iter();
             let log2_kid = log2_cb_size - 1;
 
-            mark_cu_deblock(frame, kids.next().unwrap(), x0, y0, log2_kid, display_width, display_height);
+            mark_cu_deblock(
+                frame,
+                kids.next().unwrap(),
+                x0,
+                y0,
+                log2_kid,
+                display_width,
+                display_height,
+            );
             if x1 < display_width {
-                mark_cu_deblock(frame, kids.next().unwrap(), x1, y0, log2_kid, display_width, display_height);
+                mark_cu_deblock(
+                    frame,
+                    kids.next().unwrap(),
+                    x1,
+                    y0,
+                    log2_kid,
+                    display_width,
+                    display_height,
+                );
             }
             if y1 < display_height {
-                mark_cu_deblock(frame, kids.next().unwrap(), x0, y1, log2_kid, display_width, display_height);
+                mark_cu_deblock(
+                    frame,
+                    kids.next().unwrap(),
+                    x0,
+                    y1,
+                    log2_kid,
+                    display_width,
+                    display_height,
+                );
             }
             if x1 < display_width && y1 < display_height {
-                mark_cu_deblock(frame, kids.next().unwrap(), x1, y1, log2_kid, display_width, display_height);
+                mark_cu_deblock(
+                    frame,
+                    kids.next().unwrap(),
+                    x1,
+                    y1,
+                    log2_kid,
+                    display_width,
+                    display_height,
+                );
             }
         }
         CuNode::Leaf(leaf) => mark_tt_deblock(frame, &leaf.tt, x0, y0, log2_cb_size),
@@ -350,7 +512,13 @@ pub(super) fn mark_cu_deblock(
 
 /// Mark TU-leaf boundaries within a transform tree, mirroring
 /// `build_tt_split`'s kid geometry (4 equal quadrants).
-pub(super) fn mark_tt_deblock(frame: &mut DecodedFrame, node: &Tt, x0: u32, y0: u32, log2_size: u8) {
+pub(super) fn mark_tt_deblock(
+    frame: &mut DecodedFrame,
+    node: &Tt,
+    x0: u32,
+    y0: u32,
+    log2_size: u8,
+) {
     match node {
         Tt::Split { kids, .. } => {
             let half = 1u32 << (log2_size - 1);
@@ -379,7 +547,15 @@ pub(super) fn parallel_thread_count() -> usize {
 
 /// `Placebo`-tier encode: CTU-wavefront-**parallel** analysis followed by a serial
 /// CABAC write.
-pub(super) fn encode_slice_data_parallel(state: &mut Encoder<'_>, slice_qp_y: i32) -> Vec<u8> {
+/// Build every CTU's coding-tree (CTU-wavefront-parallel analysis), reconstruct
+/// into `state.frame`, mark deblock edges, and return the per-CTU `CuNode`
+/// trees in raster order. The serial CABAC write is a separate pass
+/// ([`write_slice_from_trees`]) so SAO can be decided on the deblocked
+/// reconstruction *between* build and write (no second RDO pass).
+pub(super) fn build_slice_trees_parallel(
+    state: &mut Encoder<'_>,
+    slice_qp_y: i32,
+) -> Vec<Option<CuNode>> {
     let ctb = 1u32 << CTB_LOG2;
     let ctbs_x = state.display_width.div_ceil(ctb);
     let ctbs_y = state.display_height.div_ceil(ctb);
@@ -447,7 +623,14 @@ pub(super) fn encode_slice_data_parallel(state: &mut Encoder<'_>, slice_qp_y: i3
                         let fsnap = worker.snapshot_frame_region(x0, y0, CTB_LOG2);
                         let msnap = worker.snapshot_mode_region(x0, y0, CTB_LOG2);
                         let csnap = worker.snapshot_ct_depth_region(x0, y0, CTB_LOG2);
-                        out.push(CtuBuild { cx, cy, cu, fsnap, msnap, csnap });
+                        out.push(CtuBuild {
+                            cx,
+                            cy,
+                            cu,
+                            fsnap,
+                            msnap,
+                            csnap,
+                        });
                     }
                     out
                 }));
@@ -513,18 +696,59 @@ pub(super) fn encode_slice_data_parallel(state: &mut Encoder<'_>, slice_qp_y: i3
         }
     }
 
+    trees
+}
+
+/// Serial CABAC write of pre-built CTU trees, optionally prefixing each CTU
+/// with `sao()` syntax. This is a pure bitstream pass: it reads the cached
+/// `CuNode` coefficients/modes and evolves the CABAC contexts but does **not**
+/// touch `state.frame`, so the caller may deblock + decide SAO on the
+/// reconstruction before calling this.
+pub(super) fn write_slice_from_trees(
+    state: &mut Encoder<'_>,
+    trees: &[Option<CuNode>],
+    sao_map: Option<&SaoMap>,
+    slice_qp_y: i32,
+) -> Vec<u8> {
+    let ctb = 1u32 << CTB_LOG2;
+    let ctbs_x = state.display_width.div_ceil(ctb);
+    let ctbs_y = state.display_height.div_ceil(ctb);
+
     let mut w = BitWriter::new();
     let mut enc = CabacEncoder::new();
     let mut ctxs = Contexts::new(slice_qp_y);
-    let total = n_ctus as u32;
+    let total = (ctbs_x * ctbs_y) as u32;
     let mut done = 0u32;
     for cy in 0..ctbs_y {
         for cx in 0..ctbs_x {
             state.stats.ctu_count += 1;
+            if let Some(sao_map) = sao_map {
+                sao::write_sao(
+                    &mut enc,
+                    &mut w,
+                    &mut ctxs,
+                    sao_map,
+                    cx,
+                    cy,
+                    true,
+                    state.cat != 0,
+                    state.bit_depth,
+                );
+            }
             let cu = trees[(cy * ctbs_x + cx) as usize]
                 .as_ref()
                 .expect("every CTU built");
-            write_cu(state, &mut enc, &mut w, &mut ctxs, cu, cx * ctb, cy * ctb, CTB_LOG2, 0);
+            write_cu(
+                state,
+                &mut enc,
+                &mut w,
+                &mut ctxs,
+                cu,
+                cx * ctb,
+                cy * ctb,
+                CTB_LOG2,
+                0,
+            );
             done += 1;
             enc.encode_bin_trm(&mut w, (done == total) as u8);
         }
@@ -535,11 +759,28 @@ pub(super) fn encode_slice_data_parallel(state: &mut Encoder<'_>, slice_qp_y: i3
     w.into_bytes()
 }
 
+pub(super) fn encode_slice_data_parallel(state: &mut Encoder<'_>, slice_qp_y: i32) -> Vec<u8> {
+    let trees = build_slice_trees_parallel(state, slice_qp_y);
+    write_slice_from_trees(state, &trees, None, slice_qp_y)
+}
+
 /// Encode `slice_segment_data()` for every CTU, optionally with SAO syntax.
 pub(super) fn encode_slice_data(
     state: &mut Encoder<'_>,
     sao_map: Option<&SaoMap>,
     slice_qp_y: i32,
+) -> Vec<u8> {
+    encode_slice_data_capture(state, sao_map, slice_qp_y, None)
+}
+
+/// Serial (interleaved build+write) slice encode. When `capture` is `Some`, the
+/// per-CTU `CuNode` trees are stored (raster order) so the SAO path can replay
+/// them with SAO syntax instead of re-running RDO — see [`build_slice_trees_serial`].
+pub(super) fn encode_slice_data_capture(
+    state: &mut Encoder<'_>,
+    sao_map: Option<&SaoMap>,
+    slice_qp_y: i32,
+    mut capture: Option<&mut Vec<Option<CuNode>>>,
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
     let mut enc = CabacEncoder::new();
@@ -563,11 +804,22 @@ pub(super) fn encode_slice_data(
 
             if let Some(sao_map) = sao_map {
                 sao::write_sao(
-                    &mut enc, &mut w, &mut ctxs, sao_map, cx, cy, true, state.cat != 0, state.bit_depth,
+                    &mut enc,
+                    &mut w,
+                    &mut ctxs,
+                    sao_map,
+                    cx,
+                    cy,
+                    true,
+                    state.cat != 0,
+                    state.bit_depth,
                 );
             }
 
-            write_coding_quadtree(state, &mut enc, &mut w, &mut ctxs, x0, y0, CTB_LOG2, 0);
+            let cu = write_coding_quadtree(state, &mut enc, &mut w, &mut ctxs, x0, y0, CTB_LOG2, 0);
+            if let Some(trees) = capture.as_deref_mut() {
+                trees[(cy * ctbs_x + cx) as usize] = Some(cu);
+            }
 
             done += 1;
             enc.encode_bin_trm(&mut w, (done == total) as u8);
@@ -578,4 +830,20 @@ pub(super) fn encode_slice_data(
     w.write_bit(1);
     w.byte_align();
     w.into_bytes()
+}
+
+/// Serial build pass that captures every CTU's `CuNode` tree (and leaves the
+/// reconstruction + deblock marks in `state.frame`), for the SAO replay path on
+/// non-parallel tiers. The throwaway bitstream it writes is only there to evolve
+/// the running CABAC context that serial RD pricing depends on.
+pub(super) fn build_slice_trees_serial(
+    state: &mut Encoder<'_>,
+    slice_qp_y: i32,
+) -> Vec<Option<CuNode>> {
+    let ctb = 1u32 << CTB_LOG2;
+    let ctbs_x = state.display_width.div_ceil(ctb);
+    let ctbs_y = state.display_height.div_ceil(ctb);
+    let mut trees: Vec<Option<CuNode>> = (0..(ctbs_x * ctbs_y) as usize).map(|_| None).collect();
+    let _ = encode_slice_data_capture(state, None, slice_qp_y, Some(&mut trees));
+    trees
 }
