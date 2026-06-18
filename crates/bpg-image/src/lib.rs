@@ -58,18 +58,27 @@ pub struct Image {
 }
 
 impl Image {
-    /// Build a monochrome image from 8-bit luma samples, optionally scaling up
-    /// to a higher output bit depth.
+    /// Build a monochrome image from 8-bit luma samples (`width * height` bytes,
+    /// row-major), optionally scaling up to a higher output `bit_depth`.
     pub fn from_luma8(
-        gray: &image::GrayImage,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
         color_space: ColorSpace,
         limited_range: bool,
         bit_depth: u8,
     ) -> Self {
+        assert!(
+            matches!(
+                color_space,
+                ColorSpace::YCbCr | ColorSpace::YCbCrBt709 | ColorSpace::YCbCrBt2020
+            ),
+            "gray BPG images use a YCbCr-family color space"
+        );
         Self::from_luma_pixels(
-            gray.width(),
-            gray.height(),
-            gray.pixels().map(|px| px[0] as u16),
+            width,
+            height,
+            pixels.iter().map(|&v| v as u16),
             8,
             color_space,
             limited_range,
@@ -77,18 +86,28 @@ impl Image {
         )
     }
 
-    /// Build a monochrome image from 16-bit luma samples, converting to the
-    /// requested output bit depth.
+    /// Build a monochrome image from 16-bit luma samples (`width * height` u16
+    /// values, row-major, native endian), converting to the requested output
+    /// `bit_depth`.
     pub fn from_luma16(
-        gray: &image::ImageBuffer<image::Luma<u16>, Vec<u16>>,
+        pixels: &[u16],
+        width: u32,
+        height: u32,
         color_space: ColorSpace,
         limited_range: bool,
         bit_depth: u8,
     ) -> Self {
+        assert!(
+            matches!(
+                color_space,
+                ColorSpace::YCbCr | ColorSpace::YCbCrBt709 | ColorSpace::YCbCrBt2020
+            ),
+            "gray BPG images use a YCbCr-family color space"
+        );
         Self::from_luma_pixels(
-            gray.width(),
-            gray.height(),
-            gray.pixels().map(|px| px[0]),
+            width,
+            height,
+            pixels.iter().copied(),
             16,
             color_space,
             limited_range,
@@ -105,13 +124,6 @@ impl Image {
         limited_range: bool,
         bit_depth: u8,
     ) -> Self {
-        assert!(
-            matches!(
-                color_space,
-                ColorSpace::YCbCr | ColorSpace::YCbCrBt709 | ColorSpace::YCbCrBt2020
-            ),
-            "gray BPG images use a YCbCr-family color space"
-        );
         let in_max = (1u32 << in_bit_depth) - 1;
         let out_max = (1u32 << bit_depth) - 1;
         let y_data = pixels
@@ -135,20 +147,22 @@ impl Image {
         }
     }
 
-    /// Convert an 8-bit RGB image to a 4:4:4 YCbCr `Image`, optionally
-    /// scaling up to a higher `bit_depth` (10/12-bit) during color
-    /// conversion.
+    /// Convert an 8-bit RGB image (`width * height * 3` bytes, row-major, R G B
+    /// per pixel) to a 4:4:4 YCbCr `Image`, optionally scaling up to a higher
+    /// `bit_depth` during color conversion.
     pub fn from_rgb8(
-        rgb: &image::RgbImage,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
         color_space: ColorSpace,
         limited_range: bool,
         bit_depth: u8,
     ) -> Self {
         let cvt = ColorConvertState::new(8, bit_depth as u32, color_space, limited_range);
         Self::from_rgb_pixels(
-            rgb.width(),
-            rgb.height(),
-            rgb.pixels().map(|px| (px[0], px[1], px[2])),
+            width,
+            height,
+            pixels.chunks_exact(3).map(|p| (p[0], p[1], p[2])),
             &cvt,
             color_space,
             limited_range,
@@ -156,19 +170,22 @@ impl Image {
         )
     }
 
-    /// Convert a 16-bit RGB image (e.g. a 16-bit PNG) to a 4:4:4 YCbCr
-    /// `Image`, converting to the requested `bit_depth` (10/12-bit).
+    /// Convert a 16-bit RGB image (`width * height * 3` u16 values, row-major,
+    /// native endian) to a 4:4:4 YCbCr `Image`, converting to the requested
+    /// output `bit_depth`.
     pub fn from_rgb16(
-        rgb: &image::ImageBuffer<image::Rgb<u16>, Vec<u16>>,
+        pixels: &[u16],
+        width: u32,
+        height: u32,
         color_space: ColorSpace,
         limited_range: bool,
         bit_depth: u8,
     ) -> Self {
         let cvt = ColorConvertState::new(16, bit_depth as u32, color_space, limited_range);
         Self::from_rgb_pixels(
-            rgb.width(),
-            rgb.height(),
-            rgb.pixels().map(|px| (px[0], px[1], px[2])),
+            width,
+            height,
+            pixels.chunks_exact(3).map(|p| (p[0], p[1], p[2])),
             &cvt,
             color_space,
             limited_range,
@@ -211,6 +228,113 @@ impl Image {
             color_space,
             limited_range,
             planes: vec![plane(y_data), plane(cb_data), plane(cr_data)],
+            has_alpha: false,
+        }
+    }
+
+    /// Build an `Image` directly from pre-separated 8-bit YCbCr planes.
+    ///
+    /// This bypasses RGB→YCbCr conversion entirely — use this when input is
+    /// already decoded YCbCr (e.g. from HEIC/HEVC, H.264, or any YCbCr source).
+    ///
+    /// Plane layouts by `chroma`:
+    /// - `Gray`: only `y` is used; `cb`/`cr` must be empty.
+    /// - `Yuv420`: `cb`/`cr` are `ceil(width/2) × ceil(height/2)`.
+    /// - `Yuv422`: `cb`/`cr` are `ceil(width/2) × height`.
+    /// - `Yuv444`: all planes are `width × height`.
+    ///
+    /// Samples are upscaled from 8-bit to `out_bit_depth` (pass 8 for no scaling).
+    pub fn from_ycbcr_planes_u8(
+        y: &[u8],
+        cb: &[u8],
+        cr: &[u8],
+        width: u32,
+        height: u32,
+        chroma: ChromaFormat,
+        color_space: ColorSpace,
+        limited_range: bool,
+        out_bit_depth: u8,
+    ) -> Self {
+        let out_max = (1u32 << out_bit_depth) - 1;
+        let scale = move |v: u8| -> u16 {
+            if out_bit_depth == 8 {
+                v as u16
+            } else {
+                ((v as u32 * out_max + 127) / 255) as u16
+            }
+        };
+        let make_plane = |data: &[u8], pw: u32, ph: u32| Plane {
+            data: data.iter().map(|&v| scale(v)).collect(),
+            width: pw,
+            height: ph,
+            stride: pw as usize,
+        };
+        let y_plane = make_plane(y, width, height);
+        let planes = if chroma == ChromaFormat::Gray {
+            vec![y_plane]
+        } else {
+            let (cw, ch) = chroma_plane_dims(width, height, chroma);
+            vec![y_plane, make_plane(cb, cw, ch), make_plane(cr, cw, ch)]
+        };
+        Image {
+            width,
+            height,
+            bit_depth: out_bit_depth,
+            chroma_format: chroma,
+            color_space,
+            limited_range,
+            planes,
+            has_alpha: false,
+        }
+    }
+
+    /// Build an `Image` directly from pre-separated 16-bit YCbCr planes
+    /// (`in_bit_depth`-wide samples, native endian).
+    ///
+    /// See [`from_ycbcr_planes_u8`] for plane layout details.
+    /// Samples are rescaled from `in_bit_depth` to `out_bit_depth`.
+    pub fn from_ycbcr_planes_u16(
+        y: &[u16],
+        cb: &[u16],
+        cr: &[u16],
+        in_bit_depth: u8,
+        width: u32,
+        height: u32,
+        chroma: ChromaFormat,
+        color_space: ColorSpace,
+        limited_range: bool,
+        out_bit_depth: u8,
+    ) -> Self {
+        let in_max = (1u32 << in_bit_depth) - 1;
+        let out_max = (1u32 << out_bit_depth) - 1;
+        let scale = move |v: u16| -> u16 {
+            if in_bit_depth == out_bit_depth {
+                v
+            } else {
+                ((v as u32 * out_max + in_max / 2) / in_max) as u16
+            }
+        };
+        let make_plane = |data: &[u16], pw: u32, ph: u32| Plane {
+            data: data.iter().map(|&v| scale(v)).collect(),
+            width: pw,
+            height: ph,
+            stride: pw as usize,
+        };
+        let y_plane = make_plane(y, width, height);
+        let planes = if chroma == ChromaFormat::Gray {
+            vec![y_plane]
+        } else {
+            let (cw, ch) = chroma_plane_dims(width, height, chroma);
+            vec![y_plane, make_plane(cb, cw, ch), make_plane(cr, cw, ch)]
+        };
+        Image {
+            width,
+            height,
+            bit_depth: out_bit_depth,
+            chroma_format: chroma,
+            color_space,
+            limited_range,
+            planes,
             has_alpha: false,
         }
     }
@@ -283,19 +407,30 @@ impl Image {
     }
 }
 
+/// Chroma plane dimensions for a given luma size and subsampling format.
+fn chroma_plane_dims(width: u32, height: u32, chroma: ChromaFormat) -> (u32, u32) {
+    match chroma {
+        ChromaFormat::Gray | ChromaFormat::Yuv444 => (width, height),
+        ChromaFormat::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
+        ChromaFormat::Yuv422 => (width.div_ceil(2), height),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn from_rgb8_produces_444_planes() {
-        let mut rgb = image::RgbImage::new(2, 2);
-        rgb.put_pixel(0, 0, image::Rgb([255, 0, 0]));
-        rgb.put_pixel(1, 0, image::Rgb([0, 255, 0]));
-        rgb.put_pixel(0, 1, image::Rgb([0, 0, 255]));
-        rgb.put_pixel(1, 1, image::Rgb([255, 255, 255]));
+        // 2×2 image: red, green, blue, white
+        let pixels: &[u8] = &[
+            255, 0, 0, // (0,0): red
+            0, 255, 0, // (1,0): green
+            0, 0, 255, // (0,1): blue
+            255, 255, 255, // (1,1): white
+        ];
 
-        let img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false, 8);
+        let img = Image::from_rgb8(pixels, 2, 2, ColorSpace::YCbCr, false, 8);
         assert_eq!(img.chroma_format, ChromaFormat::Yuv444);
         assert_eq!(img.planes.len(), 3);
         for p in &img.planes {
@@ -307,11 +442,8 @@ mod tests {
 
     #[test]
     fn pad_to_cb_size_updates_chroma_dims_for_420() {
-        let mut rgb = image::RgbImage::new(3, 3);
-        for p in rgb.pixels_mut() {
-            *p = image::Rgb([100, 100, 100]);
-        }
-        let mut img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false, 8);
+        let pixels = vec![100u8; 3 * 3 * 3]; // 3×3 RGB image
+        let mut img = Image::from_rgb8(&pixels, 3, 3, ColorSpace::YCbCr, false, 8);
         img.subsample_to_420(1);
         assert_eq!((img.planes[1].width, img.planes[1].height), (2, 2));
 
@@ -325,11 +457,8 @@ mod tests {
 
     #[test]
     fn subsample_to_422_halves_chroma_width_only() {
-        let mut rgb = image::RgbImage::new(3, 3);
-        for p in rgb.pixels_mut() {
-            *p = image::Rgb([100, 100, 100]);
-        }
-        let mut img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false, 8);
+        let pixels = vec![100u8; 3 * 3 * 3]; // 3×3 RGB image
+        let mut img = Image::from_rgb8(&pixels, 3, 3, ColorSpace::YCbCr, false, 8);
         img.subsample_to_422(1);
         assert_eq!(img.chroma_format, ChromaFormat::Yuv422);
         // (3+1)/2 = 2 wide, height unchanged at 3
@@ -339,11 +468,8 @@ mod tests {
 
     #[test]
     fn pad_to_cb_size_updates_chroma_dims_for_422() {
-        let mut rgb = image::RgbImage::new(3, 3);
-        for p in rgb.pixels_mut() {
-            *p = image::Rgb([100, 100, 100]);
-        }
-        let mut img = Image::from_rgb8(&rgb, ColorSpace::YCbCr, false, 8);
+        let pixels = vec![100u8; 3 * 3 * 3]; // 3×3 RGB image
+        let mut img = Image::from_rgb8(&pixels, 3, 3, ColorSpace::YCbCr, false, 8);
         img.subsample_to_422(1);
 
         img.pad_to_cb_size(8);
@@ -352,5 +478,42 @@ mod tests {
         // chroma is half-resolution horizontally only: (8>>1, 8)
         assert_eq!((img.planes[1].width, img.planes[1].height), (4, 8));
         assert_eq!((img.planes[2].width, img.planes[2].height), (4, 8));
+    }
+
+    #[test]
+    fn from_ycbcr_planes_u8_420_roundtrip() {
+        // Y=128 plane (gray), Cb/Cr=128 (neutral chroma) — should stay near-neutral
+        let w = 4u32;
+        let h = 4u32;
+        let y = vec![128u8; (w * h) as usize];
+        let cb = vec![128u8; (w.div_ceil(2) * h.div_ceil(2)) as usize];
+        let cr = vec![128u8; (w.div_ceil(2) * h.div_ceil(2)) as usize];
+        let img = Image::from_ycbcr_planes_u8(
+            &y, &cb, &cr, w, h,
+            ChromaFormat::Yuv420, ColorSpace::YCbCr, false, 8,
+        );
+        assert_eq!(img.chroma_format, ChromaFormat::Yuv420);
+        assert_eq!(img.planes[0].data[0], 128);
+        assert_eq!(img.planes[1].data[0], 128);
+        assert_eq!((img.planes[1].width, img.planes[1].height), (2, 2));
+    }
+
+    #[test]
+    fn from_ycbcr_planes_u16_scales_bit_depth() {
+        let w = 2u32;
+        let h = 2u32;
+        // 10-bit max Y (1023)
+        let y = vec![1023u16; (w * h) as usize];
+        let cb = vec![512u16; (w * h) as usize];
+        let cr = vec![512u16; (w * h) as usize];
+        let img = Image::from_ycbcr_planes_u16(
+            &y, &cb, &cr, 10,
+            w, h,
+            ChromaFormat::Yuv444, ColorSpace::YCbCr, false, 8,
+        );
+        // 1023/1023 * 255 = 255
+        assert_eq!(img.planes[0].data[0], 255);
+        // 512/1023 * 255 ≈ 127
+        assert!((img.planes[1].data[0] as i32 - 127).abs() <= 1);
     }
 }
