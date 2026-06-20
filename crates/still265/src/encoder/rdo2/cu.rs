@@ -408,6 +408,7 @@ impl<'a> super::super::Encoder<'a> {
         log2_cb_size: u8,
         ct_depth: u8,
         ctxs: &Contexts,
+        keep_winner_committed: bool,
     ) -> (TrialResult<CuPlan>, CuNode) {
         let cb_size = 1u32 << log2_cb_size;
         let fully_inside =
@@ -466,7 +467,16 @@ impl<'a> super::super::Encoder<'a> {
             let split = CuNode::Split {
                 kids: self.build_cu_kids(x0, y0, log2_cb_size, ct_depth, ctxs),
             };
-            let split_tu_depth = self.snapshot_tu_depth_region(x0, y0, log2_cb_size);
+            let split_state = keep_winner_committed.then(|| {
+                (
+                    self.snapshot_frame_region(x0, y0, log2_cb_size),
+                    self.snapshot_mode_region(x0, y0, log2_cb_size),
+                    self.snapshot_ct_depth_region(x0, y0, log2_cb_size),
+                    self.snapshot_tu_depth_region(x0, y0, log2_cb_size),
+                )
+            });
+            let split_tu_depth = (!keep_winner_committed)
+                .then(|| self.snapshot_tu_depth_region(x0, y0, log2_cb_size));
             let split_exact = (self.stats.residual_bit_estimates - split_e0) as u32;
             let split_distortion = self.distortion_cu_node(&split, x0, y0, log2_cb_size);
             let split_bits =
@@ -505,7 +515,16 @@ impl<'a> super::super::Encoder<'a> {
             );
 
             if split_cost < leaf_cost {
-                self.restore_tu_depth_region(&split_tu_depth);
+                if let Some((split_frame, split_mode_map, split_ct_depth_map, split_tu_depth)) =
+                    split_state.as_ref()
+                {
+                    self.restore_frame_region(split_frame);
+                    self.restore_mode_region(split_mode_map);
+                    self.restore_ct_depth_region(split_ct_depth_map);
+                    self.restore_tu_depth_region(split_tu_depth);
+                } else if let Some(split_tu_depth) = split_tu_depth.as_ref() {
+                    self.restore_tu_depth_region(split_tu_depth);
+                }
                 self.record_cu_winner(x0, y0, log2_cb_size, true);
                 let plan = Self::cu_to_plan(&split);
                 return (
@@ -568,10 +587,14 @@ impl<'a> super::super::Encoder<'a> {
         }
 
         let leaf_cost = self.rd_cost(leaf_distortion, leaf_bits);
-        let leaf_frame = self.snapshot_frame_region(x0, y0, log2_cb_size);
-        let leaf_mode_map = self.snapshot_mode_region(x0, y0, log2_cb_size);
-        let leaf_ct_depth_map = self.snapshot_ct_depth_region(x0, y0, log2_cb_size);
-        let leaf_tu_depth = self.snapshot_tu_depth_region(x0, y0, log2_cb_size);
+        let leaf_state = keep_winner_committed.then(|| {
+            (
+                self.snapshot_frame_region(x0, y0, log2_cb_size),
+                self.snapshot_mode_region(x0, y0, log2_cb_size),
+                self.snapshot_ct_depth_region(x0, y0, log2_cb_size),
+                self.snapshot_tu_depth_region(x0, y0, log2_cb_size),
+            )
+        });
 
         self.restore_frame_region(&base_frame);
         self.restore_mode_region(&base_mode_map);
@@ -616,10 +639,14 @@ impl<'a> super::super::Encoder<'a> {
                 partial_split_cost,
                 (self.stats.residual_bit_estimates - split_e0) as u32,
             );
-            self.restore_frame_region(&leaf_frame);
-            self.restore_mode_region(&leaf_mode_map);
-            self.restore_ct_depth_region(&leaf_ct_depth_map);
-            self.restore_tu_depth_region(&leaf_tu_depth);
+            if let Some((leaf_frame, leaf_mode_map, leaf_ct_depth_map, leaf_tu_depth)) =
+                leaf_state.as_ref()
+            {
+                self.restore_frame_region(leaf_frame);
+                self.restore_mode_region(leaf_mode_map);
+                self.restore_ct_depth_region(leaf_ct_depth_map);
+                self.restore_tu_depth_region(leaf_tu_depth);
+            }
             let node = Self::cu_leaf_node(leaf, DecisionConfidence::Clear);
             self.record_cu_winner(x0, y0, log2_cb_size, false);
             let plan = Self::cu_to_plan(&node);
@@ -679,10 +706,14 @@ impl<'a> super::super::Encoder<'a> {
                 node,
             )
         } else {
-            self.restore_frame_region(&leaf_frame);
-            self.restore_mode_region(&leaf_mode_map);
-            self.restore_ct_depth_region(&leaf_ct_depth_map);
-            self.restore_tu_depth_region(&leaf_tu_depth);
+            if let Some((leaf_frame, leaf_mode_map, leaf_ct_depth_map, leaf_tu_depth)) =
+                leaf_state.as_ref()
+            {
+                self.restore_frame_region(leaf_frame);
+                self.restore_mode_region(leaf_mode_map);
+                self.restore_ct_depth_region(leaf_ct_depth_map);
+                self.restore_tu_depth_region(leaf_tu_depth);
+            }
             let node = Self::cu_leaf_node(leaf, confidence);
             self.record_cu_winner(x0, y0, log2_cb_size, false);
             let plan = Self::cu_to_plan(&node);
@@ -720,8 +751,10 @@ impl<'a> super::super::Encoder<'a> {
         let base_mode_map = self.snapshot_mode_region(x0, y0, log2_cb_size);
         let base_ct_depth_map = self.snapshot_ct_depth_region(x0, y0, log2_cb_size);
         let base_tu_depth = self.snapshot_tu_depth_region(x0, y0, log2_cb_size);
-        let (trial, winner) = self.decide_cu(x0, y0, log2_cb_size, ct_depth, ctxs);
-        let node = if self.effort_template.reference || self.best2_cu_reuse {
+        let keep_winner_committed = self.effort_template.reference || self.best2_cu_reuse;
+        let (trial, winner) =
+            self.decide_cu(x0, y0, log2_cb_size, ct_depth, ctxs, keep_winner_committed);
+        let node = if keep_winner_committed {
             winner
         } else {
             self.restore_frame_region(&base_frame);
