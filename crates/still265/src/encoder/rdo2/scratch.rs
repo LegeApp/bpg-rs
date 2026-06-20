@@ -30,9 +30,4 @@ pub(in crate::encoder) struct SearchScratch {
     pub(in crate::encoder) luma_exact_trace_cands: Vec<crate::trace::CandRec>,
     /// Reused trace candidate records for the chroma RD decision.
     pub(in crate::encoder) chroma_trace_cands: Vec<crate::trace::CandRec>,
-    /// Free-list of recyclable frame-region snapshots. The native TU screen pops
-    /// a snapshot here (reusing its per-plane `data` capacity) and recycles it
-    /// after the leaf-vs-split trial, instead of allocating fresh `Vec`s per
-    /// node. LIFO matches the nested recursion. Capped to bound idle memory.
-    pub(in crate::encoder) frame_snapshot_pool: Vec<super::super::types::FrameSnapshot>,
 }

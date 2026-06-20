@@ -117,11 +117,7 @@ pub fn predict_intra_into(
     dst: &mut [u16],
     dst_stride: usize,
 ) {
-    let size_usize = 1usize << log2_size;
-    assert!(dst_stride >= size_usize);
-    assert!(dst.len() >= (size_usize - 1) * dst_stride + size_usize);
-
-    let (border, border_center, size, bit_depth) = collect_prediction_border(
+    predict_intra_into_with_reader(
         frame,
         x,
         y,
@@ -129,6 +125,45 @@ pub fn predict_intra_into(
         mode,
         c_idx,
         strong_intra_smoothing_enabled,
+        dst,
+        dst_stride,
+        |_, _, _| None,
+    );
+}
+
+/// Perform intra prediction for a block into caller-owned storage, allowing the
+/// caller to override reference samples before falling back to `frame`.
+///
+/// The override is used only for reference-border reads. Returning
+/// `Some(UNINIT_SAMPLE)` preserves normal unavailable-sample handling.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_intra_into_with_reader<F>(
+    frame: &DecodedFrame,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    mode: IntraPredMode,
+    c_idx: u8,
+    strong_intra_smoothing_enabled: bool,
+    dst: &mut [u16],
+    dst_stride: usize,
+    mut sample_reader: F,
+) where
+    F: FnMut(u8, u32, u32) -> Option<u16>,
+{
+    let size_usize = 1usize << log2_size;
+    assert!(dst_stride >= size_usize);
+    assert!(dst.len() >= (size_usize - 1) * dst_stride + size_usize);
+
+    let (border, border_center, size, bit_depth) = collect_prediction_border_with_reader(
+        frame,
+        x,
+        y,
+        log2_size,
+        mode,
+        c_idx,
+        strong_intra_smoothing_enabled,
+        &mut sample_reader,
     );
     predict_intra_from_border(
         dst,
@@ -160,10 +195,64 @@ fn collect_prediction_border(
 
     let mut border = [0i32; 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1];
     let border_center = 2 * MAX_INTRA_PRED_BLOCK_SIZE;
-    fill_border_samples(frame, x, y, size, c_idx, &mut border, border_center);
+    fill_border_samples_with_reader(
+        frame,
+        x,
+        y,
+        size,
+        c_idx,
+        &mut border,
+        border_center,
+        &mut |_, _, _| None,
+    );
 
     // Reference sample filtering (H.265 8.4.4.2.3)
     // Only applied for luma, or for chroma in 4:4:4 format
+    if c_idx == 0 || chroma_format == 3 {
+        intra_prediction_sample_filtering(
+            &mut border,
+            border_center,
+            size as usize,
+            c_idx,
+            mode.as_u8(),
+            strong_intra_smoothing_enabled,
+            bit_depth as usize,
+        );
+    }
+
+    (border, border_center, size, bit_depth)
+}
+
+fn collect_prediction_border_with_reader<F>(
+    frame: &DecodedFrame,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    mode: IntraPredMode,
+    c_idx: u8,
+    strong_intra_smoothing_enabled: bool,
+    sample_reader: &mut F,
+) -> ([i32; 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1], usize, u32, u8)
+where
+    F: FnMut(u8, u32, u32) -> Option<u16>,
+{
+    let size = 1u32 << log2_size;
+    let bit_depth = frame.bit_depth;
+    let chroma_format = frame.chroma_format;
+
+    let mut border = [0i32; 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1];
+    let border_center = 2 * MAX_INTRA_PRED_BLOCK_SIZE;
+    fill_border_samples_with_reader(
+        frame,
+        x,
+        y,
+        size,
+        c_idx,
+        &mut border,
+        border_center,
+        sample_reader,
+    );
+
     if c_idx == 0 || chroma_format == 3 {
         intra_prediction_sample_filtering(
             &mut border,
@@ -415,6 +504,25 @@ fn fill_border_samples(
     border: &mut [i32],
     center: usize,
 ) {
+    fill_border_samples_with_reader(frame, x, y, size, c_idx, border, center, &mut |_, _, _| {
+        None
+    });
+}
+
+/// Fill border samples from neighboring pixels, consulting `sample_reader`
+/// before reading the committed frame.
+fn fill_border_samples_with_reader<F>(
+    frame: &DecodedFrame,
+    x: u32,
+    y: u32,
+    size: u32,
+    c_idx: u8,
+    border: &mut [i32],
+    center: usize,
+    sample_reader: &mut F,
+) where
+    F: FnMut(u8, u32, u32) -> Option<u16>,
+{
     // Border layout (indexed from center):
     //   border[-2*size .. -1] = left samples (bottom to top): p[-1][2*nTbS-1] .. p[-1][0]
     //   border[0] = top-left corner: p[-1][-1]
@@ -443,7 +551,8 @@ fn fill_border_samples(
     // Top-left corner
     let mut corner_avail = false;
     if avail_top_left {
-        let raw = read_plane(plane, stride, x - 1, y - 1);
+        let raw = sample_reader(c_idx, x - 1, y - 1)
+            .unwrap_or_else(|| read_plane(plane, stride, x - 1, y - 1));
         if raw != UNINIT_SAMPLE {
             border[center] = raw as i32;
             corner_avail = true;
@@ -451,7 +560,8 @@ fn fill_border_samples(
         }
     }
     if !corner_avail && avail_top {
-        let raw = read_plane(plane, stride, x, y - 1);
+        let raw =
+            sample_reader(c_idx, x, y - 1).unwrap_or_else(|| read_plane(plane, stride, x, y - 1));
         if raw != UNINIT_SAMPLE {
             border[center] = raw as i32;
             corner_avail = true;
@@ -459,7 +569,8 @@ fn fill_border_samples(
         }
     }
     if !corner_avail && avail_left {
-        let raw = read_plane(plane, stride, x - 1, y);
+        let raw =
+            sample_reader(c_idx, x - 1, y).unwrap_or_else(|| read_plane(plane, stride, x - 1, y));
         if raw != UNINIT_SAMPLE {
             border[center] = raw as i32;
             corner_avail = true;
@@ -482,7 +593,8 @@ fn fill_border_samples(
             // Fast path: all valid top samples are in-bounds
             let row_base = top_row_start + x as usize;
             for i in 0..top_count {
-                let raw = plane[row_base + i];
+                let rx = x + i as u32;
+                let raw = sample_reader(c_idx, rx, y - 1).unwrap_or(plane[row_base + i]);
                 if raw != UNINIT_SAMPLE {
                     let idx = center + 1 + i;
                     border[idx] = raw as i32;
@@ -494,7 +606,8 @@ fn fill_border_samples(
             for i in 0..top_count {
                 let plane_idx = top_row_start + x as usize + i;
                 if plane_idx < plane.len() {
-                    let raw = plane[plane_idx];
+                    let rx = x + i as u32;
+                    let raw = sample_reader(c_idx, rx, y - 1).unwrap_or(plane[plane_idx]);
                     if raw != UNINIT_SAMPLE {
                         let idx = center + 1 + i;
                         border[idx] = raw as i32;
@@ -516,7 +629,9 @@ fn fill_border_samples(
         if last_left_idx < plane.len() {
             // Fast path: all valid left samples are in-bounds
             for i in 0..left_count {
-                let raw = plane[(y as usize + i) * stride + left_x];
+                let ry = y + i as u32;
+                let raw = sample_reader(c_idx, x - 1, ry)
+                    .unwrap_or(plane[(y as usize + i) * stride + left_x]);
                 if raw != UNINIT_SAMPLE {
                     let idx = center - 1 - i;
                     border[idx] = raw as i32;
@@ -528,7 +643,8 @@ fn fill_border_samples(
             for i in 0..left_count {
                 let plane_idx = (y as usize + i) * stride + left_x;
                 if plane_idx < plane.len() {
-                    let raw = plane[plane_idx];
+                    let ry = y + i as u32;
+                    let raw = sample_reader(c_idx, x - 1, ry).unwrap_or(plane[plane_idx]);
                     if raw != UNINIT_SAMPLE {
                         let idx = center - 1 - i;
                         border[idx] = raw as i32;

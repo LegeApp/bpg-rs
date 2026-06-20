@@ -112,22 +112,6 @@ struct Encoder<'a> {
     /// multiple QPs, and 2000x1500, so the structure decision and exact final
     /// replay are unchanged. Escape with `BPG_RDO2_TT_NATIVE=0`.
     rdo2_tt_native: bool,
-    /// Gate (Phase 8): within the native TU screen, skip the per-node
-    /// `leaf_frame` snapshot used to restore a winning leaf after the split
-    /// trial overwrote it. Instead the leaf is committed, early-term/neighbour
-    /// leaf wins return it directly, and the rare "leaf beats split" case
-    /// recodes the (deterministic) leaf from the base snapshot. Also drops the
-    /// redundant `tu_depth` snapshots (leaf coding never writes the depth map;
-    /// `record_tu_winner` sets the final value). Byte-identical to the snapshot
-    /// path; `BPG_RDO2_TT_NOSNAP=0` restores it for A/B timing. Default on for
-    /// Best when the native screen is active.
-    rdo2_tt_nosnap: bool,
-    /// Gate (Phase 8): pool the native TU screen's per-node frame-region
-    /// snapshot in `SearchScratch.frame_snapshot_pool` instead of allocating a
-    /// fresh `FrameSnapshot` (three plane `Vec`s) per compared node. Byte-
-    /// identical (pure allocation reuse); `BPG_RDO2_TT_POOL=0` allocates per
-    /// node for A/B timing. Default on for Best when the native screen is active.
-    rdo2_tt_pool: bool,
     /// Re-entry guard: true while inside `rdo2_analyze_tt`'s cheap screen, so the
     /// recursive `build_tt` calls run the legacy path (cheap) instead of
     /// re-entering the gate.
@@ -526,8 +510,6 @@ impl<'a> Encoder<'a> {
             rdo2_chroma_scratch: self.rdo2_chroma_scratch,
             rdo2_nxn: self.rdo2_nxn,
             rdo2_tt_native: self.rdo2_tt_native,
-            rdo2_tt_nosnap: self.rdo2_tt_nosnap,
-            rdo2_tt_pool: self.rdo2_tt_pool,
             in_rdo2: false,
             elide_final_residual_pricing: false,
             analysis: self.analysis.clone(),
@@ -1203,8 +1185,6 @@ pub fn encode_with_stats(
         rdo2_chroma_scratch,
         rdo2_nxn,
         rdo2_tt_native: rdo2_best_luma_default || env_bool_or("BPG_RDO2_TT_NATIVE", false),
-        rdo2_tt_nosnap: rdo2_best_luma_default || env_bool_or("BPG_RDO2_TT_NOSNAP", false),
-        rdo2_tt_pool: rdo2_best_luma_default || env_bool_or("BPG_RDO2_TT_POOL", false),
         in_rdo2: false,
         elide_final_residual_pricing: false,
         analysis: analysis.clone(),
