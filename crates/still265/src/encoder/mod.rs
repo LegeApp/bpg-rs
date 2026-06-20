@@ -145,13 +145,79 @@ struct Encoder<'a> {
     /// `Some((perceptual, strength))` when the experimental bidirectional
     /// variance AQ is active for `Best` (drives [`Encoder::aq_qg_target`]).
     best_aq: Option<(bool, f32)>,
+    /// Gate (`BPG_BEST2_TT_REUSE=1`, Best, non-AQ): decide the transform-tree
+    /// leaf-vs-split structure directly on RDOQ (exact) cost in the native screen
+    /// and keep that winning `Tt`, instead of deciding on a cheap plain-quant
+    /// screen and then re-coding the winner in a separate final RDOQ replay.
+    /// Output-changing (RDOQ-based structure decision); validate via BD sweep.
     best2_tt_reuse: bool,
+    /// Transient: true only while the native TT screen is running under
+    /// `best2_tt_reuse`, so the screen leaf coders code at `EvalKind::Final`
+    /// (committed RDOQ) instead of `EvalKind::CheapTrial`.
+    tt_screen_final: bool,
     best2_cu_reuse: bool,
     /// Experimental: evaluate 8x8 `PartNxN` (four 4x4 luma PUs) against the
     /// normal `Part2Nx2N` CU and pick the RD winner. Env-gated (`BPG_PARTNXN`);
     /// only effective on the winner-direct `best2_cu_reuse` path.
     partnxn: bool,
     partnxn_prune: PartNxnPrune,
+    /// Gate (`BPG_NXN_PU_RDOQ_TOP=K`): in `build_cu_leaf_nxn`, RDOQ-price only the
+    /// top-`K` SATD-ranked candidate modes per 4x4 PU instead of every candidate,
+    /// then pick the RDOQ winner among those. The rough search already ranks the
+    /// candidate list by SATD, so this reuses that ordering to cut the dominant
+    /// `NxnPuExact` RDOQ volume. `None` = price every candidate (default,
+    /// byte-identical). Output-changing when set; BD-validate.
+    nxn_pu_rdoq_top: Option<usize>,
+    /// PartNxN per-PU screen diagnostic gates, parsed once at construction
+    /// instead of via `std::env::var` inside the per-sub-PU hot loop
+    /// (`BPG_NXN_CLOSE_MULT`/`BPG_NXN_EXACT`/`BPG_NXN_ADAPTIVE`/`BPG_NXN_APPROX`).
+    nxn_close_mult: f64,
+    nxn_exact: bool,
+    nxn_adaptive: bool,
+    nxn_approx: bool,
+    /// Diagnostic gate (`BPG_CU_EARLY_DIAG=1`): in `decide_cu`, compute a
+    /// candidate normal-QP force-leaf predicate and log how often it would fire
+    /// (and how often it would be wrong) per CU size, without changing the
+    /// decision. Used to confirm the resolution-scaling lever before acting.
+    cu_early_diag: bool,
+    /// Best-only CU early termination: apply the conservative force-leaf
+    /// predicate only at 16x16 CUs. The larger 32x32/64x64 force-leaf cases had
+    /// high diagnostic mistake rates on real photos.
+    best_cu_early_16: bool,
+    /// Experimental Best-only force-split (`BPG_BEST_CU_FORCE_SPLIT=edge64-lowqp`
+    /// or `edge-lowqp`): skip the large-CU leaf path in edge/text/chroma-critical
+    /// regions at QP <= 28. `Some(6)` = 64x64 only; `Some(5)` = 32x32+64x64.
+    best_cu_force_split_edge_lowqp_min_log2: Option<u8>,
+    /// Best-only x265-parity rule: below QP35, skip the non-split 64x64 intra
+    /// CU candidate and always descend to 32x32 children at max CU size. x265's
+    /// normal intra path does not call `checkIntra()` when
+    /// `log2CUSize == MAX_LOG2_CU_SIZE`; still265 keeps the slower 64x64 leaf
+    /// option at QP35+ because the measured high-QP size penalty was larger.
+    best_cu_no_64_leaf: bool,
+    /// Best-only zero-residual force-leaf at 32x32 (`BPG_BEST_CU_ZERO_LEAF_32=1`).
+    /// When a 32x32 cheap leaf has no coded residual and is not in a text/edge/
+    /// chroma-critical region, skip the split comparison. Split can only win via
+    /// mode/syntax tradeoffs, not distortion improvement. Diagnostic confirmed
+    /// <5% mistake rates across QP 24-36 on real 4K photos; population grows to
+    /// ~30% of 32x32 evals at QP36 with near-zero mistake rates.
+    best_cu_zero_leaf_32: bool,
+    /// Best-only experimental tunable cheap-leaf early termination
+    /// (`BPG_CU_EARLY_K`, `BPG_CU_EARLY_MIN_LOG2`). When `k > 0`, a CU at
+    /// `log2_cb_size >= min_log2` is forced to leaf (the split descent is skipped)
+    /// when it is not in a text/edge/chroma-critical region and `bits*k < area`.
+    /// Unlike the k=16 16x16 rule (`best_cu_early_16`) and the QP>=38-gated effort
+    /// rule, this fires at all QPs and all sizes >= min_log2 — the resolution-
+    /// scaling lever. `k=8` mirrors the x265 Balanced threshold. Default-ON at
+    /// `k=8` for Best when the frame is >= 4 MP (resolution-gated; the trade is a
+    /// pure BD loss at low res), `0` (disabled) otherwise. `BPG_CU_EARLY_K`
+    /// overrides explicitly, `=0` force-disables.
+    best_cu_early_term_k: u64,
+    best_cu_early_term_min_log2: u8,
+    /// QP floor for the tunable cheap-leaf knob (`BPG_CU_EARLY_MIN_QP`). The
+    /// diagnostic shows 32x32 split-win rate falls with QP (49%@28 -> 22%@36), so
+    /// the aggressive predicate is only safe at the high end of Best's range.
+    /// `0` = fire at all QPs (default).
+    best_cu_early_term_min_qp: i32,
     aq: AqState,
     prof: Profiler,
     trace: crate::trace::SearchTrace,
@@ -536,9 +602,23 @@ impl<'a> Encoder<'a> {
             best_tu_neighbor_limit: self.best_tu_neighbor_limit,
             best_aq: self.best_aq,
             best2_tt_reuse: self.best2_tt_reuse,
+            tt_screen_final: false,
             best2_cu_reuse: self.best2_cu_reuse,
             partnxn: self.partnxn,
             partnxn_prune: self.partnxn_prune,
+            nxn_pu_rdoq_top: self.nxn_pu_rdoq_top,
+            nxn_close_mult: self.nxn_close_mult,
+            nxn_exact: self.nxn_exact,
+            nxn_adaptive: self.nxn_adaptive,
+            nxn_approx: self.nxn_approx,
+            cu_early_diag: self.cu_early_diag,
+            best_cu_early_16: self.best_cu_early_16,
+            best_cu_force_split_edge_lowqp_min_log2: self.best_cu_force_split_edge_lowqp_min_log2,
+            best_cu_no_64_leaf: self.best_cu_no_64_leaf,
+            best_cu_zero_leaf_32: self.best_cu_zero_leaf_32,
+            best_cu_early_term_k: self.best_cu_early_term_k,
+            best_cu_early_term_min_log2: self.best_cu_early_term_min_log2,
+            best_cu_early_term_min_qp: self.best_cu_early_term_min_qp,
             aq: AqState::inert(),
             prof: Profiler {
                 on: self.prof.on,
@@ -752,20 +832,154 @@ impl<'a> Encoder<'a> {
         max_depth
     }
 
-    fn should_limit_tu_to_neighbor_leaf(&self, x0: u32, y0: u32, log2_size: u8, leaf: &Tt) -> bool {
+    fn tu_neighbor_prior_pair(&self, x0: u32, y0: u32) -> (Option<u8>, Option<u8>) {
+        let left = (x0 > 0).then(|| self.tu_depth_at(x0 - 1, y0)).flatten();
+        let above = (y0 > 0).then(|| self.tu_depth_at(x0, y0 - 1)).flatten();
+        (left, above)
+    }
+
+    fn tu_neighbor_state_index(depth: Option<u8>) -> usize {
+        match depth {
+            None => 0,
+            Some(0) => 1,
+            Some(_) => 2,
+        }
+    }
+
+    fn should_limit_tu_to_neighbor_leaf(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        leaf: &Tt,
+    ) -> bool {
+        let i = log2_size as usize;
+        if i < self.stats.tu_neighbor_limit_calls_by_log2.len() {
+            self.stats.tu_neighbor_limit_calls_by_log2[i] += 1;
+        }
         if !self.best_tu_neighbor_limit || log2_size < 4 {
+            if i < self.stats.tu_neighbor_limit_calls_by_log2.len() {
+                if !self.best_tu_neighbor_limit {
+                    self.stats.tu_neighbor_limit_disabled_by_log2[i] += 1;
+                } else {
+                    self.stats.tu_neighbor_limit_small_by_log2[i] += 1;
+                }
+            }
             return false;
         }
-        if self.tu_neighbor_prior(x0, y0) != Some(0) {
-            return false;
+        let (left_prior, above_prior) = self.tu_neighbor_prior_pair(x0, y0);
+        if i < self.stats.tu_neighbor_limit_calls_by_log2.len() {
+            let combo = Self::tu_neighbor_state_index(left_prior) * 3
+                + Self::tu_neighbor_state_index(above_prior);
+            self.stats.tu_neighbor_limit_prior_combo_by_log2[i][combo] += 1;
+        }
+        match left_prior.into_iter().chain(above_prior).max() {
+            Some(0) => {
+                if i < self.stats.tu_neighbor_limit_calls_by_log2.len() {
+                    self.stats.tu_neighbor_limit_prior_leaf_by_log2[i] += 1;
+                }
+            }
+            Some(_) => {
+                if i < self.stats.tu_neighbor_limit_calls_by_log2.len() {
+                    self.stats.tu_neighbor_limit_prior_split_by_log2[i] += 1;
+                }
+                return false;
+            }
+            None => {
+                if i < self.stats.tu_neighbor_limit_calls_by_log2.len() {
+                    self.stats.tu_neighbor_limit_prior_none_by_log2[i] += 1;
+                }
+                return false;
+            }
         }
         if tt_has_residual(leaf) {
+            if i < self.stats.tu_neighbor_limit_calls_by_log2.len() {
+                self.stats.tu_neighbor_limit_residual_reject_by_log2[i] += 1;
+            }
             return false;
         }
-        matches!(
+        if !matches!(
             self.analysis.region_class_at(x0, y0, log2_size),
             crate::preanalysis::RegionClass::Flat | crate::preanalysis::RegionClass::Gradient
-        )
+        ) {
+            if i < self.stats.tu_neighbor_limit_calls_by_log2.len() {
+                self.stats.tu_neighbor_limit_region_reject_by_log2[i] += 1;
+            }
+            return false;
+        }
+        if i < self.stats.tu_neighbor_limit_calls_by_log2.len() {
+            self.stats.tu_neighbor_limit_accept_by_log2[i] += 1;
+        }
+        true
+    }
+
+    fn record_tu_neighbor_mixed_leaf_diag(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        leaf: &Tt,
+        split_won: bool,
+    ) {
+        if !self.best_tu_neighbor_limit || log2_size < 4 {
+            return;
+        }
+        let (left_prior, above_prior) = self.tu_neighbor_prior_pair(x0, y0);
+        let mixed = matches!(
+            (
+                Self::tu_neighbor_state_index(left_prior),
+                Self::tu_neighbor_state_index(above_prior),
+            ),
+            (1, 2) | (2, 1)
+        );
+        if !mixed || tt_has_residual(leaf) {
+            return;
+        }
+        if !matches!(
+            self.analysis.region_class_at(x0, y0, log2_size),
+            crate::preanalysis::RegionClass::Flat | crate::preanalysis::RegionClass::Gradient
+        ) {
+            return;
+        }
+        let i = log2_size as usize;
+        if i >= self.stats.tu_neighbor_mixed_leaf_pred_by_log2.len() {
+            return;
+        }
+        self.stats.tu_neighbor_mixed_leaf_pred_by_log2[i] += 1;
+        if split_won {
+            self.stats.tu_neighbor_mixed_leaf_mistake_by_log2[i] += 1;
+        }
+    }
+
+    fn record_tu_neighbor_both_split_diag(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        split_won: bool,
+    ) {
+        if !self.best_tu_neighbor_limit || log2_size < 4 {
+            return;
+        }
+        let (left_prior, above_prior) = self.tu_neighbor_prior_pair(x0, y0);
+        let both_split = matches!(
+            (
+                Self::tu_neighbor_state_index(left_prior),
+                Self::tu_neighbor_state_index(above_prior),
+            ),
+            (2, 2)
+        );
+        if !both_split {
+            return;
+        }
+        let i = log2_size as usize;
+        if i >= self.stats.tu_neighbor_both_split_pred_by_log2.len() {
+            return;
+        }
+        self.stats.tu_neighbor_both_split_pred_by_log2[i] += 1;
+        if !split_won {
+            self.stats.tu_neighbor_both_split_mistake_by_log2[i] += 1;
+        }
     }
 
     fn record_tu_neighbor_leaf_skip(&mut self, x0: u32, y0: u32, log2_size: u8) {
@@ -1032,6 +1246,17 @@ pub fn encode_with_stats(
             .ok()
             .map(|v| v.trim() != "0")
             .unwrap_or(true);
+    let best_cu_force_split_edge_lowqp_min_log2 = if config.effort == Effort::Best {
+        std::env::var("BPG_BEST_CU_FORCE_SPLIT").ok().and_then(|v| {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "edge64-lowqp" | "edge64" => Some(6),
+                "edge-lowqp" | "edge32-lowqp" | "edge" => Some(5),
+                _ => None,
+            }
+        })
+    } else {
+        None
+    };
     let best_trial_approx_bits = config.effort == Effort::Best
         && std::env::var("BPG_BEST_TRIAL_APPROX_BITS")
             .ok()
@@ -1087,7 +1312,10 @@ pub fn encode_with_stats(
         config.qp,
         source_hash(width, height, bd, config.chroma, src),
     );
+    let cu_early_diag_enabled = std::env::var_os("BPG_CU_EARLY_DIAG").is_some();
     let needs_analysis = aq_active
+        || cu_early_diag_enabled
+        || best_cu_force_split_edge_lowqp_min_log2.is_some()
         || best_tu_neighbor_limit
         || effort_template.preanalysis.class_steering
         || effort_template.preanalysis.importance_force_leaf
@@ -1229,7 +1457,13 @@ pub fn encode_with_stats(
         } else {
             None
         },
-        best2_tt_reuse: config.effort == Effort::Best && !aq_active && !best2_luma_fastrd,
+        best2_tt_reuse: config.effort == Effort::Best
+            && !aq_active
+            && !best2_luma_fastrd
+            && std::env::var("BPG_BEST2_TT_REUSE")
+                .map(|v| v != "0")
+                .unwrap_or(false),
+        tt_screen_final: false,
         best2_cu_reuse: config.effort == Effort::Best && !aq_active && !best2_luma_fastrd,
         // PartNxN is a real coding tool, so it belongs on every quality-leaning
         // tier (each prunes the per-PU search via its own RD budget) — Best down
@@ -1253,6 +1487,50 @@ pub fn encode_with_stats(
             _ if config.effort == Effort::Balanced => PartNxnPrune::Conservative,
             _ => PartNxnPrune::Off,
         },
+        nxn_pu_rdoq_top: std::env::var("BPG_NXN_PU_RDOQ_TOP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&k| k >= 1),
+        nxn_close_mult: std::env::var("BPG_NXN_CLOSE_MULT")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0),
+        nxn_exact: std::env::var_os("BPG_NXN_EXACT").is_some(),
+        nxn_adaptive: std::env::var_os("BPG_NXN_EXACT").is_none()
+            && std::env::var_os("BPG_NXN_ADAPTIVE").is_some(),
+        nxn_approx: std::env::var_os("BPG_NXN_APPROX").is_some(),
+        cu_early_diag: cu_early_diag_enabled,
+        best_cu_early_16: config.effort == Effort::Best,
+        best_cu_force_split_edge_lowqp_min_log2,
+        best_cu_no_64_leaf: config.effort == Effort::Best,
+        best_cu_zero_leaf_32: config.effort == Effort::Best
+            && std::env::var_os("BPG_BEST_CU_ZERO_LEAF_32").is_some(),
+        // Resolution-gated default-on for Best: the cheap-leaf early-termination
+        // buys ~24% encode time at >=8K for +1.4% bytes but is a pure BD loss at
+        // low res (see rdo-plan-status-2026-06-20.md). Auto-enable k=8 only above
+        // ~4 MP, where the resolution-scaling win dominates. `BPG_CU_EARLY_K`
+        // overrides explicitly (including `=0` to force-disable).
+        best_cu_early_term_k: if config.effort == Effort::Best {
+            match std::env::var("BPG_CU_EARLY_K")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+            {
+                Some(k) => k,
+                None if (width as u64) * (height as u64) >= 4_000_000 => 8,
+                None => 0,
+            }
+        } else {
+            0
+        },
+        best_cu_early_term_min_log2: std::env::var("BPG_CU_EARLY_MIN_LOG2")
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .unwrap_or(5),
+        best_cu_early_term_min_qp: std::env::var("BPG_CU_EARLY_MIN_QP")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(0),
         prof: Profiler {
             on: std::env::var_os("BPG_PROFILE").is_some(),
             ..Default::default()
@@ -1378,6 +1656,129 @@ pub fn encode_with_stats(
 
     if std::env::var_os("BPG_RDO2_REPORT_LEGACY").is_some() {
         eprintln!("{}", state.stats.legacy.report());
+    }
+
+    if state.cu_early_diag {
+        let s = &state.stats;
+        eprintln!("cu-early-diag (per log2_cb_size 3..=6 = 8/16/32/64):");
+        for i in 3..=6usize {
+            let ev = s.cu_split_eval_by_log2[i];
+            if ev == 0 {
+                continue;
+            }
+            let won = s.cu_split_won_by_log2[i];
+            let pred = s.cu_force_leaf_pred_by_log2[i];
+            let mist = s.cu_force_leaf_mistake_by_log2[i];
+            let pct = |n: u64| 100.0 * n as f64 / ev as f64;
+            eprintln!(
+                "  {:>2}x{:<2}: eval={:>7} split_won={:>6} ({:>4.1}%)  pred_force_leaf={:>6} ({:>4.1}%)  mistakes={:>5} ({:>4.1}% of pred)",
+                1 << i,
+                1 << i,
+                ev,
+                won,
+                pct(won),
+                pred,
+                pct(pred),
+                mist,
+                if pred > 0 { 100.0 * mist as f64 / pred as f64 } else { 0.0 },
+            );
+            let pred_zr = s.cu_force_leaf_zero_resid_pred_by_log2[i];
+            let mist_zr = s.cu_force_leaf_zero_resid_mistake_by_log2[i];
+            eprintln!(
+                "        pred_force_leaf_zero_resid ={:>6} ({:>4.1}%)  mistakes={:>5} ({:>4.1}% of pred)",
+                pred_zr,
+                pct(pred_zr),
+                mist_zr,
+                if pred_zr > 0 { 100.0 * mist_zr as f64 / pred_zr as f64 } else { 0.0 },
+            );
+            let pred = s.cu_force_split_structured_pred_by_log2[i];
+            let mist = s.cu_force_split_structured_mistake_by_log2[i];
+            eprintln!(
+                "        pred_force_split_structured={:>6} ({:>4.1}%)  mistakes={:>5} ({:>4.1}% of pred)",
+                pred,
+                pct(pred),
+                mist,
+                if pred > 0 { 100.0 * mist as f64 / pred as f64 } else { 0.0 },
+            );
+            let pred = s.cu_force_split_edge_pred_by_log2[i];
+            let mist = s.cu_force_split_edge_mistake_by_log2[i];
+            eprintln!(
+                "        pred_force_split_edge      ={:>6} ({:>4.1}%)  mistakes={:>5} ({:>4.1}% of pred)",
+                pred,
+                pct(pred),
+                mist,
+                if pred > 0 { 100.0 * mist as f64 / pred as f64 } else { 0.0 },
+            );
+        }
+    }
+
+    if std::env::var_os("BPG_TU_NEIGHBOR_DIAG").is_some() {
+        let s = &state.stats;
+        eprintln!("tu-neighbor-diag (per log2_size 2..=6 = 4/8/16/32/64):");
+        for i in 2..=6usize {
+            let calls = s.tu_neighbor_limit_calls_by_log2[i];
+            if calls == 0 {
+                continue;
+            }
+            let pct = |n: u64| 100.0 * n as f64 / calls as f64;
+            eprintln!(
+                "  {:>2}x{:<2}: calls={:>8} prior_none={:>8} ({:>4.1}%) prior_leaf={:>8} ({:>4.1}%) prior_split={:>8} ({:>4.1}%) residual_reject={:>8} ({:>4.1}%) region_reject={:>8} ({:>4.1}%) accept={:>8} ({:>4.1}%)",
+                1 << i,
+                1 << i,
+                calls,
+                s.tu_neighbor_limit_prior_none_by_log2[i],
+                pct(s.tu_neighbor_limit_prior_none_by_log2[i]),
+                s.tu_neighbor_limit_prior_leaf_by_log2[i],
+                pct(s.tu_neighbor_limit_prior_leaf_by_log2[i]),
+                s.tu_neighbor_limit_prior_split_by_log2[i],
+                pct(s.tu_neighbor_limit_prior_split_by_log2[i]),
+                s.tu_neighbor_limit_residual_reject_by_log2[i],
+                pct(s.tu_neighbor_limit_residual_reject_by_log2[i]),
+                s.tu_neighbor_limit_region_reject_by_log2[i],
+                pct(s.tu_neighbor_limit_region_reject_by_log2[i]),
+                s.tu_neighbor_limit_accept_by_log2[i],
+                pct(s.tu_neighbor_limit_accept_by_log2[i]),
+            );
+            let labels = ["N", "L", "S"];
+            let mut combos = Vec::new();
+            for left in 0..3usize {
+                for above in 0..3usize {
+                    let count = s.tu_neighbor_limit_prior_combo_by_log2[i][left * 3 + above];
+                    if count > 0 {
+                        combos.push(format!(
+                            "{}/{}={} ({:.1}%)",
+                            labels[left],
+                            labels[above],
+                            count,
+                            pct(count)
+                        ));
+                    }
+                }
+            }
+            eprintln!("        prior_combo: {}", combos.join("  "));
+            let mixed_pred = s.tu_neighbor_mixed_leaf_pred_by_log2[i];
+            let mixed_mistake = s.tu_neighbor_mixed_leaf_mistake_by_log2[i];
+            if mixed_pred > 0 {
+                eprintln!(
+                    "        mixed_leaf_candidate: pred={} ({:.1}%) mistakes={} ({:.1}% of pred)",
+                    mixed_pred,
+                    pct(mixed_pred),
+                    mixed_mistake,
+                    100.0 * mixed_mistake as f64 / mixed_pred as f64,
+                );
+            }
+            let both_split_pred = s.tu_neighbor_both_split_pred_by_log2[i];
+            let both_split_mistake = s.tu_neighbor_both_split_mistake_by_log2[i];
+            if both_split_pred > 0 {
+                eprintln!(
+                    "        both_split_candidate: pred={} ({:.1}%) mistakes={} ({:.1}% of pred)",
+                    both_split_pred,
+                    pct(both_split_pred),
+                    both_split_mistake,
+                    100.0 * both_split_mistake as f64 / both_split_pred as f64,
+                );
+            }
+        }
     }
 
     state.stats.phase_total_us = encode_start.elapsed().as_micros() as u64;

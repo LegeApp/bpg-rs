@@ -655,6 +655,14 @@ impl<'a> super::super::Encoder<'a> {
         }
 
         self.record_close_call(leaf_cost.min(split_cost), leaf_cost.max(split_cost), margin);
+        self.record_tu_neighbor_mixed_leaf_diag(
+            x0,
+            y0,
+            log2_size,
+            &leaf_tt,
+            split_cost < leaf_cost,
+        );
+        self.record_tu_neighbor_both_split_diag(x0, y0, log2_size, split_cost < leaf_cost);
         if split_cost < leaf_cost {
             self.record_tu_winner(x0, y0, log2_size, true);
             (split_tt, split_dist)
@@ -684,6 +692,23 @@ impl<'a> super::super::Encoder<'a> {
         chroma_mode: u8,
         ctxs: &Contexts,
     ) -> Tt {
+        // best2_tt_reuse: decide the structure directly on committed RDOQ cost in
+        // the native screen and keep that `Tt` — no cheap screen + separate final
+        // replay. Output-changing (RDOQ-based leaf-vs-split); BD-validated.
+        if self.best2_tt_reuse && self.rdo2_tt_native {
+            self.tt_screen_final = true;
+            let tt = self.rdo2_tt_subtree_native(
+                x0,
+                y0,
+                log2_size,
+                trafo_depth,
+                luma_mode,
+                chroma_mode,
+                ctxs,
+            );
+            self.tt_screen_final = false;
+            return tt;
+        }
         let base_frame = self.snapshot_frame_region(x0, y0, log2_size);
         let cheap = if self.rdo2_tt_native {
             // Phase 8: screen the structure with a native rdo2 recursion whose
@@ -738,6 +763,23 @@ impl<'a> super::super::Encoder<'a> {
     /// legacy screen does. There is no chroma-cache path: the native screen is
     /// only the structure decision; the winner is exact-replayed by
     /// `final_code_tt`.
+    /// Per-leaf evaluation policy for the native TU structure screen. Normally a
+    /// committed cheap (plain-quant, approx-bits) trial used only to decide
+    /// leaf-vs-split. Under `best2_tt_reuse` the screen instead codes every leaf
+    /// at committed `EvalKind::Final` (RDOQ + exact bits), so the structure
+    /// decision is made on exact cost and the resulting `Tt` is the final coded
+    /// tree — no separate final replay.
+    fn tt_screen_leaf_policy(&self) -> EvalPolicy {
+        if self.tt_screen_final {
+            EvalPolicy::for_kind(EvalKind::Final).with_bucket(WorkBucket::FinalReplay)
+        } else {
+            let mut policy =
+                EvalPolicy::for_kind(EvalKind::CheapTrial).with_bucket(WorkBucket::TtLeafCheap);
+            policy.commit = true;
+            policy
+        }
+    }
+
     fn rdo2_tt_leaf_cheap(
         &mut self,
         x0: u32,
@@ -748,9 +790,7 @@ impl<'a> super::super::Encoder<'a> {
         chroma_mode: u8,
         ctxs: &Contexts,
     ) -> Tt {
-        let mut policy =
-            EvalPolicy::for_kind(EvalKind::CheapTrial).with_bucket(WorkBucket::TtLeafCheap);
-        policy.commit = true;
+        let policy = self.tt_screen_leaf_policy();
         let luma = self
             .rdo2_eval_leaf_block(ctxs, x0, y0, log2_size, 0, luma_mode, self.cur_qp_y, policy)
             .coded;
@@ -830,9 +870,7 @@ impl<'a> super::super::Encoder<'a> {
         ctxs: &Contexts,
         region: &mut TrialReconRegion,
     ) -> (Tt, u64) {
-        let mut policy =
-            EvalPolicy::for_kind(EvalKind::CheapTrial).with_bucket(WorkBucket::TtLeafCheap);
-        policy.commit = true;
+        let policy = self.tt_screen_leaf_policy();
         let luma = self.rdo2_eval_leaf_block_in_region(
             ctxs,
             x0,
@@ -944,9 +982,7 @@ impl<'a> super::super::Encoder<'a> {
             return None;
         }
         let (cx, cy, clog2, _count) = chroma_tb_geom(self.cat, x0, y0, log2_size)?;
-        let mut policy =
-            EvalPolicy::for_kind(EvalKind::CheapTrial).with_bucket(WorkBucket::TtLeafCheap);
-        policy.commit = true;
+        let policy = self.tt_screen_leaf_policy();
         let pred = chroma_pred_mode(self.cat, chroma_mode);
         let cb = self
             .rdo2_eval_leaf_block(ctxs, cx, cy, clog2, 1, pred, self.cur_qp_c, policy)
@@ -977,9 +1013,7 @@ impl<'a> super::super::Encoder<'a> {
         let Some((cx, cy, clog2, _count)) = chroma_tb_geom(self.cat, x0, y0, log2_size) else {
             return (None, 0);
         };
-        let mut policy =
-            EvalPolicy::for_kind(EvalKind::CheapTrial).with_bucket(WorkBucket::TtLeafCheap);
-        policy.commit = true;
+        let policy = self.tt_screen_leaf_policy();
         let pred = chroma_pred_mode(self.cat, chroma_mode);
         let cb = self.rdo2_eval_leaf_block_in_region(
             ctxs,
@@ -1424,6 +1458,8 @@ impl<'a> super::super::Encoder<'a> {
             leaf_cost.max(split_cost),
             budget.close_call_margin,
         );
+        self.record_tu_neighbor_mixed_leaf_diag(x0, y0, log2_size, &leaf, split_cost < leaf_cost);
+        self.record_tu_neighbor_both_split_diag(x0, y0, log2_size, split_cost < leaf_cost);
 
         if split_cost < leaf_cost {
             *region = split_region;

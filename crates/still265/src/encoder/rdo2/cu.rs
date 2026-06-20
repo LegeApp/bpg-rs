@@ -17,12 +17,22 @@ use crate::preanalysis::RegionClass;
 use crate::trace::WorkBucket;
 use crate::Effort;
 
-use super::super::types::{CuLeaf, CuNode, NxnInfo, PartNxnPrune, Tt};
+use super::super::types::{cu_leaf_has_residual, CuLeaf, CuNode, NxnInfo, PartNxnPrune, Tt};
 use super::cost::{
     estimate_cu_leaf_bits, estimate_cu_node_bits, estimate_intra_luma_mode_bits,
     estimate_split_cu_flag_bits,
 };
 use super::policy::{EvalKind, EvalPolicy, RdoqPolicy, ResidualBitPolicy};
+
+/// Result of [`Encoder::build_cu_scored`]: the materialized CU plus, when valid,
+/// the winner's decision-time `(distortion, frac_bits)` for parent split-cost
+/// accumulation. `scored` is `Some` only when the winner was kept committed (its
+/// score then equals a fresh region recompute); it is `None` on the final-replay
+/// path, where the caller must recompute from the replayed node.
+pub(in crate::encoder) struct BuiltCu {
+    pub(in crate::encoder) node: CuNode,
+    pub(in crate::encoder) scored: Option<(u64, u64)>,
+}
 
 impl<'a> super::super::Encoder<'a> {
     pub(super) fn build_cu_kids(
@@ -72,6 +82,150 @@ impl<'a> super::super::Encoder<'a> {
         }
     }
 
+    /// Candidate normal-QP "force leaf" predicate (diagnostic stage of the
+    /// resolution-scaling lever): would an x265-style early-termination skip the
+    /// split descent at this CU? Uses only pre-split signals so it is valid as a
+    /// real gate later. Conservative `safe` form: never on text/edge/chroma-
+    /// critical preanalysis cells; always when the leaf has zero residual (split
+    /// cannot help a perfectly-predicted block); otherwise when the leaf is very
+    /// smooth (few coded bits per pixel). Thresholds are a first guess to be
+    /// calibrated from the diagnostic counters, not an assumption.
+    fn cu_force_leaf_safe(
+        &self,
+        leaf: &CuLeaf,
+        leaf_bits: u64,
+        log2_cb_size: u8,
+        x0: u32,
+        y0: u32,
+    ) -> bool {
+        let region = self.analysis.region_class_at(x0, y0, log2_cb_size);
+        if matches!(
+            region,
+            RegionClass::TextLike | RegionClass::DirectionalEdge | RegionClass::ChromaCritical
+        ) {
+            return false;
+        }
+        if !cu_leaf_has_residual(leaf) {
+            return true;
+        }
+        let area = 1u64 << (2 * log2_cb_size as u64);
+        let bits = leaf_bits / CabacEstimator::SCALE;
+        bits * 16 < area
+    }
+
+    /// Tunable cheap-leaf predicate for the Best resolution-scaling early-term
+    /// experiment (`BPG_CU_EARLY_K`/`BPG_CU_EARLY_MIN_LOG2`): same region guard as
+    /// [`Self::cu_force_leaf_safe`] but with a caller-supplied `k` and no fixed
+    /// size, so the 32x32/64x64 force-leaf population can be BD-validated rather
+    /// than rejected on mistake-count alone. Larger `k` fires more often (more
+    /// termination, more BD risk).
+    fn cu_cheap_leaf_k(
+        &self,
+        leaf: &CuLeaf,
+        leaf_bits: u64,
+        log2_cb_size: u8,
+        x0: u32,
+        y0: u32,
+        k: u64,
+    ) -> bool {
+        let region = self.analysis.region_class_at(x0, y0, log2_cb_size);
+        if matches!(
+            region,
+            RegionClass::TextLike | RegionClass::DirectionalEdge | RegionClass::ChromaCritical
+        ) {
+            return false;
+        }
+        if !cu_leaf_has_residual(leaf) {
+            return true;
+        }
+        let area = 1u64 << (2 * log2_cb_size as u64);
+        let bits = leaf_bits / CabacEstimator::SCALE;
+        bits * k < area
+    }
+
+    fn cu_force_split_structured_diag(&self, log2_cb_size: u8, x0: u32, y0: u32) -> bool {
+        if log2_cb_size < 5 {
+            return false;
+        }
+        !matches!(
+            self.analysis.region_class_at(x0, y0, log2_cb_size),
+            RegionClass::Flat | RegionClass::Gradient | RegionClass::Noisy
+        )
+    }
+
+    fn cu_force_split_edge_diag(&self, log2_cb_size: u8, x0: u32, y0: u32) -> bool {
+        if log2_cb_size < 5 {
+            return false;
+        }
+        matches!(
+            self.analysis.region_class_at(x0, y0, log2_cb_size),
+            RegionClass::TextLike | RegionClass::DirectionalEdge | RegionClass::ChromaCritical
+        )
+    }
+
+    /// Diagnostic-only logging for the CU early-termination lever
+    /// (`BPG_CU_EARLY_DIAG=1`). At a leaf-vs-split decision where both costs are
+    /// known, record per CU size: evaluated, split-actually-won, the `safe`
+    /// force-leaf predicate fired, and predicate-fired-but-split-won (a wrong
+    /// force-leaf = the BD risk). Does not change the decision.
+    fn cu_early_diag_log(
+        &mut self,
+        leaf: &CuLeaf,
+        leaf_bits: u64,
+        log2_cb_size: u8,
+        x0: u32,
+        y0: u32,
+        split_won: bool,
+    ) {
+        if !self.cu_early_diag {
+            return;
+        }
+        let i = log2_cb_size as usize;
+        if i >= self.stats.cu_split_eval_by_log2.len() {
+            return;
+        }
+        self.stats.cu_split_eval_by_log2[i] += 1;
+        if split_won {
+            self.stats.cu_split_won_by_log2[i] += 1;
+        }
+        if self.cu_force_leaf_safe(leaf, leaf_bits, log2_cb_size, x0, y0) {
+            self.stats.cu_force_leaf_pred_by_log2[i] += 1;
+            if split_won {
+                self.stats.cu_force_leaf_mistake_by_log2[i] += 1;
+            }
+        }
+        // Zero-residual sub-predicate: strict subset of force-leaf — region not
+        // text/edge/chroma-critical AND the leaf has no coded coefficients. Split
+        // can only win here via mode/syntax, not distortion reduction.
+        {
+            let region = self.analysis.region_class_at(x0, y0, log2_cb_size);
+            if !matches!(
+                region,
+                RegionClass::TextLike
+                    | RegionClass::DirectionalEdge
+                    | RegionClass::ChromaCritical
+            ) && !cu_leaf_has_residual(leaf)
+            {
+                self.stats.cu_force_leaf_zero_resid_pred_by_log2[i] += 1;
+                if split_won {
+                    self.stats.cu_force_leaf_zero_resid_mistake_by_log2[i] += 1;
+                }
+            }
+        }
+        if self.cu_force_split_structured_diag(log2_cb_size, x0, y0) {
+            self.stats.cu_force_split_structured_pred_by_log2[i] += 1;
+            if !split_won {
+                self.stats.cu_force_split_structured_mistake_by_log2[i] += 1;
+            }
+        }
+        if self.cu_force_split_edge_diag(log2_cb_size, x0, y0) {
+            self.stats.cu_force_split_edge_pred_by_log2[i] += 1;
+            if !split_won {
+                self.stats.cu_force_split_edge_mistake_by_log2[i] += 1;
+            }
+        }
+    }
+
     /// RD cost of one 4x4 PartNxN sub-PU coded with `mode`, priced at `kind`
     /// (`CheapTrial` = plain quant + approx bits for the screen, `ExactTrial` =
     /// RDOQ + exact bits for the close-call recheck). Non-committing.
@@ -118,16 +272,12 @@ impl<'a> super::super::Encoder<'a> {
             // This stayed byte-identical in the high-res smoke, but did not
             // reduce RDOQ counts once measured against a clean full-RDOQ
             // baseline, so keep the original full-RDOQ ranking as the default.
-            let nxn_close_mult = std::env::var("BPG_NXN_CLOSE_MULT")
-                .ok()
-                .and_then(|v| v.trim().parse::<f64>().ok())
-                .filter(|v| v.is_finite() && *v > 0.0)
-                .unwrap_or(1.0);
+            // Gate values are parsed once at construction (encoder fields) rather
+            // than via `std::env::var` in this per-sub-PU hot loop.
+            let nxn_adaptive = self.nxn_adaptive;
             let close_margin = self.block_budget(px, py, 2, 0).close_call_margin
                 * self.rdo2_luma_close_mult
-                * nxn_close_mult;
-            let nxn_exact = std::env::var("BPG_NXN_EXACT").is_ok();
-            let nxn_adaptive = !nxn_exact && std::env::var("BPG_NXN_ADAPTIVE").is_ok();
+                * self.nxn_close_mult;
             // Screen policy: plain quant (no RDOQ). Residual bits default to exact
             // (accurate ranking without the RDOQ cost); `BPG_NXN_APPROX` falls back
             // to approximate bits. Default/`BPG_NXN_EXACT` is full-RDOQ ranking.
@@ -136,7 +286,7 @@ impl<'a> super::super::Encoder<'a> {
             let screen_policy = if nxn_adaptive {
                 EvalPolicy {
                     rdoq: RdoqPolicy::Off,
-                    bits: if std::env::var("BPG_NXN_APPROX").is_ok() {
+                    bits: if self.nxn_approx {
                         ResidualBitPolicy::Approx
                     } else {
                         ResidualBitPolicy::Exact
@@ -147,9 +297,13 @@ impl<'a> super::super::Encoder<'a> {
             } else {
                 exact_policy
             };
-            let mut cheap: Vec<(u8, f64)> = Vec::with_capacity(plan.candidates.len());
+            // `BPG_NXN_PU_RDOQ_TOP=K`: the candidate list is already SATD-ranked
+            // (best first), so price only the top-K modes instead of every
+            // candidate. `None` keeps the full-RDOQ reference (byte-identical).
+            let rdoq_top = self.nxn_pu_rdoq_top.unwrap_or(usize::MAX);
+            let mut cheap: Vec<(u8, f64)> = Vec::with_capacity(plan.candidates.len().min(rdoq_top));
             let mut best_cheap = f64::MAX;
-            for &mode in &plan.candidates {
+            for &mode in plan.candidates.iter().take(rdoq_top) {
                 self.stats.cu_trials += 1;
                 let cost = self.rdo2_nxn_pu_cost(px, py, mode, mpm, ctxs, screen_policy);
                 best_cheap = best_cheap.min(cost);
@@ -452,97 +606,58 @@ impl<'a> super::super::Encoder<'a> {
             let r = self.cu_trial_result(&node, x0, y0, log2_cb_size, ct_depth, ctxs);
             return (r, node);
         }
+        if self
+            .best_cu_force_split_edge_lowqp_min_log2
+            .is_some_and(|min_log2| {
+                self.search_qp() <= 28
+                    && log2_cb_size >= min_log2
+                    && self.cu_force_split_edge_diag(log2_cb_size, x0, y0)
+            })
+        {
+            let node = CuNode::Split {
+                kids: self.build_cu_kids(x0, y0, log2_cb_size, ct_depth, ctxs),
+            };
+            self.record_cu_winner(x0, y0, log2_cb_size, true);
+            let r = self.cu_trial_result(&node, x0, y0, log2_cb_size, ct_depth, ctxs);
+            return (r, node);
+        }
+        if self.best_cu_no_64_leaf && log2_cb_size == 6 && self.search_qp() < 35 {
+            let node = CuNode::Split {
+                kids: self.build_cu_kids(x0, y0, log2_cb_size, ct_depth, ctxs),
+            };
+            self.record_cu_winner(x0, y0, log2_cb_size, true);
+            let r = self.cu_trial_result(&node, x0, y0, log2_cb_size, ct_depth, ctxs);
+            return (r, node);
+        }
 
         let base_frame = self.snapshot_frame_region(x0, y0, log2_cb_size);
         let base_mode_map = self.snapshot_mode_region(x0, y0, log2_cb_size);
         let base_ct_depth_map = self.snapshot_ct_depth_region(x0, y0, log2_cb_size);
         let base_tu_depth = self.snapshot_tu_depth_region(x0, y0, log2_cb_size);
 
-        if budget.cu_split == SplitSearch::PreferSplit {
-            self.restore_frame_region(&base_frame);
-            self.restore_mode_region(&base_mode_map);
-            self.restore_ct_depth_region(&base_ct_depth_map);
-            self.restore_tu_depth_region(&base_tu_depth);
-            let split_e0 = self.stats.residual_bit_estimates;
-            let split = CuNode::Split {
-                kids: self.build_cu_kids(x0, y0, log2_cb_size, ct_depth, ctxs),
-            };
-            let split_state = keep_winner_committed.then(|| {
-                (
-                    self.snapshot_frame_region(x0, y0, log2_cb_size),
-                    self.snapshot_mode_region(x0, y0, log2_cb_size),
-                    self.snapshot_ct_depth_region(x0, y0, log2_cb_size),
-                    self.snapshot_tu_depth_region(x0, y0, log2_cb_size),
-                )
-            });
-            let split_tu_depth = (!keep_winner_committed)
-                .then(|| self.snapshot_tu_depth_region(x0, y0, log2_cb_size));
-            let split_exact = (self.stats.residual_bit_estimates - split_e0) as u32;
-            let split_distortion = self.distortion_cu_node(&split, x0, y0, log2_cb_size);
-            let split_bits =
-                estimate_cu_node_bits(ctxs, &split, x0, y0, log2_cb_size, ct_depth, self);
-            let split_cost = self.rd_cost(split_distortion, split_bits);
+        // Both the default and `PreferSplit` budgets now share one leaf-first,
+        // bound-aborted split path: build the leaf, then accumulate the split
+        // children and abort as soon as the partial split cost can no longer beat
+        // the leaf (the per-child cost is monotonic, so a partial cost >= leaf
+        // cost guarantees the full split loses). This is decision- and
+        // recon-identical to the old `PreferSplit` branch (which built the full
+        // split *and* full leaf and took the min) because `distortion_cu_node`
+        // equals the per-child `distortion_tt_region` sum and
+        // `estimate_cu_node_bits(&split)` equals `split_flag_bits + acc_node_bits`
+        // — it just stops building provably-losing split children. The only
+        // difference from the default path is that `PreferSplit` never lets the
+        // leaf early-terminate the split search.
+        let leaf = self.build_cu_leaf(x0, y0, log2_cb_size, ct_depth, ctxs);
+        let leaf_distortion = self.distortion_tt_region(x0, y0, log2_cb_size);
+        let leaf_bits = estimate_cu_leaf_bits(ctxs, &leaf, log2_cb_size, self.cat)
+            + estimate_split_cu_flag_bits(ctxs, ctx_inc, false);
 
-            self.restore_frame_region(&base_frame);
-            self.restore_mode_region(&base_mode_map);
-            self.restore_ct_depth_region(&base_ct_depth_map);
-            self.restore_tu_depth_region(&base_tu_depth);
-            let leaf = self.build_cu_leaf(x0, y0, log2_cb_size, ct_depth, ctxs);
-            let leaf_tu_depth = self.snapshot_tu_depth_region(x0, y0, log2_cb_size);
-            let leaf_distortion = self.distortion_tt_region(x0, y0, log2_cb_size);
-            let leaf_bits = estimate_cu_leaf_bits(ctxs, &leaf, log2_cb_size, self.cat)
-                + estimate_split_cu_flag_bits(ctxs, ctx_inc, false);
-            let leaf_cost = self.rd_cost(leaf_distortion, leaf_bits);
-            self.record_close_call(
-                leaf_cost.min(split_cost),
-                leaf_cost.max(split_cost),
-                budget.close_call_margin,
-            );
-            let confidence = Self::decision_confidence(
-                leaf_cost.min(split_cost),
-                leaf_cost.max(split_cost),
-                budget.close_call_margin,
-            );
-            self.trace_split_decision(
-                crate::trace::DecisionKind::Cu,
-                x0,
-                y0,
-                log2_cb_size,
-                leaf_cost,
-                split_cost,
-                0,
-                split_exact,
-            );
-
-            if split_cost < leaf_cost {
-                if let Some((split_frame, split_mode_map, split_ct_depth_map, split_tu_depth)) =
-                    split_state.as_ref()
-                {
-                    self.restore_frame_region(split_frame);
-                    self.restore_mode_region(split_mode_map);
-                    self.restore_ct_depth_region(split_ct_depth_map);
-                    self.restore_tu_depth_region(split_tu_depth);
-                } else if let Some(split_tu_depth) = split_tu_depth.as_ref() {
-                    self.restore_tu_depth_region(split_tu_depth);
-                }
-                self.record_cu_winner(x0, y0, log2_cb_size, true);
-                let plan = Self::cu_to_plan(&split);
-                return (
-                    TrialResult {
-                        plan,
-                        cost: RdCost {
-                            distortion: split_distortion,
-                            frac_bits: split_bits,
-                            cost: split_cost,
-                        },
-                        confidence,
-                    },
-                    split,
-                );
-            }
-
-            let node = Self::cu_leaf_node(leaf, confidence);
-            self.restore_tu_depth_region(&leaf_tu_depth);
+        if self.best_cu_early_16
+            && log2_cb_size == 4
+            && self.cu_force_leaf_safe(&leaf, leaf_bits, log2_cb_size, x0, y0)
+        {
+            self.stats.cu_early_terminations += 1;
+            let node = Self::cu_leaf_node(leaf, DecisionConfidence::Clear);
             self.record_cu_winner(x0, y0, log2_cb_size, false);
             let plan = Self::cu_to_plan(&node);
             return (
@@ -551,20 +666,74 @@ impl<'a> super::super::Encoder<'a> {
                     cost: RdCost {
                         distortion: leaf_distortion,
                         frac_bits: leaf_bits,
-                        cost: leaf_cost,
+                        cost: self.rd_cost(leaf_distortion, leaf_bits),
                     },
-                    confidence,
+                    confidence: DecisionConfidence::Clear,
+                },
+                node,
+            );
+        }
+        if self.best_cu_zero_leaf_32
+            && log2_cb_size == 5
+            && !cu_leaf_has_residual(&leaf)
+            && !matches!(
+                self.analysis.region_class_at(x0, y0, log2_cb_size),
+                RegionClass::TextLike
+                    | RegionClass::DirectionalEdge
+                    | RegionClass::ChromaCritical
+            )
+        {
+            self.stats.cu_early_terminations += 1;
+            let node = Self::cu_leaf_node(leaf, DecisionConfidence::Clear);
+            self.record_cu_winner(x0, y0, log2_cb_size, false);
+            let plan = Self::cu_to_plan(&node);
+            return (
+                TrialResult {
+                    plan,
+                    cost: RdCost {
+                        distortion: leaf_distortion,
+                        frac_bits: leaf_bits,
+                        cost: self.rd_cost(leaf_distortion, leaf_bits),
+                    },
+                    confidence: DecisionConfidence::Clear,
                 },
                 node,
             );
         }
 
-        let leaf = self.build_cu_leaf(x0, y0, log2_cb_size, ct_depth, ctxs);
-        let leaf_distortion = self.distortion_tt_region(x0, y0, log2_cb_size);
-        let leaf_bits = estimate_cu_leaf_bits(ctxs, &leaf, log2_cb_size, self.cat)
-            + estimate_split_cu_flag_bits(ctxs, ctx_inc, false);
+        if self.best_cu_early_term_k > 0
+            && log2_cb_size >= self.best_cu_early_term_min_log2
+            && self.search_qp() >= self.best_cu_early_term_min_qp
+            && self.cu_cheap_leaf_k(
+                &leaf,
+                leaf_bits,
+                log2_cb_size,
+                x0,
+                y0,
+                self.best_cu_early_term_k,
+            )
+        {
+            self.stats.cu_early_terminations += 1;
+            let node = Self::cu_leaf_node(leaf, DecisionConfidence::Clear);
+            self.record_cu_winner(x0, y0, log2_cb_size, false);
+            let plan = Self::cu_to_plan(&node);
+            return (
+                TrialResult {
+                    plan,
+                    cost: RdCost {
+                        distortion: leaf_distortion,
+                        frac_bits: leaf_bits,
+                        cost: self.rd_cost(leaf_distortion, leaf_bits),
+                    },
+                    confidence: DecisionConfidence::Clear,
+                },
+                node,
+            );
+        }
 
-        if self.cu_early_terminate(budget, &leaf, leaf_bits, x0, y0, log2_cb_size) {
+        if budget.cu_split != SplitSearch::PreferSplit
+            && self.cu_early_terminate(budget, &leaf, leaf_bits, x0, y0, log2_cb_size)
+        {
             if budget.allow_cu_early_terminate {
                 self.stats.cu_early_terminations += 1;
                 let node = Self::cu_leaf_node(leaf, DecisionConfidence::Clear);
@@ -615,11 +784,27 @@ impl<'a> super::super::Encoder<'a> {
         let mut bound_abort = false;
         let split_e0 = self.stats.residual_bit_estimates;
         for &(kx, ky) in &kid_pos {
-            let kid = self.build_cu(kx, ky, log2_cb_size - 1, ct_depth + 1, ctxs);
-            acc_distortion += self.distortion_tt_region(kx, ky, log2_cb_size - 1);
-            acc_node_bits +=
-                estimate_cu_node_bits(ctxs, &kid, kx, ky, log2_cb_size - 1, ct_depth + 1, self);
-            kids.push(kid);
+            let kid = self.build_cu_scored(kx, ky, log2_cb_size - 1, ct_depth + 1, ctxs);
+            // Reuse the child's decision-time score when it is committed unchanged;
+            // otherwise (final-replay path) recompute over the replayed region.
+            let (kid_distortion, kid_bits) = match kid.scored {
+                Some((d, b)) => (d, b),
+                None => (
+                    self.distortion_tt_region(kx, ky, log2_cb_size - 1),
+                    estimate_cu_node_bits(
+                        ctxs,
+                        &kid.node,
+                        kx,
+                        ky,
+                        log2_cb_size - 1,
+                        ct_depth + 1,
+                        self,
+                    ),
+                ),
+            };
+            acc_distortion += kid_distortion;
+            acc_node_bits += kid_bits;
+            kids.push(kid.node);
             let partial_split_cost = self.rd_cost(acc_distortion, split_flag_bits + acc_node_bits);
             if partial_split_cost >= leaf_cost {
                 bound_abort = true;
@@ -629,6 +814,8 @@ impl<'a> super::super::Encoder<'a> {
 
         if bound_abort {
             self.stats.cu_split_bound_aborts += 1;
+            // Split was bound-aborted, so leaf won: split_won = false.
+            self.cu_early_diag_log(&leaf, leaf_bits, log2_cb_size, x0, y0, false);
             let partial_split_cost = self.rd_cost(acc_distortion, split_flag_bits + acc_node_bits);
             self.trace.note_cu_split_bound_abort(
                 x0,
@@ -678,6 +865,14 @@ impl<'a> super::super::Encoder<'a> {
             budget.close_call_margin,
         );
         let split_exact = (self.stats.residual_bit_estimates - split_e0) as u32;
+        self.cu_early_diag_log(
+            &leaf,
+            leaf_bits,
+            log2_cb_size,
+            x0,
+            y0,
+            split_cost < leaf_cost,
+        );
         self.trace_split_decision(
             crate::trace::DecisionKind::Cu,
             x0,
@@ -740,6 +935,22 @@ impl<'a> super::super::Encoder<'a> {
         ct_depth: u8,
         ctxs: &Contexts,
     ) -> CuNode {
+        self.build_cu_scored(x0, y0, log2_cb_size, ct_depth, ctxs)
+            .node
+    }
+
+    /// Like [`build_cu`] but also returns the winner's decision-time RD score when
+    /// it is valid for parent accumulation (`scored = Some` only on the
+    /// winner-committed path; see body). Lets the split loop avoid re-walking each
+    /// child's tree for distortion/bit recomputation.
+    pub(in crate::encoder) fn build_cu_scored(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_cb_size: u8,
+        ct_depth: u8,
+        ctxs: &Contexts,
+    ) -> BuiltCu {
         let saved_policy = self.cur_policy;
         let saved_qp = (self.cur_qp_y, self.cur_qp_c);
         if self.aq.active {
@@ -754,9 +965,18 @@ impl<'a> super::super::Encoder<'a> {
         let keep_winner_committed = self.effort_template.reference || self.best2_cu_reuse;
         let (trial, winner) =
             self.decide_cu(x0, y0, log2_cb_size, ct_depth, ctxs, keep_winner_committed);
-        let node = if keep_winner_committed {
-            winner
+        let (node, scored) = if keep_winner_committed {
+            // The winner is committed unchanged, so its decision-time
+            // (distortion, frac_bits) already equal a fresh `distortion_tt_region`
+            // + `estimate_cu_node_bits` recompute over the committed region — every
+            // `decide_cu` return path builds `trial.cost` from those same helpers
+            // (matching split-flag inclusion). Hand the score to the parent so the
+            // split loop need not re-walk this child's tree.
+            (winner, Some((trial.cost.distortion, trial.cost.frac_bits)))
         } else {
+            // Non-`keep` path final-replays the plan, so the committed recon (and
+            // thus its distortion/bits) may differ from `trial.cost`; the caller
+            // must recompute from the replayed node.
             self.restore_frame_region(&base_frame);
             self.restore_mode_region(&base_mode_map);
             self.restore_ct_depth_region(&base_ct_depth_map);
@@ -767,10 +987,10 @@ impl<'a> super::super::Encoder<'a> {
                 self.rdo2_final_code_cu(&trial.plan, x0, y0, log2_cb_size, ct_depth, ctxs);
             self.elide_final_residual_pricing = saved_elide;
             Self::annotate_root_cu_confidence(&mut node, trial.confidence);
-            node
+            (node, None)
         };
         self.cur_policy = saved_policy;
         (self.cur_qp_y, self.cur_qp_c) = saved_qp;
-        node
+        BuiltCu { node, scored }
     }
 }

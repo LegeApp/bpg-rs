@@ -459,6 +459,43 @@ pub struct EncodeStats {
     pub cu_split_wins_by_region: [u64; crate::preanalysis::NUM_CLASSES],
     pub tu_leaf_wins_by_region: [u64; crate::preanalysis::NUM_CLASSES],
     pub tu_split_wins_by_region: [u64; crate::preanalysis::NUM_CLASSES],
+    /// CU early-termination diagnostic (`BPG_CU_EARLY_DIAG=1`), indexed by
+    /// `log2_cb_size` (valid 3..=6). For every splittable CU where both leaf and
+    /// split costs are known: total evaluated, split-actually-won, the candidate
+    /// `safe` force-leaf predicate fired, and predicate-fired-but-split-won
+    /// (a wrong force-leaf = the BD risk). Lets us confirm, before changing any
+    /// output, whether a normal-QP force-leaf rule fires increasingly at higher
+    /// resolution (the prerequisite for closing the scaling gap) and how often it
+    /// would be wrong. Diagnostic only — does not change the decision.
+    pub cu_split_eval_by_log2: [u64; 7],
+    pub cu_split_won_by_log2: [u64; 7],
+    pub cu_force_leaf_pred_by_log2: [u64; 7],
+    pub cu_force_leaf_mistake_by_log2: [u64; 7],
+    /// Zero-residual sub-predicate of the force-leaf predicate: region not
+    /// text/edge/chroma-critical AND the cheap leaf has zero coded residual.
+    /// Split can only win via mode/syntax here, not distortion. A strict
+    /// sub-count of `cu_force_leaf_pred_by_log2`; counted even when safe16
+    /// is already default-on, to evaluate 32x32/64x64 separately.
+    pub cu_force_leaf_zero_resid_pred_by_log2: [u64; 7],
+    pub cu_force_leaf_zero_resid_mistake_by_log2: [u64; 7],
+    pub cu_force_split_structured_pred_by_log2: [u64; 7],
+    pub cu_force_split_structured_mistake_by_log2: [u64; 7],
+    pub cu_force_split_edge_pred_by_log2: [u64; 7],
+    pub cu_force_split_edge_mistake_by_log2: [u64; 7],
+    pub tu_neighbor_limit_calls_by_log2: [u64; 7],
+    pub tu_neighbor_limit_disabled_by_log2: [u64; 7],
+    pub tu_neighbor_limit_small_by_log2: [u64; 7],
+    pub tu_neighbor_limit_prior_none_by_log2: [u64; 7],
+    pub tu_neighbor_limit_prior_leaf_by_log2: [u64; 7],
+    pub tu_neighbor_limit_prior_split_by_log2: [u64; 7],
+    pub tu_neighbor_limit_prior_combo_by_log2: [[u64; 9]; 7],
+    pub tu_neighbor_limit_residual_reject_by_log2: [u64; 7],
+    pub tu_neighbor_limit_region_reject_by_log2: [u64; 7],
+    pub tu_neighbor_limit_accept_by_log2: [u64; 7],
+    pub tu_neighbor_mixed_leaf_pred_by_log2: [u64; 7],
+    pub tu_neighbor_mixed_leaf_mistake_by_log2: [u64; 7],
+    pub tu_neighbor_both_split_pred_by_log2: [u64; 7],
+    pub tu_neighbor_both_split_mistake_by_log2: [u64; 7],
     pub full_rd_close_calls: u64,
     pub luma_close_call_escalations: u64,
     pub luma_rough_predictions: u64,
@@ -575,6 +612,102 @@ impl EncodeStats {
         merge_array(
             &mut self.tu_split_wins_by_region,
             &other.tu_split_wins_by_region,
+        );
+        merge_array(
+            &mut self.cu_split_eval_by_log2,
+            &other.cu_split_eval_by_log2,
+        );
+        merge_array(&mut self.cu_split_won_by_log2, &other.cu_split_won_by_log2);
+        merge_array(
+            &mut self.cu_force_leaf_pred_by_log2,
+            &other.cu_force_leaf_pred_by_log2,
+        );
+        merge_array(
+            &mut self.cu_force_leaf_mistake_by_log2,
+            &other.cu_force_leaf_mistake_by_log2,
+        );
+        merge_array(
+            &mut self.cu_force_leaf_zero_resid_pred_by_log2,
+            &other.cu_force_leaf_zero_resid_pred_by_log2,
+        );
+        merge_array(
+            &mut self.cu_force_leaf_zero_resid_mistake_by_log2,
+            &other.cu_force_leaf_zero_resid_mistake_by_log2,
+        );
+        merge_array(
+            &mut self.cu_force_split_structured_pred_by_log2,
+            &other.cu_force_split_structured_pred_by_log2,
+        );
+        merge_array(
+            &mut self.cu_force_split_structured_mistake_by_log2,
+            &other.cu_force_split_structured_mistake_by_log2,
+        );
+        merge_array(
+            &mut self.cu_force_split_edge_pred_by_log2,
+            &other.cu_force_split_edge_pred_by_log2,
+        );
+        merge_array(
+            &mut self.cu_force_split_edge_mistake_by_log2,
+            &other.cu_force_split_edge_mistake_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_limit_calls_by_log2,
+            &other.tu_neighbor_limit_calls_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_limit_disabled_by_log2,
+            &other.tu_neighbor_limit_disabled_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_limit_small_by_log2,
+            &other.tu_neighbor_limit_small_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_limit_prior_none_by_log2,
+            &other.tu_neighbor_limit_prior_none_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_limit_prior_leaf_by_log2,
+            &other.tu_neighbor_limit_prior_leaf_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_limit_prior_split_by_log2,
+            &other.tu_neighbor_limit_prior_split_by_log2,
+        );
+        for (dst, src) in self
+            .tu_neighbor_limit_prior_combo_by_log2
+            .iter_mut()
+            .zip(other.tu_neighbor_limit_prior_combo_by_log2.iter())
+        {
+            merge_array(dst, src);
+        }
+        merge_array(
+            &mut self.tu_neighbor_limit_residual_reject_by_log2,
+            &other.tu_neighbor_limit_residual_reject_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_limit_region_reject_by_log2,
+            &other.tu_neighbor_limit_region_reject_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_limit_accept_by_log2,
+            &other.tu_neighbor_limit_accept_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_mixed_leaf_pred_by_log2,
+            &other.tu_neighbor_mixed_leaf_pred_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_mixed_leaf_mistake_by_log2,
+            &other.tu_neighbor_mixed_leaf_mistake_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_both_split_pred_by_log2,
+            &other.tu_neighbor_both_split_pred_by_log2,
+        );
+        merge_array(
+            &mut self.tu_neighbor_both_split_mistake_by_log2,
+            &other.tu_neighbor_both_split_mistake_by_log2,
         );
         self.full_rd_close_calls += other.full_rd_close_calls;
         self.luma_close_call_escalations += other.luma_close_call_escalations;
@@ -840,6 +973,97 @@ impl fmt::Display for EncodeStats {
             f,
             "  tu_split_wins_by_region: {:?}",
             self.tu_split_wins_by_region
+        )?;
+        writeln!(
+            f,
+            "  cu_split_eval_by_log2: {:?}",
+            self.cu_split_eval_by_log2
+        )?;
+        writeln!(f, "  cu_split_won_by_log2: {:?}", self.cu_split_won_by_log2)?;
+        writeln!(
+            f,
+            "  cu_force_leaf_pred_by_log2: {:?}",
+            self.cu_force_leaf_pred_by_log2
+        )?;
+        writeln!(
+            f,
+            "  cu_force_leaf_mistake_by_log2: {:?}",
+            self.cu_force_leaf_mistake_by_log2
+        )?;
+        writeln!(
+            f,
+            "  cu_force_split_structured_pred_by_log2: {:?}",
+            self.cu_force_split_structured_pred_by_log2
+        )?;
+        writeln!(
+            f,
+            "  cu_force_split_structured_mistake_by_log2: {:?}",
+            self.cu_force_split_structured_mistake_by_log2
+        )?;
+        writeln!(
+            f,
+            "  cu_force_split_edge_pred_by_log2: {:?}",
+            self.cu_force_split_edge_pred_by_log2
+        )?;
+        writeln!(
+            f,
+            "  cu_force_split_edge_mistake_by_log2: {:?}",
+            self.cu_force_split_edge_mistake_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_limit_calls_by_log2: {:?}",
+            self.tu_neighbor_limit_calls_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_limit_prior_leaf_by_log2: {:?}",
+            self.tu_neighbor_limit_prior_leaf_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_limit_prior_split_by_log2: {:?}",
+            self.tu_neighbor_limit_prior_split_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_limit_prior_combo_by_log2: {:?}",
+            self.tu_neighbor_limit_prior_combo_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_limit_residual_reject_by_log2: {:?}",
+            self.tu_neighbor_limit_residual_reject_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_limit_region_reject_by_log2: {:?}",
+            self.tu_neighbor_limit_region_reject_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_limit_accept_by_log2: {:?}",
+            self.tu_neighbor_limit_accept_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_mixed_leaf_pred_by_log2: {:?}",
+            self.tu_neighbor_mixed_leaf_pred_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_mixed_leaf_mistake_by_log2: {:?}",
+            self.tu_neighbor_mixed_leaf_mistake_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_both_split_pred_by_log2: {:?}",
+            self.tu_neighbor_both_split_pred_by_log2
+        )?;
+        writeln!(
+            f,
+            "  tu_neighbor_both_split_mistake_by_log2: {:?}",
+            self.tu_neighbor_both_split_mistake_by_log2
         )?;
         writeln!(f, "  full_rd_close_calls: {}", self.full_rd_close_calls)?;
         writeln!(
