@@ -15,6 +15,7 @@ use super::super::types::{
 use super::policy::{EvalKind, EvalPolicy};
 use crate::contexts::Contexts;
 use crate::plan::{CuLeafPlan, CuPlan, DecisionConfidence, TtPlan};
+use crate::trace::WorkBucket;
 
 impl<'a> super::super::Encoder<'a> {
     pub(in crate::encoder) fn rdo2_final_parent_chroma_tu(
@@ -30,7 +31,7 @@ impl<'a> super::super::Encoder<'a> {
         }
         let (cx, cy, clog2, _count) = chroma_tb_geom(self.cat, x0, y0, log2_size)?;
         let pred = chroma_pred_mode(self.cat, chroma_mode);
-        let policy = EvalPolicy::for_kind(EvalKind::Final);
+        let policy = EvalPolicy::for_kind(EvalKind::Final).with_bucket(WorkBucket::FinalReplay);
         let cb = self
             .rdo2_eval_leaf_block(ctxs, cx, cy, clog2, 1, pred, self.cur_qp_c, policy)
             .coded;
@@ -55,7 +56,7 @@ impl<'a> super::super::Encoder<'a> {
         chroma_mode: u8,
         ctxs: &Contexts,
     ) -> Tt {
-        let policy = EvalPolicy::for_kind(EvalKind::Final);
+        let policy = EvalPolicy::for_kind(EvalKind::Final).with_bucket(WorkBucket::FinalReplay);
         let luma = self
             .rdo2_eval_leaf_block(ctxs, x0, y0, log2_size, 0, luma_mode, self.cur_qp_y, policy)
             .coded;

@@ -14,6 +14,7 @@ use crate::contexts::Contexts;
 use crate::effort::SplitSearch;
 use crate::plan::{CuPlan, DecisionConfidence, RdCost, TrialResult};
 use crate::preanalysis::RegionClass;
+use crate::trace::WorkBucket;
 use crate::Effort;
 
 use super::super::types::{CuLeaf, CuNode, NxnInfo, PartNxnPrune, Tt};
@@ -130,7 +131,8 @@ impl<'a> super::super::Encoder<'a> {
             // Screen policy: plain quant (no RDOQ). Residual bits default to exact
             // (accurate ranking without the RDOQ cost); `BPG_NXN_APPROX` falls back
             // to approximate bits. Default/`BPG_NXN_EXACT` is full-RDOQ ranking.
-            let exact_policy = EvalPolicy::for_kind(EvalKind::ExactTrial);
+            let exact_policy =
+                EvalPolicy::for_kind(EvalKind::ExactTrial).with_bucket(WorkBucket::NxnPuExact);
             let screen_policy = if nxn_adaptive {
                 EvalPolicy {
                     rdoq: RdoqPolicy::Off,
@@ -140,6 +142,7 @@ impl<'a> super::super::Encoder<'a> {
                         ResidualBitPolicy::Exact
                     },
                     commit: false,
+                    work_bucket: Some(crate::trace::WorkBucket::NxnPuCheap),
                 }
             } else {
                 exact_policy

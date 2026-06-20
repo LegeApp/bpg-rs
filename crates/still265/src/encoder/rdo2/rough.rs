@@ -9,6 +9,7 @@ use bpg_hevc_decode::hevc::intra::fill_mpm_candidates;
 use crate::contexts::Contexts;
 use crate::effort::RmdModeSet;
 use crate::plan::LumaModePlan;
+use crate::trace::{WorkBucket, WorkSample};
 
 impl<'a> super::super::Encoder<'a> {
     pub(in crate::encoder) fn decide_luma_modes(
@@ -35,6 +36,7 @@ impl<'a> super::super::Encoder<'a> {
         ct_depth: u8,
         ctxs: &Contexts,
     ) -> LumaModePlan {
+        let work_start = self.trace.enabled.then(std::time::Instant::now);
         let size = 1usize << log2_size;
         let src = self.source_block(0, x0, y0, size);
         let has_src8 = self.bit_depth == 8;
@@ -239,6 +241,20 @@ impl<'a> super::super::Encoder<'a> {
                 .note_luma_rmd_selection(scored.len(), n.min(scored.len()), false);
             scored.iter().take(n).map(|&(_, m)| m).collect()
         };
+        let modes_scored = scored.len() as u64;
+        if let Some(start) = work_start {
+            self.trace.note_work(
+                WorkBucket::RoughLumaAllAngles,
+                WorkSample {
+                    wall_ns: start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    log2_size,
+                    c_idx: 0,
+                    prediction_calls: modes_scored,
+                    source_block_calls: 1,
+                    ..WorkSample::default()
+                },
+            );
+        }
         scored.clear();
         self.scratch_scored = scored;
         self.scratch_src8 = src8;

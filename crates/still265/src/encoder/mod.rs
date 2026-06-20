@@ -1006,10 +1006,10 @@ pub fn encode_with_stats(
     } else {
         *crate::effort::template(config.effort)
     };
-    // Historical diagnostic: `BPG_BEST_SCHEDULER=balanced` used to combine the
+    // Historical diagnostics: `BPG_BEST_SCHEDULER=balanced` used to combine the
     // small-luma trial-RDOQ gate with approximate trial residual bits. The
-    // quality sweep showed approximate trial bits caused the regression, so the
-    // scheduler alias is now no stronger than the default Best RDOQ gate below.
+    // current rdo2 Best path makes the scheduler/RDOQ gate counters identical
+    // to `off`, so keep the explicit knobs below as diagnostics only.
     if best2_parallel {
         effort_template.parallel_analysis = true;
     }
@@ -1068,7 +1068,7 @@ pub fn encode_with_stats(
             Some("chroma") => BestTrialRdoqGate::Chroma,
             Some("luma32") | Some("32") => BestTrialRdoqGate::Luma32,
             Some("large") | Some("large-luma") => BestTrialRdoqGate::Large,
-            _ => BestTrialRdoqGate::SmallLuma,
+            _ => BestTrialRdoqGate::Off,
         }
     } else {
         BestTrialRdoqGate::Off

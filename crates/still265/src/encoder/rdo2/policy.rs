@@ -4,6 +4,8 @@
 //! obvious losers, but may not *decide* a close case without an exact recheck.
 #![allow(dead_code)] // staged rdo2 engine under construction (slice 1)
 
+use crate::trace::WorkBucket;
+
 /// How a candidate block is evaluated. Strong/obvious candidates stay
 /// [`EvalKind::CheapTrial`]; only close decisions escalate to
 /// [`EvalKind::ExactTrial`]; the chosen path is coded once at [`EvalKind::Final`].
@@ -44,6 +46,7 @@ pub(in crate::encoder) struct EvalPolicy {
     /// When true the reconstructed samples are written into the frame (the
     /// chosen path, or a split child whose siblings depend on its recon).
     pub(in crate::encoder) commit: bool,
+    pub(in crate::encoder) work_bucket: Option<WorkBucket>,
 }
 
 impl EvalPolicy {
@@ -53,18 +56,26 @@ impl EvalPolicy {
                 rdoq: RdoqPolicy::Off,
                 bits: ResidualBitPolicy::Approx,
                 commit: false,
+                work_bucket: None,
             },
             EvalKind::ExactTrial => Self {
                 rdoq: RdoqPolicy::FullSingleScan,
                 bits: ResidualBitPolicy::Exact,
                 commit: false,
+                work_bucket: None,
             },
             EvalKind::Final => Self {
                 rdoq: RdoqPolicy::FullSingleScan,
                 bits: ResidualBitPolicy::Exact,
                 commit: true,
+                work_bucket: Some(WorkBucket::FinalReplay),
             },
         }
+    }
+
+    pub(in crate::encoder) fn with_bucket(mut self, bucket: WorkBucket) -> Self {
+        self.work_bucket = Some(bucket);
+        self
     }
 }
 

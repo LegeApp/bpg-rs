@@ -22,6 +22,7 @@ use crate::contexts::ctx;
 use crate::contexts::Contexts;
 use crate::effort::{BlockSearchBudget, TrialQuality};
 use crate::plan::DecisionConfidence;
+use crate::trace::WorkBucket;
 use crate::Effort;
 
 use super::super::types::{CuLeaf, FrameSnapshot, MapSnapshot, MAX_TB_LOG2};
@@ -98,7 +99,12 @@ impl<'a> super::super::Encoder<'a> {
         ctxs: &Contexts,
         kind: EvalKind,
     ) -> LumaCandidateCost {
-        let policy = EvalPolicy::for_kind(kind);
+        let bucket = match kind {
+            EvalKind::CheapTrial => WorkBucket::LumaCandidateCheap,
+            EvalKind::ExactTrial => WorkBucket::LumaCandidateExact,
+            EvalKind::Final => WorkBucket::FinalReplay,
+        };
+        let policy = EvalPolicy::for_kind(kind).with_bucket(bucket);
         let eval = self.rdo2_eval_leaf_block(
             ctxs,
             x0,

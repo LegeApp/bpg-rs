@@ -15,6 +15,7 @@ use crate::contexts::Contexts;
 use crate::primitives;
 use crate::rdoq;
 use crate::residual::get_scan_order;
+use crate::trace::{WorkBucket, WorkSample};
 use crate::transform;
 
 use crate::effort::{BlockSearchBudget, SplitSearch};
@@ -73,6 +74,7 @@ impl<'a> super::super::Encoder<'a> {
         qp: i32,
         policy: EvalPolicy,
     ) -> LeafEval {
+        let work_start = self.trace.enabled.then(std::time::Instant::now);
         let size = 1usize << log2_size;
         let pred_mode = IntraPredMode::from_u8(mode).unwrap_or(IntraPredMode::Dc);
         let is_dst = log2_size == 2 && c_idx == 0;
@@ -264,6 +266,32 @@ impl<'a> super::super::Encoder<'a> {
         };
 
         let cost = self.rd_cost(distortion, frac_bits);
+        if let Some(start) = work_start {
+            let bucket = policy
+                .work_bucket
+                .unwrap_or(match (policy.commit, policy.rdoq) {
+                    (true, _) => WorkBucket::FinalReplay,
+                    (false, RdoqPolicy::Off) => WorkBucket::TtLeafCheap,
+                    (false, RdoqPolicy::FullSingleScan) => WorkBucket::TtLeafExact,
+                });
+            self.trace.note_work(
+                bucket,
+                WorkSample {
+                    wall_ns: start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    log2_size,
+                    c_idx,
+                    prediction_calls: 1,
+                    forward_transforms: 1,
+                    quant_calls: 1,
+                    rdoq_calls: u64::from(policy.rdoq == RdoqPolicy::FullSingleScan),
+                    inverse_transforms: u64::from(cbf),
+                    exact_residual_pricings: u64::from(policy.bits == ResidualBitPolicy::Exact),
+                    approx_residual_pricings: u64::from(policy.bits == ResidualBitPolicy::Approx),
+                    source_block_calls: 1,
+                    ..WorkSample::default()
+                },
+            );
+        }
         self.search_scratch = sc;
         LeafEval {
             distortion,
@@ -291,7 +319,12 @@ impl<'a> super::super::Encoder<'a> {
         ctxs: &Contexts,
         kind: EvalKind,
     ) -> (Tt, u64) {
-        let mut policy = EvalPolicy::for_kind(kind);
+        let bucket = match kind {
+            EvalKind::CheapTrial => WorkBucket::TtLeafCheap,
+            EvalKind::ExactTrial => WorkBucket::TtLeafExact,
+            EvalKind::Final => WorkBucket::FinalReplay,
+        };
+        let mut policy = EvalPolicy::for_kind(kind).with_bucket(bucket);
         policy.commit = true;
         let e =
             self.rdo2_eval_leaf_block(ctxs, x0, y0, log2_size, 0, luma_mode, self.cur_qp_y, policy);
@@ -554,7 +587,8 @@ impl<'a> super::super::Encoder<'a> {
         chroma_mode: u8,
         ctxs: &Contexts,
     ) -> Tt {
-        let mut policy = EvalPolicy::for_kind(EvalKind::CheapTrial);
+        let mut policy =
+            EvalPolicy::for_kind(EvalKind::CheapTrial).with_bucket(WorkBucket::TtLeafCheap);
         policy.commit = true;
         let luma = self
             .rdo2_eval_leaf_block(ctxs, x0, y0, log2_size, 0, luma_mode, self.cur_qp_y, policy)
@@ -636,7 +670,8 @@ impl<'a> super::super::Encoder<'a> {
             return None;
         }
         let (cx, cy, clog2, _count) = chroma_tb_geom(self.cat, x0, y0, log2_size)?;
-        let mut policy = EvalPolicy::for_kind(EvalKind::CheapTrial);
+        let mut policy =
+            EvalPolicy::for_kind(EvalKind::CheapTrial).with_bucket(WorkBucket::TtLeafCheap);
         policy.commit = true;
         let pred = chroma_pred_mode(self.cat, chroma_mode);
         let cb = self

@@ -21,6 +21,7 @@ use crate::cabac::CabacEstimator;
 use crate::contexts::Contexts;
 use crate::plan::ChromaModePlan;
 use crate::preanalysis::RegionClass;
+use crate::trace::{WorkBucket, WorkSample};
 use crate::Effort;
 
 use super::super::types::{chroma_pred_mode, chroma_tb_geom, CHROMA_DM_IDX};
@@ -68,6 +69,7 @@ impl<'a> super::super::Encoder<'a> {
         luma_mode: u8,
         ctxs: &Contexts,
     ) -> ChromaDecision {
+        let work_start = self.trace.enabled.then(std::time::Instant::now);
         let Some((cx, cy, clog2, count)) = chroma_tb_geom(self.cat, x0, y0, log2_size) else {
             return ChromaDecision {
                 plan: ChromaModePlan {
@@ -194,6 +196,19 @@ impl<'a> super::super::Encoder<'a> {
             n = within.clamp(1, n);
         }
         if n <= 1 {
+            if let Some(start) = work_start {
+                self.trace.note_work(
+                    WorkBucket::RoughChroma,
+                    WorkSample {
+                        wall_ns: start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                        log2_size: clog2,
+                        c_idx: 1,
+                        prediction_calls: scored.len() as u64 * u64::from(count) * 2,
+                        source_block_calls: u64::from(count) * 2,
+                        ..WorkSample::default()
+                    },
+                );
+            }
             let idx = scored[0].1;
             self.record_chroma_winner_rank(1);
             return ChromaDecision {
@@ -205,6 +220,19 @@ impl<'a> super::super::Encoder<'a> {
         }
 
         let cand_idxs: Vec<u8> = scored.iter().take(n).map(|&(_, idx)| idx).collect();
+        if let Some(start) = work_start {
+            self.trace.note_work(
+                WorkBucket::RoughChroma,
+                WorkSample {
+                    wall_ns: start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    log2_size: clog2,
+                    c_idx: 1,
+                    prediction_calls: scored.len() as u64 * u64::from(count) * 2,
+                    source_block_calls: u64::from(count) * 2,
+                    ..WorkSample::default()
+                },
+            );
+        }
         self.rdo2_chroma_rd_decision(
             ctxs,
             x0,
@@ -246,7 +274,12 @@ impl<'a> super::super::Encoder<'a> {
     ) -> ChromaCandidateCost {
         let mode = Self::chroma_mode_from_idx(luma_mode, mode_idx);
         let pred = chroma_pred_mode(self.cat, mode);
-        let mut policy = EvalPolicy::for_kind(kind);
+        let bucket = match kind {
+            EvalKind::CheapTrial => WorkBucket::ChromaCheap,
+            EvalKind::ExactTrial => WorkBucket::ChromaExact,
+            EvalKind::Final => WorkBucket::FinalReplay,
+        };
+        let mut policy = EvalPolicy::for_kind(kind).with_bucket(bucket);
         policy.commit = false;
         let exact0 = self.stats.residual_bit_estimates;
 

@@ -107,6 +107,48 @@ const CLASS_NAMES: [&str; NUM_CLASSES] = [
     "TextLike",
 ];
 
+const NUM_WORK_BUCKETS: usize = 15;
+
+/// Coarse attribution bucket for hot work units. Unlike the existing
+/// stage/component ledgers, this tracks wall time and primitive counts by the
+/// decision surface that caused the work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkBucket {
+    RoughLumaAllAngles = 0,
+    RoughChroma = 1,
+    LumaCandidateCheap = 2,
+    LumaCandidateExact = 3,
+    TtLeafCheap = 4,
+    TtLeafExact = 5,
+    TtSplitCheap = 6,
+    TtSplitExact = 7,
+    NxnPuCheap = 8,
+    NxnPuExact = 9,
+    ChromaCheap = 10,
+    ChromaExact = 11,
+    FinalReplay = 12,
+    SaoDecision = 13,
+    Deblock = 14,
+}
+
+const WORK_BUCKET_NAMES: [&str; NUM_WORK_BUCKETS] = [
+    "RoughLumaAllAngles",
+    "RoughChroma",
+    "LumaCandidateCheap",
+    "LumaCandidateExact",
+    "TtLeafCheap",
+    "TtLeafExact",
+    "TtSplitCheap",
+    "TtSplitExact",
+    "NxnPuCheap",
+    "NxnPuExact",
+    "ChromaCheap",
+    "ChromaExact",
+    "FinalReplay",
+    "SaoDecision",
+    "Deblock",
+];
+
 #[inline]
 fn size_bucket(log2_size: u8) -> usize {
     (log2_size as usize).saturating_sub(2).min(NUM_SIZES - 1)
@@ -183,6 +225,44 @@ struct CtuTally {
     final_frac_bits: u64,
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct WorkTally {
+    calls: u64,
+    wall_ns: u64,
+    log2_size_hist: [u64; NUM_SIZES],
+    component_hist: [u64; NUM_COMPONENTS],
+    prediction_calls: u64,
+    forward_transforms: u64,
+    quant_calls: u64,
+    rdoq_calls: u64,
+    inverse_transforms: u64,
+    exact_residual_pricings: u64,
+    approx_residual_pricings: u64,
+    snapshot_bytes_copied: u64,
+    snapshot_count: u64,
+    source_block_calls: u64,
+    allocated_bytes: u64,
+}
+
+/// One hot work unit to attribute to a [`WorkBucket`].
+#[derive(Clone, Copy, Default)]
+pub struct WorkSample {
+    pub wall_ns: u64,
+    pub log2_size: u8,
+    pub c_idx: u8,
+    pub prediction_calls: u64,
+    pub forward_transforms: u64,
+    pub quant_calls: u64,
+    pub rdoq_calls: u64,
+    pub inverse_transforms: u64,
+    pub exact_residual_pricings: u64,
+    pub approx_residual_pricings: u64,
+    pub snapshot_bytes_copied: u64,
+    pub snapshot_count: u64,
+    pub source_block_calls: u64,
+    pub allocated_bytes: u64,
+}
+
 #[derive(Clone, Copy)]
 struct DecisionEvent {
     kind: u8,
@@ -250,6 +330,7 @@ pub struct SearchTrace {
     stage: [StageTally; NUM_STAGES],
     code_block_volume: [[[CodeBlockVolume; NUM_SIZES]; NUM_COMPONENTS]; NUM_STAGES],
     rdoq_volume: [[[u64; NUM_SIZES]; NUM_COMPONENTS]; NUM_STAGES],
+    work: [WorkTally; NUM_WORK_BUCKETS],
     region_exact_estimates: [u64; NUM_CLASSES],
     /// Exact estimates by region class × block size (from `note_code_block`).
     region_size_exact: [[u64; NUM_SIZES]; NUM_CLASSES],
@@ -308,6 +389,7 @@ impl Default for SearchTrace {
             code_block_volume: [[[CodeBlockVolume::default(); NUM_SIZES]; NUM_COMPONENTS];
                 NUM_STAGES],
             rdoq_volume: [[[0; NUM_SIZES]; NUM_COMPONENTS]; NUM_STAGES],
+            work: [WorkTally::default(); NUM_WORK_BUCKETS],
             region_exact_estimates: [0; NUM_CLASSES],
             region_size_exact: [[0; NUM_SIZES]; NUM_CLASSES],
             ctus: Vec::new(),
@@ -504,6 +586,32 @@ impl SearchTrace {
             return;
         }
         self.rdoq_volume[stage_index(stage)][component_index(c_idx)][size_bucket(log2_size)] += 1;
+    }
+
+    pub fn note_work(&mut self, bucket: WorkBucket, sample: WorkSample) {
+        if !self.enabled {
+            return;
+        }
+        let t = &mut self.work[bucket as usize];
+        t.calls += 1;
+        t.wall_ns = t.wall_ns.saturating_add(sample.wall_ns);
+        t.log2_size_hist[size_bucket(sample.log2_size)] += 1;
+        t.component_hist[component_index(sample.c_idx)] += 1;
+        t.prediction_calls += sample.prediction_calls;
+        t.forward_transforms += sample.forward_transforms;
+        t.quant_calls += sample.quant_calls;
+        t.rdoq_calls += sample.rdoq_calls;
+        t.inverse_transforms += sample.inverse_transforms;
+        t.exact_residual_pricings += sample.exact_residual_pricings;
+        t.approx_residual_pricings += sample.approx_residual_pricings;
+        t.snapshot_bytes_copied = t
+            .snapshot_bytes_copied
+            .saturating_add(sample.snapshot_bytes_copied);
+        t.snapshot_count = t.snapshot_count.saturating_add(sample.snapshot_count);
+        t.source_block_calls = t
+            .source_block_calls
+            .saturating_add(sample.source_block_calls);
+        t.allocated_bytes = t.allocated_bytes.saturating_add(sample.allocated_bytes);
     }
 
     /// Track 0: rough luma mode scheduler selection before expensive luma RD.
@@ -737,6 +845,7 @@ impl SearchTrace {
         self.write_summary(total_residual_estimates)?;
         self.write_waste_buckets()?;
         self.write_stage_table()?;
+        self.write_work_ledger()?;
         self.write_code_block_volume()?;
         self.write_rdoq_volume()?;
         self.write_loss_hist()?;
@@ -771,6 +880,48 @@ impl SearchTrace {
                 String::new()
             },
         );
+        Ok(())
+    }
+
+    fn write_work_ledger(&self) -> std::io::Result<()> {
+        let mut w = self.create("work_ledger.csv")?;
+        writeln!(
+            w,
+            "bucket,calls,wall_ns,wall_ms,log2_4x4,log2_8x8,log2_16x16,log2_32x32,log2_64x64,component_y,component_cb,component_cr,prediction_calls,forward_transforms,quant_calls,rdoq_calls,inverse_transforms,exact_residual_pricings,approx_residual_pricings,snapshot_bytes_copied,snapshot_count,source_block_calls,allocated_bytes,avg_ns_per_call"
+        )?;
+        for (i, name) in WORK_BUCKET_NAMES.iter().enumerate() {
+            let t = self.work[i];
+            if t.calls == 0 {
+                continue;
+            }
+            writeln!(
+                w,
+                "{name},{},{},{:.3},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.1}",
+                t.calls,
+                t.wall_ns,
+                t.wall_ns as f64 / 1_000_000.0,
+                t.log2_size_hist[0],
+                t.log2_size_hist[1],
+                t.log2_size_hist[2],
+                t.log2_size_hist[3],
+                t.log2_size_hist[4],
+                t.component_hist[0],
+                t.component_hist[1],
+                t.component_hist[2],
+                t.prediction_calls,
+                t.forward_transforms,
+                t.quant_calls,
+                t.rdoq_calls,
+                t.inverse_transforms,
+                t.exact_residual_pricings,
+                t.approx_residual_pricings,
+                t.snapshot_bytes_copied,
+                t.snapshot_count,
+                t.source_block_calls,
+                t.allocated_bytes,
+                t.wall_ns as f64 / t.calls.max(1) as f64
+            )?;
+        }
         Ok(())
     }
 
