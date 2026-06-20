@@ -12,7 +12,10 @@ use bpg_hevc_decode::hevc::cabac::{
 use bpg_hevc_decode::hevc::residual::{decode_residual, ScanOrder as DecScan};
 use still265::cabac::CabacEncoder;
 use still265::contexts::Contexts;
-use still265::residual::{encode_residual, estimate_residual_bits, ScanOrder};
+use still265::residual::{
+    encode_residual, estimate_residual_bits, estimate_residual_bits_into, ResidualPricingScratch,
+    ScanOrder,
+};
 
 const SLICE_QP: i32 = 32;
 
@@ -46,6 +49,20 @@ fn round_trip(coeffs: &[i16], log2_size: u8, c_idx: u8, order: ScanOrder, sdh: b
     let mut enc_ctx = Contexts::new(SLICE_QP);
     let mut est_ctx = enc_ctx.clone();
     let estimated_bits = estimate_residual_bits(&mut est_ctx, coeffs, log2_size, c_idx, order, sdh);
+    let mut pricing_scratch = ResidualPricingScratch::default();
+    let scratch_bits = estimate_residual_bits_into(
+        &enc_ctx,
+        coeffs,
+        log2_size,
+        c_idx,
+        order,
+        sdh,
+        &mut pricing_scratch,
+    );
+    assert_eq!(
+        scratch_bits, estimated_bits,
+        "scratch residual estimate mismatch"
+    );
     encode_residual(
         &mut enc,
         &mut w,

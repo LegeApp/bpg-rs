@@ -489,8 +489,15 @@ mod tests {
         let cb = vec![128u8; (w.div_ceil(2) * h.div_ceil(2)) as usize];
         let cr = vec![128u8; (w.div_ceil(2) * h.div_ceil(2)) as usize];
         let img = Image::from_ycbcr_planes_u8(
-            &y, &cb, &cr, w, h,
-            ChromaFormat::Yuv420, ColorSpace::YCbCr, false, 8,
+            &y,
+            &cb,
+            &cr,
+            w,
+            h,
+            ChromaFormat::Yuv420,
+            ColorSpace::YCbCr,
+            false,
+            8,
         );
         assert_eq!(img.chroma_format, ChromaFormat::Yuv420);
         assert_eq!(img.planes[0].data[0], 128);
@@ -507,9 +514,16 @@ mod tests {
         let cb = vec![512u16; (w * h) as usize];
         let cr = vec![512u16; (w * h) as usize];
         let img = Image::from_ycbcr_planes_u16(
-            &y, &cb, &cr, 10,
-            w, h,
-            ChromaFormat::Yuv444, ColorSpace::YCbCr, false, 8,
+            &y,
+            &cb,
+            &cr,
+            10,
+            w,
+            h,
+            ChromaFormat::Yuv444,
+            ColorSpace::YCbCr,
+            false,
+            8,
         );
         // 1023/1023 * 255 = 255
         assert_eq!(img.planes[0].data[0], 255);

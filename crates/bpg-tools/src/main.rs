@@ -211,9 +211,7 @@ fn open_png(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::E
     let bit_depth = match decoder.get_depth().ok_or("PNG: missing bit depth")? {
         zune_core::bit_depth::BitDepth::Eight => 8u8,
         zune_core::bit_depth::BitDepth::Sixteen => 16u8,
-        _ => {
-            return Err("PNG bit depth is not supported; use 8 or 16-bit PNG".into())
-        }
+        _ => return Err("PNG bit depth is not supported; use 8 or 16-bit PNG".into()),
     };
 
     let color_type = match decoder.get_colorspace().ok_or("PNG: missing colorspace")? {
@@ -229,7 +227,13 @@ fn open_png(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::E
         }
     };
 
-    Ok(LoadedImage { width, height, color_type, bit_depth, pixels })
+    Ok(LoadedImage {
+        width,
+        height,
+        color_type,
+        bit_depth,
+        pixels,
+    })
 }
 
 /// Read a JPEG file using zune-jpeg. Always outputs 8-bit RGB.
@@ -247,7 +251,13 @@ fn open_jpeg(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::
     let width = u32::try_from(w).map_err(|_| format!("JPEG width {w} exceeds u32"))?;
     let height = u32::try_from(h).map_err(|_| format!("JPEG height {h} exceeds u32"))?;
 
-    Ok(LoadedImage { width, height, color_type: ColorType::Rgb, bit_depth: 8, pixels })
+    Ok(LoadedImage {
+        width,
+        height,
+        color_type: ColorType::Rgb,
+        bit_depth: 8,
+        pixels,
+    })
 }
 
 /// BT.709 luma coefficients (same as the image crate's to_luma8/16).
@@ -263,8 +273,14 @@ fn rgb_to_luma16(r: u16, g: u16, b: u16) -> u16 {
 fn is_gray_image(img: &LoadedImage) -> bool {
     match (img.color_type, img.bit_depth) {
         (ColorType::Gray, _) | (ColorType::GrayAlpha, _) => true,
-        (ColorType::Rgb, 8) => img.pixels.chunks_exact(3).all(|p| p[0] == p[1] && p[1] == p[2]),
-        (ColorType::Rgba, 8) => img.pixels.chunks_exact(4).all(|p| p[0] == p[1] && p[1] == p[2]),
+        (ColorType::Rgb, 8) => img
+            .pixels
+            .chunks_exact(3)
+            .all(|p| p[0] == p[1] && p[1] == p[2]),
+        (ColorType::Rgba, 8) => img
+            .pixels
+            .chunks_exact(4)
+            .all(|p| p[0] == p[1] && p[1] == p[2]),
         (ColorType::Rgb, _) => img.pixels.chunks_exact(6).all(|p| {
             u16::from_be_bytes([p[0], p[1]]) == u16::from_be_bytes([p[2], p[3]])
                 && u16::from_be_bytes([p[2], p[3]]) == u16::from_be_bytes([p[4], p[5]])
@@ -312,8 +328,16 @@ fn extract_gray8(img: &LoadedImage) -> Vec<u8> {
 fn extract_gray16(img: &LoadedImage) -> Vec<u16> {
     let be16 = |a: u8, b: u8| u16::from_be_bytes([a, b]);
     match (img.color_type, img.bit_depth) {
-        (ColorType::Gray, 16) => img.pixels.chunks_exact(2).map(|c| be16(c[0], c[1])).collect(),
-        (ColorType::GrayAlpha, 16) => img.pixels.chunks_exact(4).map(|c| be16(c[0], c[1])).collect(),
+        (ColorType::Gray, 16) => img
+            .pixels
+            .chunks_exact(2)
+            .map(|c| be16(c[0], c[1]))
+            .collect(),
+        (ColorType::GrayAlpha, 16) => img
+            .pixels
+            .chunks_exact(4)
+            .map(|c| be16(c[0], c[1]))
+            .collect(),
         (ColorType::Rgb, 16) => img
             .pixels
             .chunks_exact(6)
@@ -335,13 +359,37 @@ fn extract_gray16(img: &LoadedImage) -> Vec<u16> {
 fn extract_rgb8(img: &LoadedImage) -> Vec<u8> {
     match (img.color_type, img.bit_depth) {
         (ColorType::Rgb, 8) => img.pixels.clone(),
-        (ColorType::Rgba, 8) => img.pixels.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect(),
+        (ColorType::Rgba, 8) => img
+            .pixels
+            .chunks_exact(4)
+            .flat_map(|p| [p[0], p[1], p[2]])
+            .collect(),
         (ColorType::Gray, 8) => img.pixels.iter().flat_map(|&v| [v, v, v]).collect(),
-        (ColorType::GrayAlpha, 8) => img.pixels.chunks_exact(2).flat_map(|c| [c[0], c[0], c[0]]).collect(),
-        (ColorType::Rgb, _) => img.pixels.chunks_exact(6).flat_map(|p| [p[0], p[2], p[4]]).collect(),
-        (ColorType::Rgba, _) => img.pixels.chunks_exact(8).flat_map(|p| [p[0], p[2], p[4]]).collect(),
-        (ColorType::Gray, _) => img.pixels.chunks_exact(2).flat_map(|c| [c[0], c[0], c[0]]).collect(),
-        (ColorType::GrayAlpha, _) => img.pixels.chunks_exact(4).flat_map(|c| [c[0], c[0], c[0]]).collect(),
+        (ColorType::GrayAlpha, 8) => img
+            .pixels
+            .chunks_exact(2)
+            .flat_map(|c| [c[0], c[0], c[0]])
+            .collect(),
+        (ColorType::Rgb, _) => img
+            .pixels
+            .chunks_exact(6)
+            .flat_map(|p| [p[0], p[2], p[4]])
+            .collect(),
+        (ColorType::Rgba, _) => img
+            .pixels
+            .chunks_exact(8)
+            .flat_map(|p| [p[0], p[2], p[4]])
+            .collect(),
+        (ColorType::Gray, _) => img
+            .pixels
+            .chunks_exact(2)
+            .flat_map(|c| [c[0], c[0], c[0]])
+            .collect(),
+        (ColorType::GrayAlpha, _) => img
+            .pixels
+            .chunks_exact(4)
+            .flat_map(|c| [c[0], c[0], c[0]])
+            .collect(),
     }
 }
 
@@ -363,12 +411,18 @@ fn extract_rgb16(img: &LoadedImage) -> Vec<u16> {
         (ColorType::Gray, 16) => img
             .pixels
             .chunks_exact(2)
-            .flat_map(|c| { let v = be16(c[0], c[1]); [v, v, v] })
+            .flat_map(|c| {
+                let v = be16(c[0], c[1]);
+                [v, v, v]
+            })
             .collect(),
         (ColorType::GrayAlpha, 16) => img
             .pixels
             .chunks_exact(4)
-            .flat_map(|c| { let v = be16(c[0], c[1]); [v, v, v] })
+            .flat_map(|c| {
+                let v = be16(c[0], c[1]);
+                [v, v, v]
+            })
             .collect(),
         _ => extract_rgb8(img)
             .into_iter()
@@ -410,7 +464,11 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // SAO is on by default for every effort (the single-pass replay path makes
     // it ~free); --no-sao opts out.
-    let sao = if args.no_sao { SaoMode::Off } else { SaoMode::On };
+    let sao = if args.no_sao {
+        SaoMode::Off
+    } else {
+        SaoMode::On
+    };
     let deblock = if args.no_deblock {
         DeblockMode::Off
     } else {
@@ -429,7 +487,9 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
-    let ext = args.input.extension()
+    let ext = args
+        .input
+        .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .unwrap_or_default();
@@ -759,7 +819,7 @@ fn append_debug_stats_csv(
     if write_header {
         writeln!(
             file,
-            "input,output,effort,qp,format,bit_depth,width,height,pixels,bpg_bytes,annexb_bytes,bpp,bytes_per_mp,encode_s,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,tu_split_early_terminations,rmd_prunes,luma_candidate_expansions,chroma_candidate_expansions,final_coded_blocks,trial_coded_blocks,trial_final_ratio,final_rdoq_blocks,trial_rdoq_blocks,rdoq_trial_final_ratio,full_rd_close_calls,luma_close_call_escalations,luma_rough_predictions,chroma_rough_predictions,code_block_calls,code_block_per_final,forward_transforms,inverse_transforms,residual_bit_estimates,residual_estimates_per_final,cache_builds,cache_fast_hits,cache_fallbacks,frame_snapshots,frame_restores,map_snapshots,map_restores,bytes_snapshotted,angular_exclusions,policy_angular_forced,policy_angular_guarded,policy_early_term_suppressed,region_class_counts,luma_winner_rank_counts,chroma_winner_rank_counts,cu_leaf_wins_by_region,cu_split_wins_by_region,tu_leaf_wins_by_region,tu_split_wins_by_region"
+            "input,output,effort,qp,format,bit_depth,width,height,pixels,bpg_bytes,annexb_bytes,bpp,bytes_per_mp,encode_s,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,tu_split_early_terminations,rmd_prunes,luma_candidate_expansions,chroma_candidate_expansions,partnxn_attempts,partnxn_skips,partnxn_wins,partnxn_losses,partnxn_cu_trials,partnxn_code_block_calls,final_coded_blocks,trial_coded_blocks,trial_final_ratio,final_rdoq_blocks,trial_rdoq_blocks,rdoq_trial_final_ratio,best_tt_cheap_tu_decisions,best_tt_escalated_tu_decisions,best_tt_escalation_changed_winner,best_tt_full_trial_rdoq_blocks_saved,best_tt_exact_residual_estimates_saved,full_rd_close_calls,luma_close_call_escalations,luma_rough_predictions,chroma_rough_predictions,code_block_calls,code_block_per_final,forward_transforms,inverse_transforms,residual_bit_estimates,residual_estimates_per_final,cache_builds,cache_fast_hits,cache_fallbacks,frame_snapshots,frame_restores,map_snapshots,map_restores,bytes_snapshotted,bytes_restored,phase_total_us,phase_build_us,phase_parallel_restore_us,phase_deblock_us,phase_sao_decide_us,phase_sao_apply_us,phase_write_us,angular_exclusions,policy_angular_forced,policy_angular_guarded,policy_early_term_suppressed,region_class_counts,luma_winner_rank_counts,chroma_winner_rank_counts,cu_leaf_wins_by_region,cu_split_wins_by_region,tu_leaf_wins_by_region,tu_split_wins_by_region,partnxn_wins_by_region"
         )?;
     }
 
@@ -795,12 +855,23 @@ fn append_debug_stats_csv(
         stats.rmd_prunes.to_string(),
         stats.luma_candidate_expansions.to_string(),
         stats.chroma_candidate_expansions.to_string(),
+        stats.partnxn_attempts.to_string(),
+        stats.partnxn_skips.to_string(),
+        stats.partnxn_wins.to_string(),
+        stats.partnxn_losses.to_string(),
+        stats.partnxn_cu_trials.to_string(),
+        stats.partnxn_code_block_calls.to_string(),
         stats.final_coded_blocks.to_string(),
         stats.trial_coded_blocks.to_string(),
         format!("{:.6}", stats.trial_coded_blocks as f64 / final_blocks_f),
         stats.final_rdoq_blocks.to_string(),
         stats.trial_rdoq_blocks.to_string(),
         format!("{:.6}", stats.trial_rdoq_blocks as f64 / final_rdoq_f),
+        stats.best_tt_cheap_tu_decisions.to_string(),
+        stats.best_tt_escalated_tu_decisions.to_string(),
+        stats.best_tt_escalation_changed_winner.to_string(),
+        stats.best_tt_full_trial_rdoq_blocks_saved.to_string(),
+        stats.best_tt_exact_residual_estimates_saved.to_string(),
         stats.full_rd_close_calls.to_string(),
         stats.luma_close_call_escalations.to_string(),
         stats.luma_rough_predictions.to_string(),
@@ -822,6 +893,14 @@ fn append_debug_stats_csv(
         stats.map_snapshots.to_string(),
         stats.map_restores.to_string(),
         stats.bytes_snapshotted.to_string(),
+        stats.bytes_restored.to_string(),
+        stats.phase_total_us.to_string(),
+        stats.phase_build_us.to_string(),
+        stats.phase_parallel_restore_us.to_string(),
+        stats.phase_deblock_us.to_string(),
+        stats.phase_sao_decide_us.to_string(),
+        stats.phase_sao_apply_us.to_string(),
+        stats.phase_write_us.to_string(),
         stats.angular_exclusions.to_string(),
         stats.policy_angular_forced.to_string(),
         stats.policy_angular_guarded.to_string(),
@@ -833,6 +912,7 @@ fn append_debug_stats_csv(
         csv_field(&join_u64s(&stats.cu_split_wins_by_region)),
         csv_field(&join_u64s(&stats.tu_leaf_wins_by_region)),
         csv_field(&join_u64s(&stats.tu_split_wins_by_region)),
+        csv_field(&join_u64s(&stats.partnxn_wins_by_region)),
     ];
     writeln!(file, "{}", fields.join(","))?;
     Ok(())

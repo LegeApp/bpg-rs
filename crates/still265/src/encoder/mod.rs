@@ -21,7 +21,8 @@
 //! comes in a later milestone.
 
 mod aq;
-mod rdo;
+mod rdo2;
+mod rdo_legacy;
 mod snapshot;
 mod types;
 mod write;
@@ -31,7 +32,6 @@ use bpg_hevc_decode::hevc::slice::IntraPredMode;
 use bpg_hevc_decode::DecodedFrame;
 
 use crate::analysis_cache::{AnalysisCache, CacheDecisionConfidence};
-use crate::contexts::Contexts;
 use crate::effort::{BlockDesc, BlockSearchBudget, EffortTemplate};
 use crate::plan::DecisionConfidence;
 use crate::sao;
@@ -41,8 +41,7 @@ use self::aq::AqState;
 use self::types::*;
 pub use self::types::{EncodeStats, Source};
 use self::write::{
-    build_slice_trees_parallel, build_slice_trees_serial, encode_slice_data,
-    encode_slice_data_parallel, write_slice_from_trees,
+    build_slice_trees_parallel, build_slice_trees_serial, encode_slice_data, write_slice_from_trees,
 };
 
 struct Encoder<'a> {
@@ -73,6 +72,70 @@ struct Encoder<'a> {
     scratch_scored: Vec<(u64, u8)>,
     /// Batch buffer for `intra_pred_allangs` (33 angular slots), pooled per CU.
     scratch_allangs: Vec<u16>,
+    /// Pooled buffers for the staged `rdo2` TU search (refactor-rdo.md).
+    search_scratch: rdo2::scratch::SearchScratch,
+    /// Gate: route the transform-tree decision through the new `rdo2` staged
+    /// engine (`BPG_RDO2_TU`). Default on for Best.
+    rdo2_tu: bool,
+    /// Gate: screen luma mode candidates with cheap trials, then exact-recheck
+    /// close top-two decisions (`BPG_RDO2_LUMA`). Default on for Best.
+    rdo2_luma: bool,
+    /// Gate: use non-committing scratch block eval for Best luma leaf-screen
+    /// candidate ranking (`BPG_RDO2_LUMA_SCRATCH`). Default on for Best luma.
+    rdo2_luma_scratch: bool,
+    /// Multiplier for rdo2 luma close-call exact rechecks
+    /// (`BPG_RDO2_LUMA_CLOSE_MULT`). Default 2.0 for Best, 1.0 otherwise.
+    rdo2_luma_close_mult: f64,
+    /// Temporary fallback: use the legacy materializing exact luma escalation
+    /// even when the scratch luma screen is active
+    /// (`BPG_RDO2_LUMA_LEGACY_ESCALATE`). Default off.
+    rdo2_luma_legacy_escalate: bool,
+    /// Gate: screen chroma mode RD candidates with cheap trials, exact-recheck
+    /// close calls, and re-code the winner exactly (`BPG_RDO2_CHROMA`). Default off.
+    rdo2_chroma: bool,
+    /// Gate: when `BPG_RDO2_CHROMA` is active, use the rdo2 non-committing
+    /// evaluator for one-block chroma RD candidate costs
+    /// (`BPG_RDO2_CHROMA_SCRATCH`). Stacked 4:2:2 chroma remains on the
+    /// materializing fallback until scratch-overlay prediction exists.
+    rdo2_chroma_scratch: bool,
+    /// Gate: bound the 8x8 `PartNxN` search by the exact `Part2Nx2N` cost,
+    /// aborting (skipping the remaining PUs) once the accumulated per-PU luma RD
+    /// cost — a true lower bound on the full `PartNxN` cost — can no longer beat
+    /// it (`BPG_RDO2_NXN`). Exact, no quality loss. Default on for Best.
+    rdo2_nxn: bool,
+    /// Gate (Phase 8): when set, `rdo2_analyze_tt` screens the luma+chroma
+    /// transform tree with a **native** rdo2 recursion that costs each leaf
+    /// through `rdo2_eval_leaf_block` (explicit `EvalKind::CheapTrial` policy)
+    /// instead of re-entering the legacy recursive `build_tt` under the implicit
+    /// `best_tt_cheap_trial` flag (`BPG_RDO2_TT_NATIVE`). Default on for Best:
+    /// validated byte-identical to the legacy screen across 4:2:0/4:2:2/4:4:4,
+    /// multiple QPs, and 2000x1500, so the structure decision and exact final
+    /// replay are unchanged. Escape with `BPG_RDO2_TT_NATIVE=0`.
+    rdo2_tt_native: bool,
+    /// Gate (Phase 8): within the native TU screen, skip the per-node
+    /// `leaf_frame` snapshot used to restore a winning leaf after the split
+    /// trial overwrote it. Instead the leaf is committed, early-term/neighbour
+    /// leaf wins return it directly, and the rare "leaf beats split" case
+    /// recodes the (deterministic) leaf from the base snapshot. Also drops the
+    /// redundant `tu_depth` snapshots (leaf coding never writes the depth map;
+    /// `record_tu_winner` sets the final value). Byte-identical to the snapshot
+    /// path; `BPG_RDO2_TT_NOSNAP=0` restores it for A/B timing. Default on for
+    /// Best when the native screen is active.
+    rdo2_tt_nosnap: bool,
+    /// Gate (Phase 8): pool the native TU screen's per-node frame-region
+    /// snapshot in `SearchScratch.frame_snapshot_pool` instead of allocating a
+    /// fresh `FrameSnapshot` (three plane `Vec`s) per compared node. Byte-
+    /// identical (pure allocation reuse); `BPG_RDO2_TT_POOL=0` allocates per
+    /// node for A/B timing. Default on for Best when the native screen is active.
+    rdo2_tt_pool: bool,
+    /// Re-entry guard: true while inside `rdo2_analyze_tt`'s cheap screen, so the
+    /// recursive `build_tt` calls run the legacy path (cheap) instead of
+    /// re-entering the gate.
+    in_rdo2: bool,
+    /// Internal Phase-6 rdo2 optimization: while replaying the root CTU winner,
+    /// final residual syntax will be emitted by the writer, so analysis can skip
+    /// the duplicate exact residual bit estimate.
+    elide_final_residual_pricing: bool,
     analysis: std::sync::Arc<crate::preanalysis::AnalysisMaps>,
     analysis_cache: AnalysisCache,
     cur_policy: Option<crate::preanalysis::SearchPolicy>,
@@ -85,6 +148,12 @@ struct Encoder<'a> {
     best2_rough_lambda: bool,
     best2_rd_lambda: bool,
     best2_rdoq2: bool,
+    best_trial_approx_bits: bool,
+    best_trial_rdoq_gate: BestTrialRdoqGate,
+    best_tt_close_escalation: bool,
+    best_tt_escalation_margin: f64,
+    best_tt_cheap_trial: bool,
+    best_tt_exact_trial: bool,
     sign_data_hiding: bool,
     best2_wpp: bool,
     best_luma_leaf_screen: bool,
@@ -98,6 +167,7 @@ struct Encoder<'a> {
     /// normal `Part2Nx2N` CU and pick the RD winner. Env-gated (`BPG_PARTNXN`);
     /// only effective on the winner-direct `best2_cu_reuse` path.
     partnxn: bool,
+    partnxn_prune: PartNxnPrune,
     aq: AqState,
     prof: Profiler,
     trace: crate::trace::SearchTrace,
@@ -105,6 +175,26 @@ struct Encoder<'a> {
 }
 
 impl<'a> Encoder<'a> {
+    fn with_tt_trial_flags<R>(
+        &mut self,
+        cheap_trial: bool,
+        exact_trial: bool,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        debug_assert!(
+            !(cheap_trial && exact_trial),
+            "TU trial mode cannot be both cheap and exact"
+        );
+        let prev_cheap = self.best_tt_cheap_trial;
+        let prev_exact = self.best_tt_exact_trial;
+        self.best_tt_cheap_trial = cheap_trial;
+        self.best_tt_exact_trial = exact_trial;
+        let result = f(self);
+        self.best_tt_cheap_trial = prev_cheap;
+        self.best_tt_exact_trial = prev_exact;
+        result
+    }
+
     fn src_luma_stride(&self) -> usize {
         self.display_width as usize
     }
@@ -426,6 +516,20 @@ impl<'a> Encoder<'a> {
             scratch_pred8: Vec::new(),
             scratch_scored: Vec::new(),
             scratch_allangs: Vec::new(),
+            search_scratch: rdo2::scratch::SearchScratch::default(),
+            rdo2_tu: self.rdo2_tu,
+            rdo2_luma: self.rdo2_luma,
+            rdo2_luma_scratch: self.rdo2_luma_scratch,
+            rdo2_luma_close_mult: self.rdo2_luma_close_mult,
+            rdo2_luma_legacy_escalate: self.rdo2_luma_legacy_escalate,
+            rdo2_chroma: self.rdo2_chroma,
+            rdo2_chroma_scratch: self.rdo2_chroma_scratch,
+            rdo2_nxn: self.rdo2_nxn,
+            rdo2_tt_native: self.rdo2_tt_native,
+            rdo2_tt_nosnap: self.rdo2_tt_nosnap,
+            rdo2_tt_pool: self.rdo2_tt_pool,
+            in_rdo2: false,
+            elide_final_residual_pricing: false,
             analysis: self.analysis.clone(),
             analysis_cache: self.analysis_cache.empty_like(),
             cur_policy: self.cur_policy,
@@ -438,6 +542,12 @@ impl<'a> Encoder<'a> {
             best2_rough_lambda: self.best2_rough_lambda,
             best2_rd_lambda: self.best2_rd_lambda,
             best2_rdoq2: self.best2_rdoq2,
+            best_trial_approx_bits: self.best_trial_approx_bits,
+            best_trial_rdoq_gate: self.best_trial_rdoq_gate,
+            best_tt_close_escalation: self.best_tt_close_escalation,
+            best_tt_escalation_margin: self.best_tt_escalation_margin,
+            best_tt_cheap_trial: false,
+            best_tt_exact_trial: false,
             sign_data_hiding: self.sign_data_hiding,
             best2_wpp: self.best2_wpp,
             best_luma_leaf_screen: self.best_luma_leaf_screen,
@@ -446,6 +556,7 @@ impl<'a> Encoder<'a> {
             best2_tt_reuse: self.best2_tt_reuse,
             best2_cu_reuse: self.best2_cu_reuse,
             partnxn: self.partnxn,
+            partnxn_prune: self.partnxn_prune,
             aq: AqState::inert(),
             prof: Profiler {
                 on: self.prof.on,
@@ -552,24 +663,6 @@ impl<'a> Encoder<'a> {
                 crate::trace::CandRec::new(split_cost, split_exact),
             ],
         );
-    }
-
-    fn tt_luma_approx_delta(&self, ctxs: &Contexts, tt: &Tt) -> i64 {
-        match tt {
-            Tt::Leaf(l) => {
-                if l.luma.cbf {
-                    let approx =
-                        self.approx_residual_frac_bits(ctxs, &l.luma.levels, l.log2_size, 0);
-                    approx as i64 - l.luma.frac_bits as i64
-                } else {
-                    0
-                }
-            }
-            Tt::Split { kids, .. } => kids
-                .iter()
-                .map(|k| self.tt_luma_approx_delta(ctxs, k))
-                .sum(),
-        }
     }
 
     fn is_close_call(best: f64, runner_up: f64, margin: f64) -> bool {
@@ -839,10 +932,29 @@ pub fn encode_with_stats(
     config: &StillHevcConfig,
     src: Source<'_>,
 ) -> (Vec<u8>, DecodedFrame, EncodeStats) {
+    let encode_start = std::time::Instant::now();
     assert!(
         matches!(config.bit_depth, 8 | 10 | 12),
         "supported bit depths: 8, 10, 12"
     );
+
+    // rdo2 development phase: the intermediate quality tiers (Fastest/Fast/
+    // Balanced/Good) are collapsed onto `Best` so their divergent budgets and
+    // legacy search methods don't complicate Best/rdo2 work. Only `Best` (the
+    // rdo2 engine) and the byte-exact reference tiers (`Placebo`/`Reference`)
+    // retain distinct behaviour; the effort ladder will be rebuilt on top of a
+    // tuned rdo2 `Best` later. Reference tiers are untouched.
+    let mut coerced_config;
+    let config = if matches!(
+        config.effort,
+        Effort::Fastest | Effort::Fast | Effort::Balanced | Effort::Good
+    ) {
+        coerced_config = config.clone();
+        coerced_config.effort = Effort::Best;
+        &coerced_config
+    } else {
+        config
+    };
     let cat = chroma_array_type(config.chroma);
     let width = config.width;
     let height = config.height;
@@ -894,6 +1006,19 @@ pub fn encode_with_stats(
     } else {
         *crate::effort::template(config.effort)
     };
+    let best_balanced_scheduler = config.effort == Effort::Best
+        && std::env::var("BPG_BEST_SCHEDULER")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "balanced" | "1" | "on" | "true"
+                )
+            })
+            .unwrap_or(false);
+    if best_balanced_scheduler {
+        effort_template.residual.exact_bits_during_trials = false;
+    }
     if best2_parallel {
         effort_template.parallel_analysis = true;
     }
@@ -934,6 +1059,39 @@ pub fn encode_with_stats(
             .ok()
             .map(|v| v.trim() != "0")
             .unwrap_or(true);
+    let best_trial_approx_bits = config.effort == Effort::Best
+        && std::env::var("BPG_BEST_TRIAL_APPROX_BITS")
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(best_balanced_scheduler);
+    let best_trial_rdoq_gate = if config.effort == Effort::Best {
+        match std::env::var("BPG_BEST_TRIAL_RDOQ_GATE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("1") | Some("on") | Some("true") | Some("small-luma") => {
+                BestTrialRdoqGate::SmallLuma
+            }
+            Some("chroma") => BestTrialRdoqGate::Chroma,
+            Some("luma32") | Some("32") => BestTrialRdoqGate::Luma32,
+            Some("large") | Some("large-luma") => BestTrialRdoqGate::Large,
+            _ if best_balanced_scheduler => BestTrialRdoqGate::SmallLuma,
+            _ => BestTrialRdoqGate::Off,
+        }
+    } else {
+        BestTrialRdoqGate::Off
+    };
+    let best_tt_close_escalation = config.effort == Effort::Best
+        && std::env::var("BPG_BEST_TT_CLOSE_ESCALATION")
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(false);
+    let best_tt_escalation_margin = std::env::var("BPG_BEST_TT_ESCALATION_MARGIN")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(0.02)
+        .max(0.0);
     // AQ-gated: under the experimental variance AQ, `Best` falls back to the
     // same coding path the lower AQ tiers use. The leaf-screen / TU-neighbour /
     // TT-reuse fast paths bypass `final_code_tt`'s per-CU QP bookkeeping, which
@@ -990,6 +1148,32 @@ pub fn encode_with_stats(
             &format!("{:?}", config.chroma),
         )
     };
+    let env_bool_or = |key: &str, default: bool| {
+        std::env::var(key)
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(default)
+    };
+    let env_f64_or = |key: &str, default: f64| {
+        std::env::var(key)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(default)
+    };
+    let rdo2_best_luma_default = config.effort == Effort::Best;
+    let rdo2_tu = rdo2_best_luma_default || env_bool_or("BPG_RDO2_TU", false);
+    let rdo2_nxn = rdo2_best_luma_default || env_bool_or("BPG_RDO2_NXN", false);
+    let rdo2_luma = rdo2_best_luma_default || env_bool_or("BPG_RDO2_LUMA", false);
+    let rdo2_luma_scratch =
+        rdo2_best_luma_default || env_bool_or("BPG_RDO2_LUMA_SCRATCH", rdo2_luma);
+    let rdo2_luma_close_mult = env_f64_or(
+        "BPG_RDO2_LUMA_CLOSE_MULT",
+        if rdo2_best_luma_default { 2.0 } else { 1.0 },
+    );
+    let rdo2_chroma = rdo2_best_luma_default || env_bool_or("BPG_RDO2_CHROMA", false);
+    let rdo2_chroma_scratch =
+        rdo2_best_luma_default || env_bool_or("BPG_RDO2_CHROMA_SCRATCH", rdo2_chroma);
     let mut state = Encoder {
         display_width: width,
         display_height: height,
@@ -1017,6 +1201,21 @@ pub fn encode_with_stats(
         scratch_pred8: Vec::new(),
         scratch_scored: Vec::new(),
         scratch_allangs: Vec::new(),
+        search_scratch: rdo2::scratch::SearchScratch::default(),
+        rdo2_tu,
+        rdo2_luma,
+        rdo2_luma_scratch,
+        rdo2_luma_close_mult,
+        rdo2_luma_legacy_escalate: !rdo2_best_luma_default
+            && env_bool_or("BPG_RDO2_LUMA_LEGACY_ESCALATE", false),
+        rdo2_chroma,
+        rdo2_chroma_scratch,
+        rdo2_nxn,
+        rdo2_tt_native: rdo2_best_luma_default || env_bool_or("BPG_RDO2_TT_NATIVE", false),
+        rdo2_tt_nosnap: rdo2_best_luma_default || env_bool_or("BPG_RDO2_TT_NOSNAP", false),
+        rdo2_tt_pool: rdo2_best_luma_default || env_bool_or("BPG_RDO2_TT_POOL", false),
+        in_rdo2: false,
+        elide_final_residual_pricing: false,
         analysis: analysis.clone(),
         analysis_cache,
         cur_policy: None,
@@ -1044,6 +1243,12 @@ pub fn encode_with_stats(
         best2_rough_lambda,
         best2_rd_lambda,
         best2_rdoq2,
+        best_trial_approx_bits,
+        best_trial_rdoq_gate,
+        best_tt_close_escalation,
+        best_tt_escalation_margin,
+        best_tt_cheap_trial: false,
+        best_tt_exact_trial: false,
         sign_data_hiding: crate::sdh_active(config),
         best2_wpp,
         best_luma_leaf_screen,
@@ -1058,10 +1263,25 @@ pub fn encode_with_stats(
         // PartNxN is a real coding tool, so it belongs on every quality-leaning
         // tier (each prunes the per-PU search via its own RD budget) — Best down
         // to Fast. Off for Fastest (speed floor) and the exact reference tiers.
-        partnxn: std::env::var("BPG_PARTNXN").map(|v| v != "0").unwrap_or(matches!(
-            config.effort,
-            Effort::Best | Effort::Good | Effort::Balanced | Effort::Fast
-        )),
+        partnxn: std::env::var("BPG_PARTNXN")
+            .map(|v| v != "0")
+            .unwrap_or(matches!(
+                config.effort,
+                Effort::Best | Effort::Good | Effort::Balanced | Effort::Fast
+            )),
+        partnxn_prune: match std::env::var("BPG_PARTNXN_PRUNE")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("0") | Some("off") | Some("false") => PartNxnPrune::Off,
+            Some("1") | Some("on") | Some("true") | Some("conservative") => {
+                PartNxnPrune::Conservative
+            }
+            Some("aggressive") => PartNxnPrune::Aggressive,
+            _ if config.effort == Effort::Balanced => PartNxnPrune::Conservative,
+            _ => PartNxnPrune::Off,
+        },
         prof: Profiler {
             on: std::env::var_os("BPG_PROFILE").is_some(),
             ..Default::default()
@@ -1087,33 +1307,59 @@ pub fn encode_with_stats(
 
     let ctb = 1u32 << CTB_LOG2;
 
+    let use_parallel_analysis = state.effort_template.parallel_analysis && !state.trace.enabled;
+    if state.trace.enabled && state.effort_template.parallel_analysis {
+        eprintln!("search-trace: forcing serial analysis so the per-decision ledger is complete");
+    }
+
     let slice_data = if config.sao == SaoMode::On {
         // Production SAO (docs/sao.md): build every CTU tree once (reconstructing
         // the frame), deblock, decide SAO on the deblocked frame, then *replay*
         // the cached trees with SAO syntax — no second RDO pass. Parallel tiers
         // build via the wavefront; serial tiers build interleaved (the throwaway
         // bitstream only evolves the running context their RD pricing needs).
-        let trees = if state.effort_template.parallel_analysis {
+        let phase_start = std::time::Instant::now();
+        let trees = if use_parallel_analysis {
             build_slice_trees_parallel(&mut state, slice_qp_y)
         } else {
             build_slice_trees_serial(&mut state, slice_qp_y)
         };
+        state.stats.phase_build_us += phase_start.elapsed().as_micros() as u64;
         if state.deblock {
+            let phase_start = std::time::Instant::now();
             bpg_hevc_decode::hevc::deblock::apply_deblocking_filter(&mut state.frame, 0, 0, 0, 0);
+            state.stats.phase_deblock_us += phase_start.elapsed().as_micros() as u64;
         }
+        let phase_start = std::time::Instant::now();
         let sao_map = state.decide_sao_map(ctb);
+        state.stats.phase_sao_decide_us += phase_start.elapsed().as_micros() as u64;
+        let phase_start = std::time::Instant::now();
         let bytes = write_slice_from_trees(&mut state, &trees, Some(&sao_map), slice_qp_y);
+        state.stats.phase_write_us += phase_start.elapsed().as_micros() as u64;
         // The frame is already deblocked; SAO is the final in-loop step.
+        let phase_start = std::time::Instant::now();
         apply_sao(&mut state.frame, &sao_map, ctb);
+        state.stats.phase_sao_apply_us += phase_start.elapsed().as_micros() as u64;
         bytes
     } else {
-        let bytes = if state.effort_template.parallel_analysis {
-            encode_slice_data_parallel(&mut state, slice_qp_y)
+        let bytes = if use_parallel_analysis {
+            let phase_start = std::time::Instant::now();
+            let trees = build_slice_trees_parallel(&mut state, slice_qp_y);
+            state.stats.phase_build_us += phase_start.elapsed().as_micros() as u64;
+            let phase_start = std::time::Instant::now();
+            let bytes = write_slice_from_trees(&mut state, &trees, None, slice_qp_y);
+            state.stats.phase_write_us += phase_start.elapsed().as_micros() as u64;
+            bytes
         } else {
-            encode_slice_data(&mut state, None, slice_qp_y)
+            let phase_start = std::time::Instant::now();
+            let bytes = encode_slice_data(&mut state, None, slice_qp_y);
+            state.stats.phase_write_us += phase_start.elapsed().as_micros() as u64;
+            bytes
         };
         if state.deblock {
+            let phase_start = std::time::Instant::now();
             bpg_hevc_decode::hevc::deblock::apply_deblocking_filter(&mut state.frame, 0, 0, 0, 0);
+            state.stats.phase_deblock_us += phase_start.elapsed().as_micros() as u64;
         }
         bytes
     };
@@ -1147,8 +1393,23 @@ pub fn encode_with_stats(
             ms(p.rdoq),
             ms(p.residual_bits),
         );
+        eprintln!(
+            "profile rdo2 eval (ms): predict={:.1}  fwd_transform={:.1}  \
+             quant+rdoq={:.1}  inv_transform={:.1}  residual_price={:.1}  || rough_satd_search={:.1}",
+            ms(p.eval_predict),
+            ms(p.eval_transform),
+            ms(p.eval_quant_rdoq),
+            ms(p.eval_recon),
+            ms(p.eval_residual_price),
+            ms(p.rough_search),
+        );
     }
 
+    if std::env::var_os("BPG_RDO2_REPORT_LEGACY").is_some() {
+        eprintln!("{}", state.stats.legacy.report());
+    }
+
+    state.stats.phase_total_us = encode_start.elapsed().as_micros() as u64;
     (out, state.frame, state.stats)
 }
 

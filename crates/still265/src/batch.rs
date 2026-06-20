@@ -1,8 +1,8 @@
 //! Batch still-image encoding with memory-budget-aware concurrency.
 //!
 //! Encoding many images at once is bounded by RAM as much as by CPU: each
-//! in-flight encode holds a reconstruction frame, and the parallel `Best` path
-//! additionally clones one frame per wavefront worker. This module surfaces a
+//! in-flight encode holds a reconstruction frame, and the parallel wavefront
+//! path additionally clones one frame per wavefront worker. This module surfaces a
 //! [`MemoryEstimate`] so a caller can size concurrency against a RAM budget
 //! *before* spawning work, plus a simple image-parallel [`encode_batch`] runner.
 //!
@@ -49,8 +49,8 @@ pub struct MemoryEstimate {
     /// The input source planes (display resolution, all components).
     pub source_bytes: u64,
     /// Number of per-worker frame clones the chosen effort will hold
-    /// concurrently (0 for the serial tiers; the parallel `Best`/`Placebo` path
-    /// clones one frame per wavefront worker).
+    /// concurrently (0 for serial configs; the parallel wavefront path clones
+    /// one frame per wavefront worker).
     pub worker_frames: u32,
     /// Estimated peak resident memory for the whole encode.
     pub peak_bytes: u64,
@@ -80,19 +80,19 @@ fn plane_samples(w: u32, h: u32, chroma: ChromaFormat) -> u64 {
 }
 
 /// Whether `config` runs the frame-cloning parallel wavefront path. Mirrors the
-/// encoder's `best2_parallel` gate (Best, AQ off, not disabled by env) and the
-/// always-parallel `Placebo` tier.
+/// encoder's `best2_parallel` gate for non-reference tiers (AQ off, not disabled
+/// by env) and the always-parallel `Placebo` tier.
 fn is_parallel(config: &StillHevcConfig) -> bool {
     match config.effort {
         Effort::Placebo => true,
-        Effort::Best => {
+        Effort::Reference => false,
+        _ => {
             !crate::aq_active(config)
                 && std::env::var("BPG_BEST2_PARALLEL")
                     .ok()
                     .map(|v| v.trim() != "0")
                     .unwrap_or(true)
         }
-        _ => false,
     }
 }
 
@@ -148,7 +148,7 @@ pub fn estimate_memory(config: &StillHevcConfig) -> MemoryEstimate {
 }
 
 /// How many encodes of `config` can run concurrently within `ram_budget_bytes`,
-/// clamped to `[1, available_parallelism]`. Note the parallel `Best` path is
+/// clamped to `[1, available_parallelism]`. Note the parallel wavefront path is
 /// already multi-threaded *within* one encode, so for batch throughput it is
 /// usually best to run each encode serially (`BPG_ENC_THREADS=1`) and let this
 /// concurrency provide the parallelism across images.
@@ -177,7 +177,7 @@ pub struct BatchOutput {
 /// parallelism), preserving input order in the returned vector.
 ///
 /// Each job is independent, so this scales cleanly across images. Remember that
-/// the parallel `Best` path also threads *within* an encode: to avoid
+/// the parallel wavefront path also threads *within* an encode: to avoid
 /// oversubscription when `concurrency > 1`, set `BPG_ENC_THREADS=1` so each
 /// encode runs serially and this provides the across-image parallelism. Size
 /// `concurrency` with [`recommended_concurrency`] to stay within a RAM budget.
@@ -227,7 +227,10 @@ pub fn encode_batch(jobs: &[BatchJob<'_>], concurrency: usize) -> Vec<BatchOutpu
             }
         }
     });
-    slots.into_iter().map(|o| o.expect("every job encoded")).collect()
+    slots
+        .into_iter()
+        .map(|o| o.expect("every job encoded"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -261,12 +264,29 @@ mod tests {
     }
 
     #[test]
-    fn serial_tiers_have_no_worker_frames() {
-        // Force serial so the worker-frame count is deterministic regardless of host.
-        let fast = estimate_memory(&cfg(1024, 768, Effort::Fast, ChromaFormat::Yuv420));
-        assert_eq!(fast.worker_frames, 0);
+    fn aq_or_reference_configs_have_no_worker_frames() {
+        let mut fast_aq = cfg(1024, 768, Effort::Fast, ChromaFormat::Yuv420);
+        fast_aq.adaptive_qp = true;
+        let fast_aq = estimate_memory(&fast_aq);
+        assert_eq!(fast_aq.worker_frames, 0);
+
+        let reference = estimate_memory(&cfg(1024, 768, Effort::Reference, ChromaFormat::Yuv420));
+        assert_eq!(reference.worker_frames, 0);
         // A serial encode's peak is ~one frame + source + slack.
-        assert!(fast.peak_bytes >= fast.frame_bytes + fast.source_bytes);
+        assert!(reference.peak_bytes >= reference.frame_bytes + reference.source_bytes);
+    }
+
+    #[test]
+    fn uniform_speed_tiers_account_for_wavefront_worker_frames() {
+        if std::env::var("BPG_BEST2_PARALLEL")
+            .ok()
+            .is_some_and(|v| v.trim() == "0")
+        {
+            return;
+        }
+        let balanced = estimate_memory(&cfg(1024, 768, Effort::Balanced, ChromaFormat::Yuv420));
+        assert!(balanced.worker_frames > 0);
+        assert!(balanced.worker_frames <= 12);
     }
 
     #[test]
@@ -276,7 +296,9 @@ mod tests {
         // A budget below one instance still yields at least 1.
         assert_eq!(recommended_concurrency(&c, per / 2), 1);
         // A large budget is capped by core count, not RAM.
-        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         assert_eq!(recommended_concurrency(&c, per * 10_000), cores.max(1));
     }
 }

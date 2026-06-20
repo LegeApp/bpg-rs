@@ -319,6 +319,49 @@ pub fn estimate_residual_bits(
     sink.frac_bits()
 }
 
+/// Reusable exact residual-pricing state for non-writing analysis paths.
+///
+/// The estimator must preserve the caller's CABAC contexts, so each pricing
+/// starts from a copied context state and a reset fractional-bit accumulator.
+pub struct ResidualPricingScratch {
+    ctxs: Contexts,
+    sink: CabacEstimator,
+}
+
+impl Default for ResidualPricingScratch {
+    fn default() -> Self {
+        Self {
+            ctxs: Contexts::new(0),
+            sink: CabacEstimator::new(),
+        }
+    }
+}
+
+/// Estimate `residual_coding()` cost using caller-owned scratch state.
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_residual_bits_into(
+    base_ctxs: &Contexts,
+    coeffs: &[i16],
+    log2_size: u8,
+    c_idx: u8,
+    scan_order: ScanOrder,
+    sign_data_hiding: bool,
+    scratch: &mut ResidualPricingScratch,
+) -> u64 {
+    scratch.ctxs.clone_from(base_ctxs);
+    scratch.sink = CabacEstimator::new();
+    residual_syntax(
+        &mut scratch.sink,
+        &mut scratch.ctxs,
+        coeffs,
+        log2_size,
+        c_idx,
+        scan_order,
+        sign_data_hiding,
+    );
+    scratch.sink.frac_bits()
+}
+
 /// HEVC sign-data-hiding: make each qualifying coding group's first significant
 /// coefficient sign parity-consistent with the group's |level| sum, so the
 /// decoder can infer that sign from the parity instead of coding it. Faithful

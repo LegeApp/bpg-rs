@@ -8,6 +8,10 @@ license.workspace = true
 name = "bpg-tools"
 path = "src/main.rs"
 
+[[bin]]
+name = "bpg-highres-compare"
+path = "src/bin/highres_compare.rs"
+
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 png = "0.17"
@@ -20,6 +24,9 @@ bpg-hevc = { path = "../bpg-hevc" }
 bpg-decode = { path = "../bpg-decode" }
 bpg-encode = { path = "../bpg-encode" }
 still265 = { path = "../still265" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [features]
 # Normal `bpg-tools` builds include the bit-identical portable-SIMD hot kernels.

@@ -90,7 +90,11 @@ fn write_cu_nxn(
             nxn.mpms[pu][2].as_u8(),
         ];
         let idx = mpm_u8.iter().position(|&m| m == mode);
-        enc.encode_bin(w, idx.is_some() as u8, ctxs.get(ctx::PREV_INTRA_LUMA_PRED_FLAG));
+        enc.encode_bin(
+            w,
+            idx.is_some() as u8,
+            ctxs.get(ctx::PREV_INTRA_LUMA_PRED_FLAG),
+        );
         in_mpm[pu] = idx;
     }
     // Second pass: mpm_idx (1-2 bypass) or rem_intra_luma_pred_mode (5 bypass).
@@ -638,6 +642,7 @@ pub(super) fn build_slice_trees_parallel(
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
 
+        let restore_start = std::time::Instant::now();
         for builds in results {
             for b in builds {
                 state.restore_frame_region(&b.fsnap);
@@ -651,6 +656,7 @@ pub(super) fn build_slice_trees_parallel(
                 trees[(b.cy * ctbs_x + b.cx) as usize] = Some(b.cu);
             }
         }
+        state.stats.phase_parallel_restore_us += restore_start.elapsed().as_micros() as u64;
 
         // WPP: evolve each row's pricing context through the CTU just built (in
         // raster-within-row order — one CTU per row per diagonal), and seed the
@@ -683,6 +689,18 @@ pub(super) fn build_slice_trees_parallel(
 
     for w in &workers {
         state.stats.merge(&w.stats);
+        if state.prof.on {
+            state.prof.snapshot += w.prof.snapshot;
+            state.prof.code_block += w.prof.code_block;
+            state.prof.residual_bits += w.prof.residual_bits;
+            state.prof.rdoq += w.prof.rdoq;
+            state.prof.eval_predict += w.prof.eval_predict;
+            state.prof.eval_transform += w.prof.eval_transform;
+            state.prof.eval_quant_rdoq += w.prof.eval_quant_rdoq;
+            state.prof.eval_recon += w.prof.eval_recon;
+            state.prof.eval_residual_price += w.prof.eval_residual_price;
+            state.prof.rough_search += w.prof.rough_search;
+        }
     }
 
     if state.deblock {
@@ -757,11 +775,6 @@ pub(super) fn write_slice_from_trees(
     w.write_bit(1);
     w.byte_align();
     w.into_bytes()
-}
-
-pub(super) fn encode_slice_data_parallel(state: &mut Encoder<'_>, slice_qp_y: i32) -> Vec<u8> {
-    let trees = build_slice_trees_parallel(state, slice_qp_y);
-    write_slice_from_trees(state, &trees, None, slice_qp_y)
 }
 
 /// Encode `slice_segment_data()` for every CTU, optionally with SAO syntax.

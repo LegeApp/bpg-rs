@@ -16,8 +16,7 @@
 
 use super::round_shift;
 use bpg_hevc_decode::hevc::intra::{
-    predict_angular, reference_filter_applies, INTRA_BORDER_CENTER, INTRA_BORDER_LEN,
-    INTRA_PRED_ANGLE, INV_ANGLE,
+    reference_filter_applies, INTRA_BORDER_CENTER, INTRA_BORDER_LEN, INTRA_PRED_ANGLE, INV_ANGLE,
 };
 use wide::{i16x8, i32x4, i32x8};
 
@@ -102,6 +101,52 @@ pub fn sub_residual(
 /// rounding offset (`< 1<<shift`) stays within `i32`, and the signed lane-wise
 /// arithmetic shift + `clamp` match the scalar i32 path exactly. The (unused
 /// for `bit_depth >= 8`, `log2 >= 2`) negative-shift case defers to scalar.
+/// Forward quantization, bit-identical to [`super::quantize_scalar`].
+///
+/// `|coeff| <= 32767` and `scale <= 26214`, so `|coeff|*scale <= ~8.6e8`; the
+/// rounding offset `add` is `< 1<<qbits` with `qbits <= 27`, so `add <= ~4.5e7`
+/// and the sum stays well within `i32` (`< 2.1e9`). The lane-wise arithmetic
+/// shift, `min(32767)`, sign reapplication, and non-zero count therefore match
+/// the scalar `i64` reference exactly. `qbits >= 9` always (max TU is 32x32,
+/// max bit depth 12), so the shift is always positive.
+pub fn quantize(coeffs: &[i16], levels: &mut [i16], scale: i32, add: i32, qbits: i32) -> u32 {
+    let vscale = i32x8::new([scale; 8]);
+    let vadd = i32x8::new([add; 8]);
+    let vmax = i32x8::new([32767; 8]);
+    let zero = i32x8::new([0; 8]);
+    let mut nnz_acc = i32x8::new([0; 8]);
+
+    let mut i = 0;
+    while i + 8 <= coeffs.len() {
+        let c = i32x8::from(i16x8::from_slice_unaligned(&coeffs[i..]));
+        let absc = c.max(zero - c);
+        let level = ((absc * vscale + vadd) >> qbits).min(vmax);
+        // Re-sign: -level where c<0, level otherwise.
+        let neg = c.is_negative();
+        let signed = neg.blend(zero - level, level);
+        let arr = signed.to_array();
+        for (k, &x) in arr.iter().enumerate() {
+            levels[i + k] = x as i16;
+        }
+        // is_positive() is -1 per non-zero (level>=0) lane.
+        nnz_acc = nnz_acc + level.is_positive();
+        i += 8;
+    }
+    let mut nnz = (-nnz_acc.reduce_add()) as u32;
+
+    while i < coeffs.len() {
+        let c = coeffs[i];
+        let level = ((c.unsigned_abs() as i64 * scale as i64 + add as i64) >> qbits) as i32;
+        let level = level.min(32767);
+        if level != 0 {
+            levels[i] = if c < 0 { -level } else { level } as i16;
+            nnz += 1;
+        }
+        i += 1;
+    }
+    nnz
+}
+
 pub fn dequantize(levels: &mut [i16], combined: i32, shift: i32) {
     if shift < 0 {
         super::dequantize_scalar(levels, combined, shift);
@@ -190,8 +235,8 @@ pub fn sao_stats_e0(
             // sign(d) via inherent masks (-1 where true): is_negative = d<0,
             // is_positive = d>0. sign = is_negative - is_positive gives
             // d<0 -> -1, d>0 -> +1, d==0 -> 0.
-            let edge = (d0.is_negative() - d0.is_positive())
-                + (d1.is_negative() - d1.is_positive());
+            let edge =
+                (d0.is_negative() - d0.is_positive()) + (d1.is_negative() - d1.is_positive());
             let diff = s - r;
 
             for k in 0..4 {
@@ -325,11 +370,10 @@ fn inv_angle(mode: u8) -> i32 {
 
 /// SIMD batched all-angular intra prediction (`intra_pred_allangs`).
 ///
-/// Vertical modes (>=18) vectorize the per-row reference convolution
-/// `((32-f)*ref[i] + f*ref[i+1] + 16) >> 5` (clamped) with `i32x8`. Horizontal
-/// modes (<18) are a per-column gather, so they reuse the exact scalar
-/// `predict_angular` (SIMD-unfriendly and rare-benefit). Byte-identical to
-/// `intra_angs::intra_pred_allangs_scalar` (enforced by tests).
+/// Vertical modes (>=18) vectorize the per-row reference convolution.
+/// Horizontal modes (<18) vectorize the transposed per-column convolution.
+/// Byte-identical to `intra_angs::intra_pred_allangs_scalar` (enforced by
+/// tests).
 pub fn intra_pred_allangs(
     dst: &mut [u16],
     unfiltered: &[i32],
@@ -353,9 +397,8 @@ pub fn intra_pred_allangs(
         if mode >= 18 {
             predict_vertical_simd(slot, n, mode, max_val, border, center);
         } else {
-            predict_angular(
-                slot, n, 0, 0, n as u32, c_idx, mode, max_val, border, center,
-            );
+            let _ = c_idx;
+            predict_horizontal_simd(slot, n, mode, max_val, border, center);
         }
     }
 }
@@ -442,11 +485,107 @@ fn predict_vertical_simd(
     }
 }
 
+/// Horizontal-mode (<18) angular prediction into a `n`-stride slot, mirroring
+/// the transposed branch of the decoder's `predict_angular`. The natural row
+/// loop gathers from the reference array, so this implementation flips the
+/// loops: for one output column, rows are contiguous in the reference array and
+/// can be processed with `i32x8`, then scattered into the column.
+fn predict_horizontal_simd(
+    slot: &mut [u16],
+    n: usize,
+    mode: u8,
+    max_val: i32,
+    border: &[i32],
+    center: usize,
+) {
+    let angle = INTRA_PRED_ANGLE[mode as usize] as i32;
+    let rc = INTRA_BORDER_CENTER;
+    let ni = n as i32;
+    let mut ref_arr = [0i32; INTRA_BORDER_LEN];
+
+    for i in 0..=n {
+        ref_arr[rc + i] = border[center - i];
+    }
+    if angle < 0 {
+        let inv = inv_angle(mode);
+        let ext = (ni * angle) >> 5;
+        if ext < -1 {
+            for xx in ext..=-1 {
+                let idx = (xx * inv + 128) >> 8;
+                if idx >= 0 && idx <= 2 * ni {
+                    ref_arr[(rc as i32 + xx) as usize] = border[(center as i32 + idx) as usize];
+                }
+            }
+        }
+    } else {
+        for xx in (ni + 1)..=(2 * ni) {
+            ref_arr[rc + xx as usize] = border[center - xx as usize];
+        }
+    }
+
+    let zero = i32x8::new([0; 8]);
+    let max_v = i32x8::new([max_val; 8]);
+    let bias = i32x8::new([16; 8]);
+    for px in 0..n {
+        let i_idx = (((px as i32) + 1) * angle) >> 5;
+        let i_fact = (((px as i32) + 1) * angle) & 31;
+        let base = (rc as i32 + i_idx + 1) as usize;
+        let mut py = 0usize;
+        if i_fact != 0 {
+            let w0 = i32x8::new([32 - i_fact; 8]);
+            let f = i32x8::new([i_fact; 8]);
+            while py + 8 <= n {
+                let a =
+                    i32x8::new(<[i32; 8]>::try_from(&ref_arr[base + py..base + py + 8]).unwrap());
+                let b = i32x8::new(
+                    <[i32; 8]>::try_from(&ref_arr[base + py + 1..base + py + 9]).unwrap(),
+                );
+                let r = ((a * w0 + b * f + bias) >> 5u32).max(zero).min(max_v);
+                let arr = r.to_array();
+                for k in 0..8 {
+                    slot[(py + k) * n + px] = arr[k] as u16;
+                }
+                py += 8;
+            }
+            while py < n {
+                let v = ((32 - i_fact) * ref_arr[base + py] + i_fact * ref_arr[base + py + 1] + 16)
+                    >> 5;
+                slot[py * n + px] = v.clamp(0, max_val) as u16;
+                py += 1;
+            }
+        } else {
+            while py + 8 <= n {
+                let r =
+                    i32x8::new(<[i32; 8]>::try_from(&ref_arr[base + py..base + py + 8]).unwrap())
+                        .max(zero)
+                        .min(max_v);
+                let arr = r.to_array();
+                for k in 0..8 {
+                    slot[(py + k) * n + px] = arr[k] as u16;
+                }
+                py += 8;
+            }
+            while py < n {
+                slot[py * n + px] = ref_arr[base + py].clamp(0, max_val) as u16;
+                py += 1;
+            }
+        }
+    }
+
+    // Boundary filter for mode 10 (luma, size < 32) — row 0 of each column.
+    if mode == 10 && n < 32 {
+        for px in 0..n {
+            let pred = border[center - 1] + ((border[center + 1 + px] - border[center]) >> 1);
+            slot[px] = pred.clamp(0, max_val) as u16;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
-        dct_matrix, dequantize_scalar, forward_dct_1d as scalar_dct_1d, sao_stats_e0_scalar,
-        satd_u16_scalar, ssd_u16_scalar, sub_residual_scalar,
+        dct_matrix, dequantize_scalar, forward_dct_1d as scalar_dct_1d, quantize_scalar,
+        sao_stats_e0_scalar, satd_u16_scalar, ssd_u16_scalar, sub_residual_scalar,
     };
 
     /// Deterministic xorshift32 PRNG (no external dep).
@@ -512,13 +651,66 @@ mod tests {
                 let mut got_sum = [0i64; 5];
                 let mut got_cnt = [0u32; 5];
                 sao_stats_e0_scalar(
-                    &rec, stride, &src, stride, x0, y0, w, h, &mut want_sum, &mut want_cnt,
+                    &rec,
+                    stride,
+                    &src,
+                    stride,
+                    x0,
+                    y0,
+                    w,
+                    h,
+                    &mut want_sum,
+                    &mut want_cnt,
                 );
                 super::sao_stats_e0(
-                    &rec, stride, &src, stride, x0, y0, w, h, &mut got_sum, &mut got_cnt,
+                    &rec,
+                    stride,
+                    &src,
+                    stride,
+                    x0,
+                    y0,
+                    w,
+                    h,
+                    &mut got_sum,
+                    &mut got_cnt,
                 );
                 assert_eq!(got_sum, want_sum, "sum bd={bd} region=({x0},{y0},{w},{h})");
-                assert_eq!(got_cnt, want_cnt, "count bd={bd} region=({x0},{y0},{w},{h})");
+                assert_eq!(
+                    got_cnt, want_cnt,
+                    "count bd={bd} region=({x0},{y0},{w},{h})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn quantize_matches_scalar() {
+        // HEVC QUANT_SCALE and qbits ranges spanning all valid
+        // (qp, log2_size, bit_depth) combinations, plus a non-multiple-of-8 tail.
+        const QUANT_SCALE: [i32; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
+        let mut st = 0x1234_abcdu32;
+        for &bd in &[8i32, 10, 12] {
+            for log2 in 2i32..=5 {
+                for qp in 0i32..=51 {
+                    let per = qp / 6;
+                    let rem = (qp % 6) as usize;
+                    let transform_shift = 15 - bd - log2;
+                    let qbits = 14 + per + transform_shift;
+                    let add = (171i64 << (qbits - 9)) as i32;
+                    let scale = QUANT_SCALE[rem];
+                    for &len in &[16usize, 17, 64, 1024] {
+                        let mut coeffs = vec![0i16; len];
+                        for v in coeffs.iter_mut() {
+                            *v = (rng(&mut st) as i32 % 65536 - 32768) as i16;
+                        }
+                        let mut want = vec![0i16; len];
+                        let mut got = vec![0i16; len];
+                        let nnz_w = quantize_scalar(&coeffs, &mut want, scale, add, qbits);
+                        let nnz_g = super::quantize(&coeffs, &mut got, scale, add, qbits);
+                        assert_eq!(got, want, "levels bd={bd} log2={log2} qp={qp} len={len}");
+                        assert_eq!(nnz_g, nnz_w, "nnz bd={bd} log2={log2} qp={qp} len={len}");
+                    }
+                }
             }
         }
     }

@@ -146,6 +146,7 @@ dependencies = [
  "clap",
  "png",
  "still265",
+ "windows-sys",
  "zune-core",
  "zune-jpeg",
  "zune-png",

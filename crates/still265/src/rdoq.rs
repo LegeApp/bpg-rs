@@ -159,6 +159,20 @@ struct CoeffRec {
     rd_last: f64,   // RD cost coded as the last significant coeff (no sig flag)
 }
 
+#[derive(Default)]
+pub struct RdoqScratch {
+    recs: Vec<CoeffRec>,
+    rank_of: Vec<usize>,
+    suff_zero: Vec<f64>,
+    pref_normal: Vec<f64>,
+    levels: Vec<i16>,
+}
+
+pub struct RdoqResult<'a> {
+    pub levels: &'a mut [i16],
+    pub nnz: u32,
+}
+
 /// Single-scan RDOQ: choose quantized levels for `coeffs` directly from the
 /// transform coefficients. Returns `(levels, nnz)` with the same layout as
 /// `transform::quantize`.
@@ -174,6 +188,37 @@ pub fn rdoq_single_scan(
     lambda: f64,
     level2: bool,
 ) -> (Vec<i16>, u32) {
+    let mut scratch = RdoqScratch::default();
+    let result = rdoq_single_scan_into(
+        ctxs,
+        coeffs,
+        log2_size,
+        c_idx,
+        qp,
+        bit_depth,
+        scan_order,
+        lambda,
+        level2,
+        &mut scratch,
+    );
+    (result.levels.to_vec(), result.nnz)
+}
+
+/// Scratch-backed single-scan RDOQ. The returned levels borrow from `scratch`;
+/// callers should copy them only when a materialized coded block is needed.
+#[allow(clippy::too_many_arguments)]
+pub fn rdoq_single_scan_into<'scratch>(
+    ctxs: &Contexts,
+    coeffs: &[i16],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    scan_order: ScanOrder,
+    lambda: f64,
+    level2: bool,
+    scratch: &'scratch mut RdoqScratch,
+) -> RdoqResult<'scratch> {
     let size = 1usize << log2_size;
     let scan_sub = get_scan_sub_block(log2_size, scan_order);
     let scan_pos = get_scan_4x4(scan_order);
@@ -216,8 +261,12 @@ pub fn rdoq_single_scan(
     let gt2_base = ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + if c_idx > 0 { 4 } else { 0 };
 
     // Forward combined scan rank for every in-bounds position.
-    let mut recs: Vec<CoeffRec> = Vec::with_capacity(size * size);
-    let mut rank_of = vec![usize::MAX; size * size];
+    let recs = &mut scratch.recs;
+    recs.clear();
+    recs.reserve(size * size);
+    let rank_of = &mut scratch.rank_of;
+    rank_of.clear();
+    rank_of.resize(size * size, usize::MAX);
     for &(sbx, sby) in scan_sub.iter() {
         for &(px, py) in scan_pos.iter() {
             let x = sbx as usize * 4 + px as usize;
@@ -381,12 +430,16 @@ pub fn rdoq_single_scan(
     // consider zeroing the whole block (cbf = 0).
     let total = recs.len();
     // Suffix distortion of zeroing rank..end.
-    let mut suff_zero = vec![0f64; total + 1];
+    let suff_zero = &mut scratch.suff_zero;
+    suff_zero.clear();
+    suff_zero.resize(total + 1, 0.0);
     for k in (0..total).rev() {
         suff_zero[k] = suff_zero[k + 1] + recs[k].dist0;
     }
     // Prefix RD of coding ranks 0..k as normal coefficients.
-    let mut pref_normal = vec![0f64; total + 1];
+    let pref_normal = &mut scratch.pref_normal;
+    pref_normal.clear();
+    pref_normal.resize(total + 1, 0.0);
     for k in 0..total {
         pref_normal[k + 1] = pref_normal[k] + recs[k].rd_normal;
     }
@@ -485,7 +538,9 @@ pub fn rdoq_single_scan(
     }
 
     // Emit levels, zeroing everything after the chosen last position.
-    let mut levels = vec![0i16; size * size];
+    let levels = &mut scratch.levels;
+    levels.clear();
+    levels.resize(size * size, 0);
     let mut nnz = 0u32;
     if best_last >= 0 {
         let last = best_last as usize;
@@ -498,5 +553,8 @@ pub fn rdoq_single_scan(
         }
     }
 
-    (levels, nnz)
+    RdoqResult {
+        levels: &mut scratch.levels,
+        nnz,
+    }
 }

@@ -76,9 +76,7 @@ pub fn detect_container_kind(data: &[u8]) -> ContainerKind {
     if data.len() >= 4 && &data[0..4] == b"BPG\xFB" {
         return ContainerKind::Bpg;
     }
-    if parse_ftyp_major_brand(data)
-        .is_some_and(is_heif_brand)
-    {
+    if parse_ftyp_major_brand(data).is_some_and(is_heif_brand) {
         return ContainerKind::Heif;
     }
     ContainerKind::Unknown
@@ -274,7 +272,10 @@ pub enum DecodeError {
     HevcRebuild(bpg_hevc::HevcError),
     HevcDecode(bpg_hevc_decode::HevcError),
     Unsupported(&'static str),
-    BufferTooSmall { required: usize, actual: usize },
+    BufferTooSmall {
+        required: usize,
+        actual: usize,
+    },
     LimitExceeded(&'static str),
     /// HEIF/ISOBMFF container parse error.
     Container(&'static str),
@@ -502,8 +503,8 @@ mod tests {
     #[test]
     fn detects_heif_container_brand() {
         let bytes: [u8; 24] = [
-            0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0, 0, 0, 0, b'm',
-            b'i', b'f', b'1', b'h', b'e', b'i', b'c',
+            0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0, 0, 0, 0, b'm', b'i',
+            b'f', b'1', b'h', b'e', b'i', b'c',
         ];
         assert_eq!(detect_container_kind(&bytes), ContainerKind::Heif);
     }
@@ -536,8 +537,8 @@ mod tests {
     #[test]
     fn heif_estimate_is_placeholder_for_future_item_parsing() {
         let bytes: [u8; 24] = [
-            0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0, 0, 0, 0, b'm',
-            b'i', b'f', b'1', b'h', b'e', b'i', b'c',
+            0, 0, 0, 24, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0, 0, 0, 0, b'm', b'i',
+            b'f', b'1', b'h', b'e', b'i', b'c',
         ];
         let est = estimate_container_memory_from_bytes(&bytes).unwrap();
         assert_eq!(est.kind, ContainerKind::Heif);

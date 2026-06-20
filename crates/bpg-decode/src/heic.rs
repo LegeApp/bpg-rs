@@ -14,9 +14,9 @@
 //!
 //! All functions return [`DecodeError`](crate::DecodeError).
 
+use std::str;
 use std::string::{String, ToString};
 use std::vec::Vec;
-use std::str;
 
 use bpg_hevc_decode::hevc;
 pub use bpg_hevc_decode::DecodedFrame;
@@ -148,7 +148,11 @@ impl<'a> Iterator for BoxIter<'a> {
         let content_offset = self.offset + header_size;
         let content = &data[header_size..size_usize];
         self.offset = box_end;
-        Some(IsobmffBox { box_type, content, content_offset })
+        Some(IsobmffBox {
+            box_type,
+            content,
+            content_offset,
+        })
     }
 }
 
@@ -394,7 +398,11 @@ impl<'a> HeifContainer<'a> {
         let start = usize::try_from(loc.base_offset.checked_add(off)?).ok()?;
         let length = usize::try_from(len).ok()?;
         let end = start.checked_add(length)?;
-        if end <= source.len() { Some(&source[start..end]) } else { None }
+        if end <= source.len() {
+            Some(&source[start..end])
+        } else {
+            None
+        }
     }
 
     fn find_auxiliary_items(&self, target_id: u32, aux_type_prefix: &str) -> Vec<u32> {
@@ -493,11 +501,7 @@ fn parse_container(data: &[u8]) -> R<HeifContainer<'_>> {
     })
 }
 
-fn parse_ftyp(
-    content: &[u8],
-    brand: &mut FourCC,
-    compatible: &mut Vec<FourCC>,
-) -> R<()> {
+fn parse_ftyp(content: &[u8], brand: &mut FourCC, compatible: &mut Vec<FourCC>) -> R<()> {
     if content.len() < 8 {
         return Err(container_err("ftyp too short"));
     }
@@ -518,8 +522,7 @@ fn parse_ftyp(
         FourCC(*b"mif1"),
         FourCC(*b"msf1"),
     ];
-    let is_heif =
-        valid.contains(brand) || compatible.iter().any(|b| valid.contains(b));
+    let is_heif = valid.contains(brand) || compatible.iter().any(|b| valid.contains(b));
     if !is_heif {
         return Err(container_err("not a HEIF file"));
     }
@@ -586,7 +589,9 @@ fn parse_pitm(content: &[u8]) -> R<u32> {
         if content.len() < 8 {
             return Err(container_err("pitm v1 too short"));
         }
-        Ok(u32::from_be_bytes([content[4], content[5], content[6], content[7]]))
+        Ok(u32::from_be_bytes([
+            content[4], content[5], content[6], content[7],
+        ]))
     }
 }
 
@@ -607,7 +612,10 @@ fn parse_iloc(content: &[u8], locs: &mut Vec<ItemLocation>) -> R<()> {
         c
     } else {
         let c = u32::from_be_bytes([
-            content[pos], content[pos + 1], content[pos + 2], content[pos + 3],
+            content[pos],
+            content[pos + 1],
+            content[pos + 2],
+            content[pos + 3],
         ]);
         pos += 4;
         c
@@ -615,21 +623,28 @@ fn parse_iloc(content: &[u8], locs: &mut Vec<ItemLocation>) -> R<()> {
 
     for _ in 0..item_count {
         let id_size = if version < 2 { 2usize } else { 4 };
-        if pos + id_size > content.len() { break; }
+        if pos + id_size > content.len() {
+            break;
+        }
         let item_id = if version < 2 {
             let id = u16::from_be_bytes([content[pos], content[pos + 1]]) as u32;
             pos += 2;
             id
         } else {
             let id = u32::from_be_bytes([
-                content[pos], content[pos + 1], content[pos + 2], content[pos + 3],
+                content[pos],
+                content[pos + 1],
+                content[pos + 2],
+                content[pos + 3],
             ]);
             pos += 4;
             id
         };
 
         let construction_method = if version >= 1 {
-            if pos + 2 > content.len() { break; }
+            if pos + 2 > content.len() {
+                break;
+            }
             let m = content[pos + 1] & 0xF;
             pos += 2;
             m
@@ -637,26 +652,37 @@ fn parse_iloc(content: &[u8], locs: &mut Vec<ItemLocation>) -> R<()> {
             0
         };
 
-        if pos + 2 > content.len() { break; }
+        if pos + 2 > content.len() {
+            break;
+        }
         pos += 2; // data_reference_index
 
         let base_offset = read_uint(content, &mut pos, base_offset_size as usize);
 
-        if pos + 2 > content.len() { break; }
+        if pos + 2 > content.len() {
+            break;
+        }
         let extent_count = u16::from_be_bytes([content[pos], content[pos + 1]]);
         pos += 2;
 
         let mut extents = Vec::with_capacity(extent_count as usize);
         for _ in 0..extent_count {
             if version >= 1 && index_size > 0 {
-                if pos + index_size as usize > content.len() { break; }
+                if pos + index_size as usize > content.len() {
+                    break;
+                }
                 pos += index_size as usize;
             }
             let ext_off = read_uint(content, &mut pos, offset_size as usize);
             let ext_len = read_uint(content, &mut pos, length_size as usize);
             extents.push((ext_off, ext_len));
         }
-        locs.push(ItemLocation { item_id, construction_method, base_offset, extents });
+        locs.push(ItemLocation {
+            item_id,
+            construction_method,
+            base_offset,
+            extents,
+        });
     }
     Ok(())
 }
@@ -685,7 +711,10 @@ fn parse_iinf(content: &[u8], infos: &mut Vec<ItemInfo>) -> R<()> {
         c
     } else {
         let c = u32::from_be_bytes([
-            content[pos], content[pos + 1], content[pos + 2], content[pos + 3],
+            content[pos],
+            content[pos + 1],
+            content[pos + 2],
+            content[pos + 3],
         ]);
         pos += 4;
         c
@@ -697,7 +726,9 @@ fn parse_iinf(content: &[u8], infos: &mut Vec<ItemInfo>) -> R<()> {
             if let Ok(info) = parse_infe(child.content) {
                 infos.push(info);
                 count += 1;
-                if count >= entry_count { break; }
+                if count >= entry_count {
+                    break;
+                }
             }
         }
     }
@@ -711,7 +742,9 @@ fn parse_infe(content: &[u8]) -> Result<ItemInfo, ()> {
         2 => 12,
         _ => 14,
     };
-    if content.len() < min_len { return Err(()); }
+    if content.len() < min_len {
+        return Err(());
+    }
     let flags = u32::from_be_bytes([0, content[1], content[2], content[3]]);
     let hidden = (flags & 1) != 0;
     let mut pos = 4;
@@ -722,7 +755,10 @@ fn parse_infe(content: &[u8]) -> Result<ItemInfo, ()> {
         id
     } else {
         let id = u32::from_be_bytes([
-            content[pos], content[pos + 1], content[pos + 2], content[pos + 3],
+            content[pos],
+            content[pos + 1],
+            content[pos + 2],
+            content[pos + 3],
         ]);
         pos += 4;
         id
@@ -739,7 +775,9 @@ fn parse_infe(content: &[u8]) -> Result<ItemInfo, ()> {
 
     let item_name = if pos < content.len() {
         let end = content[pos..].iter().position(|&b| b == 0).unwrap_or(0);
-        let name = str::from_utf8(&content[pos..pos + end]).unwrap_or("").to_string();
+        let name = str::from_utf8(&content[pos..pos + end])
+            .unwrap_or("")
+            .to_string();
         pos += end + 1;
         name
     } else {
@@ -748,12 +786,20 @@ fn parse_infe(content: &[u8]) -> Result<ItemInfo, ()> {
 
     let content_type = if pos < content.len() {
         let end = content[pos..].iter().position(|&b| b == 0).unwrap_or(0);
-        str::from_utf8(&content[pos..pos + end]).unwrap_or("").to_string()
+        str::from_utf8(&content[pos..pos + end])
+            .unwrap_or("")
+            .to_string()
     } else {
         String::new()
     };
 
-    Ok(ItemInfo { item_id, item_type, item_name, content_type, hidden })
+    Ok(ItemInfo {
+        item_id,
+        item_type,
+        item_name,
+        content_type,
+        hidden,
+    })
 }
 
 fn parse_iprp(
@@ -775,7 +821,10 @@ fn parse_ipco(content: &[u8], props: &mut Vec<ItemProperty>) -> R<()> {
     for child in BoxIter::new(content) {
         let prop = match child.box_type {
             FourCC::ISPE => parse_ispe(child.content)
-                .map(|(w, h)| ItemProperty::ImageExtents { width: w, height: h })
+                .map(|(w, h)| ItemProperty::ImageExtents {
+                    width: w,
+                    height: h,
+                })
                 .unwrap_or(ItemProperty::Unknown),
             FourCC::HVCC | FourCC::HVCB => parse_hvcc(child.content)
                 .map(ItemProperty::HevcConfig)
@@ -803,14 +852,18 @@ fn parse_ipco(content: &[u8], props: &mut Vec<ItemProperty>) -> R<()> {
 }
 
 fn parse_ispe(c: &[u8]) -> Option<(u32, u32)> {
-    if c.len() < 12 { return None; }
+    if c.len() < 12 {
+        return None;
+    }
     let w = u32::from_be_bytes([c[4], c[5], c[6], c[7]]);
     let h = u32::from_be_bytes([c[8], c[9], c[10], c[11]]);
     Some((w, h))
 }
 
 fn parse_hvcc(c: &[u8]) -> Option<HvcCConfig> {
-    if c.len() < 23 { return None; }
+    if c.len() < 23 {
+        return None;
+    }
     let chroma_format = c[16] & 0x3;
     let bit_depth_luma_minus8 = c[17] & 0x7;
     let length_size_minus_one = c[21] & 0x3;
@@ -818,27 +871,42 @@ fn parse_hvcc(c: &[u8]) -> Option<HvcCConfig> {
     let mut pos = 23;
     let mut nal_units = Vec::new();
     for _ in 0..num_arrays {
-        if pos + 3 > c.len() { break; }
+        if pos + 3 > c.len() {
+            break;
+        }
         pos += 1; // nal_unit_type / array_completeness
         let num_nalus = u16::from_be_bytes([c[pos], c[pos + 1]]);
         pos += 2;
         for _ in 0..num_nalus {
-            if pos + 2 > c.len() { break; }
+            if pos + 2 > c.len() {
+                break;
+            }
             let nalu_len = u16::from_be_bytes([c[pos], c[pos + 1]]) as usize;
             pos += 2;
-            if pos + nalu_len > c.len() { break; }
+            if pos + nalu_len > c.len() {
+                break;
+            }
             nal_units.push(c[pos..pos + nalu_len].to_vec());
             pos += nalu_len;
         }
     }
-    Some(HvcCConfig { chroma_format, bit_depth_luma_minus8, length_size_minus_one, nal_units })
+    Some(HvcCConfig {
+        chroma_format,
+        bit_depth_luma_minus8,
+        length_size_minus_one,
+        nal_units,
+    })
 }
 
 fn parse_colr(c: &[u8]) -> Option<ColorInfoKind> {
-    if c.len() < 4 { return None; }
+    if c.len() < 4 {
+        return None;
+    }
     match &c[0..4] {
         b"nclx" => {
-            if c.len() < 11 { return None; }
+            if c.len() < 11 {
+                return None;
+            }
             Some(ColorInfoKind::Nclx {
                 color_primaries: u16::from_be_bytes([c[4], c[5]]),
                 transfer_characteristics: u16::from_be_bytes([c[6], c[7]]),
@@ -852,7 +920,9 @@ fn parse_colr(c: &[u8]) -> Option<ColorInfoKind> {
 }
 
 fn parse_clap(c: &[u8]) -> Option<CleanAperture> {
-    if c.len() < 32 { return None; }
+    if c.len() < 32 {
+        return None;
+    }
     Some(CleanAperture {
         width_n: u32::from_be_bytes([c[0], c[1], c[2], c[3]]),
         width_d: u32::from_be_bytes([c[4], c[5], c[6], c[7]]),
@@ -877,48 +947,68 @@ fn parse_irot(c: &[u8]) -> Option<ImageRotation> {
 }
 
 fn parse_imir(c: &[u8]) -> Option<ImageMirror> {
-    Some(ImageMirror { axis: c.first()? & 0x01 })
+    Some(ImageMirror {
+        axis: c.first()? & 0x01,
+    })
 }
 
 fn parse_auxc(c: &[u8]) -> Option<String> {
-    if c.len() < 5 { return None; }
+    if c.len() < 5 {
+        return None;
+    }
     let data = &c[4..];
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     Some(str::from_utf8(&data[..end]).unwrap_or("").to_string())
 }
 
 fn parse_ipma(content: &[u8], assocs: &mut Vec<PropertyAssoc>) -> R<()> {
-    if content.len() < 8 { return Err(container_err("ipma too short")); }
+    if content.len() < 8 {
+        return Err(container_err("ipma too short"));
+    }
     let version = content[0];
     let flags = u32::from_be_bytes([0, content[1], content[2], content[3]]);
     let mut pos = 4;
     let entry_count = u32::from_be_bytes([
-        content[pos], content[pos + 1], content[pos + 2], content[pos + 3],
+        content[pos],
+        content[pos + 1],
+        content[pos + 2],
+        content[pos + 3],
     ]);
     pos += 4;
 
     for _ in 0..entry_count {
         let id_size = if version < 1 { 2 } else { 4 };
-        if pos + id_size > content.len() { break; }
+        if pos + id_size > content.len() {
+            break;
+        }
         let item_id = if version < 1 {
             let id = u16::from_be_bytes([content[pos], content[pos + 1]]) as u32;
             pos += 2;
             id
         } else {
             let id = u32::from_be_bytes([
-                content[pos], content[pos + 1], content[pos + 2], content[pos + 3],
+                content[pos],
+                content[pos + 1],
+                content[pos + 2],
+                content[pos + 3],
             ]);
             pos += 4;
             id
         };
-        if pos >= content.len() { break; }
+        if pos >= content.len() {
+            break;
+        }
         let assoc_count = content[pos];
         pos += 1;
         let mut properties = Vec::with_capacity(assoc_count as usize);
         for _ in 0..assoc_count {
-            if pos >= content.len() { break; }
+            if pos >= content.len() {
+                break;
+            }
             let (essential, prop_idx) = if (flags & 1) != 0 {
-                if pos + 2 > content.len() { break; }
+                if pos + 2 > content.len() {
+                    break;
+                }
                 let v = u16::from_be_bytes([content[pos], content[pos + 1]]);
                 pos += 2;
                 ((v >> 15) != 0, v & 0x7FFF)
@@ -929,13 +1019,18 @@ fn parse_ipma(content: &[u8], assocs: &mut Vec<PropertyAssoc>) -> R<()> {
             };
             properties.push((prop_idx, essential));
         }
-        assocs.push(PropertyAssoc { item_id, properties });
+        assocs.push(PropertyAssoc {
+            item_id,
+            properties,
+        });
     }
     Ok(())
 }
 
 fn parse_iref(content: &[u8], refs: &mut Vec<ItemReference>) -> R<()> {
-    if content.len() < 4 { return Err(container_err("iref too short")); }
+    if content.len() < 4 {
+        return Err(container_err("iref too short"));
+    }
     let version = content[0];
     let remaining = &content[4..];
     for child in BoxIter::new(remaining) {
@@ -944,38 +1039,50 @@ fn parse_iref(content: &[u8], refs: &mut Vec<ItemReference>) -> R<()> {
         let mut pos = 0;
         while pos < data.len() {
             let id_size = if version == 0 { 2usize } else { 4 };
-            if pos + id_size > data.len() { break; }
+            if pos + id_size > data.len() {
+                break;
+            }
             let from_id = if version == 0 {
                 let id = u16::from_be_bytes([data[pos], data[pos + 1]]) as u32;
                 pos += 2;
                 id
             } else {
-                let id = u32::from_be_bytes([
-                    data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-                ]);
+                let id =
+                    u32::from_be_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 pos += 4;
                 id
             };
-            if pos + 2 > data.len() { break; }
+            if pos + 2 > data.len() {
+                break;
+            }
             let ref_count = u16::from_be_bytes([data[pos], data[pos + 1]]);
             pos += 2;
             let mut to_ids = Vec::with_capacity(ref_count as usize);
             for _ in 0..ref_count {
-                if pos + id_size > data.len() { break; }
+                if pos + id_size > data.len() {
+                    break;
+                }
                 let to_id = if version == 0 {
                     let id = u16::from_be_bytes([data[pos], data[pos + 1]]) as u32;
                     pos += 2;
                     id
                 } else {
                     let id = u32::from_be_bytes([
-                        data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
+                        data[pos],
+                        data[pos + 1],
+                        data[pos + 2],
+                        data[pos + 3],
                     ]);
                     pos += 4;
                     id
                 };
                 to_ids.push(to_id);
             }
-            refs.push(ItemReference { reference_type: ref_type, from_item_id: from_id, to_item_ids: to_ids });
+            refs.push(ItemReference {
+                reference_type: ref_type,
+                from_item_id: from_id,
+                to_item_ids: to_ids,
+            });
         }
     }
     Ok(())
@@ -987,8 +1094,7 @@ fn parse_iref(content: &[u8], refs: &mut Vec<ItemReference>) -> R<()> {
 
 fn hevc_decode_item_data(item: &Item, data: &[u8]) -> R<DecodedFrame> {
     if let Some(ref cfg) = item.hevc_config {
-        hevc::decode_with_config(&cfg.to_bhd(), data)
-            .map_err(DecodeError::HevcDecode)
+        hevc::decode_with_config(&cfg.to_bhd(), data).map_err(DecodeError::HevcDecode)
     } else {
         hevc::decode(data).map_err(DecodeError::HevcDecode)
     }
@@ -999,7 +1105,12 @@ fn hevc_decode_item_data(item: &Item, data: &[u8]) -> R<DecodedFrame> {
 // ---------------------------------------------------------------------------
 
 fn apply_color_info(frame: &mut DecodedFrame, color_info: &Option<ColorInfoKind>) {
-    if let Some(ColorInfoKind::Nclx { full_range, matrix_coefficients, .. }) = color_info {
+    if let Some(ColorInfoKind::Nclx {
+        full_range,
+        matrix_coefficients,
+        ..
+    }) = color_info
+    {
         frame.full_range = *full_range;
         frame.matrix_coeffs = *matrix_coefficients as u8;
     }
@@ -1009,9 +1120,7 @@ fn apply_transforms(frame: DecodedFrame, transforms: &[Transform]) -> DecodedFra
     let mut f = frame;
     for t in transforms {
         f = match t {
-            Transform::CleanAperture(clap) => {
-                apply_clean_aperture(f, clap)
-            }
+            Transform::CleanAperture(clap) => apply_clean_aperture(f, clap),
             Transform::Mirror(m) => match m.axis {
                 0 => f.mirror_vertical(),
                 1 => f.mirror_horizontal(),
@@ -1028,11 +1137,7 @@ fn apply_transforms(frame: DecodedFrame, transforms: &[Transform]) -> DecodedFra
     f
 }
 
-fn decode_item(
-    container: &HeifContainer<'_>,
-    item: &Item,
-    depth: u32,
-) -> R<DecodedFrame> {
+fn decode_item(container: &HeifContainer<'_>, item: &Item, depth: u32) -> R<DecodedFrame> {
     if depth > 8 {
         return Err(invalid_data("derived image reference chain too deep"));
     }
@@ -1052,14 +1157,14 @@ fn decode_item(
     Ok(frame)
 }
 
-fn decode_iden(
-    container: &HeifContainer<'_>,
-    item: &Item,
-    depth: u32,
-) -> R<DecodedFrame> {
+fn decode_iden(container: &HeifContainer<'_>, item: &Item, depth: u32) -> R<DecodedFrame> {
     let source_ids = container.get_item_references(item.id, FourCC::DIMG);
-    let &source_id = source_ids.first().ok_or_else(|| invalid_data("iden has no dimg reference"))?;
-    let source = container.get_item(source_id).ok_or_else(|| invalid_data("iden dimg target not found"))?;
+    let &source_id = source_ids
+        .first()
+        .ok_or_else(|| invalid_data("iden has no dimg reference"))?;
+    let source = container
+        .get_item(source_id)
+        .ok_or_else(|| invalid_data("iden dimg target not found"))?;
     decode_item(container, &source, depth + 1)
 }
 
@@ -1094,26 +1199,35 @@ fn decode_grid(container: &HeifContainer<'_>, grid_item: &Item) -> R<DecodedFram
         return Err(invalid_data("grid tile count mismatch"));
     }
 
-    let first_tile = container.get_item(tile_ids[0]).ok_or_else(|| invalid_data("missing tile item"))?;
-    let tile_cfg = first_tile.hevc_config.as_ref().ok_or_else(|| invalid_data("missing tile hvcC config"))?;
-    let (tile_width, tile_height) = first_tile.dimensions.ok_or_else(|| invalid_data("missing tile dimensions"))?;
+    let first_tile = container
+        .get_item(tile_ids[0])
+        .ok_or_else(|| invalid_data("missing tile item"))?;
+    let tile_cfg = first_tile
+        .hevc_config
+        .as_ref()
+        .ok_or_else(|| invalid_data("missing tile hvcC config"))?;
+    let (tile_width, tile_height) = first_tile
+        .dimensions
+        .ok_or_else(|| invalid_data("missing tile dimensions"))?;
 
     let bit_depth = tile_cfg.bit_depth_luma_minus8 + 8;
     let chroma_format = tile_cfg.chroma_format;
-    let mut output = DecodedFrame::with_params(output_width, output_height, bit_depth, chroma_format);
+    let mut output =
+        DecodedFrame::with_params(output_width, output_height, bit_depth, chroma_format);
 
     let tile_data_list: Vec<&[u8]> = tile_ids
         .iter()
         .map(|&tid| {
-            container.get_item_data(tid).ok_or_else(|| invalid_data("missing tile data"))
+            container
+                .get_item_data(tid)
+                .ok_or_else(|| invalid_data("missing tile data"))
         })
         .collect::<R<_>>()?;
 
     let decoded_tiles: Vec<DecodedFrame> = tile_data_list
         .iter()
         .map(|tile_data| {
-            hevc::decode_with_config(&tile_cfg.to_bhd(), tile_data)
-                .map_err(DecodeError::HevcDecode)
+            hevc::decode_with_config(&tile_cfg.to_bhd(), tile_data).map_err(DecodeError::HevcDecode)
         })
         .collect::<R<_>>()?;
 
@@ -1127,8 +1241,12 @@ fn decode_grid(container: &HeifContainer<'_>, grid_item: &Item) -> R<DecodedFram
         let dst_x = tile_col * tile_width;
         let dst_y = tile_row * tile_height;
 
-        let copy_w = tile_frame.cropped_width().min(output_width.saturating_sub(dst_x));
-        let copy_h = tile_frame.cropped_height().min(output_height.saturating_sub(dst_y));
+        let copy_w = tile_frame
+            .cropped_width()
+            .min(output_width.saturating_sub(dst_x));
+        let copy_h = tile_frame
+            .cropped_height()
+            .min(output_height.saturating_sub(dst_y));
         let src_x_start = tile_frame.crop_left;
         let src_y_start = tile_frame.crop_top;
 
@@ -1179,11 +1297,7 @@ fn decode_grid(container: &HeifContainer<'_>, grid_item: &Item) -> R<DecodedFram
     Ok(output)
 }
 
-fn decode_iovl(
-    container: &HeifContainer<'_>,
-    iovl_item: &Item,
-    depth: u32,
-) -> R<DecodedFrame> {
+fn decode_iovl(container: &HeifContainer<'_>, iovl_item: &Item, depth: u32) -> R<DecodedFrame> {
     let iovl_data = container
         .get_item_data(iovl_item.id)
         .ok_or_else(|| invalid_data("missing overlay descriptor"))?;
@@ -1219,10 +1333,16 @@ fn decode_iovl(
             return Err(invalid_data("overlay descriptor truncated"));
         }
         let w = u32::from_be_bytes([
-            iovl_data[pos], iovl_data[pos + 1], iovl_data[pos + 2], iovl_data[pos + 3],
+            iovl_data[pos],
+            iovl_data[pos + 1],
+            iovl_data[pos + 2],
+            iovl_data[pos + 3],
         ]);
         let h = u32::from_be_bytes([
-            iovl_data[pos + 4], iovl_data[pos + 5], iovl_data[pos + 6], iovl_data[pos + 7],
+            iovl_data[pos + 4],
+            iovl_data[pos + 5],
+            iovl_data[pos + 6],
+            iovl_data[pos + 7],
         ]);
         pos += 8;
         (w, h)
@@ -1243,10 +1363,16 @@ fn decode_iovl(
                 return Err(invalid_data("overlay offset data truncated"));
             }
             let x = i32::from_be_bytes([
-                iovl_data[pos], iovl_data[pos + 1], iovl_data[pos + 2], iovl_data[pos + 3],
+                iovl_data[pos],
+                iovl_data[pos + 1],
+                iovl_data[pos + 2],
+                iovl_data[pos + 3],
             ]);
             let y = i32::from_be_bytes([
-                iovl_data[pos + 4], iovl_data[pos + 5], iovl_data[pos + 6], iovl_data[pos + 7],
+                iovl_data[pos + 4],
+                iovl_data[pos + 5],
+                iovl_data[pos + 6],
+                iovl_data[pos + 7],
             ]);
             pos += 8;
             (x, y)
@@ -1262,22 +1388,38 @@ fn decode_iovl(
         offsets.push((x, y));
     }
 
-    let first_tile_item = container.get_item(tile_ids[0]).ok_or_else(|| invalid_data("missing overlay tile item"))?;
-    let first_tile_cfg = first_tile_item.hevc_config.as_ref().ok_or_else(|| invalid_data("missing overlay tile hvcC"))?;
+    let first_tile_item = container
+        .get_item(tile_ids[0])
+        .ok_or_else(|| invalid_data("missing overlay tile item"))?;
+    let first_tile_cfg = first_tile_item
+        .hevc_config
+        .as_ref()
+        .ok_or_else(|| invalid_data("missing overlay tile hvcC"))?;
     let bit_depth = first_tile_cfg.bit_depth_luma_minus8 + 8;
     let chroma_format = first_tile_cfg.chroma_format;
 
-    let mut output = DecodedFrame::with_params(canvas_width, canvas_height, bit_depth, chroma_format);
+    let mut output =
+        DecodedFrame::with_params(canvas_width, canvas_height, bit_depth, chroma_format);
     let fill_shift = 16u32.saturating_sub(bit_depth as u32);
     let y_fill = fill_values[0] >> fill_shift;
-    let cb_fill = if num_fill_channels > 1 { fill_values[1] >> fill_shift } else { 1u16 << (bit_depth - 1) };
-    let cr_fill = if num_fill_channels > 2 { fill_values[2] >> fill_shift } else { 1u16 << (bit_depth - 1) };
+    let cb_fill = if num_fill_channels > 1 {
+        fill_values[1] >> fill_shift
+    } else {
+        1u16 << (bit_depth - 1)
+    };
+    let cr_fill = if num_fill_channels > 2 {
+        fill_values[2] >> fill_shift
+    } else {
+        1u16 << (bit_depth - 1)
+    };
     output.y_plane.fill(y_fill);
     output.cb_plane.fill(cb_fill);
     output.cr_plane.fill(cr_fill);
 
     for (idx, &tile_id) in tile_ids.iter().enumerate() {
-        let tile_item = container.get_item(tile_id).ok_or_else(|| invalid_data("missing overlay tile"))?;
+        let tile_item = container
+            .get_item(tile_id)
+            .ok_or_else(|| invalid_data("missing overlay tile"))?;
         let tile_frame = decode_item(container, &tile_item, depth + 1)?;
         if idx == 0 {
             output.full_range = tile_frame.full_range;
@@ -1286,8 +1428,12 @@ fn decode_iovl(
         let (off_x, off_y) = offsets[idx];
         let dst_x = off_x.max(0) as u32;
         let dst_y = off_y.max(0) as u32;
-        let copy_w = tile_frame.cropped_width().min(canvas_width.saturating_sub(dst_x));
-        let copy_h = tile_frame.cropped_height().min(canvas_height.saturating_sub(dst_y));
+        let copy_w = tile_frame
+            .cropped_width()
+            .min(canvas_width.saturating_sub(dst_x));
+        let copy_h = tile_frame
+            .cropped_height()
+            .min(canvas_height.saturating_sub(dst_y));
 
         for row in 0..copy_h {
             let src_row = (tile_frame.crop_top + row) as usize;
@@ -1394,13 +1540,29 @@ fn apply_clean_aperture(frame: DecodedFrame, clap: &CleanAperture) -> DecodedFra
     let mut f = frame;
     let conf_w = f.cropped_width();
     let conf_h = f.cropped_height();
-    let clean_w = if clap.width_d > 0 { clap.width_n / clap.width_d } else { conf_w };
-    let clean_h = if clap.height_d > 0 { clap.height_n / clap.height_d } else { conf_h };
+    let clean_w = if clap.width_d > 0 {
+        clap.width_n / clap.width_d
+    } else {
+        conf_w
+    };
+    let clean_h = if clap.height_d > 0 {
+        clap.height_n / clap.height_d
+    } else {
+        conf_h
+    };
     if clean_w >= conf_w && clean_h >= conf_h {
         return f;
     }
-    let horiz = if clap.horiz_off_d > 0 { (clap.horiz_off_n as f64) / (clap.horiz_off_d as f64) } else { 0.0 };
-    let vert = if clap.vert_off_d > 0 { (clap.vert_off_n as f64) / (clap.vert_off_d as f64) } else { 0.0 };
+    let horiz = if clap.horiz_off_d > 0 {
+        (clap.horiz_off_n as f64) / (clap.horiz_off_d as f64)
+    } else {
+        0.0
+    };
+    let vert = if clap.vert_off_d > 0 {
+        (clap.vert_off_n as f64) / (clap.vert_off_d as f64)
+    } else {
+        0.0
+    };
     let extra_left = ((conf_w as f64 - clean_w as f64) / 2.0 + horiz).round() as u32;
     let extra_top = ((conf_h as f64 - clean_h as f64) / 2.0 + vert).round() as u32;
     let extra_right = conf_w.saturating_sub(clean_w).saturating_sub(extra_left);
@@ -1419,12 +1581,21 @@ fn apply_clean_aperture(frame: DecodedFrame, clap: &CleanAperture) -> DecodedFra
 /// Parse HEIC/HEIF metadata without decoding pixel data.
 pub fn get_heic_image_info(data: &[u8]) -> Result<HeicImageInfo, DecodeError> {
     let container = parse_container(data)?;
-    let primary = container.primary_item().ok_or_else(|| invalid_data("no primary image"))?;
+    let primary = container
+        .primary_item()
+        .ok_or_else(|| invalid_data("no primary image"))?;
 
-    let has_alpha = !container.find_auxiliary_items(primary.id, "urn:mpeg:hevc:2015:auxid:1").is_empty()
-        || !container.find_auxiliary_items(primary.id, "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha").is_empty();
+    let has_alpha = !container
+        .find_auxiliary_items(primary.id, "urn:mpeg:hevc:2015:auxid:1")
+        .is_empty()
+        || !container
+            .find_auxiliary_items(primary.id, "urn:mpeg:mpegB:cicp:systems:auxiliary:alpha")
+            .is_empty();
 
-    let has_exif = container.item_infos.iter().any(|i| i.item_type == FourCC(*b"Exif"));
+    let has_exif = container
+        .item_infos
+        .iter()
+        .any(|i| i.item_type == FourCC(*b"Exif"));
     let has_xmp = container.item_infos.iter().any(|i| {
         i.item_type == FourCC(*b"mime")
             && (i.content_type.contains("xmp") || i.content_type.contains("rdf+xml"))
@@ -1465,7 +1636,8 @@ pub fn get_heic_image_info(data: &[u8]) -> Result<HeicImageInfo, DecodeError> {
     }
 
     // Fallback: parse raw HEVC stream
-    let image_data = container.get_item_data(primary.id)
+    let image_data = container
+        .get_item_data(primary.id)
         .ok_or_else(|| invalid_data("missing image data"))?;
     let hevc_info = hevc::get_info(image_data).map_err(DecodeError::HevcDecode)?;
     Ok(HeicImageInfo {
@@ -1498,7 +1670,9 @@ fn tile_format_from_dimg(container: &HeifContainer<'_>, from_id: u32) -> (u8, u8
 /// Decode a HEIC/HEIF file to a raw planar YCbCr frame.
 pub fn decode_heic_to_frame(data: &[u8]) -> Result<DecodedFrame, DecodeError> {
     let container = parse_container(data)?;
-    let primary = container.primary_item().ok_or_else(|| invalid_data("no primary image"))?;
+    let primary = container
+        .primary_item()
+        .ok_or_else(|| invalid_data("no primary image"))?;
     let mut frame = decode_item(&container, &primary, 0)?;
 
     // Decode alpha
@@ -1531,21 +1705,33 @@ pub fn decode_heic(data: &[u8], layout: PixelLayout) -> Result<DecodeOutput, Dec
         PixelLayout::Bgr8 => frame.to_bgr(),
         PixelLayout::Bgra8 => frame.to_bgra(),
     };
-    Ok(DecodeOutput { data: pixels, width, height, layout })
+    Ok(DecodeOutput {
+        data: pixels,
+        width,
+        height,
+        layout,
+    })
 }
 
 /// Decode the embedded thumbnail from a HEIC/HEIF file, if present.
 ///
 /// Returns `None` when the file contains no thumbnail.
-pub fn decode_heic_thumbnail(data: &[u8], layout: PixelLayout) -> Result<Option<DecodeOutput>, DecodeError> {
+pub fn decode_heic_thumbnail(
+    data: &[u8],
+    layout: PixelLayout,
+) -> Result<Option<DecodeOutput>, DecodeError> {
     let container = parse_container(data)?;
-    let primary = container.primary_item().ok_or_else(|| invalid_data("no primary image"))?;
+    let primary = container
+        .primary_item()
+        .ok_or_else(|| invalid_data("no primary image"))?;
 
     let thumb_ids = container.find_thumbnails(primary.id);
     let Some(&thumb_id) = thumb_ids.first() else {
         return Ok(None);
     };
-    let thumb_item = container.get_item(thumb_id).ok_or_else(|| invalid_data("thumbnail item not found"))?;
+    let thumb_item = container
+        .get_item(thumb_id)
+        .ok_or_else(|| invalid_data("thumbnail item not found"))?;
     let frame = decode_item(&container, &thumb_item, 0)?;
     let width = frame.cropped_width();
     let height = frame.cropped_height();
@@ -1555,5 +1741,10 @@ pub fn decode_heic_thumbnail(data: &[u8], layout: PixelLayout) -> Result<Option<
         PixelLayout::Bgr8 => frame.to_bgr(),
         PixelLayout::Bgra8 => frame.to_bgra(),
     };
-    Ok(Some(DecodeOutput { data: pixels, width, height, layout }))
+    Ok(Some(DecodeOutput {
+        data: pixels,
+        width,
+        height,
+        layout,
+    }))
 }

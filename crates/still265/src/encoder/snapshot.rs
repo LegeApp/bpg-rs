@@ -60,12 +60,9 @@ pub(super) struct ChromaLeafCache {
     pub(super) frame: FrameSnapshot,
 }
 
-/// Result of a full RD chroma-mode evaluation: the chosen plan, plus an optional
-/// chroma-leaf-cache entry for the winner (which reuses the coded residual data
-/// and frame snapshot instead of re-coding from scratch at leaf time).
+/// Result of a full RD chroma-mode evaluation.
 pub(super) struct ChromaDecision {
     pub(super) plan: crate::plan::ChromaModePlan,
-    pub(super) leaf_cache: Option<ChromaLeafCache>,
 }
 
 impl<'a> Encoder<'a> {
@@ -103,6 +100,7 @@ impl<'a> Encoder<'a> {
 
     pub(super) fn restore_plane(&mut self, snapshot: &PlaneSnapshot) {
         self.stats.frame_restores += 1;
+        self.stats.bytes_restored += (snapshot.data.len() * size_of::<u16>()) as u64;
         let (plane, stride) = self.frame.plane_mut(snapshot.c_idx);
         for row in 0..snapshot.height {
             let src = row * snapshot.width;
@@ -134,6 +132,95 @@ impl<'a> Encoder<'a> {
         FrameSnapshot { planes }
     }
 
+    /// Like [`Self::snapshot_frame_region`] but reuses a recycled
+    /// [`FrameSnapshot`] (and its per-plane `data` capacity) from the search
+    /// scratch pool instead of allocating fresh `Vec`s. Byte-identical content;
+    /// the caller should return the snapshot via [`Self::recycle_frame_snapshot`]
+    /// once it is no longer needed. The plane count is fixed by `self.cat`, so a
+    /// recycled snapshot always has compatible plane slots.
+    pub(super) fn snapshot_frame_region_pooled(
+        &mut self,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+    ) -> FrameSnapshot {
+        let t = self.prof.on.then(std::time::Instant::now);
+        let mut snap = self
+            .search_scratch
+            .frame_snapshot_pool
+            .pop()
+            .unwrap_or_else(|| FrameSnapshot { planes: Vec::new() });
+        let size = 1usize << log2_size;
+        let mut slot = 0;
+        self.fill_pooled_plane(&mut snap, slot, 0, x0, y0, size, size);
+        slot += 1;
+        if let Some((cx, cy, clog2, count)) = chroma_tb_geom(self.cat, x0, y0, log2_size) {
+            let csize = 1usize << clog2;
+            let cheight = csize * count as usize;
+            self.fill_pooled_plane(&mut snap, slot, 1, cx, cy, csize, cheight);
+            slot += 1;
+            self.fill_pooled_plane(&mut snap, slot, 2, cx, cy, csize, cheight);
+            slot += 1;
+        }
+        snap.planes.truncate(slot);
+        if let Some(t) = t {
+            self.prof.snapshot += t.elapsed();
+        }
+        snap
+    }
+
+    /// Fill plane slot `slot` of `snap` with the current frame region, reusing
+    /// the slot's existing `data` buffer when present (clearing retains its
+    /// capacity). Mirrors [`Self::snapshot_plane`]'s clamping and accounting.
+    fn fill_pooled_plane(
+        &mut self,
+        snap: &mut FrameSnapshot,
+        slot: usize,
+        c_idx: u8,
+        x: u32,
+        y: u32,
+        width: usize,
+        height: usize,
+    ) {
+        let (plane_width, plane_height) = self.frame_plane_dims(c_idx);
+        let x = (x as usize).min(plane_width);
+        let y = (y as usize).min(plane_height);
+        let width = width.min(plane_width.saturating_sub(x));
+        let height = height.min(plane_height.saturating_sub(y));
+        if slot >= snap.planes.len() {
+            snap.planes.push(PlaneSnapshot {
+                c_idx,
+                x,
+                y,
+                width,
+                height,
+                data: Vec::new(),
+            });
+        }
+        let dst = &mut snap.planes[slot];
+        dst.c_idx = c_idx;
+        dst.x = x;
+        dst.y = y;
+        dst.width = width;
+        dst.height = height;
+        dst.data.clear();
+        let (plane, stride) = self.frame.plane(c_idx);
+        for row in 0..height {
+            let start = (y + row) * stride + x;
+            dst.data.extend_from_slice(&plane[start..start + width]);
+        }
+        self.stats.frame_snapshots += 1;
+        self.stats.bytes_snapshotted += (dst.data.len() * size_of::<u16>()) as u64;
+    }
+
+    /// Return a pooled snapshot to the free-list for reuse. Capped so an idle
+    /// encoder does not retain an unbounded number of region buffers.
+    pub(super) fn recycle_frame_snapshot(&mut self, snap: FrameSnapshot) {
+        if self.search_scratch.frame_snapshot_pool.len() < 8 {
+            self.search_scratch.frame_snapshot_pool.push(snap);
+        }
+    }
+
     pub(super) fn restore_frame_region(&mut self, snapshot: &FrameSnapshot) {
         let t = self.prof.on.then(std::time::Instant::now);
         for plane in &snapshot.planes {
@@ -141,37 +228,6 @@ impl<'a> Encoder<'a> {
         }
         if let Some(t) = t {
             self.prof.snapshot += t.elapsed();
-        }
-    }
-
-    pub(super) fn snapshot_chroma_leaf_cache(
-        &mut self,
-        x0: u32,
-        y0: u32,
-        log2_size: u8,
-        chroma_log2: u8,
-        cb: CodedBlock,
-        cr: CodedBlock,
-        cb1: CodedBlock,
-        cr1: CodedBlock,
-    ) -> ChromaLeafCache {
-        let mut planes = Vec::with_capacity(2);
-        if let Some((cx, cy, clog2, count)) = chroma_tb_geom(self.cat, x0, y0, log2_size) {
-            let csize = 1usize << clog2;
-            let cheight = csize * count as usize;
-            planes.push(self.snapshot_plane(1, cx, cy, csize, cheight));
-            planes.push(self.snapshot_plane(2, cx, cy, csize, cheight));
-        }
-        ChromaLeafCache {
-            x0,
-            y0,
-            log2_size,
-            chroma_log2,
-            cb,
-            cr,
-            cb1,
-            cr1,
-            frame: FrameSnapshot { planes },
         }
     }
 
@@ -188,6 +244,7 @@ impl<'a> Encoder<'a> {
 
     pub(super) fn restore_mode_region(&mut self, snapshot: &MapSnapshot) {
         self.stats.map_restores += 1;
+        self.stats.bytes_restored += snapshot.data.len() as u64;
         restore_map(&mut self.mode_map, snapshot);
     }
 
@@ -216,6 +273,7 @@ impl<'a> Encoder<'a> {
 
     pub(super) fn restore_ct_depth_region(&mut self, snapshot: &MapSnapshot) {
         self.stats.map_restores += 1;
+        self.stats.bytes_restored += snapshot.data.len() as u64;
         restore_map(&mut self.ct_depth_map, snapshot);
     }
 
@@ -244,6 +302,7 @@ impl<'a> Encoder<'a> {
 
     pub(super) fn restore_tu_depth_region(&mut self, snapshot: &MapSnapshot) {
         self.stats.map_restores += 1;
+        self.stats.bytes_restored += snapshot.data.len() as u64;
         restore_map(&mut self.tu_depth_map, snapshot);
     }
 }

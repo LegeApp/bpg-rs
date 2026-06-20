@@ -215,10 +215,7 @@ pub fn analyze(width: u32, height: u32, bit_depth: u8, cat: u8, src: Source<'_>)
     let frame_mean_log2var = if cells.is_empty() {
         0.0
     } else {
-        let sum: f32 = cells
-            .iter()
-            .map(|c| ((1 + c.variance) as f32).log2())
-            .sum();
+        let sum: f32 = cells.iter().map(|c| ((1 + c.variance) as f32).log2()).sum();
         sum / cells.len() as f32
     };
 

@@ -193,6 +193,19 @@ pub fn inverse_transform(
     out
 }
 
+pub fn inverse_transform_into(
+    coeffs: &[i16],
+    log2_size: u8,
+    is_intra_4x4_luma: bool,
+    bit_depth: u8,
+    out: &mut Vec<i16>,
+) {
+    let n = 1usize << log2_size;
+    out.clear();
+    out.resize(n * n, 0);
+    dec_transform::inverse_transform(coeffs, out, n, bit_depth, is_intra_4x4_luma);
+}
+
 fn hadamard4_satd(diff: &[i32; 16]) -> u32 {
     let mut tmp = [0i32; 16];
     for y in 0..4 {
@@ -313,6 +326,37 @@ pub fn dequantize(levels: &mut [i16], combined: i32, shift: i32) {
     (PRIMITIVES.dequantize)(levels, combined, shift)
 }
 
+/// Forward quantization (H.265 8.6.2, flat scaling list) of a transformed
+/// coefficient block: `level = min(32767, (|coeff| * scale + add) >> qbits)`,
+/// re-signed to match `coeff`, written into `levels` (which the caller has
+/// already sized to `coeffs.len()` and zeroed). Returns the non-zero count.
+/// Dispatched through [`PRIMITIVES`]; byte-identical to [`quantize_scalar`].
+/// Hot path: every plain-quant trial in the staged rdo2 search.
+pub fn quantize(coeffs: &[i16], levels: &mut [i16], scale: i32, add: i32, qbits: i32) -> u32 {
+    (PRIMITIVES.quantize)(coeffs, levels, scale, add, qbits)
+}
+
+/// Canonical scalar forward quantization. Reference for the SIMD backend; the
+/// `i64` intermediate matches the original `transform::quantize_into` exactly.
+pub fn quantize_scalar(
+    coeffs: &[i16],
+    levels: &mut [i16],
+    scale: i32,
+    add: i32,
+    qbits: i32,
+) -> u32 {
+    let mut nnz = 0u32;
+    for (i, &c) in coeffs.iter().enumerate() {
+        let level = ((c.unsigned_abs() as i64 * scale as i64 + add as i64) >> qbits) as i32;
+        let level = level.min(32767);
+        if level != 0 {
+            levels[i] = if c < 0 { -level } else { level } as i16;
+            nnz += 1;
+        }
+    }
+    nnz
+}
+
 /// Canonical scalar inverse quantization. Reference for all optimized backends;
 /// kept bit-identical to `bpg-hevc-decode`'s decoder dequant.
 pub fn dequantize_scalar(levels: &mut [i16], combined: i32, shift: i32) {
@@ -396,6 +440,7 @@ pub struct Primitives {
     pub ssd_u16: fn(&[u16], usize, &[u16], usize, usize) -> u64,
     pub sub_residual: fn(&[u16], usize, &[u16], usize, &mut [i16], usize),
     pub dequantize: fn(&mut [i16], i32, i32),
+    pub quantize: fn(&[i16], &mut [i16], i32, i32, i32) -> u32,
     #[allow(clippy::type_complexity)]
     pub sao_stats_e0:
         fn(&[u16], usize, &[u16], usize, u32, u32, u32, u32, &mut [i64; 5], &mut [u32; 5]),
@@ -453,6 +498,7 @@ fn select_primitives() -> Primitives {
         ssd_u16: ssd_u16_scalar,
         sub_residual: sub_residual_scalar,
         dequantize: dequantize_scalar,
+        quantize: quantize_scalar,
         sao_stats_e0: sao_stats_e0_scalar,
         forward_dct_1d,
         intra_pred_allangs: intra_angs::intra_pred_allangs_scalar,
@@ -473,6 +519,7 @@ fn select_primitives() -> Primitives {
         p.ssd_u16 = wide_simd::ssd_u16;
         p.sub_residual = wide_simd::sub_residual;
         p.dequantize = wide_simd::dequantize;
+        p.quantize = wide_simd::quantize;
         p.sao_stats_e0 = wide_simd::sao_stats_e0;
         p.forward_dct_1d = wide_simd::forward_dct_1d;
         p.intra_pred_allangs = wide_simd::intra_pred_allangs;

@@ -91,6 +91,25 @@ pub(super) const MIN_TB_LOG2: u8 = 2;
 pub(super) const MAX_INTRA_TT_DEPTH: u8 = 2;
 pub(super) const CHROMA_DM_IDX: u8 = 4;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PartNxnPrune {
+    /// Full historical PartNxN RD comparison for every eligible 8x8 CU.
+    Off,
+    /// Skip clearly unpromising PartNxN trials, but protect structured classes.
+    Conservative,
+    /// Apply the rough precheck to every eligible class.
+    Aggressive,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BestTrialRdoqGate {
+    Off,
+    Chroma,
+    Luma32,
+    Large,
+    SmallLuma,
+}
+
 /// H.265 Table 8-22 chroma QP mapping for 4:2:0 (mirrors the decoder's
 /// `chroma_qp_from_luma`).
 pub(super) fn chroma_qp_from_luma(qpi: i32) -> i32 {
@@ -122,7 +141,6 @@ impl CodedBlock {
 }
 
 pub(super) struct BlockTrial {
-    pub(super) estimate: crate::plan::BlockEstimate,
     pub(super) coded: CodedBlock,
 }
 
@@ -295,6 +313,86 @@ pub(super) fn source_hash(
 }
 
 #[derive(Debug, Default, Clone)]
+pub struct LegacyUseStats {
+    pub build_cu: u64,
+    pub decide_cu: u64,
+    pub build_tt: u64,
+    pub build_luma_tt: u64,
+    pub build_tt_leaf: u64,
+    pub build_luma_tt_leaf: u64,
+    pub trial_code_block: u64,
+    pub estimate_block: u64,
+    pub code_block_internal: u64,
+    pub build_parent_chroma_tu: u64,
+    pub decide_luma_modes: u64,
+    pub decide_chroma_mode: u64,
+    pub final_code_tt: u64,
+    pub final_code_cu: u64,
+}
+
+impl LegacyUseStats {
+    pub fn merge(&mut self, other: &Self) {
+        self.build_cu += other.build_cu;
+        self.decide_cu += other.decide_cu;
+        self.build_tt += other.build_tt;
+        self.build_luma_tt += other.build_luma_tt;
+        self.build_tt_leaf += other.build_tt_leaf;
+        self.build_luma_tt_leaf += other.build_luma_tt_leaf;
+        self.trial_code_block += other.trial_code_block;
+        self.estimate_block += other.estimate_block;
+        self.code_block_internal += other.code_block_internal;
+        self.build_parent_chroma_tu += other.build_parent_chroma_tu;
+        self.decide_luma_modes += other.decide_luma_modes;
+        self.decide_chroma_mode += other.decide_chroma_mode;
+        self.final_code_tt += other.final_code_tt;
+        self.final_code_cu += other.final_code_cu;
+    }
+
+    pub fn total(&self) -> u64 {
+        self.build_cu
+            + self.decide_cu
+            + self.build_tt
+            + self.build_luma_tt
+            + self.build_tt_leaf
+            + self.build_luma_tt_leaf
+            + self.trial_code_block
+            + self.estimate_block
+            + self.code_block_internal
+            + self.build_parent_chroma_tu
+            + self.decide_luma_modes
+            + self.decide_chroma_mode
+            + self.final_code_tt
+            + self.final_code_cu
+    }
+
+    pub fn report(&self) -> String {
+        let rows = [
+            ("legacy_build_cu", self.build_cu),
+            ("legacy_decide_cu", self.decide_cu),
+            ("legacy_build_tt", self.build_tt),
+            ("legacy_build_luma_tt", self.build_luma_tt),
+            ("legacy_build_tt_leaf", self.build_tt_leaf),
+            ("legacy_build_luma_tt_leaf", self.build_luma_tt_leaf),
+            ("legacy_trial_code_block", self.trial_code_block),
+            ("legacy_estimate_block", self.estimate_block),
+            ("legacy_code_block_internal", self.code_block_internal),
+            ("legacy_build_parent_chroma_tu", self.build_parent_chroma_tu),
+            ("legacy_decide_luma_modes", self.decide_luma_modes),
+            ("legacy_decide_chroma_mode", self.decide_chroma_mode),
+            ("legacy_final_code_tt", self.final_code_tt),
+            ("legacy_final_code_cu", self.final_code_cu),
+        ];
+        let mut out = format!("rdo2 legacy leakage report: total={}", self.total());
+        for (name, value) in rows {
+            if value != 0 {
+                out.push_str(&format!("\n  {name}: {value}"));
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 pub struct EncodeStats {
     pub ctu_count: u64,
     pub cu_trials: u64,
@@ -314,10 +412,47 @@ pub struct EncodeStats {
     pub rmd_prunes: u64,
     pub luma_candidate_expansions: u64,
     pub chroma_candidate_expansions: u64,
+    pub partnxn_attempts: u64,
+    pub partnxn_skips: u64,
+    pub partnxn_wins: u64,
+    pub partnxn_losses: u64,
+    pub partnxn_wins_by_region: [u64; crate::preanalysis::NUM_CLASSES],
+    pub partnxn_cu_trials: u64,
+    pub partnxn_code_block_calls: u64,
     pub final_coded_blocks: u64,
     pub trial_coded_blocks: u64,
     pub final_rdoq_blocks: u64,
     pub trial_rdoq_blocks: u64,
+    pub best_tt_cheap_tu_decisions: u64,
+    pub best_tt_escalated_tu_decisions: u64,
+    pub best_tt_escalation_changed_winner: u64,
+    pub best_tt_full_trial_rdoq_blocks_saved: u64,
+    pub best_tt_exact_residual_estimates_saved: u64,
+    pub rdo2_luma_cheap_cu_decisions: u64,
+    pub rdo2_luma_exact_escalations: u64,
+    pub rdo2_luma_exact_changed_winner: u64,
+    pub rdo2_luma_scratch_candidates: u64,
+    pub rdo2_luma_scratch_exact_escalations: u64,
+    pub rdo2_luma_scratch_exact_rechecks: u64,
+    pub rdo2_luma_scratch_changed_winner: u64,
+    pub rdo2_luma_scratch_legacy_evals_skipped: u64,
+    pub rdo2_luma_scratch_legacy_exact_escalations_avoided: u64,
+    pub rdo2_luma_scratch_snapshot_restores_saved: u64,
+    pub rdo2_chroma_cheap_cu_decisions: u64,
+    pub rdo2_chroma_exact_escalations: u64,
+    pub rdo2_chroma_exact_changed_winner: u64,
+    pub rdo2_chroma_scratch_candidates: u64,
+    pub rdo2_chroma_scratch_cheap_evals: u64,
+    pub rdo2_chroma_scratch_exact_evals: u64,
+    pub rdo2_chroma_scratch_exact_escalations: u64,
+    pub rdo2_chroma_scratch_changed_winner: u64,
+    pub rdo2_chroma_scratch_legacy_evals_skipped: u64,
+    pub rdo2_chroma_scratch_stacked_fallbacks: u64,
+    pub rdo2_nxn_bound_attempts: u64,
+    pub rdo2_nxn_bound_aborts: u64,
+    pub rdo2_residual_approx_pricings: u64,
+    pub rdo2_residual_exact_pricings: u64,
+    pub rdo2_residual_final_pricings_elided: u64,
     pub luma_winner_rank_counts: [u64; 5],
     pub chroma_winner_rank_counts: [u64; 6],
     pub cu_leaf_wins_by_region: [u64; crate::preanalysis::NUM_CLASSES],
@@ -340,6 +475,15 @@ pub struct EncodeStats {
     pub map_snapshots: u64,
     pub map_restores: u64,
     pub bytes_snapshotted: u64,
+    pub bytes_restored: u64,
+    pub phase_total_us: u64,
+    pub phase_build_us: u64,
+    pub phase_parallel_restore_us: u64,
+    pub phase_deblock_us: u64,
+    pub phase_sao_decide_us: u64,
+    pub phase_sao_apply_us: u64,
+    pub phase_write_us: u64,
+    pub legacy: LegacyUseStats,
 }
 
 impl EncodeStats {
@@ -361,10 +505,53 @@ impl EncodeStats {
         self.rmd_prunes += other.rmd_prunes;
         self.luma_candidate_expansions += other.luma_candidate_expansions;
         self.chroma_candidate_expansions += other.chroma_candidate_expansions;
+        self.partnxn_attempts += other.partnxn_attempts;
+        self.partnxn_skips += other.partnxn_skips;
+        self.partnxn_wins += other.partnxn_wins;
+        self.partnxn_losses += other.partnxn_losses;
+        merge_array(
+            &mut self.partnxn_wins_by_region,
+            &other.partnxn_wins_by_region,
+        );
+        self.partnxn_cu_trials += other.partnxn_cu_trials;
+        self.partnxn_code_block_calls += other.partnxn_code_block_calls;
         self.final_coded_blocks += other.final_coded_blocks;
         self.trial_coded_blocks += other.trial_coded_blocks;
         self.final_rdoq_blocks += other.final_rdoq_blocks;
         self.trial_rdoq_blocks += other.trial_rdoq_blocks;
+        self.best_tt_cheap_tu_decisions += other.best_tt_cheap_tu_decisions;
+        self.best_tt_escalated_tu_decisions += other.best_tt_escalated_tu_decisions;
+        self.best_tt_escalation_changed_winner += other.best_tt_escalation_changed_winner;
+        self.best_tt_full_trial_rdoq_blocks_saved += other.best_tt_full_trial_rdoq_blocks_saved;
+        self.best_tt_exact_residual_estimates_saved += other.best_tt_exact_residual_estimates_saved;
+        self.rdo2_luma_cheap_cu_decisions += other.rdo2_luma_cheap_cu_decisions;
+        self.rdo2_luma_exact_escalations += other.rdo2_luma_exact_escalations;
+        self.rdo2_luma_exact_changed_winner += other.rdo2_luma_exact_changed_winner;
+        self.rdo2_luma_scratch_candidates += other.rdo2_luma_scratch_candidates;
+        self.rdo2_luma_scratch_exact_escalations += other.rdo2_luma_scratch_exact_escalations;
+        self.rdo2_luma_scratch_exact_rechecks += other.rdo2_luma_scratch_exact_rechecks;
+        self.rdo2_luma_scratch_changed_winner += other.rdo2_luma_scratch_changed_winner;
+        self.rdo2_luma_scratch_legacy_evals_skipped += other.rdo2_luma_scratch_legacy_evals_skipped;
+        self.rdo2_luma_scratch_legacy_exact_escalations_avoided +=
+            other.rdo2_luma_scratch_legacy_exact_escalations_avoided;
+        self.rdo2_luma_scratch_snapshot_restores_saved +=
+            other.rdo2_luma_scratch_snapshot_restores_saved;
+        self.rdo2_chroma_cheap_cu_decisions += other.rdo2_chroma_cheap_cu_decisions;
+        self.rdo2_chroma_exact_escalations += other.rdo2_chroma_exact_escalations;
+        self.rdo2_chroma_exact_changed_winner += other.rdo2_chroma_exact_changed_winner;
+        self.rdo2_chroma_scratch_candidates += other.rdo2_chroma_scratch_candidates;
+        self.rdo2_chroma_scratch_cheap_evals += other.rdo2_chroma_scratch_cheap_evals;
+        self.rdo2_chroma_scratch_exact_evals += other.rdo2_chroma_scratch_exact_evals;
+        self.rdo2_chroma_scratch_exact_escalations += other.rdo2_chroma_scratch_exact_escalations;
+        self.rdo2_chroma_scratch_changed_winner += other.rdo2_chroma_scratch_changed_winner;
+        self.rdo2_chroma_scratch_legacy_evals_skipped +=
+            other.rdo2_chroma_scratch_legacy_evals_skipped;
+        self.rdo2_chroma_scratch_stacked_fallbacks += other.rdo2_chroma_scratch_stacked_fallbacks;
+        self.rdo2_nxn_bound_attempts += other.rdo2_nxn_bound_attempts;
+        self.rdo2_nxn_bound_aborts += other.rdo2_nxn_bound_aborts;
+        self.rdo2_residual_approx_pricings += other.rdo2_residual_approx_pricings;
+        self.rdo2_residual_exact_pricings += other.rdo2_residual_exact_pricings;
+        self.rdo2_residual_final_pricings_elided += other.rdo2_residual_final_pricings_elided;
         merge_array(
             &mut self.luma_winner_rank_counts,
             &other.luma_winner_rank_counts,
@@ -405,6 +592,15 @@ impl EncodeStats {
         self.map_snapshots += other.map_snapshots;
         self.map_restores += other.map_restores;
         self.bytes_snapshotted += other.bytes_snapshotted;
+        self.bytes_restored += other.bytes_restored;
+        self.phase_total_us += other.phase_total_us;
+        self.phase_build_us += other.phase_build_us;
+        self.phase_parallel_restore_us += other.phase_parallel_restore_us;
+        self.phase_deblock_us += other.phase_deblock_us;
+        self.phase_sao_decide_us += other.phase_sao_decide_us;
+        self.phase_sao_apply_us += other.phase_sao_apply_us;
+        self.phase_write_us += other.phase_write_us;
+        self.legacy.merge(&other.legacy);
     }
 }
 
@@ -465,10 +661,156 @@ impl fmt::Display for EncodeStats {
             "  chroma_candidate_expansions: {}",
             self.chroma_candidate_expansions
         )?;
+        writeln!(f, "  partnxn_attempts: {}", self.partnxn_attempts)?;
+        writeln!(f, "  partnxn_skips: {}", self.partnxn_skips)?;
+        writeln!(f, "  partnxn_wins: {}", self.partnxn_wins)?;
+        writeln!(f, "  partnxn_losses: {}", self.partnxn_losses)?;
+        writeln!(
+            f,
+            "  partnxn_wins_by_region: {:?}",
+            self.partnxn_wins_by_region
+        )?;
+        writeln!(f, "  partnxn_cu_trials: {}", self.partnxn_cu_trials)?;
+        writeln!(
+            f,
+            "  partnxn_code_block_calls: {}",
+            self.partnxn_code_block_calls
+        )?;
         writeln!(f, "  final_coded_blocks: {}", self.final_coded_blocks)?;
         writeln!(f, "  trial_coded_blocks: {}", self.trial_coded_blocks)?;
         writeln!(f, "  final_rdoq_blocks: {}", self.final_rdoq_blocks)?;
         writeln!(f, "  trial_rdoq_blocks: {}", self.trial_rdoq_blocks)?;
+        writeln!(
+            f,
+            "  best_tt_cheap_tu_decisions: {}",
+            self.best_tt_cheap_tu_decisions
+        )?;
+        writeln!(
+            f,
+            "  best_tt_escalated_tu_decisions: {}",
+            self.best_tt_escalated_tu_decisions
+        )?;
+        writeln!(
+            f,
+            "  best_tt_escalation_changed_winner: {}",
+            self.best_tt_escalation_changed_winner
+        )?;
+        writeln!(
+            f,
+            "  best_tt_full_trial_rdoq_blocks_saved: {}",
+            self.best_tt_full_trial_rdoq_blocks_saved
+        )?;
+        writeln!(
+            f,
+            "  best_tt_exact_residual_estimates_saved: {}",
+            self.best_tt_exact_residual_estimates_saved
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_cheap_cu_decisions: {}",
+            self.rdo2_luma_cheap_cu_decisions
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_exact_escalations: {}",
+            self.rdo2_luma_exact_escalations
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_exact_changed_winner: {}",
+            self.rdo2_luma_exact_changed_winner
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_scratch_candidates: {}",
+            self.rdo2_luma_scratch_candidates
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_scratch_exact_escalations: {}",
+            self.rdo2_luma_scratch_exact_escalations
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_scratch_exact_rechecks: {}",
+            self.rdo2_luma_scratch_exact_rechecks
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_scratch_changed_winner: {}",
+            self.rdo2_luma_scratch_changed_winner
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_scratch_legacy_evals_skipped: {}",
+            self.rdo2_luma_scratch_legacy_evals_skipped
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_scratch_legacy_exact_escalations_avoided: {}",
+            self.rdo2_luma_scratch_legacy_exact_escalations_avoided
+        )?;
+        writeln!(
+            f,
+            "  rdo2_luma_scratch_snapshot_restores_saved: {}",
+            self.rdo2_luma_scratch_snapshot_restores_saved
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_cheap_cu_decisions: {}",
+            self.rdo2_chroma_cheap_cu_decisions
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_exact_escalations: {}",
+            self.rdo2_chroma_exact_escalations
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_exact_changed_winner: {}",
+            self.rdo2_chroma_exact_changed_winner
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_scratch_candidates: {}",
+            self.rdo2_chroma_scratch_candidates
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_scratch_cheap_evals: {}",
+            self.rdo2_chroma_scratch_cheap_evals
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_scratch_exact_evals: {}",
+            self.rdo2_chroma_scratch_exact_evals
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_scratch_exact_escalations: {}",
+            self.rdo2_chroma_scratch_exact_escalations
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_scratch_changed_winner: {}",
+            self.rdo2_chroma_scratch_changed_winner
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_scratch_legacy_evals_skipped: {}",
+            self.rdo2_chroma_scratch_legacy_evals_skipped
+        )?;
+        writeln!(
+            f,
+            "  rdo2_chroma_scratch_stacked_fallbacks: {}",
+            self.rdo2_chroma_scratch_stacked_fallbacks
+        )?;
+        writeln!(
+            f,
+            "  rdo2_nxn_bound_attempts: {}",
+            self.rdo2_nxn_bound_attempts
+        )?;
+        writeln!(f, "  rdo2_nxn_bound_aborts: {}", self.rdo2_nxn_bound_aborts)?;
         writeln!(
             f,
             "  luma_winner_rank_counts: {:?}",
@@ -515,6 +857,21 @@ impl fmt::Display for EncodeStats {
             "  chroma_rough_predictions: {}",
             self.chroma_rough_predictions
         )?;
+        writeln!(
+            f,
+            "  rdo2_residual_approx_pricings: {}",
+            self.rdo2_residual_approx_pricings
+        )?;
+        writeln!(
+            f,
+            "  rdo2_residual_exact_pricings: {}",
+            self.rdo2_residual_exact_pricings
+        )?;
+        writeln!(
+            f,
+            "  rdo2_residual_final_pricings_elided: {}",
+            self.rdo2_residual_final_pricings_elided
+        )?;
         writeln!(f, "  code_block_calls: {}", self.code_block_calls)?;
         writeln!(f, "  forward_transforms: {}", self.forward_transforms)?;
         writeln!(f, "  inverse_transforms: {}", self.inverse_transforms)?;
@@ -530,7 +887,19 @@ impl fmt::Display for EncodeStats {
         writeln!(f, "  frame_restores: {}", self.frame_restores)?;
         writeln!(f, "  map_snapshots: {}", self.map_snapshots)?;
         writeln!(f, "  map_restores: {}", self.map_restores)?;
-        writeln!(f, "  bytes_snapshotted: {}", self.bytes_snapshotted)
+        writeln!(f, "  bytes_snapshotted: {}", self.bytes_snapshotted)?;
+        writeln!(f, "  bytes_restored: {}", self.bytes_restored)?;
+        writeln!(f, "  phase_total_us: {}", self.phase_total_us)?;
+        writeln!(f, "  phase_build_us: {}", self.phase_build_us)?;
+        writeln!(
+            f,
+            "  phase_parallel_restore_us: {}",
+            self.phase_parallel_restore_us
+        )?;
+        writeln!(f, "  phase_deblock_us: {}", self.phase_deblock_us)?;
+        writeln!(f, "  phase_sao_decide_us: {}", self.phase_sao_decide_us)?;
+        writeln!(f, "  phase_sao_apply_us: {}", self.phase_sao_apply_us)?;
+        writeln!(f, "  phase_write_us: {}", self.phase_write_us)
     }
 }
 
@@ -558,6 +927,14 @@ pub(super) struct Profiler {
     pub(super) code_block: std::time::Duration,
     pub(super) residual_bits: std::time::Duration,
     pub(super) rdoq: std::time::Duration,
+    /// rdo2-path inner timers (the default Best path bypasses `code_block`).
+    pub(super) eval_predict: std::time::Duration,
+    pub(super) eval_transform: std::time::Duration,
+    pub(super) eval_quant_rdoq: std::time::Duration,
+    pub(super) eval_recon: std::time::Duration,
+    pub(super) eval_residual_price: std::time::Duration,
+    /// Rough SATD intra-mode search (`decide_luma_modes`).
+    pub(super) rough_search: std::time::Duration,
 }
 
 pub(super) struct PlaneSnapshot {

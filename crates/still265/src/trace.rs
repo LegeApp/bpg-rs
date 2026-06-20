@@ -41,6 +41,7 @@ use crate::preanalysis::{AnalysisMaps, RegionClass, NUM_CLASSES};
 
 const NUM_STAGES: usize = 6;
 const NUM_KINDS: usize = 5;
+const NUM_COMPONENTS: usize = 3;
 /// Block-size buckets, indexed by `log2_size - 2`: 4x4, 8x8, 16x16, 32x32,
 /// 64x64. Transform blocks span 2..=5; CU decisions reach 6.
 const NUM_SIZES: usize = 5;
@@ -77,6 +78,8 @@ const STAGE_NAMES: [&str; NUM_STAGES] = [
     "final_code",
 ];
 
+const COMPONENT_NAMES: [&str; NUM_COMPONENTS] = ["y", "cb", "cr"];
+
 /// Search-decision kind, indexing the per-kind tables.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DecisionKind {
@@ -107,6 +110,11 @@ const CLASS_NAMES: [&str; NUM_CLASSES] = [
 #[inline]
 fn size_bucket(log2_size: u8) -> usize {
     (log2_size as usize).saturating_sub(2).min(NUM_SIZES - 1)
+}
+
+#[inline]
+fn component_index(c_idx: u8) -> usize {
+    (c_idx as usize).min(NUM_COMPONENTS - 1)
 }
 
 /// One evaluated candidate in a Track-2 decision. The winner is `argmin(cost)`.
@@ -148,6 +156,16 @@ struct StageTally {
     exact_estimates: u64,
     luma_exact_estimates: u64,
     chroma_exact_estimates: u64,
+    final_pricings_elided: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CodeBlockVolume {
+    code_blocks: u64,
+    nonzero_blocks: u64,
+    exact_estimates: u64,
+    approx_priced_blocks: u64,
+    final_pricings_elided: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -156,6 +174,7 @@ struct CtuTally {
     exact_estimates: u64,
     final_exact_estimates: u64,
     trial_exact_estimates: u64,
+    final_pricings_elided: u64,
     luma_decisions: u64,
     luma_losers: u64,
     chroma_decisions: u64,
@@ -229,6 +248,8 @@ pub struct SearchTrace {
     ctb_log2: u8,
     analysis: Option<Arc<AnalysisMaps>>,
     stage: [StageTally; NUM_STAGES],
+    code_block_volume: [[[CodeBlockVolume; NUM_SIZES]; NUM_COMPONENTS]; NUM_STAGES],
+    rdoq_volume: [[[u64; NUM_SIZES]; NUM_COMPONENTS]; NUM_STAGES],
     region_exact_estimates: [u64; NUM_CLASSES],
     /// Exact estimates by region class × block size (from `note_code_block`).
     region_size_exact: [[u64; NUM_SIZES]; NUM_CLASSES],
@@ -238,6 +259,8 @@ pub struct SearchTrace {
     luma_rmd_modes_scored: u64,
     luma_rmd_candidates_retained: u64,
     luma_rmd_mpm0_forced: u64,
+    rdo2_residual_approx_pricings: u64,
+    rdo2_residual_exact_pricings: u64,
     tu_neighbor_prior_seen: u64,
     tu_neighbor_prior_leaf: u64,
     tu_neighbor_prior_split: u64,
@@ -282,6 +305,9 @@ impl Default for SearchTrace {
             ctb_log2: 6,
             analysis: None,
             stage: [StageTally::default(); NUM_STAGES],
+            code_block_volume: [[[CodeBlockVolume::default(); NUM_SIZES]; NUM_COMPONENTS];
+                NUM_STAGES],
+            rdoq_volume: [[[0; NUM_SIZES]; NUM_COMPONENTS]; NUM_STAGES],
             region_exact_estimates: [0; NUM_CLASSES],
             region_size_exact: [[0; NUM_SIZES]; NUM_CLASSES],
             ctus: Vec::new(),
@@ -290,6 +316,8 @@ impl Default for SearchTrace {
             luma_rmd_modes_scored: 0,
             luma_rmd_candidates_retained: 0,
             luma_rmd_mpm0_forced: 0,
+            rdo2_residual_approx_pricings: 0,
+            rdo2_residual_exact_pricings: 0,
             tu_neighbor_prior_seen: 0,
             tu_neighbor_prior_leaf: 0,
             tu_neighbor_prior_split: 0,
@@ -386,6 +414,8 @@ impl SearchTrace {
         frac_bits: u64,
     ) {
         let si = stage_index(stage);
+        let ci = component_index(c_idx);
+        let sz = size_bucket(log2_size);
         let st = &mut self.stage[si];
         st.code_blocks += 1;
         if cbf {
@@ -399,13 +429,23 @@ impl SearchTrace {
                 st.chroma_exact_estimates += 1;
             }
         }
+        let volume = &mut self.code_block_volume[si][ci][sz];
+        volume.code_blocks += 1;
+        if cbf {
+            volume.nonzero_blocks += 1;
+            if exact {
+                volume.exact_estimates += 1;
+            } else {
+                volume.approx_priced_blocks += 1;
+            }
+        }
         let region = self.region_at(x, y, log2_size).index();
         if exact {
             self.region_exact_estimates[region] += 1;
-            self.region_size_exact[region][size_bucket(log2_size)] += 1;
+            self.region_size_exact[region][sz] += 1;
         }
-        let ci = self.ctu_index(x, y);
-        let ctu = &mut self.ctus[ci];
+        let ctu_idx = self.ctu_index(x, y);
+        let ctu = &mut self.ctus[ctu_idx];
         ctu.code_blocks += 1;
         if exact {
             ctu.exact_estimates += 1;
@@ -420,6 +460,52 @@ impl SearchTrace {
         }
     }
 
+    /// Track a final-coded transform block whose residual syntax bits are not
+    /// estimated during analysis because the writer will immediately emit the
+    /// same syntax from the materialized levels.
+    pub fn note_final_pricing_elided(
+        &mut self,
+        c_idx: u8,
+        x: u32,
+        y: u32,
+        log2_size: u8,
+        cbf: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let si = stage_index(WorkStage::FinalCode);
+        let ci = component_index(c_idx);
+        let sz = size_bucket(log2_size);
+        let st = &mut self.stage[si];
+        st.code_blocks += 1;
+        if cbf {
+            st.nonzero_blocks += 1;
+            st.final_pricings_elided += 1;
+        }
+        let volume = &mut self.code_block_volume[si][ci][sz];
+        volume.code_blocks += 1;
+        if cbf {
+            volume.nonzero_blocks += 1;
+            volume.final_pricings_elided += 1;
+        }
+        let ctu_idx = self.ctu_index(x, y);
+        let ctu = &mut self.ctus[ctu_idx];
+        ctu.code_blocks += 1;
+        if cbf {
+            ctu.final_pricings_elided += 1;
+        }
+    }
+
+    /// Track RDOQ blocks by the same stage/component/size dimensions as
+    /// `note_code_block`. This is a block count, not a pass count.
+    pub fn note_rdoq_block(&mut self, stage: WorkStage, c_idx: u8, log2_size: u8) {
+        if !self.enabled {
+            return;
+        }
+        self.rdoq_volume[stage_index(stage)][component_index(c_idx)][size_bucket(log2_size)] += 1;
+    }
+
     /// Track 0: rough luma mode scheduler selection before expensive luma RD.
     pub fn note_luma_rmd_selection(&mut self, scored: usize, retained: usize, mpm0_forced: bool) {
         if !self.enabled {
@@ -430,6 +516,17 @@ impl SearchTrace {
         self.luma_rmd_candidates_retained += retained as u64;
         if mpm0_forced {
             self.luma_rmd_mpm0_forced += 1;
+        }
+    }
+
+    pub fn note_rdo2_residual_pricing(&mut self, exact: bool) {
+        if !self.enabled {
+            return;
+        }
+        if exact {
+            self.rdo2_residual_exact_pricings += 1;
+        } else {
+            self.rdo2_residual_approx_pricings += 1;
         }
     }
 
@@ -640,6 +737,8 @@ impl SearchTrace {
         self.write_summary(total_residual_estimates)?;
         self.write_waste_buckets()?;
         self.write_stage_table()?;
+        self.write_code_block_volume()?;
+        self.write_rdoq_volume()?;
         self.write_loss_hist()?;
         self.write_rank_hist()?;
         self.write_region_table()?;
@@ -679,6 +778,24 @@ impl SearchTrace {
         self.stage.iter().map(field).sum()
     }
 
+    fn code_block_volume_sum(&self, field: impl Fn(&CodeBlockVolume) -> u64) -> u64 {
+        self.code_block_volume
+            .iter()
+            .flat_map(|by_component| by_component.iter())
+            .flat_map(|by_size| by_size.iter())
+            .map(field)
+            .sum()
+    }
+
+    fn rdoq_volume_sum(&self) -> u64 {
+        self.rdoq_volume
+            .iter()
+            .flat_map(|by_component| by_component.iter())
+            .flat_map(|by_size| by_size.iter())
+            .copied()
+            .sum()
+    }
+
     fn write_summary(&self, total_residual_estimates: u64) -> std::io::Result<()> {
         let mut w = self.create("search_summary.csv")?;
         writeln!(w, "metric,value")?;
@@ -695,6 +812,8 @@ impl SearchTrace {
         let final_blocks = self.stage[stage_index(WorkStage::FinalCode)].code_blocks;
         let trial_blocks = code_blocks - final_blocks;
         let exact = self.stage_sum(|s| s.exact_estimates);
+        let final_pricings_elided = self.stage_sum(|s| s.final_pricings_elided);
+        let approx_priced = self.code_block_volume_sum(|v| v.approx_priced_blocks);
         let final_exact = self.stage[stage_index(WorkStage::FinalCode)].exact_estimates;
         let trial_exact = exact - final_exact;
 
@@ -713,7 +832,10 @@ impl SearchTrace {
             "exact_residual_estimates_counter,{total_residual_estimates}"
         )?;
         writeln!(w, "exact_residual_estimates_final,{final_exact}")?;
+        writeln!(w, "final_residual_pricings_elided,{final_pricings_elided}")?;
         writeln!(w, "exact_residual_estimates_trial,{trial_exact}")?;
+        writeln!(w, "approx_residual_priced_blocks,{approx_priced}")?;
+        writeln!(w, "rdoq_blocks,{}", self.rdoq_volume_sum())?;
         writeln!(
             w,
             "exact_residual_per_final_block,{:.3}",
@@ -752,6 +874,16 @@ impl SearchTrace {
             ratio(self.luma_rmd_candidates_retained, self.luma_rmd_selections)
         )?;
         writeln!(w, "luma_rmd_mpm0_forced,{}", self.luma_rmd_mpm0_forced)?;
+        writeln!(
+            w,
+            "rdo2_residual_approx_pricings,{}",
+            self.rdo2_residual_approx_pricings
+        )?;
+        writeln!(
+            w,
+            "rdo2_residual_exact_pricings,{}",
+            self.rdo2_residual_exact_pricings
+        )?;
         writeln!(w, "tu_neighbor_prior_seen,{}", self.tu_neighbor_prior_seen)?;
         writeln!(w, "tu_neighbor_prior_leaf,{}", self.tu_neighbor_prior_leaf)?;
         writeln!(
@@ -792,6 +924,51 @@ impl SearchTrace {
             w,
             "note_cu_tu_stage_exact,attributed_to_child_luma_chroma_final_stages"
         )?;
+        Ok(())
+    }
+
+    fn write_code_block_volume(&self) -> std::io::Result<()> {
+        let mut w = self.create("code_block_volume.csv")?;
+        writeln!(
+            w,
+            "stage,component,block_size,code_blocks,nonzero_blocks,exact_residual_estimates,approx_residual_priced_blocks,final_pricings_elided"
+        )?;
+        for (si, stage) in STAGE_NAMES.iter().enumerate() {
+            for (ci, component) in COMPONENT_NAMES.iter().enumerate() {
+                for (zi, size) in SIZE_NAMES.iter().enumerate() {
+                    let v = self.code_block_volume[si][ci][zi];
+                    if v.code_blocks == 0 {
+                        continue;
+                    }
+                    writeln!(
+                        w,
+                        "{stage},{component},{size},{},{},{},{},{}",
+                        v.code_blocks,
+                        v.nonzero_blocks,
+                        v.exact_estimates,
+                        v.approx_priced_blocks,
+                        v.final_pricings_elided
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_rdoq_volume(&self) -> std::io::Result<()> {
+        let mut w = self.create("rdoq_volume.csv")?;
+        writeln!(w, "stage,component,block_size,rdoq_blocks")?;
+        for (si, stage) in STAGE_NAMES.iter().enumerate() {
+            for (ci, component) in COMPONENT_NAMES.iter().enumerate() {
+                for (zi, size) in SIZE_NAMES.iter().enumerate() {
+                    let blocks = self.rdoq_volume[si][ci][zi];
+                    if blocks == 0 {
+                        continue;
+                    }
+                    writeln!(w, "{stage},{component},{size},{blocks}")?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -861,19 +1038,20 @@ impl SearchTrace {
         let mut w = self.create("stage_table.csv")?;
         writeln!(
             w,
-            "stage,code_blocks,nonzero_blocks,exact_estimates,luma_exact,chroma_exact,exact_share_pct"
+            "stage,code_blocks,nonzero_blocks,exact_estimates,luma_exact,chroma_exact,final_pricings_elided,exact_share_pct"
         )?;
         let total_exact = self.stage_sum(|s| s.exact_estimates).max(1);
         for (i, st) in self.stage.iter().enumerate() {
             writeln!(
                 w,
-                "{},{},{},{},{},{},{:.1}",
+                "{},{},{},{},{},{},{},{:.1}",
                 STAGE_NAMES[i],
                 st.code_blocks,
                 st.nonzero_blocks,
                 st.exact_estimates,
                 st.luma_exact_estimates,
                 st.chroma_exact_estimates,
+                st.final_pricings_elided,
                 100.0 * st.exact_estimates as f64 / total_exact as f64,
             )?;
         }

@@ -61,25 +61,32 @@ pub fn forward_transform_into(
 /// before reconstruction. Returns `(levels, num_nonzero)`; `levels` is
 /// row-major with the same layout as the input coefficients.
 pub fn quantize(coeffs: &[i16], log2_size: u8, qp: i32, bit_depth: u8) -> (Vec<i16>, u32) {
+    let mut levels = Vec::new();
+    let nnz = quantize_into(coeffs, log2_size, qp, bit_depth, &mut levels);
+    (levels, nnz)
+}
+
+pub fn quantize_into(
+    coeffs: &[i16],
+    log2_size: u8,
+    qp: i32,
+    bit_depth: u8,
+    levels: &mut Vec<i16>,
+) -> u32 {
     let per = qp / 6;
     let rem = (qp % 6) as usize;
     let transform_shift = MAX_TR_DYNAMIC_RANGE - bit_depth as i32 - log2_size as i32;
     let qbits = QUANT_SHIFT + per + transform_shift;
     // Intra rounding offset (x265: 171 for I, 85 for P/B), scaled into qbits.
-    let add = 171i64 << (qbits - 9);
-    let scale = QUANT_SCALE[rem] as i64;
+    // `qbits >= 9` (max TU 32x32, max bit depth 12) and `scale <= 26214`, so both
+    // fit i32; see [`primitives::quantize`] for the overflow analysis.
+    let add = (171i64 << (qbits - 9)) as i32;
+    let scale = QUANT_SCALE[rem];
 
-    let mut levels = vec![0i16; coeffs.len()];
-    let mut nnz = 0u32;
-    for (i, &c) in coeffs.iter().enumerate() {
-        let level = ((c.unsigned_abs() as i64 * scale + add) >> qbits) as i32;
-        let level = level.min(32767);
-        if level != 0 {
-            levels[i] = if c < 0 { -level } else { level } as i16;
-            nnz += 1;
-        }
-    }
-    (levels, nnz)
+    levels.clear();
+    levels.resize(coeffs.len(), 0);
+    // Dispatched (scalar or `wide`-SIMD) forward-quant kernel; see [`primitives`].
+    primitives::quantize(coeffs, levels, scale, add, qbits)
 }
 
 /// Forward-quantizer scale and `qbits` shift for `(log2_size, qp, bit_depth)`,
@@ -154,6 +161,16 @@ pub fn inverse_transform(
     primitives::inverse_transform(coeffs, log2_size, is_intra_4x4_luma, bit_depth)
 }
 
+pub fn inverse_transform_into(
+    coeffs: &[i16],
+    log2_size: u8,
+    is_intra_4x4_luma: bool,
+    bit_depth: u8,
+    out: &mut Vec<i16>,
+) {
+    primitives::inverse_transform_into(coeffs, log2_size, is_intra_4x4_luma, bit_depth, out);
+}
+
 /// Reconstruct the residual a decoder would produce from coded `levels`:
 /// dequant (8.6.3) then inverse transform (8.6.4). The encoder adds this to
 /// its prediction and clips, exactly as the decoder does, so reconstructed
@@ -168,4 +185,19 @@ pub fn reconstruct_residual(
     let mut coeffs = levels.to_vec();
     dequantize(&mut coeffs, log2_size, qp, bit_depth);
     inverse_transform(&coeffs, log2_size, is_intra_4x4_luma, bit_depth)
+}
+
+pub fn reconstruct_residual_into(
+    levels: &[i16],
+    log2_size: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_intra_4x4_luma: bool,
+    coeffs: &mut Vec<i16>,
+    residual: &mut Vec<i16>,
+) {
+    coeffs.clear();
+    coeffs.extend_from_slice(levels);
+    dequantize(coeffs, log2_size, qp, bit_depth);
+    inverse_transform_into(coeffs, log2_size, is_intra_4x4_luma, bit_depth, residual);
 }
