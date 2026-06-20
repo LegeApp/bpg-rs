@@ -7,7 +7,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use bpg_encode::{encode_still_image, EncoderTuning};
@@ -73,7 +73,14 @@ struct Args {
     #[arg(long = "c-extra-arg")]
     c_extra_args: Vec<String>,
 
-    /// Run the C bpgenc process pinned to one logical CPU.
+    /// x265 param override for rebuilt C bpgenc wrappers. Repeat as
+    /// `--c-x265-param name=value`.
+    #[arg(long = "c-x265-param")]
+    c_x265_params: Vec<String>,
+
+    /// Run C bpgenc with true x265 single-thread controls when supported by the
+    /// wrapper (`frame-threads=1,pools=none`), plus one-CPU process affinity as
+    /// a compatibility fallback for stock bpgenc builds.
     ///
     /// Stock libbpg's x265 wrapper does not expose x265_param_parse overrides.
     /// x265's native single-thread controls are frame-threads=1 and pools=none;
@@ -627,6 +634,22 @@ fn run_c_bpgenc(
         .arg(args.compress_level.to_string())
         .args(&args.c_extra_args)
         .arg(png);
+    if args.c_single_thread {
+        cmd.env("BPG_X265_SINGLE_THREAD", "1");
+    }
+    let mut x265_params = Vec::new();
+    if args.c_single_thread {
+        x265_params.extend([
+            "frame-threads=1".to_string(),
+            "pools=none".to_string(),
+            "wpp=0".to_string(),
+            "pmode=0".to_string(),
+        ]);
+    }
+    x265_params.extend(args.c_x265_params.iter().cloned());
+    if !x265_params.is_empty() {
+        cmd.env("BPG_X265_PARAMS", x265_params.join(","));
+    }
     let output = if args.c_single_thread {
         run_command_single_cpu(cmd)?
     } else {
