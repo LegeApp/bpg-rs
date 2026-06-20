@@ -1006,19 +1006,10 @@ pub fn encode_with_stats(
     } else {
         *crate::effort::template(config.effort)
     };
-    let best_balanced_scheduler = config.effort == Effort::Best
-        && std::env::var("BPG_BEST_SCHEDULER")
-            .ok()
-            .map(|v| {
-                matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "balanced" | "1" | "on" | "true"
-                )
-            })
-            .unwrap_or(false);
-    if best_balanced_scheduler {
-        effort_template.residual.exact_bits_during_trials = false;
-    }
+    // Historical diagnostic: `BPG_BEST_SCHEDULER=balanced` used to combine the
+    // small-luma trial-RDOQ gate with approximate trial residual bits. The
+    // quality sweep showed approximate trial bits caused the regression, so the
+    // scheduler alias is now no stronger than the default Best RDOQ gate below.
     if best2_parallel {
         effort_template.parallel_analysis = true;
     }
@@ -1063,21 +1054,21 @@ pub fn encode_with_stats(
         && std::env::var("BPG_BEST_TRIAL_APPROX_BITS")
             .ok()
             .map(|v| v.trim() != "0")
-            .unwrap_or(best_balanced_scheduler);
+            .unwrap_or(false);
     let best_trial_rdoq_gate = if config.effort == Effort::Best {
         match std::env::var("BPG_BEST_TRIAL_RDOQ_GATE")
             .ok()
             .map(|v| v.trim().to_ascii_lowercase())
             .as_deref()
         {
+            Some("0") | Some("off") | Some("false") => BestTrialRdoqGate::Off,
             Some("1") | Some("on") | Some("true") | Some("small-luma") => {
                 BestTrialRdoqGate::SmallLuma
             }
             Some("chroma") => BestTrialRdoqGate::Chroma,
             Some("luma32") | Some("32") => BestTrialRdoqGate::Luma32,
             Some("large") | Some("large-luma") => BestTrialRdoqGate::Large,
-            _ if best_balanced_scheduler => BestTrialRdoqGate::SmallLuma,
-            _ => BestTrialRdoqGate::Off,
+            _ => BestTrialRdoqGate::SmallLuma,
         }
     } else {
         BestTrialRdoqGate::Off
