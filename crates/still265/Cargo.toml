@@ -1,9 +1,9 @@
 [package]
 name = "still265"
 version.workspace = true
-edition.workspace = true
+edition = "2024"
 license.workspace = true
-description = "Rust-native still-picture HEVC intra encoder (still265): a line-by-line port of x265's still-image encode path."
+description = "Rust-native still-picture HEVC intra encoder (still265)"
 
 [dependencies]
 bpg-bitstream = { path = "../bpg-bitstream" }

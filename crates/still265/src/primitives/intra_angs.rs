@@ -70,9 +70,9 @@ pub fn intra_pred_allangs_scalar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bpg_hevc_decode::DecodedFrame;
     use bpg_hevc_decode::hevc::intra::{build_reference_borders, predict_intra_into};
     use bpg_hevc_decode::hevc::slice::IntraPredMode;
-    use bpg_hevc_decode::DecodedFrame;
 
     fn fill_pseudo_random(frame: &mut DecodedFrame, bit_depth: u8) {
         let max = (1u32 << bit_depth) - 1;

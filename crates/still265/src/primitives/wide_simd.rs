@@ -16,7 +16,7 @@
 
 use super::round_shift;
 use bpg_hevc_decode::hevc::intra::{
-    reference_filter_applies, INTRA_BORDER_CENTER, INTRA_BORDER_LEN, INTRA_PRED_ANGLE, INV_ANGLE,
+    INTRA_BORDER_CENTER, INTRA_BORDER_LEN, INTRA_PRED_ANGLE, INV_ANGLE, reference_filter_applies,
 };
 use wide::{i16x8, i32x4, i32x8};
 
@@ -600,7 +600,7 @@ mod tests {
 
     #[test]
     fn allangs_simd_matches_scalar() {
-        use crate::primitives::intra_angs::{intra_pred_allangs_scalar, ANGULAR_MODES};
+        use crate::primitives::intra_angs::{ANGULAR_MODES, intra_pred_allangs_scalar};
         use bpg_hevc_decode::hevc::intra::{INTRA_BORDER_CENTER, INTRA_BORDER_LEN};
         let mut st = 0xC0FF_EE11u32;
         for &bd in &[8u8, 10, 12] {

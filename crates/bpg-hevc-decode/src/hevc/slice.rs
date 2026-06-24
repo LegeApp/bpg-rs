@@ -221,6 +221,12 @@ pub struct SliceHeader {
     /// Number of entry point offsets (for tiles/WPP)
     pub num_entry_point_offsets: u32,
 
+    /// Cumulative entry-point byte offsets (NAL-domain, incl. emulation-prevention
+    /// bytes) of each substream boundary, relative to the start of the slice data.
+    /// `entry_point_offsets[i]` is the NAL-byte offset where substream `i+1`
+    /// begins. Used to seek the CABAC engine to each tile/WPP substream start.
+    pub entry_point_offsets: Vec<u32>,
+
     /// Derived: SliceQPY = 26 + pps.init_qp_minus26 + slice_qp_delta
     pub slice_qp_y: i32,
 }
@@ -386,15 +392,23 @@ impl SliceHeader {
             pps.pps_loop_filter_across_slices_enabled_flag
         };
 
-        // Entry point offsets (tiles/WPP)
+        // Entry point offsets (tiles/WPP). Stored cumulatively (NAL-domain) so the
+        // CABAC engine can be re-seated at each substream's start; see
+        // `entry_point_offsets`. Per H.265 the coded value is
+        // entry_point_offset_minus1, so each substream size is value+1.
+        let mut entry_point_offsets: Vec<u32> = Vec::new();
         let num_entry_point_offsets =
             if pps.tiles_enabled_flag || pps.entropy_coding_sync_enabled_flag {
                 let n = reader.read_ue()?;
                 if n > 0 {
-                    // Skip the actual offset values for now
                     let offset_len = reader.read_ue()? as u8 + 1;
-                    for _ in 0..n {
-                        reader.read_bits(offset_len)?;
+                    entry_point_offsets.reserve(n as usize);
+                    for i in 0..n as usize {
+                        let mut off = reader.read_bits(offset_len)? + 1;
+                        if i > 0 {
+                            off += entry_point_offsets[i - 1];
+                        }
+                        entry_point_offsets.push(off);
                     }
                 }
                 n
@@ -443,6 +457,7 @@ impl SliceHeader {
                 slice_tc_offset_div2,
                 slice_loop_filter_across_slices_enabled_flag,
                 num_entry_point_offsets,
+                entry_point_offsets,
                 slice_qp_y,
             },
             data_offset,

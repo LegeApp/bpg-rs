@@ -9,3 +9,9 @@ bpg-bitstream = { path = "../bpg-bitstream" }
 bpg-format = { path = "../bpg-format" }
 bpg-hevc = { path = "../bpg-hevc" }
 bpg-hevc-decode = { path = "../bpg-hevc-decode" }
+
+[features]
+# Forward the decoder's portable-SIMD chroma kernels (bit-identical output).
+wide-simd = ["bpg-hevc-decode/wide-simd"]
+# Forward the decoder's rayon row-parallel color kernels (bit-identical output).
+rayon = ["bpg-hevc-decode/rayon"]

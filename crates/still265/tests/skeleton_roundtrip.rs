@@ -3,7 +3,7 @@
 //! and slice-header parsers accept. The skeleton emits no slice data, so
 //! full CTU/picture decode is out of scope here.
 
-use bpg_hevc_decode::hevc::bitstream::{parse_nal_units, NalType};
+use bpg_hevc_decode::hevc::bitstream::{NalType, parse_nal_units};
 use bpg_hevc_decode::hevc::params::{parse_pps, parse_sps, parse_vps};
 use bpg_hevc_decode::hevc::slice::SliceHeader;
 use still265::{ChromaFormat, DeblockMode, Effort, SaoMode, StillHevcConfig, StillHevcEncoder};

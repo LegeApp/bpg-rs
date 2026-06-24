@@ -20,8 +20,8 @@
 //! (`Fast`/`Balanced`/`Good`); `Fastest` uses the map only for AQ, and
 //! `Best`/`Placebo`/`Reference` keep inert search steering and uniform QP.
 
-use crate::encoder::Source;
 use crate::Effort;
+use crate::encoder::Source;
 
 /// log2 of the analysis cell size in luma samples (32x32 cells, four per CTB).
 pub const CELL_LOG2: u8 = 5;

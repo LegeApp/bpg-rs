@@ -41,7 +41,11 @@ use crate::{ChromaFormat, StillHevcConfig};
 /// `slice_segment_header()` (H.265 7.3.6.1) for a single first-slice IDR
 /// I-slice, ending with `byte_alignment()`. The returned bytes are the
 /// header only; CABAC-coded slice data (not yet implemented) follows.
-pub fn write_slice_segment_header(config: &StillHevcConfig) -> Vec<u8> {
+pub fn write_slice_segment_header(
+    config: &StillHevcConfig,
+    tiles: Option<(u32, u32)>,
+    entry_sizes: &[u32],
+) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     w.write_bit(1); // first_slice_segment_in_pic_flag
@@ -80,6 +84,33 @@ pub fn write_slice_segment_header(config: &StillHevcConfig) -> Vec<u8> {
     // so slice_loop_filter_across_slices_enabled_flag is absent (its
     // presence condition `slice_sao_* || !slice_deblocking_filter_disabled`
     // is false).
+
+    // Entry point offsets (present iff tiles or WPP are enabled in the PPS;
+    // here only tiles). One offset per tile substream except the last.
+    if tiles.is_some() {
+        w.write_ue_golomb(entry_sizes.len() as u32); // num_entry_point_offsets
+        if !entry_sizes.is_empty() {
+            // Each entry size is a NAL substream byte length and must be >= 1
+            // (every substream carries at least its trailing bits); guard the
+            // `- 1` so a degenerate empty substream can't underflow to u32::MAX
+            // and corrupt offset_len.
+            debug_assert!(
+                entry_sizes.iter().all(|&s| s >= 1),
+                "tile entry-point substream length must be >= 1, got {entry_sizes:?}"
+            );
+            let max_minus1 = entry_sizes
+                .iter()
+                .map(|&s| s.saturating_sub(1))
+                .max()
+                .unwrap();
+            // offset_len = bits needed to hold the largest entry_point_offset_minus1.
+            let offset_len = (32 - max_minus1.leading_zeros()).max(1);
+            w.write_ue_golomb(offset_len - 1); // offset_len_minus1
+            for &s in entry_sizes {
+                w.write_bits(offset_len, s.saturating_sub(1)); // entry_point_offset_minus1[i]
+            }
+        }
+    }
 
     // byte_alignment()
     w.write_bit(1); // alignment_bit_equal_to_one

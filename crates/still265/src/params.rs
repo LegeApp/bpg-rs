@@ -79,8 +79,8 @@ fn write_profile_tier_level(w: &mut BitWriter, max_sub_layers_minus1: u8) {
     w.write_bits(12, 0);
 
     w.write_bits(8, 120); // general_level_idc
-                          // max_sub_layers_minus1 == 0: no sub-layer profile/level info, and no
-                          // reserved_zero_2bits padding loop.
+    // max_sub_layers_minus1 == 0: no sub-layer profile/level info, and no
+    // reserved_zero_2bits padding loop.
 }
 
 /// `video_parameter_set_rbsp()` (H.265 7.3.2.1). BPG drops the VPS entirely
@@ -148,7 +148,7 @@ mod tests {
     }
 
     fn check_pps_rbsp_terminates_config(config: &StillHevcConfig) {
-        let pps = write_pps(config);
+        let pps = write_pps(config, effective_tile_dims(config));
         let mut r = BitReader::new(&pps);
         let ue = |r: &mut BitReader| r.read_ue_golomb().unwrap();
 
@@ -265,6 +265,35 @@ mod tests {
             check_pps_rbsp_terminates_config(&config);
         }
     }
+
+    #[test]
+    fn auto_grid_small_image_stays_single() {
+        // 16x12 CTBs (1000x750), min 6 CTBs/tile → at most 2x2; with few cores
+        // it must not over-tile, and 1 core disables tiles entirely.
+        assert_eq!(super::auto_tile_dims(16, 12, 1, 6), None);
+        // A picture smaller than two min-tiles in both axes can't tile.
+        assert_eq!(super::auto_tile_dims(6, 6, 20, 6), None);
+        assert_eq!(super::auto_tile_dims(11, 11, 20, 6), None);
+    }
+
+    #[test]
+    fn auto_grid_targets_cores_without_overshoot() {
+        // 38x29 CTBs (2400x1800), 20 cores, min 6 → 5x4 = 20 tiles (gap 0).
+        assert_eq!(super::auto_tile_dims(38, 29, 20, 6), Some((5, 4)));
+        // Min-size floor caps tile count below the core budget on the same
+        // picture: min 8 CTBs → at most 4x3 = 12.
+        assert_eq!(super::auto_tile_dims(38, 29, 20, 8), Some((4, 3)));
+        // Never exceed the core count even when the picture could host more.
+        let (c, r) = super::auto_tile_dims(63, 47, 20, 6).unwrap();
+        assert!(c * r <= 20, "tile count {} overshot cores", c * r);
+        assert!(c * r >= 16, "tile count {} undershot badly", c * r);
+    }
+
+    #[test]
+    fn auto_grid_prefers_square_tiles() {
+        // A square CTB field with 4 cores should pick 2x2, not 4x1/1x4.
+        assert_eq!(super::auto_tile_dims(24, 24, 4, 6), Some((2, 2)));
+    }
 }
 
 /// `chroma_format_idc` per H.265 Table 6-1.
@@ -309,8 +338,8 @@ pub fn write_sps(config: &StillHevcConfig) -> Vec<u8> {
     w.write_ue_golomb(4); // log2_max_pic_order_cnt_lsb_minus4
 
     w.write_bit(0); // sps_sub_layer_ordering_info_present_flag
-                    // sub_layer_ordering_info_present_flag == 0 -> the loop still runs once
-                    // (for i == sps_max_sub_layers_minus1 == 0).
+    // sub_layer_ordering_info_present_flag == 0 -> the loop still runs once
+    // (for i == sps_max_sub_layers_minus1 == 0).
     w.write_ue_golomb(0); // sps_max_dec_pic_buffering_minus1
     w.write_ue_golomb(0); // sps_max_num_reorder_pics
     w.write_ue_golomb(0); // sps_max_latency_increase_plus1
@@ -325,10 +354,10 @@ pub fn write_sps(config: &StillHevcConfig) -> Vec<u8> {
     w.write_bit(0); // scaling_list_enabled_flag
 
     w.write_bit(1); // amp_enabled_flag
-                    // sample_adaptive_offset_enabled_flag: SaoMode::Off (default) keeps the
-                    // Phase 3 simplification documented in the module docs (no
-                    // slice_sao_luma_flag/slice_sao_chroma_flag in the slice header).
-                    // SaoMode::On enables it; slice.rs then writes those two flags.
+    // sample_adaptive_offset_enabled_flag: SaoMode::Off (default) keeps the
+    // Phase 3 simplification documented in the module docs (no
+    // slice_sao_luma_flag/slice_sao_chroma_flag in the slice header).
+    // SaoMode::On enables it; slice.rs then writes those two flags.
     w.write_bit((config.sao != crate::SaoMode::Off) as u32);
 
     w.write_bit(0); // pcm_enabled_flag
@@ -375,7 +404,144 @@ pub fn write_sps(config: &StillHevcConfig) -> Vec<u8> {
 /// `slice_loop_filter_across_slices_enabled_flag`). `DeblockMode::On` enables
 /// it; `slice.rs` then writes the now-present
 /// `slice_loop_filter_across_slices_enabled_flag` bit.
-pub fn write_pps(config: &StillHevcConfig) -> Vec<u8> {
+/// Core budget the tile auto-grid targets. Mirrors the encoder's
+/// `parallel_thread_count` (`BPG_ENC_THREADS` override, else
+/// `available_parallelism`) so the grid is sized for the same pool that builds
+/// it.
+fn tile_core_count() -> u32 {
+    if let Ok(v) = std::env::var("BPG_ENC_THREADS") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            return n.max(1);
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
+/// Uniform auto-grid (Phase 5a): choose `cols x rows` so the tile count is as
+/// close to `cores` as possible *without overshooting* (extra tiles past the
+/// core count only cost bytes from broken cross-tile prediction with no added
+/// parallelism), while keeping every tile at least `min_ctbs` CTBs per
+/// dimension. The min-size floor is what stops small images from over-tiling:
+/// when the picture can't host more than one such tile the grid collapses to
+/// `None` (single tile = tiles disabled). Among equal-tile-count candidates the
+/// squarest tiling wins (least cross-tile boundary, best load balance).
+fn auto_tile_dims(ctbs_x: u32, ctbs_y: u32, cores: u32, min_ctbs: u32) -> Option<(u32, u32)> {
+    if cores <= 1 {
+        return None;
+    }
+    let max_cols = (ctbs_x / min_ctbs).max(1);
+    let max_rows = (ctbs_y / min_ctbs).max(1);
+    if max_cols * max_rows <= 1 {
+        return None;
+    }
+    let mut best: Option<(u32, u32)> = None;
+    let mut best_score = f64::INFINITY;
+    for c in 1..=max_cols {
+        for r in 1..=max_rows {
+            let t = c * r;
+            if t <= 1 || t > cores {
+                continue;
+            }
+            // Primary: get the tile count to `cores` (more parallelism).
+            // Secondary tie-break: square-ish tiles (boundary-minimizing).
+            let tile_aspect = (ctbs_x as f64 / c as f64) / (ctbs_y as f64 / r as f64);
+            let aspect_dev = tile_aspect.ln().abs();
+            let score = (cores - t) as f64 * 2.0 + aspect_dev;
+            if score < best_score {
+                best_score = score;
+                best = Some((c, r));
+            }
+        }
+    }
+    best.filter(|&(c, r)| c * r > 1)
+}
+
+/// Whether this encode will route through the tile-capable writer
+/// (`write_slice_from_trees`). The serial single-substream path
+/// (`encode_slice_data`) ignores the tile grid entirely, so declaring tiles
+/// there would desync the stream (PPS says N tiles, slice data is one raster
+/// substream). That tree-replay writer runs whenever SAO is on, or whenever the
+/// effort uses parallel analysis.
+fn tile_capable(config: &StillHevcConfig) -> bool {
+    config.sao == crate::SaoMode::On || crate::effort::template(config.effort).parallel_analysis
+}
+
+/// Whether `effort` opts into the auto tile-grid (when `BPG_TILES` is unset or
+/// `auto`). Tiling itself is orthogonal to the quality ladder — an explicit
+/// `BPG_TILES=COLSxROWS` works for any tile-capable effort — but the auto-grid
+/// default is currently scoped to the Slow tier, the validated tiled config.
+fn auto_tile_effort(effort: crate::Effort) -> bool {
+    matches!(effort, crate::Effort::Slow | crate::Effort::SlowPlus)
+}
+
+/// Effective tile grid `(columns, rows)` for this encode, or `None` when tiles
+/// are disabled. Controlled by `BPG_TILES`:
+/// * unset or `auto` → uniform auto-grid sized for the core count (Phase 5a),
+///   for efforts that opt in via [`auto_tile_effort`];
+/// * `0`/`off`/`none` → tiles disabled;
+/// * `COLSxROWS` → an explicit uniform grid (diagnostic; any tile-capable effort).
+///
+/// Returns `None` unconditionally when the encode path can't emit tiles (see
+/// [`tile_capable`]) — otherwise the PPS would declare a partition the slice data
+/// doesn't carry. `BPG_TILE_MIN_CTBS` (default 6 = 384px) tunes the auto-grid's
+/// minimum tile dimension. The request is validated against the picture's CTB
+/// dimensions; an out-of-range or trivial (1x1) request disables tiles. This is
+/// the single source of truth shared by [`write_pps`], the slice header, and the
+/// encoder, so they always agree on the partition.
+pub fn effective_tile_dims(config: &StillHevcConfig) -> Option<(u32, u32)> {
+    if !tile_capable(config) {
+        return None;
+    }
+    let ctb = 1u32 << 6; // 64x64 CTBs
+    let ctbs_x = config.width.div_ceil(ctb);
+    let ctbs_y = config.height.div_ceil(ctb);
+
+    let spec = std::env::var("BPG_TILES").ok();
+    let spec = spec.as_deref().map(str::trim);
+    match spec {
+        // Default and explicit `auto`: uniform auto-grid, for opted-in efforts.
+        None | Some("") | Some("auto") | Some("AUTO") => {
+            if !auto_tile_effort(config.effort) {
+                return None;
+            }
+            let min_ctbs = std::env::var("BPG_TILE_MIN_CTBS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .filter(|&v| v >= 1)
+                .unwrap_or(6);
+            // `BPG_TILE_OVERSUB` (default 1.0) over-partitions the grid beyond the
+            // core count. With work-stealing tile scheduling, more tiles than
+            // threads lets cheap-tile workers absorb heavy-tile slack so the
+            // parallel makespan approaches the *mean* tile cost rather than the
+            // heaviest tile's — trading a small byte cost (more cross-tile
+            // boundaries) for the ~18-22% makespan skew measured on real images.
+            let oversub = std::env::var("BPG_TILE_OVERSUB")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|&v| v >= 1.0)
+                .unwrap_or(1.0);
+            let budget = ((tile_core_count() as f64 * oversub).round() as u32).max(1);
+            auto_tile_dims(ctbs_x, ctbs_y, budget, min_ctbs)
+        }
+        Some("0") | Some("off") | Some("OFF") | Some("none") | Some("NONE") => None,
+        // Explicit `COLSxROWS`.
+        Some(s) => {
+            let (c, r) = s.split_once(|ch| ch == 'x' || ch == 'X' || ch == ',')?;
+            let cols: u32 = c.trim().parse().ok()?;
+            let rows: u32 = r.trim().parse().ok()?;
+            if cols < 1 || rows < 1 || cols > ctbs_x || rows > ctbs_y || (cols == 1 && rows == 1) {
+                return None;
+            }
+            Some((cols, rows))
+        }
+    }
+}
+
+/// `tiles` is the resolved partition from [`effective_tile_dims`], passed in by
+/// the caller so the PPS, slice header, and encoder share one computation.
+pub fn write_pps(config: &StillHevcConfig, tiles: Option<(u32, u32)>) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     w.write_ue_golomb(0); // pps_pic_parameter_set_id
@@ -390,26 +556,33 @@ pub fn write_pps(config: &StillHevcConfig) -> Vec<u8> {
     w.write_se_golomb(0); // init_qp_minus26
     w.write_bit(0); // constrained_intra_pred_flag
     w.write_bit(0); // transform_skip_enabled_flag
-                    // Adaptive quantization (per-CU QP) is gated by [`crate::aq_active`] (the
-                    // single gate the encoder also consults, so the flag and the per-CU QP plan
-                    // can't disagree). It is `0` (and the stream is the exact reference bitstream)
-                    // only on the high-quality uniform-QP tiers. `diff_cu_qp_delta_depth = 1` ⇒
-                    // Log2MinCuQpDeltaSize = CtbLog2(6) − 1 = 5, i.e. a 32x32 quantization group
-                    // aligned 1:1 with the preanalysis cell grid (H.265 7.3.2.3; decoder
-                    // `bpg-hevc-decode::hevc::ctu::decode_quantization_parameters`).
+    // Adaptive quantization (per-CU QP) is gated by [`crate::aq_active`] (the
+    // single gate the encoder also consults, so the flag and the per-CU QP plan
+    // can't disagree). It is `0` (and the stream is the exact reference bitstream)
+    // only on the high-quality uniform-QP tiers. `diff_cu_qp_delta_depth = 1` ⇒
+    // Log2MinCuQpDeltaSize = CtbLog2(6) − 1 = 5, i.e. a 32x32 quantization group
+    // aligned 1:1 with the preanalysis cell grid (H.265 7.3.2.3; decoder
+    // `bpg-hevc-decode::hevc::ctu::decode_quantization_parameters`).
     let aq_active = crate::aq_active(config);
     w.write_bit(aq_active as u32); // cu_qp_delta_enabled_flag
     if aq_active {
         w.write_ue_golomb(AQ_DIFF_CU_QP_DELTA_DEPTH); // diff_cu_qp_delta_depth (QG = 32x32)
     }
-    w.write_se_golomb(0); // pps_cb_qp_offset
-    w.write_se_golomb(0); // pps_cr_qp_offset
+    let chroma_qp_offset = crate::chroma_qp_offset() as i32;
+    w.write_se_golomb(chroma_qp_offset); // pps_cb_qp_offset
+    w.write_se_golomb(chroma_qp_offset); // pps_cr_qp_offset
     w.write_bit(0); // pps_slice_chroma_qp_offsets_present_flag
     w.write_bit(0); // weighted_pred_flag
     w.write_bit(0); // weighted_bipred_flag
     w.write_bit(0); // transquant_bypass_enabled_flag
-    w.write_bit(0); // tiles_enabled_flag
+    w.write_bit(tiles.is_some() as u32); // tiles_enabled_flag
     w.write_bit(0); // entropy_coding_sync_enabled_flag (see module docs)
+    if let Some((cols, rows)) = tiles {
+        w.write_ue_golomb(cols - 1); // num_tile_columns_minus1
+        w.write_ue_golomb(rows - 1); // num_tile_rows_minus1
+        w.write_bit(1); // uniform_spacing_flag
+        w.write_bit(1); // loop_filter_across_tiles_enabled_flag (whole-frame deblock)
+    }
     w.write_bit(1); // pps_loop_filter_across_slices_enabled_flag
     let deblock_enabled = config.deblock == crate::DeblockMode::On;
     // control present + override disabled. With the filter disabled

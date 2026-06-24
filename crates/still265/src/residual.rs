@@ -20,7 +20,7 @@
 use bpg_bitstream::BitWriter;
 
 use crate::cabac::{CabacEncoder, CabacEstimator, ContextModel};
-use crate::contexts::{ctx, Contexts};
+use crate::contexts::{Contexts, ctx};
 
 trait CabacSyntax {
     fn encode_bin(&mut self, bin_value: u8, ctx: &mut ContextModel);
@@ -724,11 +724,7 @@ impl SubBlockCfg<'_> {
             let (px, py) = scan_pos[n];
             let x = sb_x * 4 + px as usize;
             let y = sb_y * 4 + py as usize;
-            if x < size && y < size {
-                at(x, y)
-            } else {
-                0
-            }
+            if x < size && y < size { at(x, y) } else { 0 }
         };
         for n in 0..=start_pos {
             sig[n] = coeff_at(n) != 0;

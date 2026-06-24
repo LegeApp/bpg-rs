@@ -10,6 +10,99 @@ use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
+/// Per-CU/PU/TU decision capture for encoder-comparison analysis.
+///
+/// The decoder is bit-exact, so decoding a `.bpg` recovers *every* decision the
+/// producing encoder made — intra mode, TU partition, quantised coefficient
+/// levels, residual energy. Enabling this log during a decode collects those
+/// decisions so two encoders' outputs of the same image can be diffed
+/// stage-by-stage (predict → transform-unit → quant) without instrumenting the
+/// reference encoder. See `bpg-tools` `decision_diff`.
+pub static DECISION_LOG_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// A prediction-unit decision (one intra luma mode over a square region).
+#[derive(Debug, Clone)]
+#[allow(missing_docs)]
+pub struct PuRecord {
+    pub x: u32,
+    pub y: u32,
+    pub log2_size: u8,
+    pub luma_mode: u8,
+    pub chroma_mode: u8,
+}
+
+/// A transform-unit decision (coded residual block).
+#[derive(Debug, Clone)]
+#[allow(missing_docs)]
+pub struct TuRecord {
+    pub x: u32,
+    pub y: u32,
+    pub log2_size: u8,
+    pub c_idx: u8,
+    /// Number of non-zero quantised levels.
+    pub nz: u32,
+    /// Sum of absolute quantised levels (coded magnitude).
+    pub abs_level_sum: u64,
+    /// Energy (Σ r²) of the reconstructed residual after the inverse transform.
+    pub residual_energy: u64,
+}
+
+/// Collected decisions for one decode.
+#[cfg(feature = "std")]
+#[derive(Default)]
+#[allow(missing_docs)]
+pub struct DecisionLog {
+    pub pus: Vec<PuRecord>,
+    pub tus: Vec<TuRecord>,
+}
+
+#[cfg(feature = "std")]
+static DECISION_LOG: std::sync::Mutex<Option<DecisionLog>> = std::sync::Mutex::new(None);
+
+/// Fast inactive-path check (one relaxed atomic load); call sites skip the
+/// (possibly expensive) record construction when the log is off.
+#[inline]
+pub fn decision_log_active() -> bool {
+    DECISION_LOG_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Start a fresh decision log (clears any previous contents).
+#[cfg(feature = "std")]
+pub fn enable_decision_log() {
+    *DECISION_LOG.lock().unwrap() = Some(DecisionLog::default());
+    DECISION_LOG_ACTIVE.store(true, Ordering::Relaxed);
+}
+
+/// Stop logging and take the collected decisions.
+#[cfg(feature = "std")]
+pub fn take_decision_log() -> Option<DecisionLog> {
+    DECISION_LOG_ACTIVE.store(false, Ordering::Relaxed);
+    DECISION_LOG.lock().unwrap().take()
+}
+
+/// Record a PU decision (no-op when logging is inactive).
+#[cfg(feature = "std")]
+pub fn log_pu(rec: PuRecord) {
+    if let Some(log) = DECISION_LOG.lock().unwrap().as_mut() {
+        log.pus.push(rec);
+    }
+}
+
+/// Record a TU decision (no-op when logging is inactive).
+#[cfg(feature = "std")]
+pub fn log_tu(rec: TuRecord) {
+    if let Some(log) = DECISION_LOG.lock().unwrap().as_mut() {
+        log.tus.push(rec);
+    }
+}
+
+/// No-op stubs for `no_std` (no global allocator-backed mutex available).
+#[cfg(not(feature = "std"))]
+pub fn log_pu(_rec: PuRecord) {}
+/// No-op stub for `no_std`.
+#[cfg(not(feature = "std"))]
+pub fn log_tu(_rec: TuRecord) {}
+
 /// Enable verbose coefficient logging
 pub static VERBOSE_COEFFS: AtomicBool = AtomicBool::new(false);
 

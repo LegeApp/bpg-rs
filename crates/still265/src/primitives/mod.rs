@@ -33,17 +33,45 @@ fn round_shift(value: i32, shift: i32) -> i16 {
     ((value + add) >> shift).clamp(-32768, 32767) as i16
 }
 
+/// Canonical HEVC first-quadrant cosine constants (H.265 §8.6.4.2) — the master
+/// table every DCT-II transform matrix is sub-sampled from. These are hand-tuned
+/// integers, **not** analytic roundings: the π/8 entry is `83`, whereas
+/// `round(64·√2·cos(π/8)) = 84`. Using the analytic value desynchronises the
+/// encoder's forward (analysis) basis from the decoder's spec inverse (synthesis)
+/// basis — the two stop being an exact transform pair, so the encoder quantises
+/// coefficients for one basis while the decoder reconstructs with another,
+/// injecting ~1% coherent inter-band leakage (a ~52 dB reconstruction ceiling)
+/// into every block at all bitrates. This is the same table the decoder's inverse
+/// transform is built on, so forward and inverse now round-trip losslessly.
+const HEVC_DCT_BASE: [i32; 32] = [
+    64, 90, 90, 90, 89, 88, 87, 85, 83, 82, 80, 78, 75, 73, 70, 67, 64, 61, 57, 54, 50, 46, 43, 38,
+    36, 31, 25, 22, 18, 13, 9, 4,
+];
+
+/// `cos(i·π/64)` on the HEVC integer scale (±[`HEVC_DCT_BASE`]).
+#[inline]
+fn hevc_cos(i: usize) -> i32 {
+    match i % 128 {
+        i @ 0..=31 => HEVC_DCT_BASE[i],
+        32 | 96 => 0,
+        i @ 33..=63 => -HEVC_DCT_BASE[64 - i],
+        i @ 64..=95 => -HEVC_DCT_BASE[i - 64],
+        i => HEVC_DCT_BASE[128 - i],
+    }
+}
+
+/// The exact HEVC `n`×`n` DCT-II matrix (`matrix[k*n + col]` = basis `k` at sample
+/// `col`), sub-sampled from the 32-point master table by the standard cosine index
+/// `((2·col+1)·k·(32/n)) mod 128`. Reproduces the spec matrices the decoder's
+/// inverse uses (e.g. 4×4 row 1 = `[83, 36, -36, -83]`); replaces an earlier
+/// analytic `round(64·√2·cos)` build that did not match the spec — see
+/// [`HEVC_DCT_BASE`].
 fn build_dct_matrix(n: usize) -> Vec<i32> {
+    let step = 32 / n;
     let mut matrix = vec![0i32; n * n];
     for k in 0..n {
-        for i in 0..n {
-            matrix[k * n + i] = if k == 0 {
-                64
-            } else {
-                let scale = 64.0f64 * 2.0f64.sqrt();
-                let angle = std::f64::consts::PI * k as f64 * (2 * i + 1) as f64 / (2 * n) as f64;
-                (scale * angle.cos()).round() as i32
-            };
+        for col in 0..n {
+            matrix[k * n + col] = hevc_cos((2 * col + 1) * k * step);
         }
     }
     matrix

@@ -51,7 +51,8 @@ cargo run -p bpg-tools --release -- encode input.png -o output.bpg \
   to benefit from 10/12-bit output. The `still265` backend supports all three.
 - `--format` (420/422/444): chroma subsampling. The `still265` encoder
   supports all three.
-- `--effort` (fastest/fast/balanced/good/best/placebo/reference): RD-search effort ladder
+- `--effort` (floor/floor-plus/floor-plus2/floor-shallow/slow/slow-plus/fastest/fast/balanced/good/best/placebo/reference):
+  RD-search effort ladder
   (HandBrake/x265-style), trading encode time for rate-distortion quality.
   Higher tiers run more RD trials — i.e. call the CABAC bit estimator more
   often, which is the dominant cost. `balanced` is the default.
@@ -64,6 +65,12 @@ cargo run -p bpg-tools --release -- encode input.png -o output.bpg \
   - `fastest` is intentionally Kvazaar-like and aggressive: sparse progressive
     SATD RMD, one luma RD candidate, chroma DM-only, approximate residual bits,
     plain-quant trials, zero-residual CU early stop, and fixed-leaf small TUs.
+  - `slow` is the current high-res quality experiment: a shallow 64→32-first
+    still-image CTU search with progressive RMD, final-winner RDOQ, and
+    classifier-steered split/search pruning. `slow-plus` is a deliberately
+    separate experimental successor: it skips the root 64×64 leaf below QP35
+    (matching x265's all-intra root behavior), widens the progressive RMD budget,
+    and enables conservative/selective PartNxN islands by default.
   - `fast`/`balanced`/`good` additionally apply **source-derived preanalysis
     steering**: a cheap per-32x32-cell structure map (variance, edge density,
     gradient-orientation entropy, noise, chroma activity) spends search budget
@@ -152,8 +159,9 @@ and non-CTU-aligned image sizes.
   error up front rather than panicking deep in the encoder.
 - Mode decision: full-RD luma/chroma intra mode search, TU-split RD, CU-split
   RD, and multi-pass RDOQ with effort-tier-selected last-significant-position
-  optimization. The seven `--effort` tiers
-  (fastest/fast/balanced/good/best/placebo/reference)
+  optimization. The `--effort` tiers
+  (floor/floor-plus/floor-plus2/floor-shallow/slow/slow-plus/fastest/fast/
+  balanced/good/best/placebo/reference)
   scale the search breadth — rough-mode shortlist size, luma/chroma RD-candidate
   counts, single-scan-vs-exact RDOQ, and high-QP pruning for the non-reference
   tiers. Multi-candidate non-reference CUs choose luma with a DM-chroma proxy,
@@ -183,6 +191,49 @@ basis. (These numbers predate the deblocking and SAO encode support and the
 RDOQ stage-(c) work; the table has not been re-measured against the full
 3200x2528 photo since.) Finer RD search and enabling SAO/deblock in the
 default quality path remain the main quality work.
+
+### High-resolution multi-effort timing (native 12 MP / 50 MP)
+
+Measured 2026-06-22 on a 20-core machine, all SIMD + rayon enabled, multi-threaded,
+QP 28, 4:2:0, 8-bit, on two native photos from `test-set/test-set-large`
+(`bpg-highres-compare --native`). C is `bpgenc 0.9.8` (x265 4.1) at `-m 9`. PSNR is
+the Rust reconstruction vs. source (Y); the file-size deltas are at equal QP, so
+they indicate compression efficiency, not a full rate-distortion match (no C PSNR
+is decoded here, and the C/Rust QP scales are not guaranteed identical).
+
+**12.0 MP (3000×4000)** — C: 1.56 s, 789,285 B
+
+| effort | encode s | s/MP | vs C time | bytes | vs C size | psnr_y |
+|---|---:|---:|---:|---:|---:|---:|
+| best | 4.83 | 0.40 | 3.1× | 743,974 | −5.7% | 40.75 |
+| slow | 2.77 | 0.23 | 1.8× | 838,590 | +6.2% | 40.62 |
+| fastadaptive | 2.06 | 0.17 | 1.3× | 867,772 | +9.9% | 40.38 |
+
+**49.9 MP (8160×6120)** — C: 2.90 s, 570,912 B
+
+| effort | encode s | s/MP | vs C time | bytes | vs C size | psnr_y |
+|---|---:|---:|---:|---:|---:|---:|
+| best | 10.70 | 0.21 | 3.7× | 655,311 | +14.8% | 46.84 |
+| slow | 8.20 | 0.16 | 2.8× | 674,751 | +18.2% | 47.07 |
+| fastadaptive | 5.70 | 0.11 | 1.9× | 675,772 | +18.4% | 46.90 |
+
+Notes:
+
+- **Tiling / parallel scaling:** per-MP encode time *drops* as resolution grows
+  (`best` 0.40 → 0.21 s/MP, `slow` 0.23 → 0.16, `fastadaptive` 0.17 → 0.11),
+  i.e. the tiled encoder now spreads larger pictures across cores instead of doing
+  flat work-per-pixel. Part of the drop is also content (the 50 MP photo is smoother,
+  ~3× fewer CU trials/MP), so the two effects are not fully separable from this
+  two-image run, but the direction confirms tiling is engaging at high resolution.
+- **Slow vs. Best:** `best` adds NxN-PU search and exhaustive rough-mode search
+  (≈15× the CU trials of `slow`) for ~1.3–1.7× the wall-clock. The payoff is
+  size: at 12 MP `best` is ~11% smaller than `slow` at equal/slightly-better PSNR;
+  at 50 MP the gap shrinks to ~3% smaller while `slow` actually edges PSNR
+  (47.07 vs 46.84 dB), so on smooth high-res content `slow` is close to RD-parity
+  with `best` at meaningfully lower cost.
+- **vs. C:** still265 stays ~1.3–3.7× slower than x265 `-m 9` and the gap widens
+  with resolution (C parallelizes more aggressively per-MP), but `best` produces a
+  *smaller* file than C on the 12 MP photo at this QP.
 
 ## Repository layout
 

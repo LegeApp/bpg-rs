@@ -7,10 +7,11 @@
 //! `bpg_hevc::build_modified_hevc`.
 
 use bpg_encode::{EncodeError, HevcBackendCaps, HevcEncodeParams, HevcEncoder};
+use bpg_hevc_decode::DecodedFrame;
 use bpg_image::{ChromaFormat, Image};
 
 use crate::effort::describe_effort;
-use crate::encoder::{encode_with_stats, EncodeStats, Source};
+use crate::encoder::{EncodeStats, Source, encode_with_stats};
 use crate::{DeblockMode, Effort, SaoMode, StillHevcConfig};
 use std::sync::Mutex;
 
@@ -29,6 +30,7 @@ pub struct RustStillHevcEncoder {
     deblock: DeblockMode,
     adaptive_qp: bool,
     last_stats: Mutex<Option<LastEncodeStats>>,
+    last_recon: Mutex<Option<DecodedFrame>>,
 }
 
 impl RustStillHevcEncoder {
@@ -40,6 +42,7 @@ impl RustStillHevcEncoder {
             deblock: DeblockMode::On,
             adaptive_qp: false,
             last_stats: Mutex::new(None),
+            last_recon: Mutex::new(None),
         }
     }
 
@@ -74,6 +77,14 @@ impl RustStillHevcEncoder {
         self.last_stats
             .lock()
             .expect("still265 last-stats mutex poisoned")
+            .clone()
+    }
+
+    /// Return the reconstruction planes from the most recent encode.
+    pub fn last_reconstruction(&self) -> Option<DecodedFrame> {
+        self.last_recon
+            .lock()
+            .expect("still265 last-recon mutex poisoned")
             .clone()
     }
 }
@@ -144,7 +155,7 @@ impl HevcEncoder for RustStillHevcEncoder {
             cr: image.planes.get(2).map_or(&[][..], |p| p.data.as_slice()),
         };
 
-        let (annexb, _decoded, stats) = encode_with_stats(&config, src);
+        let (annexb, decoded, stats) = encode_with_stats(&config, src);
         *self
             .last_stats
             .lock()
@@ -152,6 +163,10 @@ impl HevcEncoder for RustStillHevcEncoder {
             annexb_bytes: annexb.len(),
             stats: stats.clone(),
         });
+        *self
+            .last_recon
+            .lock()
+            .expect("still265 last-recon mutex poisoned") = Some(decoded);
         if self.debug_stats {
             eprintln!("{}", describe_effort(self.effort, params.qp as i32));
             eprintln!("{stats}");

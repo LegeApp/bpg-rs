@@ -31,8 +31,15 @@ static CHROMA_QP_TABLE: [i32; 13] = [
     29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37,
 ];
 
-/// Map intermediate chroma QP to actual chroma QP (4:2:0)
-fn chroma_qp_mapping(qp_i: i32) -> i32 {
+/// Map intermediate chroma QP to actual chroma QP (H.265 §8.6.1).
+///
+/// Table 8-10 is used only for `ChromaArrayType == 1` (4:2:0). 4:2:2 and
+/// 4:4:4 use `QpC = Min(qPi, 51)` directly; using the 4:2:0 table there makes
+/// the chroma deblocking threshold non-conformant at qPi > 29.
+fn chroma_qp_mapping(qp_i: i32, chroma_array_type: u8) -> i32 {
+    if chroma_array_type != 1 {
+        return qp_i.min(51);
+    }
     if qp_i < 30 {
         qp_i
     } else if qp_i >= 43 {
@@ -361,7 +368,7 @@ fn apply_chroma_deblocking(
                         cr_qp_offset
                     };
                     let qp_i = ((qp_q + qp_p + 1) >> 1) + qp_offset;
-                    let qp_c = chroma_qp_mapping(qp_i);
+                    let qp_c = chroma_qp_mapping(qp_i, frame.chroma_format);
                     let q_tc = (qp_c + 2 + tc_offset).clamp(0, 53);
                     let tc = (TC_PRIME[q_tc as usize] as i32) << (bit_depth_c - 8);
 
@@ -431,7 +438,7 @@ fn apply_chroma_deblocking(
                         cr_qp_offset
                     };
                     let qp_i = ((qp_q + qp_p + 1) >> 1) + qp_offset;
-                    let qp_c = chroma_qp_mapping(qp_i);
+                    let qp_c = chroma_qp_mapping(qp_i, frame.chroma_format);
                     let q_tc = (qp_c + 2 + tc_offset).clamp(0, 53);
                     let tc = (TC_PRIME[q_tc as usize] as i32) << (bit_depth_c - 8);
 

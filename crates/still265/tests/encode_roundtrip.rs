@@ -3,7 +3,7 @@
 //! samples the encoder reconstructed, with a sane PSNR against the source.
 
 use bpg_hevc_decode::hevc::decode;
-use still265::encoder::{encode, Source};
+use still265::encoder::{Source, encode};
 use still265::{ChromaFormat, DeblockMode, Effort, SaoMode, StillHevcConfig};
 
 /// Build a smooth 4:2:0 YCbCr source (gradients predict well under Planar),
@@ -666,13 +666,19 @@ fn gray_non_ctu_aligned() {
 
 #[test]
 fn all_effort_tiers_round_trip() {
-    // Every tier of the seven-step effort ladder must produce a stream the
-    // decoder accepts and reconstructs bit-exactly. Textured 4:2:0 so 8x8
-    // PartNxN actually fires on the tiers that enable it (Fast..Best), exercising
-    // both the winner-direct (Best) and plan/final-code (Fast/Balanced/Good) paths.
+    // Every tier of the effort ladder must produce a stream the decoder accepts
+    // and reconstructs bit-exactly. Textured 4:2:0 so 8x8 PartNxN actually fires
+    // on the tiers that enable it (Fast..Best), exercising both the winner-direct
+    // (Best) and plan/final-code (Fast/Balanced/Good) paths.
     let (w, h, qp, bd) = (96u32, 80, 30, 8);
     let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, bd);
     for effort in [
+        Effort::Floor,
+        Effort::FloorPlus,
+        Effort::FloorPlus2,
+        Effort::FloorShallow,
+        Effort::Slow,
+        Effort::SlowPlus,
         Effort::Fastest,
         Effort::Fast,
         Effort::Balanced,
@@ -1193,11 +1199,7 @@ fn gen_plane(w: usize, h: usize, bd: u8, pat: Pattern, is_chroma: bool) -> Vec<u
                 Pattern::SaturatedChroma => {
                     if is_chroma {
                         // Push chroma to the extremes; luma stays mid.
-                        if (x + y) % 2 == 0 {
-                            0
-                        } else {
-                            max
-                        }
+                        if (x + y) % 2 == 0 { 0 } else { max }
                     } else {
                         mid
                     }

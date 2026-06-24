@@ -1,4 +1,5 @@
 /target
+/target-native
 
 # CodeGraph MCP index (per-checkout, regenerated)
 /.codegraph

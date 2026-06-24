@@ -30,14 +30,41 @@ pub mod sao;
 pub mod slice;
 pub mod trace;
 pub mod transform;
+pub mod tu_diag;
 
 pub use bpg_image::ChromaFormat;
 
-/// How much effort the mode-decision search spends, as a seven-step ladder
+/// How much effort the mode-decision search spends, as a nine-step ladder
 /// (HandBrake/x265-style naming). Higher tiers run more RD trials — i.e. call
 /// the (already table-driven, already memoized) CABAC bit estimator more often,
 /// which is the dominant cost — in exchange for quality:
 ///
+/// - [`Effort::Floor`]: experimental speed-floor baseline. It deliberately
+///   under-searches CTUs by forcing leaf CUs where legal, disabling PartNxN,
+///   using one luma candidate, and forcing leaf TUs where legal. This is for
+///   timing diagnostics, not quality.
+/// - [`Effort::FloorPlus`]: photo-oriented floor-first repair preset. It starts
+///   from `Floor`, then selectively repairs failed 64x64 leaves with richer
+///   mode/TU search or one terminal 64->32 split.
+/// - [`Effort::FloorPlus2`]: FloorPlus with a tiny best-first CTU repair
+///   auction and odds-gated mode expansion. It keeps PartNxN disabled and avoids
+///   recursive CTU search.
+/// - [`Effort::FloorShallow`]: experimental shallow-CU preset. At each 64×64
+///   CTU chooses among three candidates by real RD cost: the plain floor leaf,
+///   an enhanced 64×64 leaf (same FloorPlus mode/TU budget), and a terminal
+///   64→32 split whose four 32×32 children each receive the same enhanced budget
+///   (not the bare MPM-only terminal-child budget used by FloorPlus). No
+///   recursive CU split below 32×32, no PartNxN. Tests the hypothesis that
+///   giving split children proper prediction+TU search recovers the remaining
+///   Floor→Best gap without the complexity of FloorPlus2.
+/// - [`Effort::SlowPlus`]: experimental Slow successor. It keeps Slow's shallow
+///   64→32-first architecture and reinvests budget into denser progressive RMD
+///   (coarse_step 3, top 3 regions), one extra luma/chroma RD candidate, and
+///   conservative/selective PartNxN islands (adaptive-fidelity, RDOQ on the top
+///   PUs) in structured 8×8 leaves. At QP28 this RD-beats `Slow` (smaller *and*
+///   higher PSNR) on native 12/50 MP photos. The x265-style "skip the root
+///   64×64 leaf at low QP" rule is wired but **off by default** — it regressed
+///   size on smooth high-res content (see `slowplus_skip_root_leaf`).
 /// - [`Effort::Fastest`]: sparsest rough-mode shortlist, one RD candidate, no
 ///   chroma mode search beyond DM, no RDOQ refinement, approximate residual
 ///   bits, fixed-leaf small TUs, and the most aggressive paper-driven search
@@ -81,7 +108,26 @@ pub use bpg_image::ChromaFormat;
 ///   bit-reproducible regression-reference preset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Effort {
+    Floor,
+    FloorPlus,
+    FloorPlus2,
+    FloorShallow,
+    /// Fuzzy shallow quality mode: progressive RMD, terminal 64→32 split,
+    /// final-winner RDOQ, QP-aware search. The experimental quality tier
+    /// between the floor family and Best — recovers most of the byte gap
+    /// without full recursive CTU search.
+    Slow,
+    /// Experimental Slow successor: denser progressive RMD, one extra
+    /// luma/chroma RD candidate, and conservative/selective PartNxN enabled by
+    /// default. RD-beats `Slow` at QP28. (The x265-style no-root-64-leaf rule
+    /// is wired but off by default — it regressed size on smooth high-res.)
+    SlowPlus,
     Fastest,
+    /// QP-adaptive hybrid: uses [`FloorPlus`]'s search at low QP (< 32) and
+    /// [`Fastest`]'s search at high QP (>= 32). Intended as the new "Fast"
+    /// tier — combines thorough coding at low compression with speed at high
+    /// compression.
+    FastAdaptive,
     Fast,
     #[default]
     Balanced,
@@ -200,6 +246,17 @@ pub fn sdh_active(config: &StillHevcConfig) -> bool {
             .unwrap_or(true)
 }
 
+/// Experimental PPS chroma QP offset for rate-allocation diagnostics. Defaults
+/// to x265/libbpg parity (`0`).
+#[inline]
+pub fn chroma_qp_offset() -> i8 {
+    std::env::var("BPG_CHROMA_QP_OFFSET")
+        .ok()
+        .and_then(|v| v.trim().parse::<i8>().ok())
+        .map(|v| v.clamp(-12, 12))
+        .unwrap_or(0)
+}
+
 /// Still-picture HEVC encoder configuration.
 #[derive(Debug, Clone)]
 pub struct StillHevcConfig {
@@ -238,11 +295,16 @@ impl StillHevcEncoder {
         let mut out = Vec::new();
         nal::write_annexb_nal(&mut out, nal::NalType::Vps, &params::write_vps());
         nal::write_annexb_nal(&mut out, nal::NalType::Sps, &params::write_sps(config));
-        nal::write_annexb_nal(&mut out, nal::NalType::Pps, &params::write_pps(config));
+        let tiles = params::effective_tile_dims(config);
+        nal::write_annexb_nal(
+            &mut out,
+            nal::NalType::Pps,
+            &params::write_pps(config, tiles),
+        );
         nal::write_annexb_nal(
             &mut out,
             nal::NalType::IdrWRadl,
-            &slice::write_slice_segment_header(config),
+            &slice::write_slice_segment_header(config, tiles, &[]),
         );
         out
     }

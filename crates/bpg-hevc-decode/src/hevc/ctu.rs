@@ -77,12 +77,18 @@ fn se_trace(name: &str, val: i64, cabac: &CabacDecoder) {
     let _ = (name, val, cabac);
 }
 
-/// Chroma QP mapping table (H.265 Table 8-10)
-/// Maps qPi (0-57) to QpC for 8-bit video
-fn chroma_qp_mapping(qp_i: i32) -> i32 {
-    // Table 8-10: qPi to QpC mapping
-    // For qPi 0-29, QpC = qPi
-    // For qPi 30-57, QpC follows the table
+/// Chroma QP derivation (H.265 §8.6.1). The qPi→QpC mapping of Table 8-10 is
+/// applied only for `ChromaArrayType == 1` (4:2:0); for 4:2:2/4:4:4 the spec
+/// uses `QpC = Min(qPi, 51)` with no table. Applying the table to 4:4:4 (as the
+/// code did before) reconstructs chroma at the wrong QP whenever qPi > 29 —
+/// invisible at low QP (the table is identity there) but diverging from a
+/// conformant decoder above it.
+fn chroma_qp_mapping(qp_i: i32, chroma_array_type: u8) -> i32 {
+    if chroma_array_type != 1 {
+        return qp_i.min(51);
+    }
+    // Table 8-10: qPi to QpC mapping (4:2:0 only).
+    // For qPi 0-29, QpC = qPi; for qPi 30-57, QpC follows the table.
     static CHROMA_QP_TABLE: [i32; 58] = [
         0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         25, 26, 27, 28, 29, 29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37, 37, 38, 39, 40, 41,
@@ -99,10 +105,16 @@ pub struct SliceContext<'a> {
     pub pps: &'a Pps,
     /// Slice header
     pub header: &'a SliceHeader,
+    /// Slice data (EPB-stripped RBSP). Retained so the CABAC engine can be
+    /// re-seated at a substream (tile/WPP) start via the entry-point offsets.
+    slice_data: &'a [u8],
     /// CABAC decoder
     pub cabac: CabacDecoder<'a>,
     /// Context models
     pub ctx: [ContextModel; context::NUM_CONTEXTS],
+    /// Tile partition geometry (single-tile grid when tiles are disabled).
+    /// Drives tile-scan decode order and cross-tile neighbour availability.
+    pub tile_grid: super::tile::TileGrid,
     /// Current CTB X position (in CTB units)
     pub ctb_x: u32,
     /// Current CTB Y position (in CTB units)
@@ -212,9 +224,10 @@ impl<'a> SliceContext<'a> {
         let qp_i_cb = slice_qp + pps.pps_cb_qp_offset as i32 + header.slice_cb_qp_offset as i32;
         let qp_i_cr = slice_qp + pps.pps_cr_qp_offset as i32 + header.slice_cr_qp_offset as i32;
 
-        // Apply chroma QP mapping table (H.265 Table 8-10)
-        let qp_cb = chroma_qp_mapping(qp_i_cb.clamp(0, 57));
-        let qp_cr = chroma_qp_mapping(qp_i_cr.clamp(0, 57));
+        // Derive chroma QP (H.265 §8.6.1); table only for 4:2:0, else Min(qPi,51).
+        let cat = sps.chroma_array_type();
+        let qp_cb = chroma_qp_mapping(qp_i_cb.clamp(0, 57), cat);
+        let qp_cr = chroma_qp_mapping(qp_i_cr.clamp(0, 57), cat);
 
         debug_trace!(
             "DEBUG: Chroma QP: qp_y={}, qp_cb={}, qp_cr={}",
@@ -254,12 +267,23 @@ impl<'a> SliceContext<'a> {
         let qp_map_height = sps.pic_height_in_luma_samples.div_ceil(min_tb_size);
         let qp_map = vec![slice_qp as i8; (qp_map_stride * qp_map_height) as usize];
 
+        let tile_grid = match (pps.tiles_enabled_flag, pps.tile_info.as_ref()) {
+            (true, Some(ti)) => super::tile::TileGrid::from_tile_info(
+                sps.pic_width_in_ctbs(),
+                sps.pic_height_in_ctbs(),
+                ti,
+            ),
+            _ => super::tile::TileGrid::single(sps.pic_width_in_ctbs(), sps.pic_height_in_ctbs()),
+        };
+
         Ok(Self {
             sps,
             pps,
             header,
+            slice_data,
             cabac,
             ctx,
+            tile_grid,
             ctb_x: 0,
             ctb_y: 0,
             qp_y: slice_qp,
@@ -290,6 +314,64 @@ impl<'a> SliceContext<'a> {
         })
     }
 
+    /// Reset all CABAC context models to their slice-init state. Called at the
+    /// start of each tile (after byte-alignment), since tiles are entropy- and
+    /// context-independent per H.265 9.3.1.
+    fn reset_contexts(&mut self) {
+        let slice_qp = self.header.slice_qp_y;
+        for (i, init_val) in INIT_VALUES.iter().enumerate() {
+            self.ctx[i].init(*init_val, slice_qp);
+        }
+    }
+
+    /// Map each substream's cumulative entry-point offset (NAL-domain, incl.
+    /// emulation-prevention bytes) to a byte offset into the EPB-stripped
+    /// `slice_data` (RBSP-domain). The decoder strips all EPBs in one pass, so to
+    /// re-seat the CABAC engine at substream `k`'s start we must invert the
+    /// encoder's EPB accounting: walk the RBSP advancing a parallel NAL cursor
+    /// (which gains an extra byte wherever a `00 00 0x` triple would have had a
+    /// `0x03` inserted, with the zero-run carried continuously), and record the
+    /// RBSP position each time the NAL cursor reaches a substream boundary. This
+    /// mirrors the encoder's `tile_entry_offsets` exactly.
+    fn rbsp_substream_starts(slice_data: &[u8], cum_nal: &[u32]) -> Vec<usize> {
+        let mut starts = Vec::with_capacity(cum_nal.len());
+        let mut zeros = 0u32;
+        let mut nal_pos = 0u32;
+        let mut rbsp_pos = 0usize;
+        let mut next = 0usize;
+        while next < cum_nal.len() {
+            // Record any boundaries that fall at the current (pre-byte) position.
+            while next < cum_nal.len() && nal_pos == cum_nal[next] {
+                starts.push(rbsp_pos);
+                next += 1;
+            }
+            if rbsp_pos >= slice_data.len() {
+                break;
+            }
+            let b = slice_data[rbsp_pos];
+            // An EPB would have been inserted *before* this byte; it belongs to the
+            // substream this byte starts, so count it before testing boundaries on
+            // the next iteration.
+            if zeros >= 2 && b <= 0x03 {
+                nal_pos += 1;
+                zeros = 0;
+            }
+            nal_pos += 1;
+            rbsp_pos += 1;
+            if b == 0 {
+                zeros += 1;
+            } else {
+                zeros = 0;
+            }
+        }
+        // Any boundaries past the end clamp to the data end (defensive).
+        while next < cum_nal.len() {
+            starts.push(slice_data.len());
+            next += 1;
+        }
+        starts
+    }
+
     /// Decode all CTUs in the slice
     pub fn decode_slice(&mut self, frame: &mut DecodedFrame) -> Result<()> {
         // Initialize CABAC tracker for debugging
@@ -302,16 +384,35 @@ impl<'a> SliceContext<'a> {
 
         // Start from slice segment address
         let start_addr = self.header.slice_segment_address;
-        self.ctb_y = start_addr / pic_width_in_ctbs;
-        self.ctb_x = start_addr % pic_width_in_ctbs;
 
         let mut ctu_count = 0u32;
         let total_ctus = pic_width_in_ctbs * pic_height_in_ctbs;
+        let tiles_enabled = self.pps.tiles_enabled_flag;
+
+        // Iterate CTUs in tile-scan order. When tiles are disabled the grid is a
+        // single identity-mapped tile, so this is plain raster order.
+        let mut ctb_addr_ts = self.tile_grid.ctb_addr_rs_to_ts[start_addr as usize];
 
         // WPP: saved context models from CTB column 1 of previous row
         let mut wpp_saved_ctx: Option<[super::cabac::ContextModel; context::NUM_CONTEXTS]> = None;
 
+        // Tile substream starts (RBSP-domain), and the next one to consume. Each
+        // tile is an independent CABAC substream; we seek the engine to its start
+        // via the entry-point offsets rather than relying on the previous tile's
+        // engine position (CABAC reads ahead, so that position is not the
+        // substream boundary — the cause of the cross-tile desync).
+        let sub_starts = if tiles_enabled {
+            Self::rbsp_substream_starts(self.slice_data, &self.header.entry_point_offsets)
+        } else {
+            Vec::new()
+        };
+        let mut entry_idx = 0usize;
+
         loop {
+            let ctb_addr_rs = self.tile_grid.ctb_addr_ts_to_rs[ctb_addr_ts as usize];
+            self.ctb_y = ctb_addr_rs / pic_width_in_ctbs;
+            self.ctb_x = ctb_addr_rs % pic_width_in_ctbs;
+
             // WPP: at start of each new row (ctb_x==0, ctb_y>0), restore saved context
             if wpp
                 && self.ctb_x == 0
@@ -367,25 +468,52 @@ impl<'a> SliceContext<'a> {
                 break;
             }
 
-            // Track previous row for WPP boundary detection
-            let prev_ctb_y = self.ctb_y;
-
-            // Move to next CTB
-            self.ctb_x += 1;
-            if self.ctb_x >= pic_width_in_ctbs {
-                self.ctb_x = 0;
-                self.ctb_y += 1;
+            // Advance in tile-scan order.
+            ctb_addr_ts += 1;
+            if ctb_addr_ts >= total_ctus {
+                break;
             }
+            let next_rs = self.tile_grid.ctb_addr_ts_to_rs[ctb_addr_ts as usize];
+            let next_x = next_rs % pic_width_in_ctbs;
+            let next_y = next_rs / pic_width_in_ctbs;
 
-            // WPP: at row boundaries, decode end_of_sub_stream and reinit CABAC
-            if wpp && self.ctb_y != prev_ctb_y {
+            // Substream boundary handling. At a tile boundary, consume
+            // end_of_sub_stream_one_bit, byte-align, and reset CABAC contexts to
+            // slice-init (each tile is entropy-independent). At a WPP row
+            // boundary (tiles off), consume end_of_sub_stream and reinit without
+            // resetting contexts (the saved row context is restored at row start).
+            let new_tile = tiles_enabled
+                && !self
+                    .tile_grid
+                    .same_tile_ctb(self.ctb_x, self.ctb_y, next_x, next_y);
+            if new_tile {
+                // Seek the CABAC engine to the next tile's substream start (the
+                // authoritative boundary from the entry-point offsets) and reset
+                // contexts to slice-init (tiles are entropy-independent).
+                let _eoss = self.cabac.decode_terminate()?;
+                if let Some(&start) = sub_starts.get(entry_idx) {
+                    self.cabac = CabacDecoder::new(&self.slice_data[start..])?;
+                } else {
+                    // No entry-point offset available (malformed/legacy): fall back
+                    // to in-place reinit so we at least keep advancing.
+                    self.cabac.reinit();
+                }
+                entry_idx += 1;
+                self.reset_contexts();
+                if std::env::var_os("BPG_TILE_DEBUG").is_some() {
+                    let (bp, _, _) = self.cabac.get_position();
+                    eprintln!(
+                        "DEC_TILE: enter tile at rs=({},{}) ts={} rbsp_start={:?} cabac_byte_pos={}",
+                        next_x,
+                        next_y,
+                        ctb_addr_ts,
+                        sub_starts.get(entry_idx - 1),
+                        bp
+                    );
+                }
+            } else if wpp && next_y != self.ctb_y {
                 let _eoss = self.cabac.decode_terminate()?;
                 self.cabac.reinit();
-            }
-
-            // Check for end of picture
-            if self.ctb_y >= pic_height_in_ctbs {
-                break;
             }
         }
 
@@ -448,7 +576,8 @@ impl<'a> SliceContext<'a> {
             let pic_width_ctbs = self.sps.pic_width_in_ctbs();
             let ctb_addr_rs = y_ctb * pic_width_ctbs + x_ctb;
             let slice_addr_rs = 0u32;
-            let left_in_slice = ctb_addr_rs > slice_addr_rs;
+            let left_in_slice = ctb_addr_rs > slice_addr_rs
+                && self.tile_grid.same_tile_ctb(x_ctb - 1, y_ctb, x_ctb, y_ctb);
             if left_in_slice {
                 let ctx_idx = context::SAO_MERGE_FLAG;
                 sao_merge_left_flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
@@ -461,7 +590,8 @@ impl<'a> SliceContext<'a> {
             let pic_width_ctbs = self.sps.pic_width_in_ctbs();
             let ctb_addr_rs = y_ctb * pic_width_ctbs + x_ctb;
             let slice_addr_rs = 0u32;
-            let up_in_slice = ctb_addr_rs >= pic_width_ctbs + slice_addr_rs;
+            let up_in_slice = ctb_addr_rs >= pic_width_ctbs + slice_addr_rs
+                && self.tile_grid.same_tile_ctb(x_ctb, y_ctb - 1, x_ctb, y_ctb);
             if up_in_slice {
                 let ctx_idx = context::SAO_MERGE_FLAG;
                 sao_merge_up_flag = self.cabac.decode_bin(&mut self.ctx[ctx_idx])? != 0;
@@ -733,6 +863,13 @@ impl<'a> SliceContext<'a> {
             && (y as u32) < self.sps.pic_height_in_luma_samples
     }
 
+    /// Whether luma pixel `(ax, ay)` lies in the same tile as `(bx, by)`. Always
+    /// true when tiles are disabled.
+    fn same_tile_px(&self, ax: u32, ay: u32, bx: u32, by: u32) -> bool {
+        self.tile_grid
+            .same_tile_px(ax, ay, bx, by, self.sps.log2_ctb_size())
+    }
+
     /// Decode split_cu_flag using CABAC
     fn decode_split_cu_flag(&mut self, x0: u32, y0: u32, ct_depth: u8) -> Result<bool> {
         // Context selection based on neighboring CU depths (H.265 9.3.4.2.2)
@@ -740,8 +877,12 @@ impl<'a> SliceContext<'a> {
         // condTermA: 1 if above neighbor has larger depth
         // ctxInc = condTermL + condTermA
 
-        let available_l = self.is_neighbor_available(x0 as i32 - 1, y0 as i32);
-        let available_a = self.is_neighbor_available(x0 as i32, y0 as i32 - 1);
+        // Neighbours across a tile boundary are unavailable for context
+        // derivation (H.265 6.4.1 / 9.3.4.2.2).
+        let available_l = self.is_neighbor_available(x0 as i32 - 1, y0 as i32)
+            && self.same_tile_px(x0 - 1, y0, x0, y0);
+        let available_a = self.is_neighbor_available(x0 as i32, y0 as i32 - 1)
+            && self.same_tile_px(x0, y0 - 1, x0, y0);
 
         let mut cond_l = 0;
         let mut cond_a = 0;
@@ -862,6 +1003,15 @@ impl<'a> SliceContext<'a> {
             PartMode::Part2Nx2N => {
                 // Single PU covering entire CU
                 let modes = self.decode_intra_prediction(x0, y0, log2_cb_size, true, frame)?;
+                if super::debug::decision_log_active() {
+                    super::debug::log_pu(super::debug::PuRecord {
+                        x: x0,
+                        y: y0,
+                        log2_size: log2_cb_size,
+                        luma_mode: modes.0.as_u8(),
+                        chroma_mode: modes.1.as_u8(),
+                    });
+                }
                 if self.debug_ctu {
                     let (r, o) = self.cabac.get_state();
                     debug_trace!(
@@ -930,6 +1080,24 @@ impl<'a> SliceContext<'a> {
                 // NOTE: Prediction is NOT done here. It happens in decode_transform_unit_leaf
                 // and the 8x8→4x4 chroma split handler, so each TU is predicted →
                 // reconstructed before the next TU reads its neighbors.
+
+                if super::debug::decision_log_active() {
+                    let cm = chroma_mode.as_u8();
+                    for (px, py, lm) in [
+                        (x0, y0, luma_mode_0),
+                        (x0 + half, y0, luma_mode_1),
+                        (x0, y0 + half, luma_mode_2),
+                        (x0 + half, y0 + half, luma_mode_3),
+                    ] {
+                        super::debug::log_pu(super::debug::PuRecord {
+                            x: px,
+                            y: py,
+                            log2_size: log2_pu_size,
+                            luma_mode: lm.as_u8(),
+                            chroma_mode: cm,
+                        });
+                    }
+                }
 
                 (luma_mode_0, chroma_mode)
             }
@@ -1237,6 +1405,52 @@ impl<'a> SliceContext<'a> {
         Ok(())
     }
 
+    /// Plane subsampling shifts `(x, y)` for component `c_idx` under the active
+    /// chroma array type. Delegates to the shared [`super::tile::plane_shifts`]
+    /// so encoder and decoder agree on the chroma-format mapping.
+    fn plane_shifts(&self, c_idx: u8) -> (u8, u8) {
+        super::tile::plane_shifts(c_idx, self.sps.chroma_array_type())
+    }
+
+    /// Intra-predict into `frame`, clamping reference samples to the current
+    /// tile when tiles are enabled. Cross-tile reference samples are unavailable
+    /// (forced via the `Some(UNINIT_SAMPLE)` reader override), so a tile decodes
+    /// independently of its already-reconstructed neighbours.
+    fn predict_intra_tiled(
+        &self,
+        frame: &mut DecodedFrame,
+        x: u32,
+        y: u32,
+        log2_size: u8,
+        mode: IntraPredMode,
+        c_idx: u8,
+        sis: bool,
+    ) {
+        if self.tile_grid.is_single() {
+            intra::predict_intra(frame, x, y, log2_size, mode, c_idx, sis);
+            return;
+        }
+        let ctb_log2 = self.sps.log2_ctb_size();
+        let (sx, sy) = self.plane_shifts(c_idx);
+        let (tx0, ty0, tx1, ty1) = self.tile_grid.tile_plane_bounds(x, y, ctb_log2, sx, sy);
+        intra::predict_intra_with_reader(
+            frame,
+            x,
+            y,
+            log2_size,
+            mode,
+            c_idx,
+            sis,
+            move |_c, rx, ry| {
+                if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
+                    Some(super::picture::UNINIT_SAMPLE)
+                } else {
+                    None
+                }
+            },
+        );
+    }
+
     /// Predict one chroma TB and, if `cbf` is set, decode+add its residual.
     fn predict_apply_chroma(
         &mut self,
@@ -1249,7 +1463,7 @@ impl<'a> SliceContext<'a> {
         frame: &mut DecodedFrame,
     ) -> Result<()> {
         let sis = self.sps.strong_intra_smoothing_enabled_flag;
-        intra::predict_intra(frame, cx, cy, log2_size, mode, c_idx, sis);
+        self.predict_intra_tiled(frame, cx, cy, log2_size, mode, c_idx, sis);
         if cbf {
             let cat = self.sps.chroma_array_type();
             let scan = residual::get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
@@ -1327,7 +1541,7 @@ impl<'a> SliceContext<'a> {
 
         // Predict luma at TU level BEFORE residual application
         // This ensures each TU reads reconstructed neighbors from prior TUs
-        intra::predict_intra(frame, x0, y0, log2_size, actual_luma_mode, 0, sis);
+        self.predict_intra_tiled(frame, x0, y0, log2_size, actual_luma_mode, 0, sis);
 
         let scan_order = residual::get_scan_order(log2_size, actual_luma_mode.as_u8(), 0, cat);
 
@@ -1355,11 +1569,11 @@ impl<'a> SliceContext<'a> {
             let chroma_scan_order =
                 residual::get_scan_order(log2_size, chroma_mode.as_u8(), 1, cat);
 
-            intra::predict_intra(frame, x0, y0, log2_size, chroma_mode, 1, sis);
+            self.predict_intra_tiled(frame, x0, y0, log2_size, chroma_mode, 1, sis);
             if cbf_cb {
                 self.decode_and_apply_residual(x0, y0, log2_size, 1, chroma_scan_order, frame)?;
             }
-            intra::predict_intra(frame, x0, y0, log2_size, chroma_mode, 2, sis);
+            self.predict_intra_tiled(frame, x0, y0, log2_size, chroma_mode, 2, sis);
             if cbf_cr {
                 self.decode_and_apply_residual(x0, y0, log2_size, 2, chroma_scan_order, frame)?;
             }
@@ -1444,6 +1658,21 @@ impl<'a> SliceContext<'a> {
         let size = 1usize << log2_size;
         let num_coeffs = size * size;
 
+        // Capture the coded (pre-dequant) level distribution for decision analysis.
+        let coded_levels = if super::debug::decision_log_active() {
+            let mut nz = 0u32;
+            let mut abs_level_sum = 0u64;
+            for &c in &coeff_buf.coeffs[..num_coeffs] {
+                if c != 0 {
+                    nz += 1;
+                    abs_level_sum += (c as i64).unsigned_abs();
+                }
+            }
+            Some((nz, abs_level_sum))
+        } else {
+            None
+        };
+
         // Dequantize coefficients in-place
         let coeffs = &mut coeff_buf.coeffs;
 
@@ -1512,6 +1741,22 @@ impl<'a> SliceContext<'a> {
         } else {
             let is_intra_4x4_luma = log2_size == 2 && c_idx == 0;
             transform::inverse_transform(coeffs, residual, size, bit_depth, is_intra_4x4_luma);
+        }
+
+        if let Some((nz, abs_level_sum)) = coded_levels {
+            let residual_energy: u64 = residual[..num_coeffs]
+                .iter()
+                .map(|&r| (r as i64 * r as i64) as u64)
+                .sum();
+            super::debug::log_tu(super::debug::TuRecord {
+                x: x0,
+                y: y0,
+                log2_size,
+                c_idx,
+                nz,
+                abs_level_sum,
+                residual_energy,
+            });
         }
 
         // Add residual to prediction — single SIMD dispatch for entire block
@@ -1769,6 +2014,19 @@ impl<'a> SliceContext<'a> {
         if x0 == 0 {
             return IntraPredMode::Dc;
         }
+        // The left neighbour is unavailable across a tile boundary (the
+        // above-neighbour CTB-row guard already covers tile *row* boundaries).
+        if !self.tile_grid.is_single() {
+            let ctb_log2 = self.sps.log2_ctb_size();
+            if !self.tile_grid.same_tile_ctb(
+                (x0 - 1) >> ctb_log2,
+                y0 >> ctb_log2,
+                x0 >> ctb_log2,
+                y0 >> ctb_log2,
+            ) {
+                return IntraPredMode::Dc;
+            }
+        }
         self.get_intra_mode_at(x0 - 1, y0)
     }
 
@@ -1830,18 +2088,6 @@ impl<'a> SliceContext<'a> {
         }
         se_trace("rem_intra_luma", val as i64, &self.cabac);
         Ok(val)
-    }
-
-    /// H.265 Table 8-6: chroma QP mapping for 4:2:0
-    fn chroma_qp_from_luma(qpi: i32) -> i32 {
-        static TAB8_22: [i32; 13] = [29, 30, 31, 32, 33, 33, 34, 34, 35, 35, 36, 36, 37];
-        if qpi < 30 {
-            qpi
-        } else if qpi >= 43 {
-            qpi - 6
-        } else {
-            TAB8_22[(qpi - 30) as usize]
-        }
     }
 
     /// Get QPY at a sample position from the QP map
@@ -1963,7 +2209,9 @@ impl<'a> SliceContext<'a> {
             self.qp_y = 0;
         }
 
-        // Compute chroma QP (4:2:0)
+        // Compute chroma QP. Table 8-10 applies only for 4:2:0; 4:2:2/4:4:4
+        // use Min(qPi, 51). Keep this in sync with the slice-init path above and
+        // still265's `encoder::types::chroma_qp_from_luma`.
         let qp_bd_offset_c = 6 * (self.sps.bit_depth_c() as i32 - 8);
         let qpi_cb =
             (qpy + self.pps.pps_cb_qp_offset as i32 + self.header.slice_cb_qp_offset as i32)
@@ -1971,9 +2219,10 @@ impl<'a> SliceContext<'a> {
         let qpi_cr =
             (qpy + self.pps.pps_cr_qp_offset as i32 + self.header.slice_cr_qp_offset as i32)
                 .clamp(-qp_bd_offset_c, 57);
+        let cat = self.sps.chroma_array_type();
 
-        self.qp_cb = Self::chroma_qp_from_luma(qpi_cb) + qp_bd_offset_c;
-        self.qp_cr = Self::chroma_qp_from_luma(qpi_cr) + qp_bd_offset_c;
+        self.qp_cb = chroma_qp_mapping(qpi_cb, cat) + qp_bd_offset_c;
+        self.qp_cr = chroma_qp_mapping(qpi_cr, cat) + qp_bd_offset_c;
 
         self.current_qpy = qpy;
     }

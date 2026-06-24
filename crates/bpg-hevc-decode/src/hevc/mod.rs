@@ -8,17 +8,19 @@ pub mod cabac;
 mod color_convert;
 mod ctu;
 pub mod deblock;
-pub(crate) mod debug;
+pub mod debug;
 pub mod intra;
 pub mod params;
 mod picture;
 pub mod residual;
 pub mod sao;
 pub mod slice;
+pub mod tile;
 pub mod transform;
 mod transform_simd;
 
-pub use picture::DecodedFrame;
+pub use color_convert::is_ycbcr_matrix;
+pub use picture::{DecodedFrame, UNINIT_SAMPLE};
 
 use crate::error::HevcError;
 use crate::heif::HevcDecoderConfig;

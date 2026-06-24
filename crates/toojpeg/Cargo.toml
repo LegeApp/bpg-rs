@@ -1,0 +1,16 @@
+[package]
+name = "toojpeg"
+version.workspace = true
+edition = "2021"
+license = "MIT"
+description = "Vendored baseline-DCT JPEG encoder (Rust port of TooJpeg) with a native-YCbCr-plane entry point for color-space-preserving BPG/HEIC->JPEG output."
+
+[lib]
+name = "toojpeg"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]

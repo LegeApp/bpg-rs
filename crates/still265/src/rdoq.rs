@@ -28,8 +28,8 @@
 //!   corpus (occasional sub-1% local loss from the frozen-context estimate).
 
 use crate::cabac::CabacEstimator;
-use crate::contexts::{ctx, Contexts};
-use crate::residual::{calc_sig_coeff_flag_ctx, get_scan_4x4, get_scan_sub_block, ScanOrder};
+use crate::contexts::{Contexts, ctx};
+use crate::residual::{ScanOrder, calc_sig_coeff_flag_ctx, get_scan_4x4, get_scan_sub_block};
 use crate::transform::DequantParams;
 
 /// x265 `g_quantScales` (forward quant scale per `qp % 6`).
@@ -335,11 +335,7 @@ pub fn rdoq_single_scan_into<'scratch>(
                 let c1c2idx =
                     (if c1_idx < 8 { 1u32 } else { 0 }) + (if c2_idx == 0 { 2 } else { 0 });
                 let base_level = if c1_idx < 8 {
-                    if c2_idx == 0 {
-                        3
-                    } else {
-                        2
-                    }
+                    if c2_idx == 0 { 3 } else { 2 }
                 } else {
                     1
                 };

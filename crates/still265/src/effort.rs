@@ -8,7 +8,7 @@
 use std::fmt;
 
 use crate::preanalysis::{RegionClass, SearchPolicy};
-use crate::{is_reference_tier, Effort};
+use crate::{Effort, is_reference_tier};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntropyContextMode {
@@ -192,6 +192,13 @@ pub struct RdoqPassBudget {
 impl RdoqPassBudget {
     pub fn passes(self, log2_size: u8, _component: ComponentKind, nnz: u32) -> u8 {
         match self.effort {
+            Effort::Floor
+            | Effort::FloorPlus
+            | Effort::FloorPlus2
+            | Effort::FloorShallow
+            | Effort::Slow
+            | Effort::SlowPlus
+            | Effort::FastAdaptive => 0,
             Effort::Fastest | Effort::Fast => 0,
             Effort::Balanced => {
                 if self.qp < 38 && log2_size <= 3 && nnz <= 32 {
@@ -204,11 +211,7 @@ impl RdoqPassBudget {
                 if self.qp >= 44 {
                     0
                 } else if self.qp >= 38 {
-                    if log2_size <= 3 && nnz <= 32 {
-                        1
-                    } else {
-                        0
-                    }
+                    if log2_size <= 3 && nnz <= 32 { 1 } else { 0 }
                 } else if log2_size <= 4 && nnz <= 64 {
                     1
                 } else {
@@ -368,7 +371,11 @@ impl EffortTemplate {
         let effective_template = template(effective);
         let rmd_mode_set = effective_template.rmd.mode_set;
         let base_luma = self.luma_rd_candidates_base(desc.log2_size, desc.qp);
-        let luma_rd_cap = if self.name == Effort::Best { 9 } else { 4 };
+        let luma_rd_cap = match self.name {
+            Effort::Best => 9,
+            Effort::SlowPlus => 6,
+            _ => 4,
+        };
         let luma_rd_candidates =
             (base_luma as i8 + policy.luma_rd_bias).clamp(1, luma_rd_cap) as u8;
         let base_chroma = self.chroma_rd_candidates_base(desc.qp);
@@ -385,9 +392,43 @@ impl EffortTemplate {
             self.cu_split.default_search
         };
         let zero_residual_tu_early_terminate = match self.name {
+            Effort::Floor
+            | Effort::FloorPlus
+            | Effort::FloorPlus2
+            | Effort::FloorShallow
+            | Effort::FastAdaptive => true,
             Effort::Fastest | Effort::Fast => true,
             Effort::Balanced => desc.qp >= 38,
-            Effort::Good | Effort::Best | Effort::Placebo | Effort::Reference => false,
+            Effort::Slow
+            | Effort::SlowPlus
+            | Effort::Good
+            | Effort::Best
+            | Effort::Placebo
+            | Effort::Reference => false,
+        };
+
+        let tu_split = if matches!(self.name, Effort::Slow | Effort::SlowPlus) {
+            self.tu_split.default_search
+        } else if matches!(
+            self.name,
+            Effort::Floor
+                | Effort::FloorPlus
+                | Effort::FloorPlus2
+                | Effort::FloorShallow
+                | Effort::FastAdaptive
+        ) {
+            SplitSearch::ForceLeaf
+        } else if self.name == Effort::Fastest && desc.log2_size <= 4 {
+            SplitSearch::ForceLeaf
+        } else if zero_residual_tu_early_terminate {
+            SplitSearch::PreferLeaf
+        } else if matches!(
+            split_policy,
+            SplitSearch::ForceSplit | SplitSearch::PreferSplit
+        ) {
+            split_policy
+        } else {
+            self.tu_split.default_search
         };
 
         BlockSearchBudget {
@@ -403,18 +444,7 @@ impl EffortTemplate {
             chroma_trial_quality: effective_template.chroma.trial_quality,
             final_quality: effective_template.residual.final_quality,
             cu_split: split_policy,
-            tu_split: if self.name == Effort::Fastest && desc.log2_size <= 4 {
-                SplitSearch::ForceLeaf
-            } else if zero_residual_tu_early_terminate {
-                SplitSearch::PreferLeaf
-            } else if matches!(
-                split_policy,
-                SplitSearch::ForceSplit | SplitSearch::PreferSplit
-            ) {
-                split_policy
-            } else {
-                self.tu_split.default_search
-            },
+            tu_split,
             close_call_margin: CLOSE_CALL_MARGIN,
             exact_residual_bits_for_trials: effective_template.residual.exact_bits_during_trials,
             rdoq_for_trials: effective_template.residual.rdoq_during_trials,
@@ -435,6 +465,13 @@ impl EffortTemplate {
         }
 
         match self.name {
+            Effort::Floor
+            | Effort::FloorPlus
+            | Effort::FloorPlus2
+            | Effort::FloorShallow
+            | Effort::Slow
+            | Effort::SlowPlus
+            | Effort::FastAdaptive => self.rmd.max_luma_rd_candidates,
             Effort::Fast => {
                 if log2_size >= 4 {
                     self.rmd.max_luma_rd_candidates
@@ -466,6 +503,13 @@ impl EffortTemplate {
 
     fn chroma_rd_candidates_base(&self, qp: i32) -> u8 {
         match self.name {
+            Effort::Floor
+            | Effort::FloorPlus
+            | Effort::FloorPlus2
+            | Effort::FloorShallow
+            | Effort::Slow
+            | Effort::SlowPlus
+            | Effort::FastAdaptive => self.chroma.max_rd_candidates,
             Effort::Good => {
                 if qp >= 44 {
                     1
@@ -538,6 +582,310 @@ fn policy_for(class: RegionClass) -> SearchPolicy {
     }
 }
 
+static FLOOR: EffortTemplate = EffortTemplate {
+    name: Effort::Floor,
+    reference: false,
+    entropy_context: EntropyContextMode::Running,
+    parallel_analysis: false,
+    rmd: RmdTemplate {
+        mode_set: RmdModeSet::MpmPlanarDcOnly,
+        max_luma_rd_candidates: 1,
+    },
+    luma: LumaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        chroma_during_luma_trials: false,
+    },
+    chroma: ChromaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        max_rd_candidates: 0,
+    },
+    residual: ResidualSearchTemplate {
+        rdoq_during_trials: false,
+        exact_bits_during_trials: false,
+        final_quality: TrialQuality::Final,
+    },
+    cu_split: CuSplitTemplate {
+        default_search: SplitSearch::ForceLeaf,
+        early_terminate: CuEarlyTerminateRule::Fastest,
+    },
+    tu_split: TuSplitTemplate {
+        default_search: SplitSearch::ForceLeaf,
+        zero_residual_early_terminate: true,
+    },
+    preanalysis: PreanalysisTemplate {
+        class_steering: false,
+        allow_candidate_expansion: false,
+        importance_rmd_prune_factor: None,
+        importance_force_leaf: false,
+    },
+};
+
+static FLOOR_PLUS: EffortTemplate = EffortTemplate {
+    name: Effort::FloorPlus,
+    reference: false,
+    entropy_context: EntropyContextMode::Running,
+    parallel_analysis: false,
+    rmd: RmdTemplate {
+        mode_set: RmdModeSet::MpmPlanarDcOnly,
+        max_luma_rd_candidates: 1,
+    },
+    luma: LumaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        chroma_during_luma_trials: false,
+    },
+    chroma: ChromaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        max_rd_candidates: 0,
+    },
+    residual: ResidualSearchTemplate {
+        rdoq_during_trials: false,
+        exact_bits_during_trials: false,
+        final_quality: TrialQuality::Final,
+    },
+    cu_split: CuSplitTemplate {
+        default_search: SplitSearch::ForceLeaf,
+        early_terminate: CuEarlyTerminateRule::Fastest,
+    },
+    tu_split: TuSplitTemplate {
+        default_search: SplitSearch::ForceLeaf,
+        zero_residual_early_terminate: true,
+    },
+    preanalysis: PreanalysisTemplate {
+        class_steering: false,
+        allow_candidate_expansion: false,
+        importance_rmd_prune_factor: None,
+        importance_force_leaf: false,
+    },
+};
+
+static FLOOR_PLUS2: EffortTemplate = EffortTemplate {
+    name: Effort::FloorPlus2,
+    reference: false,
+    entropy_context: EntropyContextMode::Running,
+    parallel_analysis: false,
+    rmd: RmdTemplate {
+        mode_set: RmdModeSet::MpmPlanarDcOnly,
+        max_luma_rd_candidates: 1,
+    },
+    luma: LumaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        chroma_during_luma_trials: false,
+    },
+    chroma: ChromaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        max_rd_candidates: 0,
+    },
+    residual: ResidualSearchTemplate {
+        rdoq_during_trials: false,
+        exact_bits_during_trials: false,
+        final_quality: TrialQuality::Final,
+    },
+    cu_split: CuSplitTemplate {
+        default_search: SplitSearch::ForceLeaf,
+        early_terminate: CuEarlyTerminateRule::Fastest,
+    },
+    tu_split: TuSplitTemplate {
+        default_search: SplitSearch::ForceLeaf,
+        zero_residual_early_terminate: true,
+    },
+    preanalysis: PreanalysisTemplate {
+        class_steering: false,
+        allow_candidate_expansion: false,
+        importance_rmd_prune_factor: None,
+        importance_force_leaf: false,
+    },
+};
+
+static FLOOR_SHALLOW: EffortTemplate = EffortTemplate {
+    name: Effort::FloorShallow,
+    reference: false,
+    entropy_context: EntropyContextMode::Running,
+    parallel_analysis: false,
+    rmd: RmdTemplate {
+        mode_set: RmdModeSet::MpmPlanarDcOnly,
+        max_luma_rd_candidates: 1,
+    },
+    luma: LumaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        chroma_during_luma_trials: false,
+    },
+    chroma: ChromaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        max_rd_candidates: 0,
+    },
+    residual: ResidualSearchTemplate {
+        rdoq_during_trials: false,
+        exact_bits_during_trials: false,
+        final_quality: TrialQuality::Final,
+    },
+    cu_split: CuSplitTemplate {
+        default_search: SplitSearch::ForceLeaf,
+        early_terminate: CuEarlyTerminateRule::Fastest,
+    },
+    tu_split: TuSplitTemplate {
+        default_search: SplitSearch::ForceLeaf,
+        zero_residual_early_terminate: true,
+    },
+    preanalysis: PreanalysisTemplate {
+        class_steering: false,
+        allow_candidate_expansion: false,
+        importance_rmd_prune_factor: None,
+        importance_force_leaf: false,
+    },
+};
+
+/// Slow quality mode: a fuzzy shallow CTU encoder with odds-gated progressive
+/// RMD, terminal 64→32 split, EnhancedLeaf children, and final-winner RDOQ.
+/// No trial RDOQ — the search uses FastRd; the final winner is re-encoded with
+/// [`RdoqPolicy::FullSingleScan`] via `rdo2_final_code_cu`.
+static SLOW: EffortTemplate = EffortTemplate {
+    name: Effort::Slow,
+    reference: false,
+    entropy_context: EntropyContextMode::Running,
+    parallel_analysis: false,
+    rmd: RmdTemplate {
+        mode_set: RmdModeSet::Progressive {
+            coarse_step: 4,
+            top_regions: 2,
+            refine_radius: 2,
+        },
+        max_luma_rd_candidates: 4,
+    },
+    luma: LumaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        chroma_during_luma_trials: false,
+    },
+    chroma: ChromaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        max_rd_candidates: 2,
+    },
+    residual: ResidualSearchTemplate {
+        rdoq_during_trials: false,
+        exact_bits_during_trials: false,
+        final_quality: TrialQuality::Final,
+    },
+    cu_split: CuSplitTemplate {
+        default_search: SplitSearch::EvaluateBoth,
+        early_terminate: CuEarlyTerminateRule::Fastest,
+    },
+    tu_split: TuSplitTemplate {
+        default_search: SplitSearch::EvaluateBoth,
+        zero_residual_early_terminate: true,
+    },
+    preanalysis: PreanalysisTemplate {
+        class_steering: true,
+        allow_candidate_expansion: false,
+        importance_rmd_prune_factor: None,
+        importance_force_leaf: false,
+    },
+};
+
+/// SlowPlus quality experiment: Slow's CTU auction with an x265-like no-64-leaf
+/// root at low QP, denser progressive RMD, one extra luma/chroma candidate, and
+/// default conservative PartNxN islands. Kept separate from Slow so the current
+/// high-res baseline remains comparable while this can be BD-swept.
+static SLOW_PLUS: EffortTemplate = EffortTemplate {
+    name: Effort::SlowPlus,
+    reference: false,
+    entropy_context: EntropyContextMode::Running,
+    parallel_analysis: false,
+    rmd: RmdTemplate {
+        mode_set: RmdModeSet::Progressive {
+            coarse_step: 3,
+            top_regions: 3,
+            refine_radius: 2,
+        },
+        max_luma_rd_candidates: 5,
+    },
+    luma: LumaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        chroma_during_luma_trials: false,
+    },
+    chroma: ChromaSearchTemplate {
+        trial_quality: TrialQuality::FastRd,
+        max_rd_candidates: 3,
+    },
+    residual: ResidualSearchTemplate {
+        rdoq_during_trials: false,
+        exact_bits_during_trials: false,
+        final_quality: TrialQuality::Final,
+    },
+    cu_split: CuSplitTemplate {
+        default_search: SplitSearch::EvaluateBoth,
+        early_terminate: CuEarlyTerminateRule::Fast,
+    },
+    tu_split: TuSplitTemplate {
+        default_search: SplitSearch::EvaluateBoth,
+        zero_residual_early_terminate: false,
+    },
+    preanalysis: PreanalysisTemplate {
+        class_steering: true,
+        allow_candidate_expansion: true,
+        importance_rmd_prune_factor: None,
+        importance_force_leaf: false,
+    },
+};
+/// Slice-QP threshold at or above which [`Effort::FastAdaptive`] switches from
+/// its low-QP base ([`Effort::FloorPlus`]) to its high-QP base
+/// ([`Effort::Fastest`]). Testing showed the lighter Fastest search is the
+/// better rate-distortion trade at high QP, where FloorPlus's extra effort
+/// stops paying off.
+pub const FAST_ADAPTIVE_FASTEST_QP: i32 = 32;
+
+/// How a user-facing [`Effort`] decomposes into the concrete base template(s)
+/// actually run. Most efforts are a single base; *composite* efforts combine
+/// existing bases (e.g. QP-adaptive selection) rather than defining a new
+/// template of their own. This is the single mechanism for composing presets;
+/// new combined tiers should add an arm to [`composition`] instead of cloning a
+/// template.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffortComposition {
+    /// One base template, used at every QP.
+    Single(Effort),
+    /// QP-adaptive: `below` for slice QP `< qp_threshold`, `at_or_above`
+    /// otherwise. Both must be base (non-composite) efforts.
+    QpSplit {
+        below: Effort,
+        at_or_above: Effort,
+        qp_threshold: i32,
+    },
+}
+
+/// Decompose `effort` into base templates. The single source of truth for how
+/// composite efforts are built; [`resolve_for_qp`] and [`template`] both
+/// consult it. `FastAdaptive` is `FloorPlus` below [`FAST_ADAPTIVE_FASTEST_QP`]
+/// and `Fastest` at or above it.
+pub fn composition(effort: Effort) -> EffortComposition {
+    match effort {
+        Effort::FastAdaptive => EffortComposition::QpSplit {
+            below: Effort::FloorPlus,
+            at_or_above: Effort::Fastest,
+            qp_threshold: FAST_ADAPTIVE_FASTEST_QP,
+        },
+        other => EffortComposition::Single(other),
+    }
+}
+
+/// Resolve `effort` to the concrete base [`Effort`] to run for a slice coded at
+/// `slice_qp_y`. Base efforts return themselves; composites select a base. The
+/// encoder calls this once per slice so every downstream flag sees a real base.
+pub fn resolve_for_qp(effort: Effort, slice_qp_y: i32) -> Effort {
+    match composition(effort) {
+        EffortComposition::Single(e) => e,
+        EffortComposition::QpSplit {
+            below,
+            at_or_above,
+            qp_threshold,
+        } => {
+            if slice_qp_y >= qp_threshold {
+                at_or_above
+            } else {
+                below
+            }
+        }
+    }
+}
+
 static FASTEST: EffortTemplate = EffortTemplate {
     name: Effort::Fastest,
     reference: false,
@@ -573,10 +921,10 @@ static FASTEST: EffortTemplate = EffortTemplate {
         zero_residual_early_terminate: true,
     },
     preanalysis: PreanalysisTemplate {
-        class_steering: false,
+        class_steering: true,
         allow_candidate_expansion: false,
-        importance_rmd_prune_factor: Some(1.10),
-        importance_force_leaf: true,
+        importance_rmd_prune_factor: None,
+        importance_force_leaf: false,
     },
 };
 
@@ -868,7 +1216,21 @@ static REFERENCE: EffortTemplate = EffortTemplate {
 #[inline]
 pub fn template(effort: Effort) -> &'static EffortTemplate {
     match effort {
+        Effort::Floor => &FLOOR,
+        Effort::FloorPlus => &FLOOR_PLUS,
+        Effort::FloorPlus2 => &FLOOR_PLUS2,
+        Effort::FloorShallow => &FLOOR_SHALLOW,
+        Effort::Slow => &SLOW,
+        Effort::SlowPlus => &SLOW_PLUS,
         Effort::Fastest => &FASTEST,
+        // `FastAdaptive` is a composite (see [`composition`]); the encoder
+        // resolves it to a concrete base via [`resolve_for_qp`] before any
+        // template lookup. For QP-agnostic direct queries, fall back to its
+        // low-QP base template so this stays total.
+        Effort::FastAdaptive => match composition(Effort::FastAdaptive) {
+            EffortComposition::QpSplit { below, .. } => template(below),
+            EffortComposition::Single(e) => template(e),
+        },
         Effort::Fast => &FAST,
         Effort::Balanced => &BALANCED,
         Effort::Good => &GOOD,
@@ -890,6 +1252,13 @@ pub fn select_rdoq_single_scan(effort: Effort) -> bool {
 #[inline]
 fn angular_prune_var_threshold_8bit(effort: Effort) -> Option<i64> {
     match effort {
+        Effort::Floor
+        | Effort::FloorPlus
+        | Effort::FloorPlus2
+        | Effort::FloorShallow
+        | Effort::Slow
+        | Effort::SlowPlus
+        | Effort::FastAdaptive => Some(256),
         Effort::Fastest => Some(128),
         Effort::Fast => Some(32),
         Effort::Balanced => Some(8),
@@ -903,6 +1272,14 @@ fn qp_budget_effort(effort: Effort, qp: i32) -> Effort {
         return effort;
     }
     match (effort, qp) {
+        (Effort::Floor, _) => Effort::Floor,
+        (Effort::FloorPlus, _) => Effort::FloorPlus,
+        (Effort::FloorPlus2, _) => Effort::FloorPlus2,
+        (Effort::FloorShallow, _) => Effort::FloorShallow,
+        (Effort::Slow, _) => Effort::Slow,
+        (Effort::SlowPlus, _) => Effort::SlowPlus,
+        // `FastAdaptive` is resolved to a base effort up front by
+        // [`resolve_for_qp`]; it never reaches per-CU budget remapping.
         (Effort::Good, q) if q >= 44 => Effort::Fast,
         (Effort::Good, q) if q >= 38 => Effort::Balanced,
         (Effort::Balanced, q) if q >= 44 => Effort::Fastest,
