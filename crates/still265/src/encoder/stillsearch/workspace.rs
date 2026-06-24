@@ -3,7 +3,6 @@
 use super::arena::CoeffArena;
 use super::ledger::StillSearchLedger;
 use crate::contexts::Contexts;
-use crate::rdoq::RdoqScratch;
 use crate::residual::ResidualPricingScratch;
 
 pub(super) struct CtuWorkspace {
@@ -15,8 +14,6 @@ pub(super) struct CtuWorkspace {
     /// Re-seeded per CTU from the live writer context at coding-tree entry.
     pub(super) price_base: Contexts,
     pub(super) price_scratch: ResidualPricingScratch,
-    /// Reusable scratch for single-scan RDOQ level decisions.
-    pub(super) rdoq_scratch: RdoqScratch,
 }
 
 impl Default for CtuWorkspace {
@@ -27,7 +24,6 @@ impl Default for CtuWorkspace {
             block_scratch: BlockScratch::default(),
             price_base: Contexts::new(0),
             price_scratch: ResidualPricingScratch::default(),
-            rdoq_scratch: RdoqScratch::default(),
         }
     }
 }
