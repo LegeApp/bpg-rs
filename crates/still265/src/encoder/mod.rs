@@ -16,7 +16,7 @@ use bpg_hevc_decode::DecodedFrame;
 use bpg_hevc_decode::hevc::sao::{SaoMap, apply_sao};
 use bpg_hevc_decode::hevc::slice::IntraPredMode;
 
-use crate::{DeblockMode, SaoMode, StillHevcConfig, nal, params, slice};
+use crate::{DeblockMode, SaoMode, StillHevcConfig, nal, params, sao, slice};
 
 use self::aq::AqState;
 use self::syntax::CuNode;
@@ -94,10 +94,242 @@ impl<'a> Encoder<'a> {
             .unwrap_or(1u16 << self.bit_depth.saturating_sub(1))
     }
 
+    /// Source plane view `(samples, stride, width, height)` for SAO statistics,
+    /// mirroring [`Self::src_sample`]'s component-to-plane mapping.
+    fn src_plane(&self, c_idx: u8) -> (&[u16], usize, u32, u32) {
+        match c_idx {
+            0 => (
+                self.src.y,
+                self.display_width as usize,
+                self.display_width,
+                self.display_height,
+            ),
+            1 => {
+                let (cw, ch) = self.src_chroma_dims();
+                (self.src.cb, self.src_chroma_stride(), cw, ch)
+            }
+            2 => {
+                let (cw, ch) = self.src_chroma_dims();
+                (self.src.cr, self.src_chroma_stride(), cw, ch)
+            }
+            _ => (&[], 0, 0, 0),
+        }
+    }
+
+    /// Accumulate Edge-Offset statistics for one component and `eo_class` over a
+    /// CTB region of the deblocked reconstruction vs the source. Categories with
+    /// no edge (index 2) are dropped, matching the decoder's offset application.
+    fn sao_eo_stats(
+        &self,
+        c_idx: u8,
+        eo_class: u8,
+        x_start: u32,
+        y_start: u32,
+        x_end: u32,
+        y_end: u32,
+    ) -> sao::EoStats {
+        let (plane, stride) = self.frame.plane(c_idx);
+        let (plane_w, plane_h) = self.frame.component_dims(c_idx);
+
+        // Horizontal EO over an interior region (left/right neighbours valid and
+        // the source unclamped) uses the dispatched SIMD kernel. Plane-edge /
+        // source-padding CTBs fall through to the generic scalar loop below.
+        if eo_class == 0 {
+            let (src_plane, src_stride, sw, sh) = self.src_plane(c_idx);
+            if x_start >= 1
+                && x_end > x_start
+                && x_end + 1 <= plane_w
+                && x_end <= sw
+                && y_end <= plane_h
+                && y_end <= sh
+            {
+                let mut stats = sao::EoStats::default();
+                crate::primitives::sao_stats_e0(
+                    plane,
+                    stride,
+                    src_plane,
+                    src_stride,
+                    x_start,
+                    y_start,
+                    x_end - x_start,
+                    y_end - y_start,
+                    &mut stats.sum,
+                    &mut stats.count,
+                );
+                return stats;
+            }
+        }
+
+        let (dx0, dy0, dx1, dy1) = sao::EO_OFFSETS[eo_class as usize & 3];
+
+        let mut stats = sao::EoStats::default();
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                let nx0 = x as i32 + dx0;
+                let ny0 = y as i32 + dy0;
+                let nx1 = x as i32 + dx1;
+                let ny1 = y as i32 + dy1;
+                if nx0 < 0
+                    || nx0 >= plane_w as i32
+                    || ny0 < 0
+                    || ny0 >= plane_h as i32
+                    || nx1 < 0
+                    || nx1 >= plane_w as i32
+                    || ny1 < 0
+                    || ny1 >= plane_h as i32
+                {
+                    continue;
+                }
+
+                let idx = y as usize * stride + x as usize;
+                let recon = plane[idx] as i32;
+                let n0 = plane[ny0 as usize * stride + nx0 as usize] as i32;
+                let n1 = plane[ny1 as usize * stride + nx1 as usize] as i32;
+
+                let sign0 = (recon - n0).signum();
+                let sign1 = (recon - n1).signum();
+                let edge_idx = (2 + sign0 + sign1) as usize;
+                if edge_idx == 2 {
+                    continue;
+                }
+
+                let src = self.src_sample(c_idx, x, y) as i64;
+                stats.sum[edge_idx] += src - recon as i64;
+                stats.count[edge_idx] += 1;
+            }
+        }
+        stats
+    }
+
+    /// Accumulate Band-Offset statistics for one component over a CTB region.
+    fn sao_bo_stats(
+        &self,
+        c_idx: u8,
+        x_start: u32,
+        y_start: u32,
+        x_end: u32,
+        y_end: u32,
+    ) -> sao::BoStats {
+        let (plane, stride) = self.frame.plane(c_idx);
+        let band_shift = self.bit_depth.saturating_sub(5);
+        let mut stats = sao::BoStats::default();
+        for y in y_start..y_end {
+            for x in x_start..x_end {
+                let idx = y as usize * stride + x as usize;
+                let recon = plane[idx] as i32;
+                let src = self.src_sample(c_idx, x, y) as i64;
+                let band = ((recon as u16 >> band_shift) & 31) as usize;
+                stats.sum[band] += src - recon as i64;
+                stats.count[band] += 1;
+            }
+        }
+        stats
+    }
+
+    /// Pick the best SAO type for one component (off / band / edge) by distortion
+    /// reduction. Returns `(type_idx, eo_class, offsets, band_position, reduction)`;
+    /// `reduction == 0` means SAO-off wins.
+    fn best_sao_component(
+        &self,
+        c_idx: u8,
+        x_start: u32,
+        y_start: u32,
+        x_end: u32,
+        y_end: u32,
+    ) -> (u8, u8, [i8; 4], u8, i64) {
+        let mut best = (0u8, 0u8, [0i8; 4], 0u8, 0i64);
+
+        let bo_stats = self.sao_bo_stats(c_idx, x_start, y_start, x_end, y_end);
+        let (band_pos, bo_offsets, bo_reduction) =
+            sao::bo_offsets_and_reduction(&bo_stats, self.bit_depth);
+        if bo_reduction > best.4 {
+            best = (1, 0, bo_offsets, band_pos, bo_reduction);
+        }
+
+        for eo_class in 0..4u8 {
+            let stats = self.sao_eo_stats(c_idx, eo_class, x_start, y_start, x_end, y_end);
+            let (offsets, reduction) = sao::eo_offsets_and_reduction(&stats, self.bit_depth);
+            if reduction > best.4 {
+                best = (2, eo_class, offsets, 0, reduction);
+            }
+        }
+
+        best
+    }
+
     fn decide_sao_map(&self, ctb_size: u32) -> SaoMap {
-        let width_ctbs = self.display_width.div_ceil(ctb_size);
-        let height_ctbs = self.display_height.div_ceil(ctb_size);
-        SaoMap::new(width_ctbs, height_ctbs)
+        let ctbs_x = self.display_width.div_ceil(ctb_size);
+        let ctbs_y = self.display_height.div_ceil(ctb_size);
+        let mut map = SaoMap::new(ctbs_x, ctbs_y);
+        let (sub_x, sub_y) = self.frame.chroma_subsampling();
+
+        let (luma_w, luma_h) = self.frame.component_dims(0);
+        let (chroma_w, chroma_h) = if self.cat == 0 {
+            (0, 0)
+        } else {
+            self.frame.component_dims(1)
+        };
+
+        for ctb_y in 0..ctbs_y {
+            for ctb_x in 0..ctbs_x {
+                let x0 = ctb_x * ctb_size;
+                let y0 = ctb_y * ctb_size;
+                let info = map.get_mut(ctb_x, ctb_y);
+
+                let lx_end = (x0 + ctb_size).min(luma_w);
+                let ly_end = (y0 + ctb_size).min(luma_h);
+                let best = self.best_sao_component(0, x0, y0, lx_end, ly_end);
+                if best.4 > 0 {
+                    info.sao_type_idx[0] = best.0;
+                    info.sao_eo_class[0] = best.1;
+                    info.sao_offset_val[0] = best.2;
+                    info.sao_band_position[0] = best.3;
+                }
+
+                if self.cat != 0 {
+                    let cx0 = x0 / sub_x;
+                    let cy0 = y0 / sub_y;
+                    let cx_end = (cx0 + ctb_size / sub_x).min(chroma_w);
+                    let cy_end = (cy0 + ctb_size / sub_y).min(chroma_h);
+                    let mut best_chroma = (0u8, 0u8, 0u8, 0u8, [0i8; 4], [0i8; 4], 0i64);
+
+                    let cb_bo_stats = self.sao_bo_stats(1, cx0, cy0, cx_end, cy_end);
+                    let cr_bo_stats = self.sao_bo_stats(2, cx0, cy0, cx_end, cy_end);
+                    let (cb_band, cb_offsets, cb_reduction) =
+                        sao::bo_offsets_and_reduction(&cb_bo_stats, self.bit_depth);
+                    let (cr_band, cr_offsets, cr_reduction) =
+                        sao::bo_offsets_and_reduction(&cr_bo_stats, self.bit_depth);
+                    let total = cb_reduction + cr_reduction;
+                    if total > best_chroma.6 {
+                        best_chroma = (1, 0, cb_band, cr_band, cb_offsets, cr_offsets, total);
+                    }
+
+                    for eo_class in 0..4u8 {
+                        let cb_stats = self.sao_eo_stats(1, eo_class, cx0, cy0, cx_end, cy_end);
+                        let cr_stats = self.sao_eo_stats(2, eo_class, cx0, cy0, cx_end, cy_end);
+                        let (cb_offsets, cb_reduction) =
+                            sao::eo_offsets_and_reduction(&cb_stats, self.bit_depth);
+                        let (cr_offsets, cr_reduction) =
+                            sao::eo_offsets_and_reduction(&cr_stats, self.bit_depth);
+                        let total = cb_reduction + cr_reduction;
+                        if total > best_chroma.6 {
+                            best_chroma = (2, eo_class, 0, 0, cb_offsets, cr_offsets, total);
+                        }
+                    }
+                    if best_chroma.6 > 0 {
+                        info.sao_type_idx[1] = best_chroma.0;
+                        info.sao_type_idx[2] = best_chroma.0;
+                        info.sao_eo_class[1] = best_chroma.1;
+                        info.sao_eo_class[2] = best_chroma.1;
+                        info.sao_band_position[1] = best_chroma.2;
+                        info.sao_band_position[2] = best_chroma.3;
+                        info.sao_offset_val[1] = best_chroma.4;
+                        info.sao_offset_val[2] = best_chroma.5;
+                    }
+                }
+            }
+        }
+        map
     }
 
     pub(in crate::encoder) fn same_tile_px(&self, ax: u32, ay: u32, bx: u32, by: u32) -> bool {
