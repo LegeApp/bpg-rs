@@ -1,9 +1,17 @@
-//! Rust-only high-resolution encode timing harness with multi-effort comparison
-//! and quality metrics.
+//! High-resolution encode timing harness comparing the still265 StillSearch
+//! core against C `bpgenc`, with quality metrics and the StillSearch work
+//! ledger.
 //!
-//! Generates deterministic high-res PNGs from `test-set`, then compares
-//! process-level `bpgenc` time with in-process still265 encode timing across
-//! multiple effort presets.
+//! Generates deterministic high-res PNGs from `test-set` (or encodes sources
+//! natively with `--native`), then compares process-level `bpgenc` time with
+//! in-process still265 encode timing.
+//!
+//! ⚠️ EFFORT IS CURRENTLY INERT. The StillSearch v2 core does not yet consult
+//! `cfg.effort` — every tier runs the same single search, so passing multiple
+//! `--efforts` just produces identical rows. The default is therefore a single
+//! tier. The legacy preset ladder (best/slow/fastadaptive) and its README
+//! timings belong to the removed rdo2 core; compare those by hand until
+//! StillSearch reintroduces effort policies (plan Phase 15).
 //!
 //! ⚠️ QP-AXIS OFFSET — READ BEFORE INTERPRETING QP-MATCHED NUMBERS. still265's
 //! effective quantiser is roughly **2 QP steps COARSER** than x265/bpgenc at the
@@ -19,7 +27,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use bpg_encode::{encode_still_image, EncoderTuning};
@@ -69,8 +77,10 @@ struct Args {
     #[arg(short = 'm', long = "compress-level", default_value_t = 8)]
     compress_level: u8,
 
-    /// Rust RD-search effort(s). Comma-separated list, e.g. floor,best,fastest
-    #[arg(long, default_value = "best,fastest,floor,floorplus,floorshallow")]
+    /// Rust RD-search effort(s). Comma-separated. NOTE: the StillSearch core
+    /// currently ignores effort (single behavior), so multiple values just
+    /// repeat the same encode; the default is one tier.
+    #[arg(long, default_value = "balanced")]
     efforts: String,
 
     /// Chroma format.
@@ -330,6 +340,7 @@ struct Row {
     bytes_restored: u64,
     partnxn_attempts: u64,
     partnxn_wins: u64,
+    stillsearch_ledger: [u64; 15],
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -378,7 +389,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&csv_path)?;
     writeln!(
         csv,
-        "effort,source,width,height,pixels,run,c_total_s,c_bpg_bytes,rust_total_s,rust_prepare_s,rust_encode_s,rust_bpg_bytes,rust_annexb_bytes,psnr_y,psnr_cb,psnr_cr,psnr_rgb,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,code_block_calls,forward_transforms,trial_coded_blocks,final_coded_blocks,trial_rdoq_blocks,final_rdoq_blocks,phase_build_us,phase_write_us,bytes_restored,partnxn_attempts,partnxn_wins,c_rgb_psnr,rust_rgb_psnr,c_y_psnr"
+        "effort,source,width,height,pixels,run,c_total_s,c_bpg_bytes,rust_total_s,rust_prepare_s,rust_encode_s,rust_bpg_bytes,rust_annexb_bytes,psnr_y,psnr_cb,psnr_cr,psnr_rgb,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,code_block_calls,forward_transforms,trial_coded_blocks,final_coded_blocks,trial_rdoq_blocks,final_rdoq_blocks,phase_build_us,phase_write_us,bytes_restored,partnxn_attempts,partnxn_wins,c_rgb_psnr,rust_rgb_psnr,c_y_psnr,ss_rough_luma,ss_luma_cheap,ss_luma_exact,ss_tu_leaf,ss_tu_split,ss_nxn_rough,ss_nxn_batch,ss_chroma_rough,ss_chroma_trial,ss_rdoq,ss_residual_price,ss_final_commit,ss_writer,ss_deblock,ss_sao"
     )?;
 
     let mut rows: Vec<Row> = Vec::new();
@@ -472,6 +483,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bytes_restored: rust_result.bytes_restored,
                         partnxn_attempts: rust_result.partnxn_attempts,
                         partnxn_wins: rust_result.partnxn_wins,
+                        stillsearch_ledger: rust_result.stillsearch_ledger,
                     };
                     write_csv_row(&mut csv, &row)?;
                     let q_str = row
@@ -797,6 +809,7 @@ fn c_decoded_y_psnr(bpg: &[u8], src: &RgbImage, args: &Args) -> Option<f64> {
 
 #[cfg(windows)]
 fn run_command_single_cpu(mut cmd: Command) -> Result<Output, Box<dyn std::error::Error>> {
+    use std::process::Stdio;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let handle = child.as_raw_handle();
@@ -837,6 +850,11 @@ struct RustResult {
     bytes_restored: u64,
     partnxn_attempts: u64,
     partnxn_wins: u64,
+    /// StillSearch per-CTU work-ledger bucket call counts (summed over the
+    /// frame). Indexed by `WorkBucket` order: RoughLuma, LumaCheap, LumaExact,
+    /// TuLeaf, TuSplit, NxnRough, NxnBatch, ChromaRough, ChromaTrial, Rdoq,
+    /// ResidualPrice, FinalCommit, Writer, Deblock, Sao.
+    stillsearch_ledger: [u64; 15],
     /// True end-to-end RGB PSNR (decode `.bpg` → RGB vs source), comparable to the
     /// C number from [`decoded_rgb_psnr`].
     rgb_psnr: Option<f64>,
@@ -981,6 +999,7 @@ fn run_rust_encode_inner(
         bytes_restored: last.stats.bytes_restored,
         partnxn_attempts: last.stats.partnxn_attempts,
         partnxn_wins: last.stats.partnxn_wins,
+        stillsearch_ledger: last.stats.stillsearch_ledger,
         rgb_psnr,
     })
 }
@@ -1060,7 +1079,7 @@ fn write_csv_row(out: &mut File, row: &Row) -> Result<(), Box<dyn std::error::Er
     let qcb = q.map_or(String::new(), |q| format!("{:.4}", q.psnr_cb));
     let qcr = q.map_or(String::new(), |q| format!("{:.4}", q.psnr_cr));
     let qrgb = q.map_or(String::new(), |q| format!("{:.4}", q.psnr_rgb));
-    writeln!(
+    write!(
         out,
         "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         csv_field(&row.effort),
@@ -1100,6 +1119,13 @@ fn write_csv_row(out: &mut File, row: &Row) -> Result<(), Box<dyn std::error::Er
         row.rust_rgb_psnr.map_or(String::new(), |p| format!("{p:.4}")),
         row.c_y_psnr.map_or(String::new(), |p| format!("{p:.4}")),
     )?;
+    let ledger = row
+        .stillsearch_ledger
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    writeln!(out, ",{ledger}")?;
     Ok(())
 }
 
@@ -1244,33 +1270,61 @@ fn write_combined_summary(
 
     writeln!(out, "---")?;
     writeln!(out)?;
-    writeln!(out, "## Key work-volume metrics")?;
+    writeln!(out, "## StillSearch work ledger (per-bucket call counts)")?;
     writeln!(out)?;
     writeln!(
         out,
-        "| effort | cu_trials | code_blocks | fwd_xform | trial_rdoq | final_rdoq | cu_force_leaf | cu_bound_abort | partnxn_att | partnxn_win |"
+        "Summed over the frame, for the first size group. These are the live \
+         StillSearch instrumentation buckets (`WorkBucket`); the old rdo2 \
+         work-volume columns are retired with that core. `cu_trials` and \
+         `partnxn_*` are the surviving CU-level counters.",
     )?;
-    writeln!(out, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")?;
+    writeln!(out)?;
+
+    const BUCKETS: [&str; 15] = [
+        "RoughLuma",
+        "LumaCheap",
+        "LumaExact",
+        "TuLeaf",
+        "TuSplit",
+        "NxnRough",
+        "NxnBatch",
+        "ChromaRough",
+        "ChromaTrial",
+        "Rdoq",
+        "ResidualPrice",
+        "FinalCommit",
+        "Writer",
+        "Deblock",
+        "Sao",
+    ];
 
     let first_size_key = by_size.keys().next();
     if let Some(size_key) = first_size_key {
         let group = &by_size[size_key];
+        writeln!(
+            out,
+            "| effort | cu_trials | partnxn_att | partnxn_win | {} |",
+            BUCKETS.join(" | "),
+        )?;
+        writeln!(
+            out,
+            "|---|---:|---:|---:|{}|",
+            "---:|".repeat(BUCKETS.len()),
+        )?;
         for effort in efforts {
             let name = effort.as_str();
             if let Some(row) = group.iter().find(|r| r.effort == name) {
+                let ledger = row
+                    .stillsearch_ledger
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
                 writeln!(
                     out,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |",
-                    name,
-                    row.cu_trials,
-                    row.code_block_calls,
-                    row.forward_transforms,
-                    row.trial_rdoq_blocks,
-                    row.final_rdoq_blocks,
-                    row.cu_force_leaf,
-                    row.cu_split_bound_aborts,
-                    row.partnxn_attempts,
-                    row.partnxn_wins,
+                    "| {} | {} | {} | {} | {} |",
+                    name, row.cu_trials, row.partnxn_attempts, row.partnxn_wins, ledger,
                 )?;
             }
         }
