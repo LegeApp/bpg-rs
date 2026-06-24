@@ -21,7 +21,7 @@ use bpg_hevc_decode::hevc::slice::IntraPredMode;
 use crate::cabac::{CabacEstimator, ContextModel};
 use crate::contexts::{Contexts, ctx};
 use crate::plan::DecisionConfidence;
-use crate::primitives::ssd_u16;
+use crate::primitives::{satd_u16, ssd_u16};
 use crate::residual::{apply_sign_data_hiding, estimate_residual_bits_into, get_scan_order};
 use crate::transform;
 
@@ -45,6 +45,11 @@ pub(in crate::encoder) static SPLIT_WINS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]
 pub(in crate::encoder) static LEAF_WINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// Count of CU luma-mode decisions that selected a non-DC mode (test guard for
+/// the rough+RD mode search actually doing work).
+#[cfg(test)]
+pub(in crate::encoder) static LUMA_NONDC_PICKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 pub(in crate::encoder) struct StillSearch {
@@ -323,6 +328,23 @@ fn entropy_bits(model: &ContextModel, bin: u8) -> u64 {
     model.entropy_bits(bin) as u64
 }
 
+/// Max rough-search candidates (within the x265 25% threshold) carried into the
+/// exact RD luma-mode pass, before MPMs are unioned in. Tunable per effort tier.
+const ROUGH_RD_CANDS: usize = 4;
+
+/// Estimated `prev_intra_luma_pred_flag` + `mpm_idx`/`rem_intra_luma_pred_mode`
+/// bits (1/32768-bit units) for signaling `mode` given the MPM list, mirroring
+/// `write_intra_luma_mode`.
+fn luma_mode_bits(ctxs: &Contexts, mpm_u8: [u8; 3], mode: u8) -> u64 {
+    let prev = &ctxs.models[ctx::PREV_INTRA_LUMA_PRED_FLAG];
+    let bypass = CabacEstimator::SCALE;
+    match mpm_u8.iter().position(|&m| m == mode) {
+        Some(0) => entropy_bits(prev, 1) + bypass,
+        Some(_) => entropy_bits(prev, 1) + 2 * bypass,
+        None => entropy_bits(prev, 0) + 5 * bypass,
+    }
+}
+
 impl<S, O> StillSearchDepth<S, O>
 where
     S: CtuSourceCache,
@@ -380,16 +402,19 @@ where
             state.neighbor_left_mode(x0, y0),
             state.neighbor_above_mode(x0, y0),
         );
-        let luma_mode = IntraPredMode::Dc.as_u8();
-        state.store_mode(x0, y0, log2_cb_size, luma_mode);
 
         if state.aq.active {
             state.aq_set_cu_qp(x0, y0);
         }
         let lambda = rd_lambda(state.cur_qp_y);
 
-        // Decide the transform tree without mutating the shared frame; the
-        // winner's recon lives in the overlay.
+        // Phase 5: choose the luma mode by rough SATD shortlist + exact RD.
+        self.overlay.clear();
+        let luma_mode = self.decide_cu_luma_mode(state, x0, y0, log2_cb_size, mpm, lambda);
+        state.store_mode(x0, y0, log2_cb_size, luma_mode);
+
+        // Re-run the winning mode to populate the overlay with its recon; this is
+        // the single final transform-tree decision committed to the frame.
         self.overlay.clear();
         let (tt, _cost) = self.decide_tt(state, x0, y0, log2_cb_size, 0, luma_mode, lambda);
 
@@ -400,6 +425,122 @@ where
 
         state.stats.final_coded_blocks += 1;
         CuNode::Leaf(emit::cu_leaf(mpm, luma_mode, tt)).tap_confidence(DecisionConfidence::Clear)
+    }
+
+    /// Choose the CU's luma intra mode: an x265-shaped rough SATD pass over all
+    /// 35 modes builds an MPM-protected shortlist (within 25% of the best rough
+    /// cost), which is then evaluated by exact transform-tree RD. The overlay is
+    /// left empty (each trial's patches are rewound).
+    fn decide_cu_luma_mode(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_cb_size: u8,
+        mpm: [IntraPredMode; 3],
+        lambda: f64,
+    ) -> u8 {
+        let mpm_u8 = [mpm[0].as_u8(), mpm[1].as_u8(), mpm[2].as_u8()];
+        let scale = CabacEstimator::SCALE as f64;
+
+        // Rough pass: SATD of each mode's prediction over a representative block
+        // (CU size, capped at the max TU) from the committed neighbours.
+        let rough_log2 = log2_cb_size.min(MAX_TB_LOG2);
+        let size = 1usize << rough_log2;
+        let n = size * size;
+        let mut src = vec![0u16; n];
+        for y in 0..size {
+            for x in 0..size {
+                src[y * size + x] = self.source.sample(0, x0 + x as u32, y0 + y as u32);
+            }
+        }
+        let lambda_sad = lambda.sqrt();
+        let mut pred = vec![0u16; n];
+        let mut rough: Vec<(f64, u8)> = Vec::with_capacity(35);
+        for m in 0u8..=34 {
+            let mode = IntraPredMode::from_u8(m).expect("0..=34 are valid intra modes");
+            self.predict_into(state, x0, y0, rough_log2, 0, mode, &mut pred);
+            let satd = satd_u16(&src, size, &pred, size, size);
+            let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
+            rough.push((satd as f64 + lambda_sad * mbits as f64 / scale, m));
+        }
+        self.workspace.ledger.bump(WorkBucket::RoughLuma);
+
+        rough.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let best_rough = rough[0].0;
+
+        // Shortlist: the cheapest rough candidates within 25% of the best, then
+        // union the MPMs so a context-cheap mode is never dropped.
+        let mut shortlist: Vec<u8> = Vec::with_capacity(ROUGH_RD_CANDS + 3);
+        for &(cost, m) in rough.iter() {
+            if shortlist.len() >= ROUGH_RD_CANDS || cost > best_rough * 1.25 {
+                break;
+            }
+            shortlist.push(m);
+        }
+        for &mm in mpm_u8.iter() {
+            if !shortlist.contains(&mm) {
+                shortlist.push(mm);
+            }
+        }
+
+        // Exact pass: full transform-tree RD per shortlist mode (+ mode bits).
+        let mut best_mode = shortlist[0];
+        let mut best_total = f64::INFINITY;
+        for &mode in &shortlist {
+            let mark = self.overlay.mark();
+            let (_tt, tt_cost) = self.decide_tt(state, x0, y0, log2_cb_size, 0, mode, lambda);
+            let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+            let total = tt_cost + lambda * mbits as f64 / scale;
+            self.overlay.truncate(mark);
+            self.workspace.ledger.bump(WorkBucket::LumaExact);
+            if total < best_total {
+                best_total = total;
+                best_mode = mode;
+            }
+        }
+        #[cfg(test)]
+        if best_mode != IntraPredMode::Dc.as_u8() {
+            LUMA_NONDC_PICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        best_mode
+    }
+
+    /// Predict a block into caller-owned `dst` (`size*size`, stride `size`),
+    /// reading the committed frame immutably with overlay-first reference
+    /// samples and tile-boundary clamping. Never mutates the shared frame.
+    fn predict_into(
+        &self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+        mode: IntraPredMode,
+        dst: &mut [u16],
+    ) {
+        let size = 1usize << log2_size;
+        let tile_bounds = state.tile_clamp_bounds(x0, y0, c_idx);
+        let overlay = &self.overlay;
+        intra::predict_intra_into_with_reader(
+            &state.frame,
+            x0,
+            y0,
+            log2_size,
+            mode,
+            c_idx,
+            true,
+            dst,
+            size,
+            |c, rx, ry| {
+                if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
+                    if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
+                        return Some(UNINIT_SAMPLE);
+                    }
+                }
+                overlay.sample(c, rx, ry)
+            },
+        );
     }
 
     /// Decide one transform-tree node: full leaf vs four split children, by RD
@@ -432,26 +573,34 @@ where
             return self.eval_tt_leaf(state, x0, y0, log2_size, trafo_depth, luma_mode, false, lambda);
         }
 
-        // Both candidates are legal: evaluate leaf, then split, keeping only the
-        // winner's overlay patches.
+        // Both candidates are legal. Evaluate SPLIT first, then LEAF, keeping
+        // only the winner's overlay patches.
+        //
+        // Order matters for reference-sample correctness: the leaf's recon patch
+        // covers the whole region, so if it were pushed first, a split child's
+        // extended references (planar bottom-left/top-right, angular) into a
+        // not-yet-coded sibling sub-region would read the leaf's phantom recon
+        // instead of being unavailable — diverging from the decoder. A leaf
+        // never reads inside its own region, so evaluating it after the split
+        // (whose patches sit underneath) is safe.
         let mark0 = self.overlay.mark();
-        let (leaf_tt, leaf_cost) =
-            self.eval_tt_leaf(state, x0, y0, log2_size, trafo_depth, luma_mode, true, lambda);
-        let leaf_end = self.overlay.mark();
         let (split_tt, split_cost) =
             self.eval_tt_split(state, x0, y0, log2_size, trafo_depth, luma_mode, true, lambda);
+        let split_end = self.overlay.mark();
+        let (leaf_tt, leaf_cost) =
+            self.eval_tt_leaf(state, x0, y0, log2_size, trafo_depth, luma_mode, true, lambda);
 
         if split_cost < leaf_cost {
             #[cfg(test)]
             SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Drop the leaf's now-shadowed patches; split patches remain visible.
-            self.overlay.drain_range(mark0, leaf_end);
+            // Drop the leaf patch; the split children's patches remain visible.
+            self.overlay.truncate(split_end);
             (split_tt, split_cost)
         } else {
             #[cfg(test)]
             LEAF_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            // Drop the split children's patches; leaf patch remains.
-            self.overlay.truncate(leaf_end);
+            // Drop the split children's patches; the leaf patch remains.
+            self.overlay.drain_range(mark0, split_end);
             (leaf_tt, leaf_cost)
         }
     }
@@ -618,29 +767,7 @@ where
         // 2. Predict into local scratch, reading the committed frame immutably
         //    with overlay-first reference samples (no frame mutation).
         let mut pred = vec![0u16; n];
-        {
-            let tile_bounds = state.tile_clamp_bounds(x0, y0, c_idx);
-            let overlay = &self.overlay;
-            intra::predict_intra_into_with_reader(
-                &state.frame,
-                x0,
-                y0,
-                log2_size,
-                mode,
-                c_idx,
-                true,
-                &mut pred,
-                size,
-                |c, rx, ry| {
-                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
-                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
-                            return Some(UNINIT_SAMPLE);
-                        }
-                    }
-                    overlay.sample(c, rx, ry)
-                },
-            );
-        }
+        self.predict_into(state, x0, y0, log2_size, c_idx, mode, &mut pred);
 
         // 3. Residual -> forward transform -> quant (+ optional sign hiding) and
         //    reconstruct the coded candidate, all in CTU-local scratch.
@@ -837,6 +964,48 @@ mod tests {
             i = end;
         }
         out
+    }
+
+    #[test]
+    fn luma_mode_search_selects_directional_mode() {
+        use crate::encoder::{Source, encode};
+        use crate::{ChromaFormat, DeblockMode, Effort, SaoMode, StillHevcConfig};
+        use std::sync::atomic::Ordering;
+
+        // Vertical stripes: DC is a poor predictor; the rough+RD search (with
+        // MPM-protected shortlist) must pick a non-DC mode for these CUs.
+        let (w, h) = (128usize, 128usize);
+        let mut y = vec![0u16; w * h];
+        for px in y.iter_mut().enumerate() {
+            let i = px.0 % w;
+            *px.1 = if (i / 4) & 1 == 0 { 60 } else { 200 };
+        }
+        let chroma = vec![128u16; (w / 2) * (h / 2)];
+        let config = StillHevcConfig {
+            width: w as u32,
+            height: h as u32,
+            bit_depth: 8,
+            chroma: ChromaFormat::Yuv420,
+            qp: 27,
+            effort: Effort::Balanced,
+            sao: SaoMode::Off,
+            deblock: DeblockMode::Off,
+            adaptive_qp: false,
+        };
+        super::LUMA_NONDC_PICKS.store(0, Ordering::Relaxed);
+        let _ = encode(
+            &config,
+            Source {
+                y: &y,
+                cb: &chroma,
+                cr: &chroma,
+            },
+        );
+        let nondc = super::LUMA_NONDC_PICKS.load(Ordering::Relaxed);
+        assert!(
+            nondc > 0,
+            "luma mode search never picked a non-DC mode on vertical-stripe content"
+        );
     }
 
     #[test]
