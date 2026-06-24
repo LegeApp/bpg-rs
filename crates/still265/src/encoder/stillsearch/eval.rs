@@ -110,10 +110,23 @@ where
             }
 
             transform::forward_transform_into(residual, log2_size, is_dst4, bit_depth, coeff, tmp);
-            nnz = transform::quantize_into(coeff, log2_size, qp, bit_depth, levels);
-            // Quant-stage volume. The new core uses hard quantization here; the
-            // `Rdoq` bucket counts these calls and becomes true rate-distortion
-            // optimized quantization once RDOQ is wired (plan Phase 10).
+            // Rate-distortion optimized quantization against the frozen CTU-entry
+            // context (HM/x265 single-scan RDOQ), replacing hard quantization.
+            let rdoq = crate::rdoq::rdoq_single_scan_into(
+                &self.workspace.price_base,
+                coeff,
+                log2_size,
+                c_idx,
+                qp,
+                bit_depth,
+                scan,
+                lambda,
+                true,
+                &mut self.workspace.rdoq_scratch,
+            );
+            nnz = rdoq.nnz;
+            levels.clear();
+            levels.extend_from_slice(rdoq.levels);
             self.workspace.ledger.bump(WorkBucket::Rdoq);
             if sdh_enabled && nnz > 0 {
                 let (scale, qbits) = transform::quant_params(log2_size, qp, bit_depth);
@@ -256,9 +269,22 @@ where
             }
 
             transform::forward_transform_into(residual, log2_size, is_dst4, 8, coeff, tmp);
-            nnz = transform::quantize_into(coeff, log2_size, qp, 8, levels);
-            // Quant-stage volume (hard quant; see eval_component for the
-            // `Rdoq`-bucket / RDOQ note).
+            // Rate-distortion optimized quantization (see eval_component).
+            let rdoq = crate::rdoq::rdoq_single_scan_into(
+                &self.workspace.price_base,
+                coeff,
+                log2_size,
+                c_idx,
+                qp,
+                8,
+                scan,
+                lambda,
+                true,
+                &mut self.workspace.rdoq_scratch,
+            );
+            nnz = rdoq.nnz;
+            levels.clear();
+            levels.extend_from_slice(rdoq.levels);
             self.workspace.ledger.bump(WorkBucket::Rdoq);
             if sdh_enabled && nnz > 0 {
                 let (scale, qbits) = transform::quant_params(log2_size, qp, 8);
