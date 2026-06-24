@@ -6,12 +6,15 @@
 //! natively with `--native`), then compares process-level `bpgenc` time with
 //! in-process still265 encode timing.
 //!
-//! ⚠️ EFFORT IS CURRENTLY INERT. The StillSearch v2 core does not yet consult
-//! `cfg.effort` — every tier runs the same single search, so passing multiple
-//! `--efforts` just produces identical rows. The default is therefore a single
-//! tier. The legacy preset ladder (best/slow/fastadaptive) and its README
-//! timings belong to the removed rdo2 core; compare those by hand until
-//! StillSearch reintroduces effort policies (plan Phase 15).
+//! ⚠️ EFFORT IS MOSTLY INERT. The StillSearch v2 core runs one search shape
+//! regardless of tier; the only surviving effort dependence is the PartNxN
+//! gate (`part_nxn_enabled`, on for best/slowplus/placebo/reference) plus a
+//! couple of AQ/analysis-cache bits. So `best` exercises the full core
+//! including 8x8 NxN, while `balanced` skips NxN — but neither changes rough/
+//! TU/CU search depth. The default is `best` (full core). The legacy preset
+//! ladder and its README timings belong to the removed rdo2 core; compare
+//! those by hand until StillSearch reintroduces real effort policies
+//! (plan Phase 15).
 //!
 //! ⚠️ QP-AXIS OFFSET — READ BEFORE INTERPRETING QP-MATCHED NUMBERS. still265's
 //! effective quantiser is roughly **2 QP steps COARSER** than x265/bpgenc at the
@@ -78,9 +81,10 @@ struct Args {
     compress_level: u8,
 
     /// Rust RD-search effort(s). Comma-separated. NOTE: the StillSearch core
-    /// currently ignores effort (single behavior), so multiple values just
-    /// repeat the same encode; the default is one tier.
-    #[arg(long, default_value = "balanced")]
+    /// only varies PartNxN by effort (best/slowplus/placebo/reference enable
+    /// 8x8 NxN; others skip it); search depth is otherwise identical. Default
+    /// `best` exercises the full core.
+    #[arg(long, default_value = "best")]
     efforts: String,
 
     /// Chroma format.
