@@ -92,6 +92,8 @@ where
         self.overlay.commit_to_frame(&mut state.frame);
         self.overlay.clear();
         self.workspace.ledger.bump(WorkBucket::FinalCommit);
+        // One plan->syntax materialization per CTU (emit::cu_node below).
+        self.workspace.ledger.bump(WorkBucket::Writer);
         self.workspace
             .ledger
             .merge_into(&mut state.stats.stillsearch_ledger);

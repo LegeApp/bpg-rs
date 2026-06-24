@@ -111,6 +111,10 @@ where
 
             transform::forward_transform_into(residual, log2_size, is_dst4, bit_depth, coeff, tmp);
             nnz = transform::quantize_into(coeff, log2_size, qp, bit_depth, levels);
+            // Quant-stage volume. The new core uses hard quantization here; the
+            // `Rdoq` bucket counts these calls and becomes true rate-distortion
+            // optimized quantization once RDOQ is wired (plan Phase 10).
+            self.workspace.ledger.bump(WorkBucket::Rdoq);
             if sdh_enabled && nnz > 0 {
                 let (scale, qbits) = transform::quant_params(log2_size, qp, bit_depth);
                 nnz = apply_sign_data_hiding(levels, coeff, log2_size, scan, scale, qbits, nnz);
@@ -253,6 +257,9 @@ where
 
             transform::forward_transform_into(residual, log2_size, is_dst4, 8, coeff, tmp);
             nnz = transform::quantize_into(coeff, log2_size, qp, 8, levels);
+            // Quant-stage volume (hard quant; see eval_component for the
+            // `Rdoq`-bucket / RDOQ note).
+            self.workspace.ledger.bump(WorkBucket::Rdoq);
             if sdh_enabled && nnz > 0 {
                 let (scale, qbits) = transform::quant_params(log2_size, qp, 8);
                 nnz = apply_sign_data_hiding(levels, coeff, log2_size, scan, scale, qbits, nnz);
