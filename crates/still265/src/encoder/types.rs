@@ -193,6 +193,10 @@ pub struct EncodeStats {
     /// remain compatibility-only and new search work should not write rdo2-era
     /// fields.
     pub stillsearch_ledger: [u64; 15],
+    /// Optional StillSearch per-bucket wall-clock nanoseconds. Populated only
+    /// when `BPG_STILLSEARCH_PROFILE=1`; otherwise all buckets remain zero.
+    /// Bucket order matches [`Self::stillsearch_ledger`].
+    pub stillsearch_ledger_ns: [u64; 15],
 }
 
 impl EncodeStats {
@@ -210,6 +214,13 @@ impl EncodeStats {
             .zip(other.stillsearch_ledger.iter())
         {
             *dst += *src;
+        }
+        for (dst, src) in self
+            .stillsearch_ledger_ns
+            .iter_mut()
+            .zip(other.stillsearch_ledger_ns.iter())
+        {
+            *dst = dst.saturating_add(*src);
         }
     }
 }

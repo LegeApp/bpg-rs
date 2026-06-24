@@ -344,7 +344,14 @@ struct Row {
     bytes_restored: u64,
     partnxn_attempts: u64,
     partnxn_wins: u64,
+    angular_exclusions: u64,
+    angular_game_blocks: u64,
+    angular_iame_blocks: u64,
+    angular_modes_before: u64,
+    angular_modes_after: u64,
+    angular_modes_removed: u64,
     stillsearch_ledger: [u64; 15],
+    stillsearch_ledger_ns: [u64; 15],
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -393,7 +400,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&csv_path)?;
     writeln!(
         csv,
-        "effort,source,width,height,pixels,run,c_total_s,c_bpg_bytes,rust_total_s,rust_prepare_s,rust_encode_s,rust_bpg_bytes,rust_annexb_bytes,psnr_y,psnr_cb,psnr_cr,psnr_rgb,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,code_block_calls,forward_transforms,trial_coded_blocks,final_coded_blocks,trial_rdoq_blocks,final_rdoq_blocks,phase_build_us,phase_write_us,bytes_restored,partnxn_attempts,partnxn_wins,c_rgb_psnr,rust_rgb_psnr,c_y_psnr,ss_rough_luma,ss_luma_cheap,ss_luma_exact,ss_tu_leaf,ss_tu_split,ss_nxn_rough,ss_nxn_batch,ss_chroma_rough,ss_chroma_trial,ss_rdoq,ss_residual_price,ss_final_commit,ss_writer,ss_deblock,ss_sao"
+        "effort,source,width,height,pixels,run,c_total_s,c_bpg_bytes,rust_total_s,rust_prepare_s,rust_encode_s,rust_bpg_bytes,rust_annexb_bytes,psnr_y,psnr_cb,psnr_cr,psnr_rgb,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,code_block_calls,forward_transforms,trial_coded_blocks,final_coded_blocks,trial_rdoq_blocks,final_rdoq_blocks,phase_build_us,phase_write_us,bytes_restored,partnxn_attempts,partnxn_wins,angular_exclusions,angular_game_blocks,angular_iame_blocks,angular_modes_before,angular_modes_after,angular_modes_removed,c_rgb_psnr,rust_rgb_psnr,c_y_psnr,ss_rough_luma,ss_luma_cheap,ss_luma_exact,ss_tu_leaf,ss_tu_split,ss_nxn_rough,ss_nxn_batch,ss_chroma_rough,ss_chroma_trial,ss_rdoq,ss_residual_price,ss_final_commit,ss_writer,ss_deblock,ss_sao,ssns_rough_luma,ssns_luma_cheap,ssns_luma_exact,ssns_tu_leaf,ssns_tu_split,ssns_nxn_rough,ssns_nxn_batch,ssns_chroma_rough,ssns_chroma_trial,ssns_rdoq,ssns_residual_price,ssns_final_commit,ssns_writer,ssns_deblock,ssns_sao"
     )?;
 
     let mut rows: Vec<Row> = Vec::new();
@@ -487,7 +494,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bytes_restored: rust_result.bytes_restored,
                         partnxn_attempts: rust_result.partnxn_attempts,
                         partnxn_wins: rust_result.partnxn_wins,
+                        angular_exclusions: rust_result.angular_exclusions,
+                        angular_game_blocks: rust_result.angular_game_blocks,
+                        angular_iame_blocks: rust_result.angular_iame_blocks,
+                        angular_modes_before: rust_result.angular_modes_before,
+                        angular_modes_after: rust_result.angular_modes_after,
+                        angular_modes_removed: rust_result.angular_modes_removed,
                         stillsearch_ledger: rust_result.stillsearch_ledger,
+                        stillsearch_ledger_ns: rust_result.stillsearch_ledger_ns,
                     };
                     write_csv_row(&mut csv, &row)?;
                     let q_str = row
@@ -854,11 +868,20 @@ struct RustResult {
     bytes_restored: u64,
     partnxn_attempts: u64,
     partnxn_wins: u64,
+    angular_exclusions: u64,
+    angular_game_blocks: u64,
+    angular_iame_blocks: u64,
+    angular_modes_before: u64,
+    angular_modes_after: u64,
+    angular_modes_removed: u64,
     /// StillSearch per-CTU work-ledger bucket call counts (summed over the
     /// frame). Indexed by `WorkBucket` order: RoughLuma, LumaCheap, LumaExact,
     /// TuLeaf, TuSplit, NxnRough, NxnBatch, ChromaRough, ChromaTrial, Rdoq,
     /// ResidualPrice, FinalCommit, Writer, Deblock, Sao.
     stillsearch_ledger: [u64; 15],
+    /// Optional StillSearch per-bucket wall-clock nanoseconds; nonzero only when
+    /// BPG_STILLSEARCH_PROFILE=1 is set. Same bucket order as `stillsearch_ledger`.
+    stillsearch_ledger_ns: [u64; 15],
     /// True end-to-end RGB PSNR (decode `.bpg` → RGB vs source), comparable to the
     /// C number from [`decoded_rgb_psnr`].
     rgb_psnr: Option<f64>,
@@ -1003,7 +1026,14 @@ fn run_rust_encode_inner(
         bytes_restored: last.stats.bytes_restored,
         partnxn_attempts: last.stats.partnxn_attempts,
         partnxn_wins: last.stats.partnxn_wins,
+        angular_exclusions: last.stats.angular_exclusions,
+        angular_game_blocks: last.stats.rdo2_angular_game_blocks,
+        angular_iame_blocks: last.stats.rdo2_angular_iame_blocks,
+        angular_modes_before: last.stats.rdo2_angular_modes_before,
+        angular_modes_after: last.stats.rdo2_angular_modes_after,
+        angular_modes_removed: last.stats.rdo2_angular_modes_removed,
         stillsearch_ledger: last.stats.stillsearch_ledger,
+        stillsearch_ledger_ns: last.stats.stillsearch_ledger_ns,
         rgb_psnr,
     })
 }
@@ -1085,7 +1115,7 @@ fn write_csv_row(out: &mut File, row: &Row) -> Result<(), Box<dyn std::error::Er
     let qrgb = q.map_or(String::new(), |q| format!("{:.4}", q.psnr_rgb));
     write!(
         out,
-        "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         csv_field(&row.effort),
         csv_field(&row.source),
         row.width,
@@ -1119,6 +1149,12 @@ fn write_csv_row(out: &mut File, row: &Row) -> Result<(), Box<dyn std::error::Er
         row.bytes_restored,
         row.partnxn_attempts,
         row.partnxn_wins,
+        row.angular_exclusions,
+        row.angular_game_blocks,
+        row.angular_iame_blocks,
+        row.angular_modes_before,
+        row.angular_modes_after,
+        row.angular_modes_removed,
         row.c_rgb_psnr.map_or(String::new(), |p| format!("{p:.4}")),
         row.rust_rgb_psnr.map_or(String::new(), |p| format!("{p:.4}")),
         row.c_y_psnr.map_or(String::new(), |p| format!("{p:.4}")),
@@ -1129,7 +1165,13 @@ fn write_csv_row(out: &mut File, row: &Row) -> Result<(), Box<dyn std::error::Er
         .map(u64::to_string)
         .collect::<Vec<_>>()
         .join(",");
-    writeln!(out, ",{ledger}")?;
+    let ledger_ns = row
+        .stillsearch_ledger_ns
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    writeln!(out, ",{ledger},{ledger_ns}")?;
     Ok(())
 }
 

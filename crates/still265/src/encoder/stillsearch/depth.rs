@@ -5,7 +5,7 @@ use crate::encoder::Encoder;
 use crate::encoder::syntax::CuNode;
 
 use super::emit;
-use super::ledger::WorkBucket;
+use super::ledger::{StillSearchLedger, WorkBucket};
 use super::overlay::{OverlayCache, ReconOverlay8, ReconOverlay16};
 use super::source::{CtuSource8, CtuSource16, CtuSourceCache};
 use super::workspace::CtuWorkspace;
@@ -88,16 +88,37 @@ where
         self.source.reset_from_ctu(state, x0, y0, log2_cb_size);
         self.overlay.clear();
 
+        let lambda = super::price::rd_lambda(state.cur_qp_y);
         let (plan, _cost) = self.decide_cu(state, x0, y0, log2_cb_size, ct_depth);
+
+        // Winner-only RDOQ finalize: discard the hard-quant trial recon, then
+        // re-code the chosen plan in decoder order with RDOQ, rebuilding coeffs/
+        // recon/CBFs. Search decided the structure; this only refines coding.
+        self.overlay.clear();
+        let plan = self.finalize_cu(state, plan, x0, y0, log2_cb_size, lambda);
+
+        let final_commit_timer = StillSearchLedger::start_timer();
         self.overlay.commit_to_frame(&mut state.frame);
+        self.workspace
+            .ledger
+            .finish_timer(WorkBucket::FinalCommit, final_commit_timer);
         self.overlay.clear();
         self.workspace.ledger.bump(WorkBucket::FinalCommit);
         // One plan->syntax materialization per CTU (emit::cu_node below).
         self.workspace.ledger.bump(WorkBucket::Writer);
+        state.stats.final_rdoq_blocks += self.workspace.ledger.calls(WorkBucket::Rdoq);
+        let writer_timer = StillSearchLedger::start_timer();
+        let cu = emit::cu_node(plan, &self.workspace.coeffs);
+        self.workspace
+            .ledger
+            .finish_timer(WorkBucket::Writer, writer_timer);
         self.workspace
             .ledger
             .merge_into(&mut state.stats.stillsearch_ledger);
-        emit::cu_node(plan, &self.workspace.coeffs)
+        self.workspace
+            .ledger
+            .merge_wall_ns_into(&mut state.stats.stillsearch_ledger_ns);
+        cu
     }
 }
 

@@ -295,6 +295,57 @@ pub fn build_reference_borders(
     (unfiltered, filtered, center, bit_depth)
 }
 
+/// Overlay-aware variant of [`build_reference_borders`]: identical output, but
+/// reference samples are read through `sample_reader` first (returning `None`
+/// falls back to the committed frame, `Some(UNINIT_SAMPLE)` forces the
+/// unavailable-edge path). This lets the encoder build the batch-predict borders
+/// once from its CTU-local recon overlay, matching what repeated
+/// [`predict_intra_into_with_reader`] calls would have seen per mode.
+#[allow(clippy::type_complexity)]
+pub fn build_reference_borders_with_reader<F>(
+    frame: &DecodedFrame,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    c_idx: u8,
+    strong_intra_smoothing_enabled: bool,
+    mut sample_reader: F,
+) -> ([i32; INTRA_BORDER_LEN], [i32; INTRA_BORDER_LEN], usize, u8)
+where
+    F: FnMut(u8, u32, u32) -> Option<u16>,
+{
+    let size = 1u32 << log2_size;
+    let bit_depth = frame.bit_depth;
+    let chroma_format = frame.chroma_format;
+    let center = INTRA_BORDER_CENTER;
+
+    let mut unfiltered = [0i32; INTRA_BORDER_LEN];
+    fill_border_samples_with_reader(
+        frame,
+        x,
+        y,
+        size,
+        c_idx,
+        &mut unfiltered,
+        center,
+        &mut sample_reader,
+    );
+
+    let mut filtered = unfiltered;
+    if (c_idx == 0 || chroma_format == 3) && size > 4 {
+        apply_reference_filter(
+            &mut filtered,
+            center,
+            size as usize,
+            c_idx,
+            strong_intra_smoothing_enabled,
+            bit_depth as usize,
+        );
+    }
+
+    (unfiltered, filtered, center, bit_depth)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn predict_intra_from_border(
     plane: &mut [u16],

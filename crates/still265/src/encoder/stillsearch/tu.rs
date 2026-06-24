@@ -7,6 +7,7 @@ use crate::encoder::Encoder;
 
 use super::depth::StillSearchDepth;
 use super::emit;
+use super::eval::{QuantMode, ResidualPricingMode};
 use super::ledger::WorkBucket;
 use super::overlay::OverlayCache;
 use super::plan::TtPlan;
@@ -67,6 +68,9 @@ where
                 luma_mode,
                 false,
                 lambda,
+                QuantMode::HardQuantSearch,
+                ResidualPricingMode::Exact,
+                true,
             );
         }
 
@@ -91,6 +95,9 @@ where
             luma_mode,
             true,
             lambda,
+            QuantMode::HardQuantSearch,
+            ResidualPricingMode::Exact,
+            true,
         );
 
         if split_cost < leaf_cost {
@@ -119,6 +126,9 @@ where
         luma_mode: u8,
         code_split_flag: bool,
         lambda: f64,
+        quant_mode: QuantMode,
+        residual_pricing: ResidualPricingMode,
+        retain_coeff: bool,
     ) -> (TtPlan, f64) {
         self.workspace.ledger.bump(WorkBucket::TuLeaf);
 
@@ -135,6 +145,9 @@ where
             qp_y,
             trafo_depth,
             lambda,
+            quant_mode,
+            residual_pricing,
+            retain_coeff,
         );
         let mut cost = luma.cost;
 
@@ -153,13 +166,37 @@ where
                 let qp_c = state.cur_qp_c;
                 let step = 1u32 << clog2;
 
-                let cb_e =
-                    self.eval_component(state, cx, cy, clog2, 1, cmode, qp_c, trafo_depth, lambda);
+                let cb_e = self.eval_component(
+                    state,
+                    cx,
+                    cy,
+                    clog2,
+                    1,
+                    cmode,
+                    qp_c,
+                    trafo_depth,
+                    lambda,
+                    quant_mode,
+                    ResidualPricingMode::Exact,
+                    retain_coeff,
+                );
                 cost += cb_e.cost;
                 cb = cb_e.into_plan_block();
 
-                let cr_e =
-                    self.eval_component(state, cx, cy, clog2, 2, cmode, qp_c, trafo_depth, lambda);
+                let cr_e = self.eval_component(
+                    state,
+                    cx,
+                    cy,
+                    clog2,
+                    2,
+                    cmode,
+                    qp_c,
+                    trafo_depth,
+                    lambda,
+                    quant_mode,
+                    ResidualPricingMode::Exact,
+                    retain_coeff,
+                );
                 cost += cr_e.cost;
                 cr = cr_e.into_plan_block();
 
@@ -175,6 +212,9 @@ where
                         qp_c,
                         trafo_depth,
                         lambda,
+                        quant_mode,
+                        ResidualPricingMode::Exact,
+                        retain_coeff,
                     );
                     cost += cb1_e.cost;
                     cb1 = cb1_e.into_plan_block();
@@ -189,6 +229,9 @@ where
                         qp_c,
                         trafo_depth,
                         lambda,
+                        quant_mode,
+                        ResidualPricingMode::Exact,
+                        retain_coeff,
                     );
                     cost += cr1_e.cost;
                     cr1 = cr1_e.into_plan_block();
@@ -214,6 +257,138 @@ where
             cr1,
         );
         (tt, cost)
+    }
+
+    /// Evaluate a luma-mode candidate with x265's first-pass intra shape:
+    /// forced transform splits are honored, but optional TU splits are not
+    /// explored. The full recursive TU search is then run only for the selected
+    /// best mode. This is cheaper than `decide_tt` and provides the
+    /// StillSearch `LumaCheap` stage.
+    pub(super) fn decide_tt_luma_no_optional_split(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        luma_mode: u8,
+        lambda: f64,
+    ) -> f64 {
+        let must_split = log2_size > MAX_TB_LOG2;
+        if must_split {
+            return self.eval_tt_forced_split_no_optional(
+                state,
+                x0,
+                y0,
+                log2_size,
+                trafo_depth,
+                luma_mode,
+                lambda,
+            );
+        }
+
+        let split_flag_coded =
+            state.cat != 2 && log2_size > MIN_SPLIT_LOG2 && trafo_depth < MAX_INTRA_TT_DEPTH;
+        self.eval_tt_luma_leaf(
+            state,
+            x0,
+            y0,
+            log2_size,
+            trafo_depth,
+            luma_mode,
+            split_flag_coded,
+            lambda,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn eval_tt_luma_leaf(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        luma_mode: u8,
+        code_split_flag: bool,
+        lambda: f64,
+    ) -> f64 {
+        self.workspace.ledger.bump(WorkBucket::TuLeaf);
+
+        let luma_pred = IntraPredMode::from_u8(luma_mode).unwrap_or(IntraPredMode::Dc);
+        let luma = self.eval_component(
+            state,
+            x0,
+            y0,
+            log2_size,
+            0,
+            luma_pred,
+            state.cur_qp_y,
+            trafo_depth,
+            lambda,
+            QuantMode::HardQuantSearch,
+            if super::env::luma_cheap_residual_price_exact() {
+                ResidualPricingMode::Exact
+            } else {
+                ResidualPricingMode::Skip
+            },
+            false,
+        );
+        let mut cost = luma.cost;
+
+        if code_split_flag {
+            let bits = split_flag_bits(&self.workspace.price_base, log2_size, false);
+            cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
+        }
+        cost
+    }
+
+    fn eval_tt_forced_split_no_optional(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        luma_mode: u8,
+        lambda: f64,
+    ) -> f64 {
+        self.workspace.ledger.bump(WorkBucket::TuSplit);
+
+        let half = 1u32 << (log2_size - 1);
+        let kid_log2 = log2_size - 1;
+        let kid_depth = trafo_depth + 1;
+        let c0 = self.decide_tt_luma_no_optional_split(
+            state, x0, y0, kid_log2, kid_depth, luma_mode, lambda,
+        );
+        let c1 = self.decide_tt_luma_no_optional_split(
+            state,
+            x0 + half,
+            y0,
+            kid_log2,
+            kid_depth,
+            luma_mode,
+            lambda,
+        );
+        let c2 = self.decide_tt_luma_no_optional_split(
+            state,
+            x0,
+            y0 + half,
+            kid_log2,
+            kid_depth,
+            luma_mode,
+            lambda,
+        );
+        let c3 = self.decide_tt_luma_no_optional_split(
+            state,
+            x0 + half,
+            y0 + half,
+            kid_log2,
+            kid_depth,
+            luma_mode,
+            lambda,
+        );
+        c0 + c1 + c2 + c3
     }
 
     /// Evaluate this node as a split into four child transform trees.

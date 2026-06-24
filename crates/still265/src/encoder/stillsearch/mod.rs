@@ -9,13 +9,16 @@
 //! - The shared reconstructed frame is mutated only by final commit.
 //! - No frame snapshot/restore is used as a trial mechanism.
 
+mod angular;
 mod api;
 mod arena;
 mod cost;
 mod cu;
 mod depth;
 mod emit;
+mod env;
 mod eval;
+mod finalize;
 mod geom;
 mod ledger;
 mod nxn;

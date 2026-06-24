@@ -3,6 +3,7 @@
 use super::arena::CoeffArena;
 use super::ledger::StillSearchLedger;
 use crate::contexts::Contexts;
+use crate::rdoq::RdoqScratch;
 use crate::residual::ResidualPricingScratch;
 
 pub(super) struct CtuWorkspace {
@@ -14,6 +15,11 @@ pub(super) struct CtuWorkspace {
     /// Re-seeded per CTU from the live writer context at coding-tree entry.
     pub(super) price_base: Contexts,
     pub(super) price_scratch: ResidualPricingScratch,
+    /// Reusable scratch for the retained-block single-scan RDOQ refinement.
+    pub(super) rdoq_scratch: RdoqScratch,
+    /// Best rough SATD score for the current 8×8 CU (set by decide_cu_luma_mode
+    /// when log2_cb_size==3, consumed by decide_cu_min_leaf_or_nxn).
+    pub(super) last_8x8_rough_satd: f64,
 }
 
 impl Default for CtuWorkspace {
@@ -24,6 +30,8 @@ impl Default for CtuWorkspace {
             block_scratch: BlockScratch::default(),
             price_base: Contexts::new(0),
             price_scratch: ResidualPricingScratch::default(),
+            rdoq_scratch: RdoqScratch::default(),
+            last_8x8_rough_satd: f64::INFINITY,
         }
     }
 }
@@ -55,6 +63,12 @@ pub(super) struct BlockScratch {
     pub(super) levels_i16: Vec<i16>,
     pub(super) dequant_coeff_i16: Vec<i16>,
     pub(super) recon_residual_i16: Vec<i16>,
+    pub(super) rough_angular_batch_u16: Vec<u16>,
+    pub(super) rough_pred_u8: Vec<u8>,
+    pub(super) component_src_u8: Vec<u8>,
+    pub(super) component_pred_u8: Vec<u8>,
+    pub(super) component_recon_u8: Vec<u8>,
+    pub(super) component_pred_tmp_u16: Vec<u16>,
 }
 
 impl BlockScratch {
@@ -68,6 +82,12 @@ impl BlockScratch {
         self.levels_i16.clear();
         self.dequant_coeff_i16.clear();
         self.recon_residual_i16.clear();
+        self.rough_angular_batch_u16.clear();
+        self.rough_pred_u8.clear();
+        self.component_src_u8.clear();
+        self.component_pred_u8.clear();
+        self.component_recon_u8.clear();
+        self.component_pred_tmp_u16.clear();
     }
 
     pub(super) fn residual_i16_for_log2(&mut self, log2_size: u8) -> &mut Vec<i16> {

@@ -25,6 +25,11 @@ use crate::contexts::{Contexts, ctx};
 trait CabacSyntax {
     fn encode_bin(&mut self, bin_value: u8, ctx: &mut ContextModel);
     fn encode_bin_ep(&mut self, bin_value: u8);
+    fn encode_bins_ep(&mut self, bin_values: u32, num_bins: u32) {
+        for i in (0..num_bins).rev() {
+            self.encode_bin_ep(((bin_values >> i) & 1) as u8);
+        }
+    }
 }
 
 struct CabacWriter<'a, 'b> {
@@ -41,6 +46,10 @@ impl CabacSyntax for CabacWriter<'_, '_> {
     fn encode_bin_ep(&mut self, bin_value: u8) {
         self.enc.encode_bin_ep(self.w, bin_value);
     }
+
+    fn encode_bins_ep(&mut self, bin_values: u32, num_bins: u32) {
+        self.enc.encode_bins_ep(self.w, bin_values, num_bins);
+    }
 }
 
 impl CabacSyntax for CabacEstimator {
@@ -50,6 +59,10 @@ impl CabacSyntax for CabacEstimator {
 
     fn encode_bin_ep(&mut self, bin_value: u8) {
         CabacEstimator::encode_bin_ep(self, bin_value);
+    }
+
+    fn encode_bins_ep(&mut self, bin_values: u32, num_bins: u32) {
+        CabacEstimator::encode_bins_ep(self, bin_values, num_bins);
     }
 }
 
@@ -348,7 +361,12 @@ pub fn estimate_residual_bits_into(
     sign_data_hiding: bool,
     scratch: &mut ResidualPricingScratch,
 ) -> u64 {
-    scratch.ctxs.clone_from(base_ctxs);
+    // `residual_coding()` only touches the residual syntax context range
+    // [LAST_SIG_COEFF_X_PREFIX, SAO_MERGE_FLAG). Copying just that range avoids
+    // rewriting the whole 170-context array for every trial-priced block while
+    // preserving exact context evolution within the residual estimator.
+    scratch.ctxs.models[ctx::LAST_SIG_COEFF_X_PREFIX..ctx::SAO_MERGE_FLAG]
+        .copy_from_slice(&base_ctxs.models[ctx::LAST_SIG_COEFF_X_PREFIX..ctx::SAO_MERGE_FLAG]);
     scratch.sink = CabacEstimator::new();
     residual_syntax(
         &mut scratch.sink,
@@ -579,19 +597,20 @@ fn find_last_sig(
     scan_sub: &[(u8, u8)],
     scan_pos: &[(u8, u8); 16],
 ) -> (usize, usize) {
-    let mut last_sb_idx = 0usize;
-    let mut last_pos_in_sb = 0usize;
-    for (sbi, &(sbx, sby)) in scan_sub.iter().enumerate() {
-        for (n, &(px, py)) in scan_pos.iter().enumerate() {
+    // The last significant coefficient is the highest position in combined
+    // sub-block + intra-sub-block scan order. Search from the end and return
+    // immediately; trial residual pricing touches this path for every coded
+    // candidate and sparse blocks are common after quantization.
+    for (sbi, &(sbx, sby)) in scan_sub.iter().enumerate().rev() {
+        for (n, &(px, py)) in scan_pos.iter().enumerate().rev() {
             let x = sbx as usize * 4 + px as usize;
             let y = sby as usize * 4 + py as usize;
             if x < size && y < size && coeffs[y * size + x] != 0 {
-                last_sb_idx = sbi;
-                last_pos_in_sb = n;
+                return (sbi, n);
             }
         }
     }
-    (last_sb_idx, last_pos_in_sb)
+    (0, 0)
 }
 
 /// Emit `last_sig_coeff_x/y` prefix + bypass suffix for the given last position.
@@ -848,13 +867,16 @@ impl SubBlockCfg<'_> {
         let sign_hidden = sign_data_hiding && (last_sig_pos - first_sig_pos) > 3;
 
         // Signs (bypass), high scan pos -> low; the lowest-pos sign is hidden.
-        for i in 0..n_sig.saturating_sub(1) {
-            let neg = coeff_at(sig_positions[i]) < 0;
-            sink.encode_bin_ep(neg as u8);
-        }
-        if !sign_hidden {
-            let neg = coeff_at(sig_positions[n_sig - 1]) < 0;
-            sink.encode_bin_ep(neg as u8);
+        // x265's entropy path batches bypass bins (`encodeBinsEP`); doing the
+        // same here avoids a call/context dispatch per sign in the exact
+        // residual-pricing hot loop while preserving the exact bit order.
+        let sign_bins = if sign_hidden { n_sig - 1 } else { n_sig };
+        if sign_bins > 0 {
+            let mut signs = 0u32;
+            for &n in &sig_positions[..sign_bins] {
+                signs = (signs << 1) | (coeff_at(n) < 0) as u32;
+            }
+            sink.encode_bins_ep(signs, sign_bins as u32);
         }
 
         // coeff_abs_level_remaining, high scan pos -> low, adaptive Rice.
@@ -1215,13 +1237,7 @@ fn encode_coeff_abs_level_remaining<S: CabacSyntax>(sink: &mut S, value: u32, ri
     if value < (4u32 << rice) {
         let prefix = value >> rice;
         let suffix = value & ((1u32 << rice) - 1);
-        for _ in 0..prefix {
-            sink.encode_bin_ep(1);
-        }
-        sink.encode_bin_ep(0);
-        if rice > 0 {
-            encode_bypass_bits(sink, suffix, rice as u8);
-        }
+        encode_bypass_prefix_suffix(sink, prefix, suffix, rice);
     } else {
         // Find prefix p >= 4 whose EGk bucket contains `value`.
         let mut p = 4u32;
@@ -1230,12 +1246,8 @@ fn encode_coeff_abs_level_remaining<S: CabacSyntax>(sink: &mut S, value: u32, ri
             let width = 1u32 << (p - 3 + rice);
             if value < base + width {
                 let suffix = value - base;
-                let n_bits = (p - 3 + rice) as u8;
-                for _ in 0..p {
-                    sink.encode_bin_ep(1);
-                }
-                sink.encode_bin_ep(0);
-                encode_bypass_bits(sink, suffix, n_bits);
+                let n_bits = p - 3 + rice;
+                encode_bypass_prefix_suffix(sink, p, suffix, n_bits);
                 return;
             }
             p += 1;
@@ -1243,10 +1255,37 @@ fn encode_coeff_abs_level_remaining<S: CabacSyntax>(sink: &mut S, value: u32, ri
     }
 }
 
+/// Emit `ones` one-bits, one zero terminator, then `suffix_bits` bypass suffix
+/// bits. This is the common bypass shape for coeff_abs_level_remaining. It is
+/// equivalent to repeated `encode_bin_ep` calls but lets both the real CABAC
+/// writer and the fractional-bit estimator use their batched bypass path.
+fn encode_bypass_prefix_suffix<S: CabacSyntax>(
+    sink: &mut S,
+    ones: u32,
+    suffix: u32,
+    suffix_bits: u32,
+) {
+    let total = ones + 1 + suffix_bits;
+    if total <= u32::BITS {
+        let prefix = if ones == 0 { 0 } else { (1u64 << ones) - 1 };
+        let pattern = (prefix << (1 + suffix_bits)) | suffix as u64;
+        sink.encode_bins_ep(pattern as u32, total);
+        return;
+    }
+
+    // Extremely large escaped levels are not expected for still265's i16
+    // coefficient range, but keep the helper total for correctness.
+    for _ in 0..ones {
+        sink.encode_bin_ep(1);
+    }
+    sink.encode_bin_ep(0);
+    encode_bypass_bits(sink, suffix, suffix_bits as u8);
+}
+
 /// Emit `n_bits` of `value`, MSB first, as bypass bins (the order the decoder's
 /// `decode_bypass_bits` reads).
 fn encode_bypass_bits<S: CabacSyntax>(sink: &mut S, value: u32, n_bits: u8) {
-    for i in (0..n_bits).rev() {
-        sink.encode_bin_ep(((value >> i) & 1) as u8);
+    if n_bits > 0 {
+        sink.encode_bins_ep(value, n_bits as u32);
     }
 }

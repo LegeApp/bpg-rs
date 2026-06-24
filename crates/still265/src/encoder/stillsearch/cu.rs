@@ -109,6 +109,23 @@ where
         let (leaf_plan, leaf_cost) = self.decide_cu_leaf(state, x0, y0, 3, ct_depth);
         let leaf_saved = self.overlay.detach_from(mark0);
 
+        // Rough SATD below the env threshold means the block is too smooth for
+        // PartNxN to improve over the 2Nx2N leaf — skip it.
+        let nxn_threshold = super::env::nxn_skip_satd_threshold();
+        if nxn_threshold > 0.0 && self.workspace.last_8x8_rough_satd < nxn_threshold {
+            state.stats.partnxn_skips += 1;
+            state.stats.partnxn_losses += 1;
+            self.overlay.truncate(mark0);
+            self.overlay.reattach(leaf_saved);
+            if let CuPlan::Leaf(ref leaf) = leaf_plan {
+                state.store_mode(x0, y0, 3, leaf.luma_mode);
+                state.set_ct_depth(x0, y0, 3, ct_depth);
+            }
+            let part_leaf = part_mode_bits(&self.workspace.price_base, false);
+            let chroma_bits = chroma_dm_bits(&self.workspace.price_base, state.cat);
+            return (leaf_plan, leaf_cost + lambda * (part_leaf + chroma_bits) as f64 / scale);
+        }
+
         self.restore_8x8_modes(state, x0, y0, incoming_modes);
         let (nxn_plan, nxn_cost) = self.decide_cu_part_nxn(state, x0, y0, ct_depth, lambda);
 

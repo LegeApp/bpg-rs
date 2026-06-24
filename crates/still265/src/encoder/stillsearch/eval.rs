@@ -11,12 +11,29 @@ use crate::transform;
 
 use super::arena::CoeffId;
 use super::depth::StillSearchDepth;
-use super::ledger::WorkBucket;
+use super::ledger::{StillSearchLedger, WorkBucket};
 use super::overlay::OverlayCache;
 use super::plan::PlanBlock;
 use super::price::entropy_bits;
 use super::source::CtuSourceCache;
 use super::workspace::BlockScratch;
+
+/// Quantization mode for the shared component evaluator. Search/screening uses
+/// [`QuantMode::HardQuantSearch`] (the green baseline); only the winner-only
+/// RDOQ finalizer uses [`QuantMode::RdoqFinal`]. The two modes share the same
+/// prediction, transform, sign-data-hiding, recon, and residual-pricing path —
+/// only the quantization step differs.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum QuantMode {
+    HardQuantSearch,
+    RdoqFinal,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResidualPricingMode {
+    Exact,
+    Skip,
+}
 
 /// Result of evaluating one transform block (luma or one chroma component).
 /// Coefficients live in the CTU coeff arena; the trial holds only a `Copy`
@@ -59,9 +76,24 @@ where
         qp: i32,
         trafo_depth: u8,
         lambda: f64,
+        quant_mode: QuantMode,
+        residual_pricing: ResidualPricingMode,
+        retain_coeff: bool,
     ) -> BlockTrial {
+        // Chroma block evaluations (Cb/Cr) are otherwise invisible in the
+        // ledger: luma evals are attributed to RoughLuma/LumaExact/Tu*/Nxn*,
+        // but chroma has no rough/exact search of its own (DM-only). Count
+        // every chroma component evaluation here so the profile accounts for
+        // chroma transform/quant/pricing work. Counted once per call: the
+        // 8-bit path below is only reached through this function.
+        let chroma_timer = if c_idx != 0 {
+            self.workspace.ledger.bump(WorkBucket::ChromaTrial);
+            StillSearchLedger::start_timer()
+        } else {
+            None
+        };
         if bit_depth_is_8(state) {
-            return self.eval_component_8(
+            let out = self.eval_component_8(
                 state,
                 x0,
                 y0,
@@ -71,7 +103,14 @@ where
                 qp,
                 trafo_depth,
                 lambda,
+                quant_mode,
+                residual_pricing,
+                retain_coeff,
             );
+            self.workspace
+                .ledger
+                .finish_timer(WorkBucket::ChromaTrial, chroma_timer);
+            return out;
         }
 
         let size = 1usize << log2_size;
@@ -110,11 +149,31 @@ where
             }
 
             transform::forward_transform_into(residual, log2_size, is_dst4, bit_depth, coeff, tmp);
-            nnz = transform::quantize_into(coeff, log2_size, qp, bit_depth, levels);
-            // Quant-stage volume. The new core uses hard quantization here; the
-            // `Rdoq` bucket counts these calls and becomes true rate-distortion
-            // optimized quantization once RDOQ is wired (plan Phase 10).
-            self.workspace.ledger.bump(WorkBucket::Rdoq);
+            nnz = match quant_mode {
+                QuantMode::HardQuantSearch => {
+                    transform::quantize_into(coeff, log2_size, qp, bit_depth, levels)
+                }
+                QuantMode::RdoqFinal => {
+                    let timer = StillSearchLedger::start_timer();
+                    let rdoq = crate::rdoq::rdoq_single_scan_into(
+                        &self.workspace.price_base,
+                        coeff,
+                        log2_size,
+                        c_idx,
+                        qp,
+                        bit_depth,
+                        scan,
+                        lambda,
+                        true,
+                        &mut self.workspace.rdoq_scratch,
+                    );
+                    levels.clear();
+                    levels.extend_from_slice(rdoq.levels);
+                    self.workspace.ledger.bump(WorkBucket::Rdoq);
+                    self.workspace.ledger.finish_timer(WorkBucket::Rdoq, timer);
+                    rdoq.nnz
+                }
+            };
             if sdh_enabled && nnz > 0 {
                 let (scale, qbits) = transform::quant_params(log2_size, qp, bit_depth);
                 nnz = apply_sign_data_hiding(levels, coeff, log2_size, scan, scale, qbits, nnz);
@@ -153,7 +212,11 @@ where
         let scale = CabacEstimator::SCALE as f64;
         let cost_zero = dist_zero as f64 + lambda * cbf0_bits as f64 / scale;
 
-        let coded = if nnz > 0 {
+        let coded_min_cost = dist_coded as f64 + lambda * cbf1_bits as f64 / scale;
+        let coded = if nnz > 0 && residual_pricing == ResidualPricingMode::Skip {
+            Some((0, coded_min_cost))
+        } else if nnz > 0 && coded_min_cost < cost_zero {
+            let timer = StillSearchLedger::start_timer();
             let residual_bits = estimate_residual_bits_into(
                 &self.workspace.price_base,
                 &levels_vec,
@@ -164,18 +227,21 @@ where
                 &mut self.workspace.price_scratch,
             );
             self.workspace.ledger.bump(WorkBucket::ResidualPrice);
+            self.workspace
+                .ledger
+                .finish_timer(WorkBucket::ResidualPrice, timer);
             let cost = dist_coded as f64 + lambda * (residual_bits + cbf1_bits) as f64 / scale;
             Some((residual_bits, cost))
         } else {
             None
         };
 
-        match coded {
+        let out = match coded {
             Some((residual_bits, cost_coded)) if cost_coded < cost_zero => {
                 let recon = recon_coded.expect("coded candidate has recon");
                 self.overlay
                     .push_block(c_idx, x0, y0, size as u32, size as u32, &recon);
-                let coeff = Some(self.workspace.coeffs.push(&levels_vec));
+                let coeff = retain_coeff.then(|| self.workspace.coeffs.push(&levels_vec));
                 BlockTrial {
                     coeff,
                     cbf: true,
@@ -193,7 +259,11 @@ where
                     cost: cost_zero,
                 }
             }
-        }
+        };
+        self.workspace
+            .ledger
+            .finish_timer(WorkBucket::ChromaTrial, chroma_timer);
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -208,6 +278,9 @@ where
         qp: i32,
         trafo_depth: u8,
         lambda: f64,
+        quant_mode: QuantMode,
+        residual_pricing: ResidualPricingMode,
+        retain_coeff: bool,
     ) -> BlockTrial {
         let size = 1usize << log2_size;
         let n = size * size;
@@ -215,18 +288,13 @@ where
         let sdh_enabled = state.sign_data_hiding;
         let is_dst4 = c_idx == 0 && log2_size == 2;
 
-        let mut src = vec![0u8; n];
-        for y in 0..size {
-            for x in 0..size {
-                src[y * size + x] = self
-                    .source
-                    .sample(c_idx, x0 + x as u32, y0 + y as u32)
-                    .min(u8::MAX as u16) as u8;
-            }
-        }
+        let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
+        src.resize(n, 0);
+        self.source.sample_block_u8(c_idx, x0, y0, size, &mut src);
 
-        let mut pred = vec![0u8; n];
-        let mut pred_u16 = Vec::with_capacity(n);
+        let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
+        pred.resize(n, 0);
+        let mut pred_u16 = std::mem::take(&mut self.workspace.block_scratch.component_pred_tmp_u16);
         self.predict_into_u8(
             state,
             x0,
@@ -240,7 +308,8 @@ where
 
         let mut levels_vec = Vec::new();
         let mut nnz;
-        let mut recon_coded: Option<Vec<u8>> = None;
+        let mut recon_coded = false;
+        let mut recon = std::mem::take(&mut self.workspace.block_scratch.component_recon_u8);
         let dist_zero = ssd_u8(&src, size, &pred, size, size);
         let mut dist_coded = dist_zero;
         let scan = get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
@@ -256,10 +325,31 @@ where
             }
 
             transform::forward_transform_into(residual, log2_size, is_dst4, 8, coeff, tmp);
-            nnz = transform::quantize_into(coeff, log2_size, qp, 8, levels);
-            // Quant-stage volume (hard quant; see eval_component for the
-            // `Rdoq`-bucket / RDOQ note).
-            self.workspace.ledger.bump(WorkBucket::Rdoq);
+            nnz = match quant_mode {
+                QuantMode::HardQuantSearch => {
+                    transform::quantize_into(coeff, log2_size, qp, 8, levels)
+                }
+                QuantMode::RdoqFinal => {
+                    let timer = StillSearchLedger::start_timer();
+                    let rdoq = crate::rdoq::rdoq_single_scan_into(
+                        &self.workspace.price_base,
+                        coeff,
+                        log2_size,
+                        c_idx,
+                        qp,
+                        8,
+                        scan,
+                        lambda,
+                        true,
+                        &mut self.workspace.rdoq_scratch,
+                    );
+                    levels.clear();
+                    levels.extend_from_slice(rdoq.levels);
+                    self.workspace.ledger.bump(WorkBucket::Rdoq);
+                    self.workspace.ledger.finish_timer(WorkBucket::Rdoq, timer);
+                    rdoq.nnz
+                }
+            };
             if sdh_enabled && nnz > 0 {
                 let (scale, qbits) = transform::quant_params(log2_size, qp, 8);
                 nnz = apply_sign_data_hiding(levels, coeff, log2_size, scan, scale, qbits, nnz);
@@ -275,13 +365,19 @@ where
                     dequant,
                     recon_residual,
                 );
-                let mut recon = vec![0u8; n];
+                recon.clear();
+                recon.resize(n, 0);
                 for i in 0..n {
                     recon[i] = (pred[i] as i32 + recon_residual[i] as i32).clamp(0, 255) as u8;
                 }
                 dist_coded = ssd_u8(&src, size, &recon, size, size);
-                levels_vec = levels.clone();
-                recon_coded = Some(recon);
+                // Clone levels only when we will actually use them (residual
+                // pricing or coeff retention). Skip-pricing + discard covers
+                // most cheap-pass evaluations.
+                if retain_coeff || residual_pricing == ResidualPricingMode::Exact {
+                    levels_vec = levels.clone();
+                }
+                recon_coded = true;
             }
         }
 
@@ -296,7 +392,11 @@ where
         let scale = CabacEstimator::SCALE as f64;
         let cost_zero = dist_zero as f64 + lambda * cbf0_bits as f64 / scale;
 
-        let coded = if nnz > 0 {
+        let coded_min_cost = dist_coded as f64 + lambda * cbf1_bits as f64 / scale;
+        let coded = if nnz > 0 && residual_pricing == ResidualPricingMode::Skip {
+            Some((0, coded_min_cost))
+        } else if nnz > 0 && coded_min_cost < cost_zero {
+            let timer = StillSearchLedger::start_timer();
             let residual_bits = estimate_residual_bits_into(
                 &self.workspace.price_base,
                 &levels_vec,
@@ -307,18 +407,21 @@ where
                 &mut self.workspace.price_scratch,
             );
             self.workspace.ledger.bump(WorkBucket::ResidualPrice);
+            self.workspace
+                .ledger
+                .finish_timer(WorkBucket::ResidualPrice, timer);
             let cost = dist_coded as f64 + lambda * (residual_bits + cbf1_bits) as f64 / scale;
             Some((residual_bits, cost))
         } else {
             None
         };
 
-        match coded {
+        let out = match coded {
             Some((residual_bits, cost_coded)) if cost_coded < cost_zero => {
-                let recon = recon_coded.expect("coded candidate has recon");
+                debug_assert!(recon_coded, "coded candidate has recon");
                 self.overlay
                     .push_block_u8(c_idx, x0, y0, size as u32, size as u32, &recon);
-                let coeff = Some(self.workspace.coeffs.push(&levels_vec));
+                let coeff = retain_coeff.then(|| self.workspace.coeffs.push(&levels_vec));
                 BlockTrial {
                     coeff,
                     cbf: true,
@@ -336,7 +439,13 @@ where
                     cost: cost_zero,
                 }
             }
-        }
+        };
+
+        self.workspace.block_scratch.component_src_u8 = src;
+        self.workspace.block_scratch.component_pred_u8 = pred;
+        self.workspace.block_scratch.component_recon_u8 = recon;
+        self.workspace.block_scratch.component_pred_tmp_u16 = pred_u16;
+        out
     }
 }
 

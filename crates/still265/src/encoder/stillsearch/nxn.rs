@@ -4,12 +4,13 @@ use bpg_hevc_decode::hevc::slice::IntraPredMode;
 
 use crate::cabac::CabacEstimator;
 use crate::encoder::Encoder;
+use crate::primitives::intra_angs;
 use crate::primitives::{satd_u8, satd_u16};
 
 use super::depth::StillSearchDepth;
 use super::emit;
-use super::eval::BlockTrial;
-use super::ledger::WorkBucket;
+use super::eval::{BlockTrial, QuantMode, ResidualPricingMode};
+use super::ledger::{StillSearchLedger, WorkBucket};
 use super::overlay::OverlayCache;
 use super::plan::{CuPlan, NxnInfoPlan, ParentChromaPlan, TtPlan};
 use super::price::{ROUGH_RD_CANDS, luma_mode_bits};
@@ -99,6 +100,9 @@ where
                     state.cur_qp_c,
                     1,
                     lambda,
+                    QuantMode::HardQuantSearch,
+                    ResidualPricingMode::Exact,
+                    true,
                 );
                 cost += cb_e.cost;
                 cb = cb_e.into_plan_block();
@@ -112,6 +116,9 @@ where
                     state.cur_qp_c,
                     1,
                     lambda,
+                    QuantMode::HardQuantSearch,
+                    ResidualPricingMode::Exact,
+                    true,
                 );
                 cost += cr_e.cost;
                 cr = cr_e.into_plan_block();
@@ -202,6 +209,9 @@ where
             state.cur_qp_c,
             0,
             lambda,
+            QuantMode::HardQuantSearch,
+            ResidualPricingMode::Exact,
+            true,
         );
         let mut cost = cb0.cost;
         let mut cb1 = None;
@@ -216,6 +226,9 @@ where
                 state.cur_qp_c,
                 0,
                 lambda,
+                QuantMode::HardQuantSearch,
+                ResidualPricingMode::Exact,
+                true,
             );
             cost += cb.cost;
             cb1 = Some(cb);
@@ -231,6 +244,9 @@ where
             state.cur_qp_c,
             0,
             lambda,
+            QuantMode::HardQuantSearch,
+            ResidualPricingMode::Exact,
+            true,
         );
         cost += cr0.cost;
         let mut cr1 = None;
@@ -245,6 +261,9 @@ where
                 state.cur_qp_c,
                 0,
                 lambda,
+                QuantMode::HardQuantSearch,
+                ResidualPricingMode::Exact,
+                true,
             );
             cost += cr.cost;
             cr1 = Some(cr);
@@ -275,29 +294,45 @@ where
         lambda: f64,
         set: &mut NxnRoughSet,
     ) {
+        let timer = StillSearchLedger::start_timer();
         let mpm_u8 = [mpm[0].as_u8(), mpm[1].as_u8(), mpm[2].as_u8()];
         let scale = CabacEstimator::SCALE as f64;
         let size = 4usize;
         let lambda_sad = lambda.sqrt();
         let mut rough = [(0.0f64, 0u8); 35];
+        // Build the 4x4 angular predictions (modes 2..=34) once from a single
+        // overlay-aware reference border, mirroring the CU-level rough batch.
+        // Planar/DC (0/1) stay on the per-mode predictor.
+        let n = size * size;
+        let mut batch = [0u16; intra_angs::ANGULAR_MODES * 16];
+        self.predict_all_angular_into_u16(
+            state,
+            x0,
+            y0,
+            2,
+            &mut batch[..intra_angs::ANGULAR_MODES * n],
+        );
         if state.bit_depth == 8 {
             let mut src = [0u8; 16];
-            for y in 0..size {
-                for x in 0..size {
-                    src[y * size + x] = self
-                        .source
-                        .sample(0, x0 + x as u32, y0 + y as u32)
-                        .min(u8::MAX as u16) as u8;
-                }
-            }
+            self.source.sample_block_u8(0, x0, y0, size, &mut src);
             let mut pred = [0u8; 16];
             let mut tmp_u16 = Vec::with_capacity(16);
-            for (idx, m) in (0u8..=34).enumerate() {
-                let mode = IntraPredMode::from_u8(m).expect("0..=34 are valid intra modes");
+            for (idx, m) in (0u8..=1).enumerate() {
+                let mode = IntraPredMode::from_u8(m).expect("0..=1 are valid intra modes");
                 self.predict_into_u8(state, x0, y0, 2, 0, mode, &mut pred, &mut tmp_u16);
                 let satd = satd_u8(&src, size, &pred, size, size);
                 let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
                 rough[idx] = (satd as f64 + lambda_sad * mbits as f64 / scale, m);
+            }
+            for m in 2u8..=34 {
+                let off = intra_angs::slot_offset(m, 2);
+                let slot = &batch[off..off + n];
+                for (d, &s) in pred.iter_mut().zip(slot.iter()) {
+                    *d = s.min(u8::MAX as u16) as u8;
+                }
+                let satd = satd_u8(&src, size, &pred, size, size);
+                let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
+                rough[m as usize] = (satd as f64 + lambda_sad * mbits as f64 / scale, m);
             }
         } else {
             let mut src = [0u16; 16];
@@ -307,22 +342,37 @@ where
                 }
             }
             let mut pred = [0u16; 16];
-            for (idx, m) in (0u8..=34).enumerate() {
-                let mode = IntraPredMode::from_u8(m).expect("0..=34 are valid intra modes");
+            for (idx, m) in (0u8..=1).enumerate() {
+                let mode = IntraPredMode::from_u8(m).expect("0..=1 are valid intra modes");
                 self.predict_into(state, x0, y0, 2, 0, mode, &mut pred);
                 let satd = satd_u16(&src, size, &pred, size, size);
                 let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
                 rough[idx] = (satd as f64 + lambda_sad * mbits as f64 / scale, m);
             }
+            for m in 2u8..=34 {
+                let off = intra_angs::slot_offset(m, 2);
+                let slot = &batch[off..off + n];
+                let satd = satd_u16(&src, size, slot, size, size);
+                let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
+                rough[m as usize] = (satd as f64 + lambda_sad * mbits as f64 / scale, m);
+            }
         }
-        rough.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        rough.sort_by(|a, b| {
+            a.0.partial_cmp(&b.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
         self.workspace.ledger.bump(WorkBucket::NxnRough);
+        self.workspace
+            .ledger
+            .finish_timer(WorkBucket::NxnRough, timer);
 
         let best_rough = rough[0].0;
+        let rough_rd_cands = super::env::rough_rd_cands();
         let mut modes = [0u8; ROUGH_RD_CANDS + 3];
         let mut len = 0usize;
         for &(cost, m) in rough.iter() {
-            if len >= ROUGH_RD_CANDS || cost > best_rough * 1.25 {
+            if len >= rough_rd_cands || cost > best_rough * 1.25 {
                 break;
             }
             modes[len] = m;
@@ -354,10 +404,23 @@ where
         let scale = CabacEstimator::SCALE as f64;
         let mut best: Option<(u8, BlockTrial, O::Saved, f64)> = None;
         for &mode in rough_set.modes(pu) {
+            let timer = StillSearchLedger::start_timer();
             let mark = self.overlay.mark();
             let pred_mode = IntraPredMode::from_u8(mode).unwrap_or(IntraPredMode::Dc);
-            let trial =
-                self.eval_component(state, x0, y0, 2, 0, pred_mode, state.cur_qp_y, 1, lambda);
+            let trial = self.eval_component(
+                state,
+                x0,
+                y0,
+                2,
+                0,
+                pred_mode,
+                state.cur_qp_y,
+                1,
+                lambda,
+                QuantMode::HardQuantSearch,
+                ResidualPricingMode::Exact,
+                true,
+            );
             let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
             let total = trial.cost + lambda * mbits as f64 / scale;
             let recon = self.overlay.detach_from(mark);
@@ -366,6 +429,9 @@ where
                 _ => best = Some((mode, trial, recon, total)),
             }
             self.workspace.ledger.bump(WorkBucket::NxnBatch);
+            self.workspace
+                .ledger
+                .finish_timer(WorkBucket::NxnBatch, timer);
         }
 
         let (mode, trial, recon, total) = best.expect("PartNxN shortlist is never empty");

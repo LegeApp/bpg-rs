@@ -398,6 +398,68 @@ Sao
 
 No speed claim should be accepted without bucket movement.
 
+## Environment gates
+
+StillSearch-specific environment gates must be declared and parsed in:
+
+```text
+crates/still265/src/encoder/stillsearch/env.rs
+```
+
+Do not add ad-hoc `std::env::var*` checks in search modules. The current
+StillSearch gates are:
+
+```text
+BPG_STILLSEARCH_PROFILE=1
+  Populate per-bucket `stillsearch_ledger_ns` wall-clock timings.
+
+BPG_STILLSEARCH_LUMA_CHEAP=0
+  Disable the x265-style luma-only cheap pass and restore full recursive TU
+  search for every rough-shortlisted luma mode.
+
+BPG_STILLSEARCH_LUMA_CHEAP_EXACT_TOP=<usize>  [default: 1]
+  Number of cheap-ranked luma candidates to remeasure with full TU search.
+  1 is fastest (default). 2 remeasures the top-2 for marginal quality insurance.
+  3 matches old exhaustive behavior. Sweep showed no quality loss at 1 vs 2 or 3.
+
+BPG_STILLSEARCH_ROUGH_RD_CANDS=<usize>  [default: 2]
+  Max rough-pass candidates carried into the cheap luma pass (before MPM union).
+  2 is default (capped at 4 = ROUGH_RD_CANDS). Sweep showed no quality loss at
+  2 vs 3 or 4 on test images; saving ~1.5s at 12MP.
+
+BPG_STILLSEARCH_NXN_SKIP_SATD=<float>  [default: 1000]
+  Skip PartNxN for 8×8 CUs whose rough SATD is below this threshold.
+  1000 = default: smooth blocks skip NxN (PSNR unchanged or slightly better;
+  saves ~3s at 12MP). NxN over-selects smooth blocks due to frozen-context bias.
+  Set to 0 to disable. 2000 saves an additional ~1s (+2.5% bytes, PSNR improves).
+
+BPG_STILLSEARCH_LUMA_CHEAP_RESIDUAL_PRICE=skip
+  Diagnostic only. Rank the luma-cheap first pass without exact residual syntax
+  pricing. The full winner pass remains exact. Defaults to exact because smoke
+  testing showed good speed but worse rate.
+
+BPG_STILLSEARCH_ANGULAR_EXCLUSION=game|iame|tsame
+  Env-gated diagnostic angular-mode prefilter for rough luma search.
+  Defaults to off. `BPG_BEST_ANGULAR_EXCLUSION` is accepted as a legacy alias.
+
+BPG_ANGULAR_GAME_VAR=<float>
+BPG_ANGULAR_IAME_FACTOR=<float>
+BPG_ANGULAR_MIN_KEEP=<usize>
+BPG_ANGULAR_MIN_LOG2=<u8>
+  Parameters for the angular-exclusion diagnostic.
+```
+
+### Default speed point (Best effort, QP=28, 12MP)
+
+As of 2026-06-24, the default Best effort averages ~15.5s on three 12MP test images
+(4000×3000 crop). Quality vs C bpgenc -m8: −0.73 dB PSNR_y, −0.4% bytes.
+
+Key call counts: LumaCheap ~3.9× cu_trials, LumaExact = 1× cu_trials, NxnRough
+~0.94× cu_trials (skip=1000 fires on ~62% of 8×8 CUs).
+
+For maximum speed (~14-15s average): set NXN_SKIP_SATD=2000 (saves 1s more,
+slight byte increase but PSNR improves due to NxN bias correction).
+
 ## Implementation order
 
 Recommended sequence:

@@ -5,6 +5,20 @@ use crate::encoder::Encoder;
 pub(super) trait CtuSourceCache {
     fn reset_from_ctu(&mut self, state: &Encoder<'_>, x0: u32, y0: u32, log2_cb_size: u8);
     fn sample(&self, c_idx: u8, x: u32, y: u32) -> u16;
+
+    /// Copy a `size × size` block of samples into `dst` (row-major, stride =
+    /// `size`). Coordinates are in the plane's own space. The block must be
+    /// fully within the cached CTU region; no bounds-clamping is applied.
+    /// The default impl falls back to per-sample `sample()` calls.
+    fn sample_block_u8(&self, c_idx: u8, x0: u32, y0: u32, size: usize, dst: &mut [u8]) {
+        for y in 0..size {
+            for x in 0..size {
+                dst[y * size + x] = self
+                    .sample(c_idx, x0 + x as u32, y0 + y as u32)
+                    .min(u8::MAX as u16) as u8;
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -36,6 +50,18 @@ struct CachedPlane16 {
 }
 
 impl CtuSourceCache for CtuSource8 {
+    fn sample_block_u8(&self, c_idx: u8, x0: u32, y0: u32, size: usize, dst: &mut [u8]) {
+        let plane = &self.planes[c_idx as usize];
+        debug_assert!(x0 >= plane.x && y0 >= plane.y);
+        let bx = (x0 - plane.x) as usize;
+        let by = (y0 - plane.y) as usize;
+        let pw = plane.width as usize;
+        for y in 0..size {
+            let src_off = (by + y) * pw + bx;
+            dst[y * size..][..size].copy_from_slice(&plane.samples[src_off..][..size]);
+        }
+    }
+
     fn reset_from_ctu(&mut self, state: &Encoder<'_>, x0: u32, y0: u32, log2_cb_size: u8) {
         for c_idx in 0..3u8 {
             let (sx, sy) = state.plane_shifts(c_idx);
