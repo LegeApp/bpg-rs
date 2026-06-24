@@ -36,8 +36,6 @@ pub(super) struct Encoder<'a> {
     mode_stride: usize,
     ct_depth_map: Vec<u8>,
     ct_depth_stride: usize,
-    tu_depth_map: Vec<u8>,
-    tu_depth_stride: usize,
     deblock: bool,
     sign_data_hiding: bool,
     aq: AqState,
@@ -122,44 +120,6 @@ impl<'a> Encoder<'a> {
         Some(self.tile_grid.tile_plane_bounds(x, y, CTB_LOG2, sx, sy))
     }
 
-    pub(in crate::encoder) fn predict_intra_tiled(
-        &mut self,
-        x: u32,
-        y: u32,
-        log2_size: u8,
-        mode: IntraPredMode,
-        c_idx: u8,
-    ) {
-        if let Some((tx0, ty0, tx1, ty1)) = self.tile_clamp_bounds(x, y, c_idx) {
-            bpg_hevc_decode::hevc::intra::predict_intra_with_reader(
-                &mut self.frame,
-                x,
-                y,
-                log2_size,
-                mode,
-                c_idx,
-                true,
-                move |_c, rx, ry| {
-                    if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
-                        Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE)
-                    } else {
-                        None
-                    }
-                },
-            );
-        } else {
-            bpg_hevc_decode::hevc::intra::predict_intra(
-                &mut self.frame,
-                x,
-                y,
-                log2_size,
-                mode,
-                c_idx,
-                true,
-            );
-        }
-    }
-
     pub(in crate::encoder) fn split_ctx_inc(&self, x0: u32, y0: u32, ct_depth: u8) -> usize {
         let mut inc = 0usize;
         if x0 > 0 && self.same_tile_px(x0 - 1, y0, x0, y0) {
@@ -197,27 +157,6 @@ impl<'a> Encoder<'a> {
                 let idx = (sy + dy) as usize * self.ct_depth_stride + (sx + dx) as usize;
                 if idx < self.ct_depth_map.len() {
                     self.ct_depth_map[idx] = ct_depth;
-                }
-            }
-        }
-    }
-
-    pub(in crate::encoder) fn store_tu_depth(
-        &mut self,
-        x0: u32,
-        y0: u32,
-        log2_size: u8,
-        split: bool,
-    ) {
-        let depth = u8::from(split);
-        let n = (1u32 << log2_size) / 4;
-        let sx = x0 / 4;
-        let sy = y0 / 4;
-        for dy in 0..n {
-            for dx in 0..n {
-                let idx = (sy + dy) as usize * self.tu_depth_stride + (sx + dx) as usize;
-                if idx < self.tu_depth_map.len() {
-                    self.tu_depth_map[idx] = depth;
                 }
             }
         }
@@ -374,8 +313,6 @@ pub fn encode_with_stats(
         mode_stride,
         ct_depth_map: vec![0xFF; ct_depth_stride * ct_depth_height],
         ct_depth_stride,
-        tu_depth_map: vec![0xFF; mode_stride * mode_height],
-        tu_depth_stride: mode_stride,
         deblock,
         sign_data_hiding: crate::sdh_active(config),
         aq: AqState {
