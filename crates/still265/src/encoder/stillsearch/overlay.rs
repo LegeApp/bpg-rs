@@ -91,6 +91,18 @@ impl ReconOverlay8 {
         }
     }
 
+    /// Detach all patches from `mark` onward into an owned buffer, leaving the
+    /// overlay at `mark`. Used to evaluate an alternative candidate on a clean
+    /// overlay, then [`reattach`](Self::reattach) the winner if it was the first.
+    pub(super) fn split_off(&mut self, mark: usize) -> Vec<ReconPatch8> {
+        let mark = mark.min(self.patches.len());
+        self.patches.split_off(mark)
+    }
+
+    pub(super) fn reattach(&mut self, patches: Vec<ReconPatch8>) {
+        self.patches.extend(patches);
+    }
+
     pub(super) fn commit_to_frame(&self, frame: &mut DecodedFrame) {
         for p in &self.patches {
             let (plane, stride) = frame.plane_mut(p.c_idx);
@@ -158,6 +170,15 @@ impl ReconOverlay16 {
         if start < end {
             self.patches.drain(start..end);
         }
+    }
+
+    pub(super) fn split_off(&mut self, mark: usize) -> Vec<ReconPatch16> {
+        let mark = mark.min(self.patches.len());
+        self.patches.split_off(mark)
+    }
+
+    pub(super) fn reattach(&mut self, patches: Vec<ReconPatch16>) {
+        self.patches.extend(patches);
     }
 
     pub(super) fn commit_to_frame(&self, frame: &mut DecodedFrame) {

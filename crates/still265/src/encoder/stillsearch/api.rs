@@ -51,6 +51,10 @@ pub(in crate::encoder) static LEAF_WINS: std::sync::atomic::AtomicU64 =
 #[cfg(test)]
 pub(in crate::encoder) static LUMA_NONDC_PICKS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+/// Count of CU decisions where the split candidate beat the leaf (Phase 6 guard).
+#[cfg(test)]
+pub(in crate::encoder) static CU_SPLIT_WINS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 pub(in crate::encoder) struct StillSearch {
     imp: StillSearchImpl,
@@ -113,16 +117,21 @@ where
 /// CTU-local reconstruction overlay used for non-mutating trials. Trials push
 /// candidate recon patches; the winning branch commits once to `state.frame`.
 trait OverlayCache {
+    /// Owned patch buffer detached by [`detach_from`](Self::detach_from).
+    type Saved;
     fn clear(&mut self);
     fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16>;
     fn push_block(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32, samples: &[u16]);
     fn mark(&self) -> usize;
     fn truncate(&mut self, mark: usize);
     fn drain_range(&mut self, start: usize, end: usize);
+    fn detach_from(&mut self, mark: usize) -> Self::Saved;
+    fn reattach(&mut self, saved: Self::Saved);
     fn commit_to_frame(&self, frame: &mut DecodedFrame);
 }
 
 impl OverlayCache for ReconOverlay8 {
+    type Saved = Vec<super::overlay::ReconPatch8>;
     fn clear(&mut self) {
         ReconOverlay8::clear(self);
     }
@@ -141,12 +150,19 @@ impl OverlayCache for ReconOverlay8 {
     fn drain_range(&mut self, start: usize, end: usize) {
         ReconOverlay8::drain_range(self, start, end);
     }
+    fn detach_from(&mut self, mark: usize) -> Self::Saved {
+        ReconOverlay8::split_off(self, mark)
+    }
+    fn reattach(&mut self, saved: Self::Saved) {
+        ReconOverlay8::reattach(self, saved);
+    }
     fn commit_to_frame(&self, frame: &mut DecodedFrame) {
         ReconOverlay8::commit_to_frame(self, frame);
     }
 }
 
 impl OverlayCache for ReconOverlay16 {
+    type Saved = Vec<super::overlay::ReconPatch16>;
     fn clear(&mut self) {
         ReconOverlay16::clear(self);
     }
@@ -164,6 +180,12 @@ impl OverlayCache for ReconOverlay16 {
     }
     fn drain_range(&mut self, start: usize, end: usize) {
         ReconOverlay16::drain_range(self, start, end);
+    }
+    fn detach_from(&mut self, mark: usize) -> Self::Saved {
+        ReconOverlay16::split_off(self, mark)
+    }
+    fn reattach(&mut self, saved: Self::Saved) {
+        ReconOverlay16::reattach(self, saved);
     }
     fn commit_to_frame(&self, frame: &mut DecodedFrame) {
         ReconOverlay16::commit_to_frame(self, frame);
@@ -362,39 +384,129 @@ where
         self.workspace.set_price_qp(state.cur_qp_y);
         self.source.reset_from_ctu(state, x0, y0, log2_cb_size);
         self.overlay.clear();
-        self.build_cu(state, x0, y0, log2_cb_size, ct_depth)
+
+        // Phase 6: decide the whole CTU coding quadtree (leaf-vs-split RD), then
+        // commit the winning branch's recon to the shared frame exactly once.
+        let (node, _cost) = self.decide_cu(state, x0, y0, log2_cb_size, ct_depth);
+        self.overlay.commit_to_frame(&mut state.frame);
+        self.overlay.clear();
+        self.workspace.ledger.bump(WorkBucket::FinalCommit);
+        node
     }
 
-    fn build_cu(
+    /// Decide one CU: code it as a single `Leaf2Nx2N` or split into four sub-CUs,
+    /// whichever has the lower RD cost. On return the overlay holds exactly the
+    /// winner's recon for this region and `mode_map`/`ct_depth_map` reflect it.
+    ///
+    /// The leaf is evaluated first and its patches detached, so the split's
+    /// sub-CUs evaluate against a clean overlay (a sub-CU's references into a
+    /// not-yet-coded sibling must read as unavailable, never the leaf's phantom
+    /// recon). On a leaf win the leaf recon is reattached and its uniform mode/
+    /// depth restored over the region; on a split win the sub-CU stores already
+    /// stand.
+    fn decide_cu(
         &mut self,
         state: &mut Encoder<'_>,
         x0: u32,
         y0: u32,
         log2_cb_size: u8,
         ct_depth: u8,
-    ) -> CuNode {
+    ) -> (CuNode, f64) {
         let cb_size = 1u32 << log2_cb_size;
         let fully_inside =
             x0 + cb_size <= state.display_width && y0 + cb_size <= state.display_height;
-        if !fully_inside && log2_cb_size > 3 {
-            let half = cb_size / 2;
-            let x1 = x0 + half;
-            let y1 = y0 + half;
-            // Final syntax only. Candidate search must use PlanId/TtPlanId arenas.
-            let mut kids = Vec::with_capacity(4);
-            kids.push(self.build_cu(state, x0, y0, log2_cb_size - 1, ct_depth + 1));
-            if x1 < state.display_width {
-                kids.push(self.build_cu(state, x1, y0, log2_cb_size - 1, ct_depth + 1));
-            }
-            if y1 < state.display_height {
-                kids.push(self.build_cu(state, x0, y1, log2_cb_size - 1, ct_depth + 1));
-            }
-            if x1 < state.display_width && y1 < state.display_height {
-                kids.push(self.build_cu(state, x1, y1, log2_cb_size - 1, ct_depth + 1));
-            }
-            return CuNode::Split { kids };
+        let can_split = log2_cb_size > 3;
+
+        // Picture-edge CUs must split (implicit, not coded); no leaf option.
+        if !fully_inside && can_split {
+            return self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
+        }
+        if !can_split {
+            return self.decide_cu_leaf(state, x0, y0, log2_cb_size, ct_depth);
         }
 
+        // Both candidates legal: evaluate leaf, detach it, evaluate split clean.
+        let mark0 = self.overlay.mark();
+        let (leaf_node, leaf_cost) = self.decide_cu_leaf(state, x0, y0, log2_cb_size, ct_depth);
+        let leaf_saved = self.overlay.detach_from(mark0);
+        let (split_node, split_cost) = self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
+
+        // split_cu_flag bits at this node's context.
+        let lambda = rd_lambda(state.cur_qp_y);
+        let scale = CabacEstimator::SCALE as f64;
+        let ci = ctx::SPLIT_CU_FLAG + state.split_ctx_inc(x0, y0, ct_depth);
+        let model = &self.workspace.price_base.models[ci];
+        let leaf_total = leaf_cost + lambda * entropy_bits(model, 0) as f64 / scale;
+        let split_total = split_cost + lambda * entropy_bits(model, 1) as f64 / scale;
+
+        if split_total < leaf_total {
+            // Keep split (its patches + sub-CU mode/depth stores already stand).
+            #[cfg(test)]
+            CU_SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (split_node, split_total)
+        } else {
+            // Restore the leaf: drop split patches, reattach leaf recon, and
+            // re-store the leaf's uniform mode/depth over the region.
+            self.overlay.truncate(mark0);
+            self.overlay.reattach(leaf_saved);
+            if let CuNode::Leaf(ref leaf) = leaf_node {
+                state.store_mode(x0, y0, log2_cb_size, leaf.luma_mode);
+                state.set_ct_depth(x0, y0, log2_cb_size, ct_depth);
+            }
+            (leaf_node, leaf_total)
+        }
+    }
+
+    /// Split this CU into its in-bounds sub-CUs (z-order), recursing into
+    /// [`decide_cu`]. Mirrors the writer's quadtree child iteration.
+    fn decide_cu_split(
+        &mut self,
+        state: &mut Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_cb_size: u8,
+        ct_depth: u8,
+    ) -> (CuNode, f64) {
+        let half = (1u32 << log2_cb_size) / 2;
+        let x1 = x0 + half;
+        let y1 = y0 + half;
+        let kid_log2 = log2_cb_size - 1;
+        let kd = ct_depth + 1;
+        let mut kids = Vec::with_capacity(4);
+        let mut cost = 0.0;
+
+        let (k, c) = self.decide_cu(state, x0, y0, kid_log2, kd);
+        kids.push(k);
+        cost += c;
+        if x1 < state.display_width {
+            let (k, c) = self.decide_cu(state, x1, y0, kid_log2, kd);
+            kids.push(k);
+            cost += c;
+        }
+        if y1 < state.display_height {
+            let (k, c) = self.decide_cu(state, x0, y1, kid_log2, kd);
+            kids.push(k);
+            cost += c;
+        }
+        if x1 < state.display_width && y1 < state.display_height {
+            let (k, c) = self.decide_cu(state, x1, y1, kid_log2, kd);
+            kids.push(k);
+            cost += c;
+        }
+        (CuNode::Split { kids }, cost)
+    }
+
+    /// Code this CU as a single `Leaf2Nx2N`: pick the luma mode (rough+RD) and
+    /// the transform tree, leaving the recon in the overlay and recording the
+    /// CU's mode/depth.
+    fn decide_cu_leaf(
+        &mut self,
+        state: &mut Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_cb_size: u8,
+        ct_depth: u8,
+    ) -> (CuNode, f64) {
         state.stats.cu_trials += 1;
         state.set_ct_depth(x0, y0, log2_cb_size, ct_depth);
 
@@ -408,29 +520,24 @@ where
         }
         let lambda = rd_lambda(state.cur_qp_y);
 
-        // Phase 5: choose the luma mode by rough SATD shortlist + exact RD.
-        self.overlay.clear();
-        let luma_mode = self.decide_cu_luma_mode(state, x0, y0, log2_cb_size, mpm, lambda);
+        let (luma_mode, mode_cost) =
+            self.decide_cu_luma_mode(state, x0, y0, log2_cb_size, mpm, lambda);
         state.store_mode(x0, y0, log2_cb_size, luma_mode);
 
-        // Re-run the winning mode to populate the overlay with its recon; this is
-        // the single final transform-tree decision committed to the frame.
-        self.overlay.clear();
+        // Re-run the winning mode to populate the overlay with its recon.
         let (tt, _cost) = self.decide_tt(state, x0, y0, log2_cb_size, 0, luma_mode, lambda);
 
-        // Commit the winning branch's recon to the shared frame, exactly once.
-        self.overlay.commit_to_frame(&mut state.frame);
-        self.overlay.clear();
-        self.workspace.ledger.bump(WorkBucket::FinalCommit);
-
         state.stats.final_coded_blocks += 1;
-        CuNode::Leaf(emit::cu_leaf(mpm, luma_mode, tt)).tap_confidence(DecisionConfidence::Clear)
+        let node = CuNode::Leaf(emit::cu_leaf(mpm, luma_mode, tt))
+            .tap_confidence(DecisionConfidence::Clear);
+        (node, mode_cost)
     }
 
     /// Choose the CU's luma intra mode: an x265-shaped rough SATD pass over all
     /// 35 modes builds an MPM-protected shortlist (within 25% of the best rough
-    /// cost), which is then evaluated by exact transform-tree RD. The overlay is
-    /// left empty (each trial's patches are rewound).
+    /// cost), which is then evaluated by exact transform-tree RD. Returns the
+    /// winning mode and its RD cost (tt cost + mode-signaling bits). The overlay
+    /// is left empty (each trial's patches are rewound).
     fn decide_cu_luma_mode(
         &mut self,
         state: &Encoder<'_>,
@@ -439,7 +546,7 @@ where
         log2_cb_size: u8,
         mpm: [IntraPredMode; 3],
         lambda: f64,
-    ) -> u8 {
+    ) -> (u8, f64) {
         let mpm_u8 = [mpm[0].as_u8(), mpm[1].as_u8(), mpm[2].as_u8()];
         let scale = CabacEstimator::SCALE as f64;
 
@@ -503,7 +610,7 @@ where
         if best_mode != IntraPredMode::Dc.as_u8() {
             LUMA_NONDC_PICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        best_mode
+        (best_mode, best_total)
     }
 
     /// Predict a block into caller-owned `dst` (`size*size`, stride `size`),
@@ -1005,6 +1112,56 @@ mod tests {
         assert!(
             nondc > 0,
             "luma mode search never picked a non-DC mode on vertical-stripe content"
+        );
+    }
+
+    #[test]
+    fn cu_split_wins_on_mixed_direction_content() {
+        use crate::encoder::{Source, encode};
+        use crate::{ChromaFormat, DeblockMode, Effort, SaoMode, StillHevcConfig};
+        use std::sync::atomic::Ordering;
+
+        // Left half vertical stripes, right half horizontal stripes: a single
+        // large CU cannot pick one good mode, so CU split must win for some CUs.
+        let (w, h) = (128usize, 128usize);
+        let mut y = vec![0u16; w * h];
+        for j in 0..h {
+            for i in 0..w {
+                let v = if i < w / 2 {
+                    if (i / 4) & 1 == 0 { 60 } else { 200 }
+                } else if (j / 4) & 1 == 0 {
+                    60
+                } else {
+                    200
+                };
+                y[j * w + i] = v;
+            }
+        }
+        let chroma = vec![128u16; (w / 2) * (h / 2)];
+        let config = StillHevcConfig {
+            width: w as u32,
+            height: h as u32,
+            bit_depth: 8,
+            chroma: ChromaFormat::Yuv420,
+            qp: 27,
+            effort: Effort::Balanced,
+            sao: SaoMode::Off,
+            deblock: DeblockMode::Off,
+            adaptive_qp: false,
+        };
+        super::CU_SPLIT_WINS.store(0, Ordering::Relaxed);
+        let _ = encode(
+            &config,
+            Source {
+                y: &y,
+                cb: &chroma,
+                cr: &chroma,
+            },
+        );
+        let splits = super::CU_SPLIT_WINS.load(Ordering::Relaxed);
+        assert!(
+            splits > 0,
+            "CU split never won on mixed-direction content (Phase 6 inactive?)"
         );
     }
 
