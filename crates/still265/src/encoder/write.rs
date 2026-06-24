@@ -66,8 +66,8 @@ pub(super) fn write_intra_luma_mode(
 
 /// Emit an 8x8 `PartNxN` CU: `part_mode=0`, four `prev_intra_luma_pred_flag`
 /// (all context bins first), then four `mpm_idx`/`rem` (bypass), one chroma
-/// mode, and the forced-split transform tree. Mirrors the decoder's
-/// `decode_coding_unit` `PartNxN` branch exactly.
+/// mode (or four per-PU chroma modes for 4:4:4), and the forced-split transform
+/// tree. Mirrors the decoder's `decode_coding_unit` `PartNxN` branch exactly.
 #[allow(clippy::too_many_arguments)]
 fn write_cu_nxn(
     state: &mut Encoder<'_>,
@@ -131,7 +131,11 @@ fn write_cu_nxn(
         }
     }
 
-    if state.cat != 0 {
+    if state.cat == 3 {
+        for pu in 0..4 {
+            write_intra_chroma_mode(enc, w, ctxs, nxn.chroma_mode_idx[pu]);
+        }
+    } else if state.cat != 0 {
         write_intra_chroma_mode(enc, w, ctxs, leaf.chroma_mode_idx);
     }
     let cat = state.cat;
@@ -244,9 +248,17 @@ pub(super) fn write_tt(
                     let scan = get_scan_order(c.log2_size, c.chroma_mode, 1, cat);
                     encode_residual(enc, w, ctxs, &c.cb.levels, c.log2_size, 1, scan, sdh);
                 }
+                if c.cb1.cbf {
+                    let scan = get_scan_order(c.log2_size, c.chroma_mode, 1, cat);
+                    encode_residual(enc, w, ctxs, &c.cb1.levels, c.log2_size, 1, scan, sdh);
+                }
                 if c.cr.cbf {
                     let scan = get_scan_order(c.log2_size, c.chroma_mode, 2, cat);
                     encode_residual(enc, w, ctxs, &c.cr.levels, c.log2_size, 2, scan, sdh);
+                }
+                if c.cr1.cbf {
+                    let scan = get_scan_order(c.log2_size, c.chroma_mode, 2, cat);
+                    encode_residual(enc, w, ctxs, &c.cr1.levels, c.log2_size, 2, scan, sdh);
                 }
             }
         }
@@ -431,9 +443,10 @@ pub(super) fn write_coding_quadtree(
     log2_cb_size: u8,
     ct_depth: u8,
 ) -> CuNode {
-    let _ = ctxs;
+    let price_ctx = ctxs.clone();
     let cu = super::stillsearch::StillSearch::new(state.bit_depth).build_ctu(
         state,
+        &price_ctx,
         x0,
         y0,
         log2_cb_size,

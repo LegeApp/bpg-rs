@@ -1,17 +1,17 @@
 //! CTU-local workspace and scratch buffers.
 
-use super::arena::CtuArenas;
+use super::arena::CoeffArena;
 use super::ledger::StillSearchLedger;
 use crate::contexts::Contexts;
 use crate::residual::ResidualPricingScratch;
 
 pub(super) struct CtuWorkspace {
-    pub(super) arenas: CtuArenas,
+    pub(super) coeffs: CoeffArena,
     pub(super) ledger: StillSearchLedger,
     pub(super) block_scratch: BlockScratch,
-    /// Frozen entry context for trial residual/flag pricing (the standard
-    /// HM/x265 RDOQ approximation: contexts are not re-coded across candidates).
-    /// Re-seeded per CTU with the slice QP.
+    /// Frozen CTU-entry context for trial residual/flag pricing (the standard
+    /// HM/x265 RDO approximation: contexts are not re-coded across candidates).
+    /// Re-seeded per CTU from the live writer context at coding-tree entry.
     pub(super) price_base: Contexts,
     pub(super) price_scratch: ResidualPricingScratch,
 }
@@ -19,7 +19,7 @@ pub(super) struct CtuWorkspace {
 impl Default for CtuWorkspace {
     fn default() -> Self {
         Self {
-            arenas: CtuArenas::default(),
+            coeffs: CoeffArena::default(),
             ledger: StillSearchLedger::default(),
             block_scratch: BlockScratch::default(),
             price_base: Contexts::new(0),
@@ -30,14 +30,14 @@ impl Default for CtuWorkspace {
 
 impl CtuWorkspace {
     pub(super) fn reset(&mut self) {
-        self.arenas.clear();
+        self.coeffs.clear();
         self.ledger.clear_ctu();
         self.block_scratch.clear_ctu();
     }
 
-    /// Seed the trial-pricing entry context with the slice QP.
-    pub(super) fn set_price_qp(&mut self, slice_qp: i32) {
-        self.price_base = Contexts::new(slice_qp.clamp(0, 51));
+    /// Seed the trial-pricing entry context with the live CTU-entry context.
+    pub(super) fn set_price_context(&mut self, ctxs: &Contexts) {
+        self.price_base = ctxs.clone();
     }
 }
 

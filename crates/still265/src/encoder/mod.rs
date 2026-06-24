@@ -42,6 +42,7 @@ pub(super) struct Encoder<'a> {
     cur_qp_y: i32,
     cur_qp_c: i32,
     best_aq: Option<(bool, f32)>,
+    part_nxn_enabled: bool,
     analysis: Arc<crate::preanalysis::AnalysisMaps>,
     stats: EncodeStats,
 }
@@ -337,6 +338,13 @@ pub fn encode_with_stats(
         } else {
             None
         },
+        part_nxn_enabled: matches!(
+            config.effort,
+            crate::Effort::SlowPlus
+                | crate::Effort::Best
+                | crate::Effort::Placebo
+                | crate::Effort::Reference
+        ),
         analysis,
         stats: EncodeStats::default(),
     };

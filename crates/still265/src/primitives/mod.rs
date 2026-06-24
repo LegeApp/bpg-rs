@@ -288,6 +288,23 @@ pub fn satd_u16_scalar(a: &[u16], stride_a: usize, b: &[u16], stride_b: usize, s
     satd_by(a, stride_a, b, stride_b, size, |v| v as i32)
 }
 
+/// Sum of squared differences over an 8-bit `size`x`size` block. This is the
+/// scalar 8-bit hot-path counterpart to [`ssd_u16`]; SIMD dispatch can be added
+/// behind the same primitive table once the 8-bit path is fully settled.
+pub fn ssd_u8(a: &[u8], stride_a: usize, b: &[u8], stride_b: usize, size: usize) -> u64 {
+    debug_assert!(stride_a >= size && stride_b >= size);
+    let mut sse = 0u64;
+    for j in 0..size {
+        let ra = &a[j * stride_a..j * stride_a + size];
+        let rb = &b[j * stride_b..j * stride_b + size];
+        for (&x, &y) in ra.iter().zip(rb.iter()) {
+            let d = x as i32 - y as i32;
+            sse += (d * d) as u64;
+        }
+    }
+    sse
+}
+
 /// Sum of squared differences over a `size`x`size` block (HEVC distortion).
 /// Dispatched through [`PRIMITIVES`]; byte-identical to [`ssd_u16_scalar`].
 /// Maps to x265's `pixel_ssd` (`ssd-a.asm`).
@@ -637,6 +654,25 @@ mod tests {
                     x as u8
                 }
             };
+        }
+    }
+
+    #[test]
+    fn ssd_u8_matches_widened_u16_reference() {
+        let mut seed = 0x243f_6a88u32;
+        for &size in &[4usize, 8, 16, 32] {
+            let stride = size + 5;
+            let mut a = vec![0u8; stride * size];
+            let mut b = vec![0u8; stride * size];
+            fill_pattern(&mut a, 99, &mut seed);
+            fill_pattern(&mut b, 99, &mut seed);
+            let aw: Vec<u16> = a.iter().map(|&v| u16::from(v)).collect();
+            let bw: Vec<u16> = b.iter().map(|&v| u16::from(v)).collect();
+            assert_eq!(
+                ssd_u8(&a, stride, &b, stride, size),
+                ssd_u16_scalar(&aw, stride, &bw, stride, size),
+                "size={size}"
+            );
         }
     }
 

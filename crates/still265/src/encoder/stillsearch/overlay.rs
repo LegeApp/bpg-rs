@@ -72,7 +72,29 @@ impl ReconOverlay8 {
             y,
             width,
             height,
-            samples: samples.iter().map(|&s| s.min(u8::MAX as u16) as u8).collect(),
+            samples: samples
+                .iter()
+                .map(|&s| s.min(u8::MAX as u16) as u8)
+                .collect(),
+        });
+    }
+
+    pub(super) fn push_block_u8(
+        &mut self,
+        c_idx: u8,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        samples: &[u8],
+    ) {
+        self.patches.push(ReconPatch8 {
+            c_idx,
+            x,
+            y,
+            width,
+            height,
+            samples: samples.to_vec(),
         });
     }
 
@@ -204,5 +226,106 @@ impl ReconOverlay16 {
             }
         }
         None
+    }
+}
+
+/// CTU-local reconstruction overlay used for non-mutating trials. Trials push
+/// candidate recon patches; the winning branch commits once to `state.frame`.
+pub(super) trait OverlayCache {
+    /// Owned patch buffer detached by [`detach_from`](Self::detach_from).
+    type Saved;
+    fn clear(&mut self);
+    fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16>;
+    fn push_block(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32, samples: &[u16]);
+    fn push_block_u8(
+        &mut self,
+        c_idx: u8,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        samples: &[u8],
+    ) {
+        let widened: Vec<u16> = samples.iter().map(|&s| u16::from(s)).collect();
+        self.push_block(c_idx, x, y, width, height, &widened);
+    }
+    fn mark(&self) -> usize;
+    fn truncate(&mut self, mark: usize);
+    fn drain_range(&mut self, start: usize, end: usize);
+    fn detach_from(&mut self, mark: usize) -> Self::Saved;
+    fn reattach(&mut self, saved: Self::Saved);
+    fn commit_to_frame(&self, frame: &mut bpg_hevc_decode::DecodedFrame);
+}
+
+impl OverlayCache for ReconOverlay8 {
+    type Saved = Vec<ReconPatch8>;
+    fn clear(&mut self) {
+        ReconOverlay8::clear(self);
+    }
+    fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16> {
+        ReconOverlay8::sample(self, c_idx, x, y).map(u16::from)
+    }
+    fn push_block(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32, samples: &[u16]) {
+        ReconOverlay8::push_block(self, c_idx, x, y, width, height, samples);
+    }
+    fn push_block_u8(
+        &mut self,
+        c_idx: u8,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        samples: &[u8],
+    ) {
+        ReconOverlay8::push_block_u8(self, c_idx, x, y, width, height, samples);
+    }
+    fn mark(&self) -> usize {
+        ReconOverlay8::mark(self)
+    }
+    fn truncate(&mut self, mark: usize) {
+        ReconOverlay8::truncate(self, mark);
+    }
+    fn drain_range(&mut self, start: usize, end: usize) {
+        ReconOverlay8::drain_range(self, start, end);
+    }
+    fn detach_from(&mut self, mark: usize) -> Self::Saved {
+        ReconOverlay8::split_off(self, mark)
+    }
+    fn reattach(&mut self, saved: Self::Saved) {
+        ReconOverlay8::reattach(self, saved);
+    }
+    fn commit_to_frame(&self, frame: &mut bpg_hevc_decode::DecodedFrame) {
+        ReconOverlay8::commit_to_frame(self, frame);
+    }
+}
+
+impl OverlayCache for ReconOverlay16 {
+    type Saved = Vec<ReconPatch16>;
+    fn clear(&mut self) {
+        ReconOverlay16::clear(self);
+    }
+    fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16> {
+        ReconOverlay16::sample(self, c_idx, x, y)
+    }
+    fn push_block(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32, samples: &[u16]) {
+        ReconOverlay16::push_block(self, c_idx, x, y, width, height, samples);
+    }
+    fn mark(&self) -> usize {
+        ReconOverlay16::mark(self)
+    }
+    fn truncate(&mut self, mark: usize) {
+        ReconOverlay16::truncate(self, mark);
+    }
+    fn drain_range(&mut self, start: usize, end: usize) {
+        ReconOverlay16::drain_range(self, start, end);
+    }
+    fn detach_from(&mut self, mark: usize) -> Self::Saved {
+        ReconOverlay16::split_off(self, mark)
+    }
+    fn reattach(&mut self, saved: Self::Saved) {
+        ReconOverlay16::reattach(self, saved);
+    }
+    fn commit_to_frame(&self, frame: &mut bpg_hevc_decode::DecodedFrame) {
+        ReconOverlay16::commit_to_frame(self, frame);
     }
 }

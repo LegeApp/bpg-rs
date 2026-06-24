@@ -50,7 +50,11 @@ pub(super) struct ParentChromaTu {
     pub(super) log2_size: u8,
     pub(super) chroma_mode: u8,
     pub(super) cb: CodedBlock,
+    /// Second stacked chroma TB (4:2:2 only).
+    pub(super) cb1: CodedBlock,
     pub(super) cr: CodedBlock,
+    /// Second stacked chroma TB (4:2:2 only).
+    pub(super) cr1: CodedBlock,
 }
 
 /// Final transform tree syntax for one coded CU.
@@ -105,6 +109,9 @@ impl Tt {
 pub(super) struct NxnInfo {
     pub(super) luma_modes: [u8; 4],
     pub(super) mpms: [[IntraPredMode; 3]; 4],
+    /// Per-PU `intra_chroma_pred_mode` indexes for 4:4:4 PartNxN. Subsampled
+    /// formats use the CU-level `CuLeaf::chroma_mode_idx` instead.
+    pub(super) chroma_mode_idx: [u8; 4],
 }
 
 /// A coding unit, fully coded (intra mode + transform tree).

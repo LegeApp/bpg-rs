@@ -133,6 +133,10 @@ pub struct EncodeStats {
     pub partnxn_losses: u64,
     pub partnxn_cu_trials: u64,
     pub partnxn_code_block_calls: u64,
+    /// Final 4:2:2 PartNxN winners whose parent chroma used a second stacked
+    /// Cb/Cr coded block flag (`cb1` or `cr1`). This is a StillSearch-specific
+    /// correctness/coverage counter, not a legacy RDO stat.
+    pub partnxn_422_parent_chroma_second_cbf: u64,
     pub final_coded_blocks: u64,
     pub trial_coded_blocks: u64,
     pub final_rdoq_blocks: u64,
@@ -184,6 +188,11 @@ pub struct EncodeStats {
     pub tu_leaf_wins_by_region: [u64; crate::preanalysis::NUM_CLASSES],
     pub tu_split_wins_by_region: [u64; crate::preanalysis::NUM_CLASSES],
     pub partnxn_wins_by_region: [u64; crate::preanalysis::NUM_CLASSES],
+    /// Picture-level StillSearch work ledger aggregated from CTU-local ledgers.
+    /// Bucket order is internal to StillSearch for now; legacy counters above
+    /// remain compatibility-only and new search work should not write rdo2-era
+    /// fields.
+    pub stillsearch_ledger: [u64; 15],
 }
 
 impl EncodeStats {
@@ -195,6 +204,13 @@ impl EncodeStats {
         self.phase_sao_decide_us += other.phase_sao_decide_us;
         self.phase_sao_apply_us += other.phase_sao_apply_us;
         self.phase_write_us += other.phase_write_us;
+        for (dst, src) in self
+            .stillsearch_ledger
+            .iter_mut()
+            .zip(other.stillsearch_ledger.iter())
+        {
+            *dst += *src;
+        }
     }
 }
 

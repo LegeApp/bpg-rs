@@ -3,7 +3,7 @@
 //! samples the encoder reconstructed, with a sane PSNR against the source.
 
 use bpg_hevc_decode::hevc::decode;
-use still265::encoder::{Source, encode};
+use still265::encoder::{Source, encode, encode_with_stats};
 use still265::{ChromaFormat, DeblockMode, Effort, SaoMode, StillHevcConfig};
 
 /// Build a smooth 4:2:0 YCbCr source (gradients predict well under Planar),
@@ -787,13 +787,14 @@ fn best_partnxn_round_trip() {
     // A textured source forces 8x8 CUs where PartNxN wins the RD trial; the
     // decoder must reconstruct the encoder's samples bit-exactly (the four-PU
     // mode syntax + forced-split transform tree all match the decode path).
-    for (w, h, qp) in [(128u32, 128u32, 30u8), (96, 96, 34)] {
+    let mut nxn_wins = 0u64;
+    for (w, h, qp) in [(128u32, 128u32, 18u8), (96, 96, 34)] {
         let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, 8);
         let config = StillHevcConfig {
             effort: Effort::Best,
             ..cfg(w, h, qp, 8)
         };
-        let (bytes, recon) = encode(
+        let (bytes, recon, stats) = encode_with_stats(
             &config,
             Source {
                 y: &y,
@@ -801,6 +802,7 @@ fn best_partnxn_round_trip() {
                 cr: &cr,
             },
         );
+        nxn_wins += stats.partnxn_wins;
         let decoded = decode(&bytes).expect("decoder must accept Best PartNxN stream");
         assert_plane_eq(
             &decoded.y_plane,
@@ -821,6 +823,126 @@ fn best_partnxn_round_trip() {
             &format!("Best PartNxN cr recon ({w}x{h} qp{qp})"),
         );
     }
+    assert!(
+        nxn_wins > 0,
+        "Best PartNxN search never selected an 8x8 NxN CU across textured cases"
+    );
+}
+
+#[test]
+fn best_partnxn_422_round_trip() {
+    // 4:2:2 PartNxN keeps four luma 4x4 PUs, but chroma is coded as parent
+    // chroma on the forced-split 8x8 root: two stacked 4x4 Cb TBs and two
+    // stacked 4x4 Cr TBs. The small top/bottom chroma variation below is enough
+    // to exercise cb1/cr1 while preserving natural NxN wins from luma texture.
+    let (w, h, qp) = (64u32, 64u32, 12u8);
+    let mut y = vec![0u16; (w * h) as usize];
+    for j in 0..h as usize {
+        for i in 0..w as usize {
+            let checker = if ((i / 8) ^ (j / 8)) & 1 == 0 {
+                42
+            } else {
+                186
+            };
+            y[j * w as usize + i] = (checker + ((i * 3 + j * 5) % 17) as i32) as u16;
+        }
+    }
+    let cw = w.div_ceil(2) as usize;
+    let mut cb = vec![0u16; cw * h as usize];
+    let mut cr = vec![0u16; cw * h as usize];
+    for j in 0..h as usize {
+        for i in 0..cw {
+            let s = if (j / 4) & 1 == 0 { -6 } else { 6 };
+            cb[j * cw + i] = (128 + s) as u16;
+            cr[j * cw + i] = (128 - s + ((i % 3) as i32 - 1)).clamp(0, 255) as u16;
+        }
+    }
+
+    let config = StillHevcConfig {
+        effort: Effort::Best,
+        ..cfg_chroma(w, h, qp, 8, ChromaFormat::Yuv422)
+    };
+    let (bytes, recon, stats) = encode_with_stats(
+        &config,
+        Source {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+        },
+    );
+    assert!(
+        stats.partnxn_wins > 0,
+        "Best 4:2:2 PartNxN search never selected an 8x8 NxN CU"
+    );
+    assert!(
+        stats.partnxn_422_parent_chroma_second_cbf > 0,
+        "Best 4:2:2 PartNxN never coded the second stacked parent chroma TB"
+    );
+    let decoded = decode(&bytes).expect("decoder must accept Best 4:2:2 PartNxN stream");
+    assert_plane_eq(
+        &decoded.y_plane,
+        &recon.y_plane,
+        decoded.width as usize,
+        "Best 4:2:2 PartNxN luma recon",
+    );
+    assert_plane_eq(
+        &decoded.cb_plane,
+        &recon.cb_plane,
+        decoded.width.div_ceil(2) as usize,
+        "Best 4:2:2 PartNxN cb recon",
+    );
+    assert_plane_eq(
+        &decoded.cr_plane,
+        &recon.cr_plane,
+        decoded.width.div_ceil(2) as usize,
+        "Best 4:2:2 PartNxN cr recon",
+    );
+}
+
+#[test]
+fn best_partnxn_444_round_trip() {
+    // 4:4:4 PartNxN signals one chroma mode per 4x4 PU and each forced-split
+    // 4x4 child carries Cb/Cr TUs. Use luma texture with neutral chroma so NxN
+    // wins while still exercising per-PU chroma syntax and reconstruction.
+    let (w, h, qp) = (64u32, 64u32, 18u8);
+    let (y, mut cb, mut cr) = make_textured_source_444(w as usize, h as usize, 8);
+    cb.fill(128);
+    cr.fill(128);
+    let config = StillHevcConfig {
+        effort: Effort::Best,
+        ..cfg_chroma(w, h, qp, 8, ChromaFormat::Yuv444)
+    };
+    let (bytes, recon, stats) = encode_with_stats(
+        &config,
+        Source {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+        },
+    );
+    assert!(
+        stats.partnxn_wins > 0,
+        "Best 4:4:4 PartNxN search never selected an 8x8 NxN CU"
+    );
+    let decoded = decode(&bytes).expect("decoder must accept Best 4:4:4 PartNxN stream");
+    assert_plane_eq(
+        &decoded.y_plane,
+        &recon.y_plane,
+        decoded.width as usize,
+        "Best 4:4:4 PartNxN luma recon",
+    );
+    assert_plane_eq(
+        &decoded.cb_plane,
+        &recon.cb_plane,
+        decoded.width as usize,
+        "Best 4:4:4 PartNxN cb recon",
+    );
+    assert_plane_eq(
+        &decoded.cr_plane,
+        &recon.cr_plane,
+        decoded.width as usize,
+        "Best 4:4:4 PartNxN cr recon",
+    );
 }
 
 #[test]

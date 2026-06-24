@@ -20,7 +20,7 @@ pub(super) enum WorkBucket {
 }
 
 impl WorkBucket {
-    const COUNT: usize = 15;
+    pub(super) const COUNT: usize = 15;
 
     fn idx(self) -> usize {
         self as usize
@@ -43,5 +43,11 @@ impl StillSearchLedger {
 
     pub(super) fn calls(&self, bucket: WorkBucket) -> u64 {
         self.calls[bucket.idx()]
+    }
+
+    pub(super) fn merge_into(&self, dst: &mut [u64; WorkBucket::COUNT]) {
+        for (d, s) in dst.iter_mut().zip(self.calls.iter()) {
+            *d += *s;
+        }
     }
 }
