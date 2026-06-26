@@ -252,341 +252,317 @@ impl DecodedFrame {
         )
     }
 
-    /// Convert YCbCr to RGB with conformance window cropping
-    pub fn to_rgb(&self) -> Vec<u8> {
-        let out_width = self.cropped_width();
-        let out_height = self.cropped_height();
-        let total = (out_width * out_height) as usize;
-        let mut rgb = vec![0u8; total * 3];
-        let shift = self.bit_depth - 8;
+    /// Lanczos-upsample subsampled chroma (4:2:0/4:2:2) to full luma resolution,
+    /// returning 8-bit `(cb, cr)` planes of `width * height` samples. Returns
+    /// `None` for 4:4:4 and monochrome (no upsampling needed). `shift` is
+    /// `bit_depth - 8` so the result is always 8-bit. Shared by RGB output
+    /// (`write_pixels`) and YCbCr output (`to_ycbcr444_8bit`) so both use the
+    /// same bit-exact kernels.
+    fn upsampled_full_chroma(&self, shift: u8) -> Option<(Vec<u16>, Vec<u16>)> {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        match self.chroma_format {
+            1 => {
+                let c_stride = self.c_stride();
+                let w2 = (self.width as usize + 1) / 2;
+                let h2 = (self.height as usize + 1) / 2;
+                Some((
+                    color_convert::upsample_chroma_420(
+                        &self.cb_plane,
+                        w2,
+                        h2,
+                        c_stride,
+                        w,
+                        h,
+                        shift as u32,
+                    ),
+                    color_convert::upsample_chroma_420(
+                        &self.cr_plane,
+                        w2,
+                        h2,
+                        c_stride,
+                        w,
+                        h,
+                        shift as u32,
+                    ),
+                ))
+            }
+            2 => {
+                let c_stride = self.c_stride();
+                let w2 = (self.width as usize + 1) / 2;
+                Some((
+                    color_convert::upsample_chroma_422(
+                        &self.cb_plane,
+                        w2,
+                        h,
+                        c_stride,
+                        w,
+                        h,
+                        shift as u32,
+                    ),
+                    color_convert::upsample_chroma_422(
+                        &self.cr_plane,
+                        w2,
+                        h,
+                        c_stride,
+                        w,
+                        h,
+                        shift as u32,
+                    ),
+                ))
+            }
+            _ => None,
+        }
+    }
 
+    /// Render the cropped picture as interleaved 8-bit `[Y, Cb, Cr]` at full
+    /// 4:4:4 resolution (chroma Lanczos-upsampled, bit-exact with the RGB path),
+    /// **without** any YCbCr→RGB conversion. This is the color-space-preserving
+    /// path for re-encoding to JPEG: when the frame is BT.601 full-range 8-bit,
+    /// these samples can be written straight into a JFIF JPEG. The stored planes
+    /// are not mutated. Monochrome frames get neutral chroma (128).
+    pub fn to_ycbcr444_8bit(&self) -> Vec<u8> {
+        let shift = self.bit_depth - 8;
+        let w = self.width as usize;
+        let cw = self.cropped_width() as usize;
+        let ch = self.cropped_height() as usize;
+        let full = self.upsampled_full_chroma(shift);
+        let mut out = vec![0u8; cw * ch * 3];
         let y_start = self.crop_top;
-        let y_end = self.height - self.crop_bottom;
+        let x_start = self.crop_left;
+        let x_end = self.width - self.crop_right;
+        color_convert::for_each_row(&mut out, cw * 3, |row, out_row| {
+            let y = y_start + row as u32;
+            let mut off = 0usize;
+            for x in x_start..x_end {
+                let idx = y as usize * w + x as usize;
+                let y_val = (self.y_plane[idx] >> shift).min(255) as u8;
+                let (cb, cr) = match &full {
+                    Some((cb, cr)) => (cb[idx].min(255) as u8, cr[idx].min(255) as u8),
+                    None => {
+                        let (cb, cr) = self.get_chroma(x, y, shift);
+                        (cb.clamp(0, 255) as u8, cr.clamp(0, 255) as u8)
+                    }
+                };
+                out_row[off] = y_val;
+                out_row[off + 1] = cb;
+                out_row[off + 2] = cr;
+                off += 3;
+            }
+        });
+        out
+    }
+
+    /// Render the cropped luma plane as 8-bit grayscale (`cropped_width *
+    /// cropped_height` bytes), for writing monochrome frames to JPEG without
+    /// going through RGB.
+    pub fn to_luma8(&self) -> Vec<u8> {
+        let shift = self.bit_depth - 8;
+        let w = self.width as usize;
+        let cw = self.cropped_width() as usize;
+        let ch = self.cropped_height() as usize;
+        let mut out = vec![0u8; cw * ch];
+        let mut off = 0usize;
+        for y in self.crop_top..(self.height - self.crop_bottom) {
+            for x in self.crop_left..(self.width - self.crop_right) {
+                let idx = y as usize * w + x as usize;
+                out[off] = (self.y_plane[idx] >> shift).min(255) as u8;
+                off += 1;
+            }
+        }
+        out
+    }
+
+    /// Like [`to_luma8`] but expands a limited-range luma plane to full range
+    /// (JFIF expects full-range luma). For full-range 8-bit input it equals
+    /// [`to_luma8`]. Used for the grayscale JPEG path so non-full-range mono
+    /// frames keep correct tones without an RGB conversion.
+    pub fn to_luma8_jfif(&self) -> Vec<u8> {
+        let w = self.width as usize;
+        let cw = self.cropped_width() as usize;
+        let ch = self.cropped_height() as usize;
+        let bd = self.bit_depth;
+        let fr = self.full_range;
+        let mut out = vec![0u8; cw * ch];
+        let mut off = 0usize;
+        for y in self.crop_top..(self.height - self.crop_bottom) {
+            for x in self.crop_left..(self.width - self.crop_right) {
+                let idx = y as usize * w + x as usize;
+                out[off] = color_convert::luma_to_jfif_8bit(self.y_plane[idx] as i32, bd, fr);
+                off += 1;
+            }
+        }
+        out
+    }
+
+    /// Render the cropped picture as interleaved 8-bit `[Y, Cb, Cr]` transcoded
+    /// to **JFIF (BT.601 full-range)** YCbCr — the baseline JPEG color space —
+    /// for sources that are not already BT.601 full-range (BT.709/BT.2020 or
+    /// limited range). Chroma is Lanczos-upsampled to 4:4:4 first, then each
+    /// pixel is converted in the YCbCr domain via
+    /// [`color_convert::transcode_to_jfif_ycbcr`]; no clamped RGB image is ever
+    /// formed. Only valid when `is_ycbcr_matrix(self.matrix_coeffs)`.
+    pub fn to_jfif_ycbcr444_8bit(&self) -> Vec<u8> {
+        let shift = self.bit_depth - 8;
+        let w = self.width as usize;
+        let cw = self.cropped_width() as usize;
+        let ch = self.cropped_height() as usize;
+        let full = self.upsampled_full_chroma(shift);
+        let mc = self.matrix_coeffs;
+        let fr = self.full_range;
+        let y_start = self.crop_top;
+        let x_start = self.crop_left;
+        let x_end = self.width - self.crop_right;
+        let mut out = vec![0u8; cw * ch * 3];
+        color_convert::for_each_row(&mut out, cw * 3, |row, out_row| {
+            let y = y_start + row as u32;
+            let mut off = 0usize;
+            for x in x_start..x_end {
+                let idx = y as usize * w + x as usize;
+                let y8 = (self.y_plane[idx] >> shift).min(255) as i32;
+                let (cb8, cr8) = match &full {
+                    Some((cb, cr)) => (cb[idx].min(255) as i32, cr[idx].min(255) as i32),
+                    None => self.get_chroma(x, y, shift),
+                };
+                let (yy, cb, cr) = color_convert::transcode_to_jfif_ycbcr(y8, cb8, cr8, fr, mc);
+                out_row[off] = yy;
+                out_row[off + 1] = cb;
+                out_row[off + 2] = cr;
+                off += 3;
+            }
+        });
+        out
+    }
+
+    /// Render the cropped picture into `out` as interleaved 8-bit pixels of
+    /// `stride` bytes each; `r_pos`/`g_pos`/`b_pos` (and optional `a_pos`) give the
+    /// byte offset of each channel within a pixel. For subsampled 4:2:0/4:2:2
+    /// formats, chroma is Lanczos-upsampled to luma resolution (bit-exact with
+    /// bpgdec) on the fly; the stored YCbCr planes are never mutated, so native
+    /// chroma stays available for non-RGB consumers.
+    fn write_pixels(
+        &self,
+        out: &mut [u8],
+        stride: usize,
+        r_pos: usize,
+        g_pos: usize,
+        b_pos: usize,
+        a_pos: Option<usize>,
+    ) {
+        let shift = self.bit_depth - 8;
+        let y_start = self.crop_top;
         let x_start = self.crop_left;
         let x_end = self.width - self.crop_right;
         let w = self.width as usize;
 
-        let mut out_idx = 0;
+        // Subsampled chroma: upsample to full resolution once, separate from the
+        // native planes (preserving unmodified YCbCr for other consumers).
+        let full = self.upsampled_full_chroma(shift);
+        let cw = (x_end - x_start) as usize;
 
-        if self.chroma_format == 1 && !matches!(self.matrix_coeffs, 0 | 8) {
-            // SIMD-accelerated 4:2:0 path (AVX2 when available, scalar fallback)
-            let c_stride = self.c_stride();
-            color_convert::convert_420_to_rgb(
-                &self.y_plane,
-                &self.cb_plane,
-                &self.cr_plane,
-                w,
-                c_stride,
-                y_start,
-                y_end,
-                x_start,
-                x_end,
-                shift as u32,
-                self.full_range,
-                self.matrix_coeffs,
-                &mut rgb,
-            );
-        } else {
-            for y in y_start..y_end {
-                for x in x_start..x_end {
-                    let y_idx = y as usize * w + x as usize;
-                    let y_val = (self.y_plane[y_idx] >> shift) as i32;
-                    let (cb_val, cr_val) = self.get_chroma(x, y, shift);
-                    let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
-                    rgb[out_idx] = r;
-                    rgb[out_idx + 1] = g;
-                    rgb[out_idx + 2] = b;
-                    out_idx += 3;
+        // YCbCr→RGB is a cross-channel per-pixel conversion; the win comes from
+        // spreading whole output rows across cores (see `for_each_row`), which is
+        // bit-identical to the sequential pass.
+        color_convert::for_each_row(out, cw * stride, |row, out_row| {
+            let y = y_start + row as u32;
+            let mut off = 0usize;
+            for (col, x) in (x_start..x_end).enumerate() {
+                let idx = y as usize * w + x as usize;
+                let y_val = (self.y_plane[idx] >> shift) as i32;
+                let (cb_val, cr_val) = match &full {
+                    Some((cb, cr)) => (cb[idx] as i32, cr[idx] as i32),
+                    None => self.get_chroma(x, y, shift),
+                };
+                let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
+                out_row[off + r_pos] = r;
+                out_row[off + g_pos] = g;
+                out_row[off + b_pos] = b;
+                if let Some(ap) = a_pos {
+                    let pixel_idx = row * cw + col;
+                    let alpha = match self.alpha_plane {
+                        Some(ref a) if pixel_idx < a.len() => {
+                            (a[pixel_idx] >> shift).min(255) as u8
+                        }
+                        _ => 255,
+                    };
+                    out_row[off + ap] = alpha;
                 }
+                off += stride;
             }
-        }
+        });
+    }
 
+    /// Convert YCbCr to RGB with conformance window cropping.
+    pub fn to_rgb(&self) -> Vec<u8> {
+        let total = (self.cropped_width() * self.cropped_height()) as usize;
+        let mut rgb = vec![0u8; total * 3];
+        self.write_pixels(&mut rgb, 3, 0, 1, 2, None);
         rgb
     }
 
-    /// Convert YCbCr to BGRA with conformance window cropping.
-    /// Produces BGRA byte order (blue, green, red, alpha).
-    /// Uses real alpha values from `alpha_plane` if present, otherwise alpha=255.
+    /// Convert YCbCr to BGRA with conformance window cropping (blue, green, red,
+    /// alpha). Uses real alpha from `alpha_plane` if present, otherwise 255.
     pub fn to_bgra(&self) -> Vec<u8> {
-        let out_width = self.cropped_width();
-        let out_height = self.cropped_height();
-        let mut bgra = Vec::with_capacity((out_width * out_height * 4) as usize);
-        let shift = self.bit_depth - 8;
-
-        let y_start = self.crop_top;
-        let y_end = self.height - self.crop_bottom;
-        let x_start = self.crop_left;
-        let x_end = self.width - self.crop_right;
-
-        let mut pixel_idx = 0usize;
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let y_idx = (y * self.width + x) as usize;
-                let y_val = (self.y_plane[y_idx] >> shift) as i32;
-
-                let (cb_val, cr_val) = self.get_chroma(x, y, shift);
-
-                let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
-                bgra.push(b);
-                bgra.push(g);
-                bgra.push(r);
-
-                let alpha = if let Some(ref alpha) = self.alpha_plane {
-                    if pixel_idx < alpha.len() {
-                        (alpha[pixel_idx] >> shift).min(255) as u8
-                    } else {
-                        255
-                    }
-                } else {
-                    255
-                };
-                bgra.push(alpha);
-
-                pixel_idx += 1;
-            }
-        }
-
+        let total = (self.cropped_width() * self.cropped_height()) as usize;
+        let mut bgra = vec![0u8; total * 4];
+        self.write_pixels(&mut bgra, 4, 2, 1, 0, Some(3));
         bgra
     }
 
     /// Convert YCbCr to BGR with conformance window cropping.
     pub fn to_bgr(&self) -> Vec<u8> {
-        let out_width = self.cropped_width();
-        let out_height = self.cropped_height();
-        let mut bgr = Vec::with_capacity((out_width * out_height * 3) as usize);
-        let shift = self.bit_depth - 8;
-
-        let y_start = self.crop_top;
-        let y_end = self.height - self.crop_bottom;
-        let x_start = self.crop_left;
-        let x_end = self.width - self.crop_right;
-
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let y_idx = (y * self.width + x) as usize;
-                let y_val = (self.y_plane[y_idx] >> shift) as i32;
-                let (cb_val, cr_val) = self.get_chroma(x, y, shift);
-
-                let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
-                bgr.push(b);
-                bgr.push(g);
-                bgr.push(r);
-            }
-        }
-
+        let total = (self.cropped_width() * self.cropped_height()) as usize;
+        let mut bgr = vec![0u8; total * 3];
+        self.write_pixels(&mut bgr, 3, 2, 1, 0, None);
         bgr
     }
 
-    /// Write pixels into a pre-allocated buffer in RGB format.
-    /// Returns the number of bytes written.
+    /// Write pixels into a pre-allocated RGB buffer. Returns the number of bytes
+    /// needed; only writes when `output` is large enough.
     pub fn write_rgb_into(&self, output: &mut [u8]) -> usize {
-        let out_width = self.cropped_width();
-        let out_height = self.cropped_height();
-        let shift = self.bit_depth - 8;
-
-        let y_start = self.crop_top;
-        let y_end = self.height - self.crop_bottom;
-        let x_start = self.crop_left;
-        let x_end = self.width - self.crop_right;
-        let w = self.width as usize;
-
-        let mut offset = 0;
-        if self.chroma_format == 1 && !matches!(self.matrix_coeffs, 0 | 8) {
-            // SIMD-accelerated 4:2:0 path
-            let c_stride = self.c_stride();
-            let needed = (out_width * out_height * 3) as usize;
-            if output.len() >= needed {
-                color_convert::convert_420_to_rgb(
-                    &self.y_plane,
-                    &self.cb_plane,
-                    &self.cr_plane,
-                    w,
-                    c_stride,
-                    y_start,
-                    y_end,
-                    x_start,
-                    x_end,
-                    shift as u32,
-                    self.full_range,
-                    self.matrix_coeffs,
-                    output,
-                );
-            }
-        } else {
-            for y in y_start..y_end {
-                for x in x_start..x_end {
-                    let y_idx = y as usize * w + x as usize;
-                    let y_val = (self.y_plane[y_idx] >> shift) as i32;
-                    let (cb_val, cr_val) = self.get_chroma(x, y, shift);
-                    let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
-                    if offset + 3 <= output.len() {
-                        output[offset] = r;
-                        output[offset + 1] = g;
-                        output[offset + 2] = b;
-                        offset += 3;
-                    }
-                }
-            }
+        let needed = (self.cropped_width() * self.cropped_height()) as usize * 3;
+        if output.len() >= needed {
+            self.write_pixels(output, 3, 0, 1, 2, None);
         }
-        (out_width * out_height * 3) as usize
+        needed
     }
 
-    /// Write pixels into a pre-allocated buffer in RGBA format.
-    /// Returns the number of bytes written.
+    /// Write pixels into a pre-allocated RGBA buffer. Returns the number of bytes
+    /// needed; only writes when `output` is large enough.
     pub fn write_rgba_into(&self, output: &mut [u8]) -> usize {
-        let out_width = self.cropped_width();
-        let out_height = self.cropped_height();
-        let shift = self.bit_depth - 8;
-
-        let y_start = self.crop_top;
-        let y_end = self.height - self.crop_bottom;
-        let x_start = self.crop_left;
-        let x_end = self.width - self.crop_right;
-
-        let mut offset = 0;
-        let mut pixel_idx = 0usize;
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let y_idx = (y * self.width + x) as usize;
-                let y_val = (self.y_plane[y_idx] >> shift) as i32;
-                let (cb_val, cr_val) = self.get_chroma(x, y, shift);
-                let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
-                let alpha = if let Some(ref alpha) = self.alpha_plane {
-                    if pixel_idx < alpha.len() {
-                        (alpha[pixel_idx] >> shift).min(255) as u8
-                    } else {
-                        255
-                    }
-                } else {
-                    255
-                };
-                if offset + 4 <= output.len() {
-                    output[offset] = r;
-                    output[offset + 1] = g;
-                    output[offset + 2] = b;
-                    output[offset + 3] = alpha;
-                    offset += 4;
-                }
-                pixel_idx += 1;
-            }
+        let needed = (self.cropped_width() * self.cropped_height()) as usize * 4;
+        if output.len() >= needed {
+            self.write_pixels(output, 4, 0, 1, 2, Some(3));
         }
-        (out_width * out_height * 4) as usize
+        needed
     }
 
-    /// Write pixels into a pre-allocated buffer in BGRA format.
-    /// Returns the number of bytes written.
+    /// Write pixels into a pre-allocated BGRA buffer. Returns the number of bytes
+    /// needed; only writes when `output` is large enough.
     pub fn write_bgra_into(&self, output: &mut [u8]) -> usize {
-        let out_width = self.cropped_width();
-        let out_height = self.cropped_height();
-        let shift = self.bit_depth - 8;
-
-        let y_start = self.crop_top;
-        let y_end = self.height - self.crop_bottom;
-        let x_start = self.crop_left;
-        let x_end = self.width - self.crop_right;
-
-        let mut offset = 0;
-        let mut pixel_idx = 0usize;
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let y_idx = (y * self.width + x) as usize;
-                let y_val = (self.y_plane[y_idx] >> shift) as i32;
-                let (cb_val, cr_val) = self.get_chroma(x, y, shift);
-                let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
-                let alpha = if let Some(ref alpha) = self.alpha_plane {
-                    if pixel_idx < alpha.len() {
-                        (alpha[pixel_idx] >> shift).min(255) as u8
-                    } else {
-                        255
-                    }
-                } else {
-                    255
-                };
-                if offset + 4 <= output.len() {
-                    output[offset] = b;
-                    output[offset + 1] = g;
-                    output[offset + 2] = r;
-                    output[offset + 3] = alpha;
-                    offset += 4;
-                }
-                pixel_idx += 1;
-            }
+        let needed = (self.cropped_width() * self.cropped_height()) as usize * 4;
+        if output.len() >= needed {
+            self.write_pixels(output, 4, 2, 1, 0, Some(3));
         }
-        (out_width * out_height * 4) as usize
+        needed
     }
 
-    /// Write pixels into a pre-allocated buffer in BGR format.
-    /// Returns the number of bytes written.
+    /// Write pixels into a pre-allocated BGR buffer. Returns the number of bytes
+    /// needed; only writes when `output` is large enough.
     pub fn write_bgr_into(&self, output: &mut [u8]) -> usize {
-        let out_width = self.cropped_width();
-        let out_height = self.cropped_height();
-        let shift = self.bit_depth - 8;
-
-        let y_start = self.crop_top;
-        let y_end = self.height - self.crop_bottom;
-        let x_start = self.crop_left;
-        let x_end = self.width - self.crop_right;
-
-        let mut offset = 0;
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let y_idx = (y * self.width + x) as usize;
-                let y_val = (self.y_plane[y_idx] >> shift) as i32;
-                let (cb_val, cr_val) = self.get_chroma(x, y, shift);
-                let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
-                if offset + 3 <= output.len() {
-                    output[offset] = b;
-                    output[offset + 1] = g;
-                    output[offset + 2] = r;
-                    offset += 3;
-                }
-            }
+        let needed = (self.cropped_width() * self.cropped_height()) as usize * 3;
+        if output.len() >= needed {
+            self.write_pixels(output, 3, 2, 1, 0, None);
         }
-        (out_width * out_height * 3) as usize
+        needed
     }
 
     /// Convert YCbCr to RGBA with conformance window cropping.
     /// Uses real alpha values from `alpha_plane` if present, otherwise alpha=255.
     pub fn to_rgba(&self) -> Vec<u8> {
-        let out_width = self.cropped_width();
-        let out_height = self.cropped_height();
-        let mut rgba = Vec::with_capacity((out_width * out_height * 4) as usize);
-        let shift = self.bit_depth - 8;
-
-        // Iterate over cropped region
-        let y_start = self.crop_top;
-        let y_end = self.height - self.crop_bottom;
-        let x_start = self.crop_left;
-        let x_end = self.width - self.crop_right;
-
-        let mut pixel_idx = 0usize;
-        for y in y_start..y_end {
-            for x in x_start..x_end {
-                let y_idx = (y * self.width + x) as usize;
-                let y_val = (self.y_plane[y_idx] >> shift) as i32;
-
-                let (cb_val, cr_val) = self.get_chroma(x, y, shift);
-
-                let (r, g, b) = self.ycbcr_to_rgb(y_val, cb_val, cr_val);
-                rgba.push(r);
-                rgba.push(g);
-                rgba.push(b);
-
-                let alpha = if let Some(ref alpha) = self.alpha_plane {
-                    if pixel_idx < alpha.len() {
-                        (alpha[pixel_idx] >> shift).min(255) as u8
-                    } else {
-                        255
-                    }
-                } else {
-                    255
-                };
-                rgba.push(alpha);
-
-                pixel_idx += 1;
-            }
-        }
-
+        let total = (self.cropped_width() * self.cropped_height()) as usize;
+        let mut rgba = vec![0u8; total * 4];
+        self.write_pixels(&mut rgba, 4, 0, 1, 2, Some(3));
         rgba
     }
 

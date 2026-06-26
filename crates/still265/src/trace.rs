@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use crate::cabac::CabacEstimator;
 use crate::plan::WorkStage;
-use crate::preanalysis::{AnalysisMaps, RegionClass, NUM_CLASSES};
+use crate::preanalysis::{AnalysisMaps, NUM_CLASSES, RegionClass};
 
 const NUM_STAGES: usize = 6;
 const NUM_KINDS: usize = 5;

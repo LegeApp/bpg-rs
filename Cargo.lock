@@ -87,11 +87,11 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bpg-bitstream"
-version = "0.1.0"
+version = "0.4.0"
 
 [[package]]
 name = "bpg-decode"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bpg-bitstream",
  "bpg-format",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "bpg-encode"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bpg-format",
  "bpg-hevc",
@@ -110,42 +110,46 @@ dependencies = [
 
 [[package]]
 name = "bpg-format"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bpg-bitstream",
 ]
 
 [[package]]
 name = "bpg-hevc"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bpg-bitstream",
 ]
 
 [[package]]
 name = "bpg-hevc-decode"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "archmage",
+ "rayon",
  "safe_unaligned_simd",
+ "wide",
 ]
 
 [[package]]
 name = "bpg-image"
-version = "0.1.0"
+version = "0.4.0"
 
 [[package]]
 name = "bpg-tools"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bpg-decode",
  "bpg-encode",
  "bpg-format",
  "bpg-hevc",
+ "bpg-hevc-decode",
  "bpg-image",
  "clap",
  "png",
  "still265",
+ "toojpeg",
  "windows-sys",
  "zune-core",
  "zune-jpeg",
@@ -218,6 +222,37 @@ checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
 ]
+
+[[package]]
+name = "crossbeam-deque"
+version = "0.8.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9dd111b7b7f7d55b72c0a6ae361660ee5853c9af73f70c3c2ef6858b950e2e51"
+dependencies = [
+ "crossbeam-epoch",
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-epoch"
+version = "0.9.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
+
+[[package]]
+name = "either"
+version = "1.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
 
 [[package]]
 name = "fdeflate"
@@ -298,6 +333,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayon"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
+dependencies = [
+ "either",
+ "rayon-core",
+]
+
+[[package]]
+name = "rayon-core"
+version = "1.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
+dependencies = [
+ "crossbeam-deque",
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "safe_arch"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -320,7 +375,7 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
 name = "still265"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "bpg-bitstream",
  "bpg-encode",
@@ -346,6 +401,10 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "toojpeg"
+version = "0.4.0"
 
 [[package]]
 name = "unicode-ident"

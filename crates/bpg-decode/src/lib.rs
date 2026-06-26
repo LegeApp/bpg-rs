@@ -12,6 +12,7 @@ use bpg_format::{BpgHeader, ChromaPhase, ColorSpaceCode, FormatError, PixelForma
 use bpg_hevc::{rebuild_annexb_from_bpg_payload, BpgHevcInfo};
 use std::path::Path;
 
+pub use bpg_hevc_decode::hevc::is_ycbcr_matrix;
 pub use bpg_hevc_decode::DecodedFrame;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

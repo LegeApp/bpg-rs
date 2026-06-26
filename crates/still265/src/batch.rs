@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bpg_image::ChromaFormat;
 
-use crate::encoder::{encode_with_stats, EncodeStats, Source};
+use crate::encoder::{EncodeStats, Source, encode_with_stats};
 use crate::{Effort, StillHevcConfig};
 
 const CTB: u32 = 64;

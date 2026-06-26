@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "bpg-highres-compare"
 path = "src/bin/highres_compare.rs"
 
+[[bin]]
+name = "bpg-decision-diff"
+path = "src/bin/decision_diff.rs"
+
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 png = "0.17"
@@ -22,18 +26,25 @@ bpg-image = { path = "../bpg-image" }
 bpg-format = { path = "../bpg-format" }
 bpg-hevc = { path = "../bpg-hevc" }
 bpg-decode = { path = "../bpg-decode" }
+bpg-hevc-decode = { path = "../bpg-hevc-decode" }
 bpg-encode = { path = "../bpg-encode" }
 still265 = { path = "../still265" }
+toojpeg = { path = "../toojpeg" }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [features]
-# Normal `bpg-tools` builds include the bit-identical portable-SIMD hot kernels.
-default = ["wide-simd"]
+# Normal `bpg-tools` builds include the bit-identical portable-SIMD hot kernels
+# and rayon-parallel decoder color conversion.
+default = ["wide-simd", "rayon"]
+# Parallelize decoder color conversion (YCbCr→RGB / chroma upsampling) across
+# cores. Bit-identical output. The effective speedup for these cross-channel
+# per-pixel conversions (SIMD helps little here).
+rayon = ["bpg-decode/rayon"]
 # Marker feature for profiling runs, intended for:
 # cargo flamegraph --profile profiling -p bpg-tools --features flamegraph -- ...
 flamegraph = ["still265/flamegraph"]
-# Build the `still265` encoder with its portable-SIMD (`wide`) hot kernels.
-# Selectable at runtime via `BPG_PRIMITIVES`; bit-identical output either way.
-wide-simd = ["still265/wide-simd"]
+# Build the `still265` encoder and the `bpg-hevc-decode` chroma kernels with
+# their portable-SIMD (`wide`) hot paths. Bit-identical output either way.
+wide-simd = ["still265/wide-simd", "bpg-decode/wide-simd"]

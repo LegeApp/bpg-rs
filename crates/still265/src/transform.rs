@@ -101,6 +101,23 @@ pub fn quant_params(log2_size: u8, qp: i32, bit_depth: u8) -> (i64, i32) {
     (QUANT_SCALE[rem] as i64, qbits)
 }
 
+/// x265's RDOQ measures distortion in the transform-coefficient domain, not
+/// directly in pixel SSE. In `Quant::rdoQuant` it scales each coefficient
+/// squared error by:
+///
+/// ```text
+/// scaleBits = SCALE_BITS - 2 * transformShift
+/// transformShift = MAX_TR_DYNAMIC_RANGE - bit_depth - log2TrSize
+/// SCALE_BITS = 15
+/// ```
+///
+/// before adding `lambda2 * CABAC_bits`. Our RDOQ code keeps the coefficient
+/// squared error unscaled (`(coeff - dequant(level))^2`), so the equivalent
+/// operation is to divide the pixel-domain lambda by `2^scaleBits`.
+///
+/// Missing this conversion makes the bit term 32×/128×/512×/2048× too large for
+/// 4×4/8×8/16×16/32×32 8-bit transforms, aggressively zeroing coefficients and
+/// shifting the effective QP axis coarser than x265.
 /// Dequantize levels in place (flat scaling list), bit-identical to
 /// `bpg-hevc-decode::hevc::transform::dequantize` (H.265 8.6.3).
 pub fn dequantize(levels: &mut [i16], log2_size: u8, qp: i32, bit_depth: u8) {

@@ -1,13 +1,36 @@
-//! Rust-only high-resolution encode timing harness.
+//! High-resolution encode timing harness comparing the still265 StillSearch
+//! core against C `bpgenc`, with quality metrics and the StillSearch work
+//! ledger.
 //!
-//! Generates deterministic high-res PNGs from `test-set`, then compares
-//! process-level `bpgenc` time with in-process still265 encode timing.
+//! Generates deterministic high-res PNGs from `test-set` (or encodes sources
+//! natively with `--native`), then compares process-level `bpgenc` time with
+//! in-process still265 encode timing.
+//!
+//! ⚠️ EFFORT IS MOSTLY INERT. The StillSearch v2 core runs one search shape
+//! regardless of tier; the only surviving effort dependence is the PartNxN
+//! gate (`part_nxn_enabled`, on for best/slowplus/placebo/reference) plus a
+//! couple of AQ/analysis-cache bits. So `best` exercises the full core
+//! including 8x8 NxN, while `balanced` skips NxN — but neither changes rough/
+//! TU/CU search depth. The default is `best` (full core). The legacy preset
+//! ladder and its README timings belong to the removed rdo2 core; compare
+//! those by hand until StillSearch reintroduces real effort policies
+//! (plan Phase 15).
+//!
+//! ⚠️ QP-AXIS OFFSET — READ BEFORE INTERPRETING QP-MATCHED NUMBERS. still265's
+//! effective quantiser is roughly **2 QP steps COARSER** than x265/bpgenc at the
+//! same nominal `-q`/`qp`. At equal nominal QP still265 makes a smaller file and
+//! retains fewer/weaker coefficients; rust QP24 ≈ bpgenc QP26 in coefficient
+//! count/bytes (measured 4 MP 2026-06-23, `bpg-decision-diff`). So an equal-QP
+//! C-vs-rust row is NOT an equal-rate comparison and OVERSTATES the quality gap
+//! by most of ~1 dB — always compare at matched BYTES (the real equal-bitrate
+//! deficit in textured regions is ~0.6 dB, an RDOQ coefficient-strength gap, not
+//! the full equal-QP gap). This fact keeps getting rediscovered; hence this note.
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
 use bpg_encode::{encode_still_image, EncoderTuning};
@@ -38,7 +61,7 @@ struct Args {
     bpgenc: PathBuf,
 
     /// Comma-separated output sizes, e.g. 1000x750,2000x1500,4000x3000.
-    #[arg(long, default_value = "1000x750,2000x1500,4000x3000")]
+    #[arg(long, default_value = "1000x750")]
     sizes: String,
 
     /// Number of timing runs per case.
@@ -57,16 +80,19 @@ struct Args {
     #[arg(short = 'm', long = "compress-level", default_value_t = 8)]
     compress_level: u8,
 
-    /// Rust RD-search effort.
-    #[arg(long, value_enum, default_value_t = EffortArg::Balanced)]
-    effort: EffortArg,
+    /// Rust RD-search effort(s). Comma-separated. NOTE: the StillSearch core
+    /// only varies PartNxN by effort (best/slowplus/placebo/reference enable
+    /// 8x8 NxN; others skip it); search depth is otherwise identical. Default
+    /// `best` exercises the full core.
+    #[arg(long, default_value = "best")]
+    efforts: String,
 
     /// Chroma format.
-    #[arg(short = 'f', long, value_enum, default_value_t = FormatArg::Yuv420)]
+    #[arg(short = 'f', long, default_value_t = FormatArg::Yuv420)]
     format: FormatArg,
 
     /// Rust still265 SAO mode.
-    #[arg(long, value_enum, default_value_t = SaoArg::On)]
+    #[arg(long, default_value_t = SaoArg::On)]
     sao: SaoArg,
 
     /// Extra argument passed through to C bpgenc. Repeat for multiple args.
@@ -81,11 +107,6 @@ struct Args {
     /// Run C bpgenc with true x265 single-thread controls when supported by the
     /// wrapper (`frame-threads=1,pools=none`), plus one-CPU process affinity as
     /// a compatibility fallback for stock bpgenc builds.
-    ///
-    /// Stock libbpg's x265 wrapper does not expose x265_param_parse overrides.
-    /// x265's native single-thread controls are frame-threads=1 and pools=none;
-    /// this flag enforces the equivalent benchmark constraint for the bundled
-    /// executable by applying one-CPU process affinity.
     #[arg(long)]
     c_single_thread: bool,
 
@@ -105,9 +126,43 @@ struct Args {
     #[arg(long)]
     regenerate: bool,
 
+    /// Encode each source image directly at its native resolution (no
+    /// synthetic resampling/grain). Ignores --sizes.
+    #[arg(long)]
+    native: bool,
+
+    /// Enable per-CU adaptive quantization (default: off = uniform QP).
+    #[arg(long)]
+    adaptive_qp: bool,
+
     /// Print still265 debug stats during Rust encodes.
     #[arg(long)]
     debug_stats: bool,
+}
+
+fn parse_efforts(s: &str) -> Result<Vec<EffortArg>, String> {
+    s.split(',')
+        .map(|name| {
+            let trimmed = name.trim().to_lowercase();
+            match trimmed.as_str() {
+                "floor" => Ok(EffortArg::Floor),
+                "floorplus" => Ok(EffortArg::FloorPlus),
+                "floorplus2" => Ok(EffortArg::FloorPlus2),
+                "floorshallow" => Ok(EffortArg::FloorShallow),
+                "slow" => Ok(EffortArg::Slow),
+                "slowplus" => Ok(EffortArg::SlowPlus),
+                "fastest" => Ok(EffortArg::Fastest),
+                "fastadaptive" => Ok(EffortArg::FastAdaptive),
+                "fast" => Ok(EffortArg::Fast),
+                "balanced" => Ok(EffortArg::Balanced),
+                "good" => Ok(EffortArg::Good),
+                "best" => Ok(EffortArg::Best),
+                "placebo" => Ok(EffortArg::Placebo),
+                "reference" => Ok(EffortArg::Reference),
+                _ => Err(format!("unknown effort '{trimmed}'; valid: floor, floorplus, floorplus2, floorshallow, slow, slowplus, fastest, fastadaptive, fast, balanced, good, best, placebo, reference")),
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -116,9 +171,16 @@ struct Size {
     height: u32,
 }
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug)]
 enum EffortArg {
+    Floor,
+    FloorPlus,
+    FloorPlus2,
+    FloorShallow,
+    Slow,
+    SlowPlus,
     Fastest,
+    FastAdaptive,
     Fast,
     Balanced,
     Good,
@@ -127,10 +189,38 @@ enum EffortArg {
     Reference,
 }
 
+impl EffortArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            EffortArg::Floor => "floor",
+            EffortArg::FloorPlus => "floorplus",
+            EffortArg::FloorPlus2 => "floorplus2",
+            EffortArg::FloorShallow => "floorshallow",
+            EffortArg::Slow => "slow",
+            EffortArg::SlowPlus => "slowplus",
+            EffortArg::Fastest => "fastest",
+            EffortArg::FastAdaptive => "fastadaptive",
+            EffortArg::Fast => "fast",
+            EffortArg::Balanced => "balanced",
+            EffortArg::Good => "good",
+            EffortArg::Best => "best",
+            EffortArg::Placebo => "placebo",
+            EffortArg::Reference => "reference",
+        }
+    }
+}
+
 impl From<EffortArg> for Effort {
     fn from(value: EffortArg) -> Self {
         match value {
+            EffortArg::Floor => Effort::Floor,
+            EffortArg::FloorPlus => Effort::FloorPlus,
+            EffortArg::FloorPlus2 => Effort::FloorPlus2,
+            EffortArg::FloorShallow => Effort::FloorShallow,
+            EffortArg::Slow => Effort::Slow,
+            EffortArg::SlowPlus => Effort::SlowPlus,
             EffortArg::Fastest => Effort::Fastest,
+            EffortArg::FastAdaptive => Effort::FastAdaptive,
             EffortArg::Fast => Effort::Fast,
             EffortArg::Balanced => Effort::Balanced,
             EffortArg::Good => Effort::Good,
@@ -151,10 +241,29 @@ enum FormatArg {
     Yuv444,
 }
 
+impl std::fmt::Display for FormatArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FormatArg::Yuv420 => write!(f, "420"),
+            FormatArg::Yuv422 => write!(f, "422"),
+            FormatArg::Yuv444 => write!(f, "444"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum SaoArg {
     On,
     Off,
+}
+
+impl std::fmt::Display for SaoArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SaoArg::On => write!(f, "on"),
+            SaoArg::Off => write!(f, "off"),
+        }
+    }
 }
 
 impl From<SaoArg> for SaoMode {
@@ -174,6 +283,13 @@ impl FormatArg {
             FormatArg::Yuv444 => "444",
         }
     }
+    fn chroma_subsampling(self, w: usize, h: usize) -> (usize, usize) {
+        match self {
+            FormatArg::Yuv420 => (w.div_ceil(2), h.div_ceil(2)),
+            FormatArg::Yuv422 => (w.div_ceil(2), h),
+            FormatArg::Yuv444 => (w, h),
+        }
+    }
 }
 
 struct RgbImage {
@@ -183,7 +299,16 @@ struct RgbImage {
 }
 
 #[derive(Clone)]
+struct QualityMetrics {
+    psnr_y: f64,
+    psnr_cb: f64,
+    psnr_cr: f64,
+    psnr_rgb: f64,
+}
+
+#[derive(Clone)]
 struct Row {
+    effort: String,
     source: String,
     width: u32,
     height: u32,
@@ -191,78 +316,42 @@ struct Row {
     run: usize,
     c_total: Option<Duration>,
     c_bytes: Option<u64>,
+    /// Decoded RGB PSNR of the C bpgenc output vs source (same metric as `rust_rgb_psnr`).
+    c_rgb_psnr: Option<f64>,
+    /// Decoded luma-Y PSNR of the C output vs source Y (comparable to rust `psnr_y`).
+    c_y_psnr: Option<f64>,
+    /// Decoded RGB PSNR of the still265 output vs source.
+    rust_rgb_psnr: Option<f64>,
     rust_total: Duration,
     rust_prepare: Duration,
     rust_encode: Duration,
     rust_bpg_bytes: usize,
     rust_annexb_bytes: usize,
+    quality: Option<QualityMetrics>,
     ctu_count: u64,
     cu_trials: u64,
     cu_early_terminations: u64,
     cu_split_bound_aborts: u64,
     cu_force_leaf: u64,
-    tu_split_early_terminations: u64,
-    rmd_prunes: u64,
-    luma_candidate_expansions: u64,
-    chroma_candidate_expansions: u64,
-    partnxn_attempts: u64,
-    partnxn_skips: u64,
-    partnxn_wins: u64,
-    partnxn_losses: u64,
-    partnxn_cu_trials: u64,
-    partnxn_code_block_calls: u64,
-    trial_coded_blocks: u64,
-    final_coded_blocks: u64,
-    final_rdoq_blocks: u64,
-    trial_rdoq_blocks: u64,
-    best_tt_cheap_tu_decisions: u64,
-    best_tt_escalated_tu_decisions: u64,
-    best_tt_escalation_changed_winner: u64,
-    best_tt_full_trial_rdoq_blocks_saved: u64,
-    best_tt_exact_residual_estimates_saved: u64,
-    rdo2_chroma_scratch_candidates: u64,
-    rdo2_chroma_scratch_cheap_evals: u64,
-    rdo2_chroma_scratch_exact_evals: u64,
-    rdo2_chroma_scratch_exact_escalations: u64,
-    rdo2_chroma_scratch_changed_winner: u64,
-    rdo2_chroma_scratch_legacy_evals_skipped: u64,
-    rdo2_chroma_scratch_stacked_fallbacks: u64,
-    full_rd_close_calls: u64,
-    luma_close_call_escalations: u64,
-    luma_rough_predictions: u64,
-    chroma_rough_predictions: u64,
     code_block_calls: u64,
     forward_transforms: u64,
-    inverse_transforms: u64,
-    residual_bit_estimates: u64,
-    cache_builds: u64,
-    cache_fast_hits: u64,
-    cache_fallbacks: u64,
-    frame_snapshots: u64,
-    frame_restores: u64,
-    map_snapshots: u64,
-    map_restores: u64,
-    bytes_snapshotted: u64,
-    bytes_restored: u64,
-    phase_total_us: u64,
+    trial_coded_blocks: u64,
+    final_coded_blocks: u64,
+    trial_rdoq_blocks: u64,
+    final_rdoq_blocks: u64,
     phase_build_us: u64,
-    phase_parallel_restore_us: u64,
-    phase_deblock_us: u64,
-    phase_sao_decide_us: u64,
-    phase_sao_apply_us: u64,
     phase_write_us: u64,
+    bytes_restored: u64,
+    partnxn_attempts: u64,
+    partnxn_wins: u64,
     angular_exclusions: u64,
-    policy_angular_forced: u64,
-    policy_angular_guarded: u64,
-    policy_early_term_suppressed: u64,
-    region_class_counts: String,
-    luma_winner_rank_counts: String,
-    chroma_winner_rank_counts: String,
-    cu_leaf_wins_by_region: String,
-    cu_split_wins_by_region: String,
-    tu_leaf_wins_by_region: String,
-    tu_split_wins_by_region: String,
-    partnxn_wins_by_region: String,
+    angular_game_blocks: u64,
+    angular_iame_blocks: u64,
+    angular_modes_before: u64,
+    angular_modes_after: u64,
+    angular_modes_removed: u64,
+    stillsearch_ledger: [u64; 16],
+    stillsearch_ledger_ns: [u64; 16],
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -272,6 +361,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if ![8, 10, 12].contains(&args.bit_depth) {
         return Err("--bit-depth must be 8, 10, or 12".into());
+    }
+    let efforts = parse_efforts(&args.efforts)?;
+    if efforts.is_empty() {
+        return Err("at least one effort required".into());
     }
     let sizes = parse_sizes(&args.sizes)?;
 
@@ -307,147 +400,142 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&csv_path)?;
     writeln!(
         csv,
-        "source,width,height,pixels,run,c_total_s,c_bpg_bytes,rust_total_s,rust_prepare_s,rust_encode_s,rust_bpg_bytes,rust_annexb_bytes,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,tu_split_early_terminations,rmd_prunes,luma_candidate_expansions,chroma_candidate_expansions,partnxn_attempts,partnxn_skips,partnxn_wins,partnxn_losses,partnxn_cu_trials,partnxn_code_block_calls,trial_coded_blocks,final_coded_blocks,final_rdoq_blocks,trial_rdoq_blocks,best_tt_cheap_tu_decisions,best_tt_escalated_tu_decisions,best_tt_escalation_changed_winner,best_tt_full_trial_rdoq_blocks_saved,best_tt_exact_residual_estimates_saved,rdo2_chroma_scratch_candidates,rdo2_chroma_scratch_cheap_evals,rdo2_chroma_scratch_exact_evals,rdo2_chroma_scratch_exact_escalations,rdo2_chroma_scratch_changed_winner,rdo2_chroma_scratch_legacy_evals_skipped,rdo2_chroma_scratch_stacked_fallbacks,full_rd_close_calls,luma_close_call_escalations,luma_rough_predictions,chroma_rough_predictions,code_block_calls,forward_transforms,inverse_transforms,residual_bit_estimates,cache_builds,cache_fast_hits,cache_fallbacks,frame_snapshots,frame_restores,map_snapshots,map_restores,bytes_snapshotted,bytes_restored,phase_total_us,phase_build_us,phase_parallel_restore_us,phase_deblock_us,phase_sao_decide_us,phase_sao_apply_us,phase_write_us,angular_exclusions,policy_angular_forced,policy_angular_guarded,policy_early_term_suppressed,region_class_counts,luma_winner_rank_counts,chroma_winner_rank_counts,cu_leaf_wins_by_region,cu_split_wins_by_region,tu_leaf_wins_by_region,tu_split_wins_by_region,partnxn_wins_by_region"
+        "effort,source,width,height,pixels,run,c_total_s,c_bpg_bytes,rust_total_s,rust_prepare_s,rust_encode_s,rust_bpg_bytes,rust_annexb_bytes,psnr_y,psnr_cb,psnr_cr,psnr_rgb,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,code_block_calls,forward_transforms,trial_coded_blocks,final_coded_blocks,trial_rdoq_blocks,final_rdoq_blocks,phase_build_us,phase_write_us,bytes_restored,partnxn_attempts,partnxn_wins,angular_exclusions,angular_game_blocks,angular_iame_blocks,angular_modes_before,angular_modes_after,angular_modes_removed,c_rgb_psnr,rust_rgb_psnr,c_y_psnr,ss_rough_luma,ss_luma_cheap,ss_luma_exact,ss_tu_leaf,ss_tu_split,ss_nxn_rough,ss_nxn_batch,ss_chroma_rough,ss_chroma_trial,ss_rdoq,ss_residual_price,ss_final_commit,ss_writer,ss_deblock,ss_sao,ssns_rough_luma,ssns_luma_cheap,ssns_luma_exact,ssns_tu_leaf,ssns_tu_split,ssns_nxn_rough,ssns_nxn_batch,ssns_chroma_rough,ssns_chroma_trial,ssns_rdoq,ssns_residual_price,ssns_final_commit,ssns_writer,ssns_deblock,ssns_sao"
     )?;
 
-    let mut rows = Vec::new();
+    let mut rows: Vec<Row> = Vec::new();
     for source in sources {
         let base = source
             .file_stem()
             .and_then(OsStr::to_str)
             .unwrap_or("source")
             .to_string();
-        let src_img = load_rgb(&source)?;
-        for &size in &sizes {
-            let png_path = generated_dir.join(format!("{base}_{}x{}.png", size.width, size.height));
-            if args.regenerate || !png_path.exists() {
-                let synthetic = synthesize_rgb(&src_img, size);
-                save_rgb_png(&png_path, &synthetic)?;
+
+        // Build the list of (png_path, size) cases. In --native mode each source
+        // is encoded directly at its own resolution; otherwise we synthesize a
+        // resampled PNG for every requested --sizes entry.
+        let cases: Vec<(PathBuf, Size)> = if args.native {
+            let dims = png_dimensions(&source)?;
+            vec![(
+                source.clone(),
+                Size {
+                    width: dims.0,
+                    height: dims.1,
+                },
+            )]
+        } else {
+            let src_img = load_rgb(&source)?;
+            let mut v = Vec::new();
+            for &size in &sizes {
+                let png_path =
+                    generated_dir.join(format!("{base}_{}x{}.png", size.width, size.height));
+                if args.regenerate || !png_path.exists() {
+                    let synthetic = synthesize_rgb(&src_img, size);
+                    save_rgb_png(&png_path, &synthetic)?;
+                }
+                v.push((png_path, size));
             }
-            for run in 1..=args.runs {
-                let c_result = if args.skip_c {
-                    None
-                } else {
-                    let c_out = c_dir.join(format!(
+            v
+        };
+
+        for (png_path, size) in cases {
+            for &effort in &efforts {
+                let effort_dir = rust_dir.join(effort.as_str());
+                fs::create_dir_all(&effort_dir)?;
+
+                for run in 1..=args.runs {
+                    let c_result = if args.skip_c {
+                        None
+                    } else {
+                        let c_out = c_dir.join(format!(
+                            "{base}_{}x{}_run{run}.bpg",
+                            size.width, size.height
+                        ));
+                        Some(run_c_bpgenc(&bpgenc, &png_path, &c_out, &args)?)
+                    };
+
+                    let rust_out = effort_dir.join(format!(
                         "{base}_{}x{}_run{run}.bpg",
                         size.width, size.height
                     ));
-                    Some(run_c_bpgenc(&bpgenc, &png_path, &c_out, &args)?)
-                };
-                let rust_out = rust_dir.join(format!(
-                    "{base}_{}x{}_run{run}.bpg",
-                    size.width, size.height
-                ));
-                let rust_result = run_rust_encode(&png_path, &rust_out, &args)?;
-                let row = Row {
-                    source: base.clone(),
-                    width: size.width,
-                    height: size.height,
-                    pixels: u64::from(size.width) * u64::from(size.height),
-                    run,
-                    c_total: c_result.as_ref().map(|r| r.0),
-                    c_bytes: c_result.as_ref().map(|r| r.1),
-                    rust_total: rust_result.total,
-                    rust_prepare: rust_result.prepare,
-                    rust_encode: rust_result.encode,
-                    rust_bpg_bytes: rust_result.bpg_bytes,
-                    rust_annexb_bytes: rust_result.annexb_bytes,
-                    ctu_count: rust_result.ctu_count,
-                    cu_trials: rust_result.cu_trials,
-                    cu_early_terminations: rust_result.cu_early_terminations,
-                    cu_split_bound_aborts: rust_result.cu_split_bound_aborts,
-                    cu_force_leaf: rust_result.cu_force_leaf,
-                    tu_split_early_terminations: rust_result.tu_split_early_terminations,
-                    rmd_prunes: rust_result.rmd_prunes,
-                    luma_candidate_expansions: rust_result.luma_candidate_expansions,
-                    chroma_candidate_expansions: rust_result.chroma_candidate_expansions,
-                    partnxn_attempts: rust_result.partnxn_attempts,
-                    partnxn_skips: rust_result.partnxn_skips,
-                    partnxn_wins: rust_result.partnxn_wins,
-                    partnxn_losses: rust_result.partnxn_losses,
-                    partnxn_cu_trials: rust_result.partnxn_cu_trials,
-                    partnxn_code_block_calls: rust_result.partnxn_code_block_calls,
-                    trial_coded_blocks: rust_result.trial_coded_blocks,
-                    final_coded_blocks: rust_result.final_coded_blocks,
-                    final_rdoq_blocks: rust_result.final_rdoq_blocks,
-                    trial_rdoq_blocks: rust_result.trial_rdoq_blocks,
-                    best_tt_cheap_tu_decisions: rust_result.best_tt_cheap_tu_decisions,
-                    best_tt_escalated_tu_decisions: rust_result.best_tt_escalated_tu_decisions,
-                    best_tt_escalation_changed_winner: rust_result
-                        .best_tt_escalation_changed_winner,
-                    best_tt_full_trial_rdoq_blocks_saved: rust_result
-                        .best_tt_full_trial_rdoq_blocks_saved,
-                    best_tt_exact_residual_estimates_saved: rust_result
-                        .best_tt_exact_residual_estimates_saved,
-                    rdo2_chroma_scratch_candidates: rust_result.rdo2_chroma_scratch_candidates,
-                    rdo2_chroma_scratch_cheap_evals: rust_result.rdo2_chroma_scratch_cheap_evals,
-                    rdo2_chroma_scratch_exact_evals: rust_result.rdo2_chroma_scratch_exact_evals,
-                    rdo2_chroma_scratch_exact_escalations: rust_result
-                        .rdo2_chroma_scratch_exact_escalations,
-                    rdo2_chroma_scratch_changed_winner: rust_result
-                        .rdo2_chroma_scratch_changed_winner,
-                    rdo2_chroma_scratch_legacy_evals_skipped: rust_result
-                        .rdo2_chroma_scratch_legacy_evals_skipped,
-                    rdo2_chroma_scratch_stacked_fallbacks: rust_result
-                        .rdo2_chroma_scratch_stacked_fallbacks,
-                    full_rd_close_calls: rust_result.full_rd_close_calls,
-                    luma_close_call_escalations: rust_result.luma_close_call_escalations,
-                    luma_rough_predictions: rust_result.luma_rough_predictions,
-                    chroma_rough_predictions: rust_result.chroma_rough_predictions,
-                    code_block_calls: rust_result.code_block_calls,
-                    forward_transforms: rust_result.forward_transforms,
-                    inverse_transforms: rust_result.inverse_transforms,
-                    residual_bit_estimates: rust_result.residual_bit_estimates,
-                    cache_builds: rust_result.cache_builds,
-                    cache_fast_hits: rust_result.cache_fast_hits,
-                    cache_fallbacks: rust_result.cache_fallbacks,
-                    frame_snapshots: rust_result.frame_snapshots,
-                    frame_restores: rust_result.frame_restores,
-                    map_snapshots: rust_result.map_snapshots,
-                    map_restores: rust_result.map_restores,
-                    bytes_snapshotted: rust_result.bytes_snapshotted,
-                    bytes_restored: rust_result.bytes_restored,
-                    phase_total_us: rust_result.phase_total_us,
-                    phase_build_us: rust_result.phase_build_us,
-                    phase_parallel_restore_us: rust_result.phase_parallel_restore_us,
-                    phase_deblock_us: rust_result.phase_deblock_us,
-                    phase_sao_decide_us: rust_result.phase_sao_decide_us,
-                    phase_sao_apply_us: rust_result.phase_sao_apply_us,
-                    phase_write_us: rust_result.phase_write_us,
-                    angular_exclusions: rust_result.angular_exclusions,
-                    policy_angular_forced: rust_result.policy_angular_forced,
-                    policy_angular_guarded: rust_result.policy_angular_guarded,
-                    policy_early_term_suppressed: rust_result.policy_early_term_suppressed,
-                    region_class_counts: rust_result.region_class_counts,
-                    luma_winner_rank_counts: rust_result.luma_winner_rank_counts,
-                    chroma_winner_rank_counts: rust_result.chroma_winner_rank_counts,
-                    cu_leaf_wins_by_region: rust_result.cu_leaf_wins_by_region,
-                    cu_split_wins_by_region: rust_result.cu_split_wins_by_region,
-                    tu_leaf_wins_by_region: rust_result.tu_leaf_wins_by_region,
-                    tu_split_wins_by_region: rust_result.tu_split_wins_by_region,
-                    partnxn_wins_by_region: rust_result.partnxn_wins_by_region,
-                };
-                write_csv_row(&mut csv, &row)?;
-                println!(
-                    "{} {}x{} run {}: c={} rust_total={:.3}s rust_encode={:.3}s cu_trials={}",
-                    row.source,
-                    row.width,
-                    row.height,
-                    row.run,
-                    row.c_total.map_or("skipped".to_string(), |d| format!(
-                        "{:.3}s",
-                        d.as_secs_f64()
-                    )),
-                    row.rust_total.as_secs_f64(),
-                    row.rust_encode.as_secs_f64(),
-                    row.cu_trials,
-                );
-                rows.push(row);
+                    let rust_result = run_rust_encode(&png_path, &rust_out, effort, &args)?;
+
+                    let row = Row {
+                        effort: effort.as_str().to_string(),
+                        source: base.clone(),
+                        width: size.width,
+                        height: size.height,
+                        pixels: u64::from(size.width) * u64::from(size.height),
+                        run,
+                        c_total: c_result.as_ref().map(|r| r.time),
+                        c_bytes: c_result.as_ref().map(|r| r.bytes),
+                        c_rgb_psnr: c_result.as_ref().and_then(|r| r.rgb_psnr),
+                        c_y_psnr: c_result.as_ref().and_then(|r| r.y_psnr),
+                        rust_rgb_psnr: rust_result.rgb_psnr,
+                        rust_total: rust_result.total,
+                        rust_prepare: rust_result.prepare,
+                        rust_encode: rust_result.encode,
+                        rust_bpg_bytes: rust_result.bpg_bytes,
+                        rust_annexb_bytes: rust_result.annexb_bytes,
+                        quality: rust_result.quality,
+                        ctu_count: rust_result.ctu_count,
+                        cu_trials: rust_result.cu_trials,
+                        cu_early_terminations: rust_result.cu_early_terminations,
+                        cu_split_bound_aborts: rust_result.cu_split_bound_aborts,
+                        cu_force_leaf: rust_result.cu_force_leaf,
+                        code_block_calls: rust_result.code_block_calls,
+                        forward_transforms: rust_result.forward_transforms,
+                        trial_coded_blocks: rust_result.trial_coded_blocks,
+                        final_coded_blocks: rust_result.final_coded_blocks,
+                        trial_rdoq_blocks: rust_result.trial_rdoq_blocks,
+                        final_rdoq_blocks: rust_result.final_rdoq_blocks,
+                        phase_build_us: rust_result.phase_build_us,
+                        phase_write_us: rust_result.phase_write_us,
+                        bytes_restored: rust_result.bytes_restored,
+                        partnxn_attempts: rust_result.partnxn_attempts,
+                        partnxn_wins: rust_result.partnxn_wins,
+                        angular_exclusions: rust_result.angular_exclusions,
+                        angular_game_blocks: rust_result.angular_game_blocks,
+                        angular_iame_blocks: rust_result.angular_iame_blocks,
+                        angular_modes_before: rust_result.angular_modes_before,
+                        angular_modes_after: rust_result.angular_modes_after,
+                        angular_modes_removed: rust_result.angular_modes_removed,
+                        stillsearch_ledger: rust_result.stillsearch_ledger,
+                        stillsearch_ledger_ns: rust_result.stillsearch_ledger_ns,
+                    };
+                    write_csv_row(&mut csv, &row)?;
+                    let q_str = row
+                        .quality
+                        .as_ref()
+                        .map_or(String::new(), |q| format!(" psnr_y={:.2}", q.psnr_y));
+                    let rgb_str = row
+                        .rust_rgb_psnr
+                        .map_or(String::new(), |p| format!(" rgb={p:.2}"));
+                    let c_str = match (row.c_bytes, row.c_y_psnr, row.c_rgb_psnr) {
+                        (Some(b), Some(y), Some(p)) => format!("  [C {b}B y={y:.2} rgb={p:.2}]"),
+                        (Some(b), _, _) => format!("  [C {b}B]"),
+                        _ => String::new(),
+                    };
+                    println!(
+                        "{} {} {}x{} run {}: encode={:.3}s bpg={}B{}{}{}",
+                        row.effort,
+                        row.source,
+                        row.width,
+                        row.height,
+                        row.run,
+                        row.rust_encode.as_secs_f64(),
+                        row.rust_bpg_bytes,
+                        q_str,
+                        rgb_str,
+                        c_str,
+                    );
+                    rows.push(row);
+                }
             }
         }
     }
 
-    write_summary(&work_dir.join("summary.md"), &rows)?;
+    write_combined_summary(&work_dir.join("summary.md"), &rows, &efforts, &args)?;
     println!("wrote {}", csv_path.display());
     println!("wrote {}", work_dir.join("summary.md").display());
     Ok(())
@@ -512,6 +600,12 @@ fn is_image(path: &Path) -> bool {
             .as_deref(),
         Some("png" | "jpg" | "jpeg")
     )
+}
+
+/// Read just the pixel dimensions of a PNG/JPEG without keeping the decoded buffer.
+fn png_dimensions(path: &Path) -> Result<(u32, u32), Box<dyn std::error::Error>> {
+    let img = load_rgb(path)?;
+    Ok((img.width, img.height))
 }
 
 fn load_rgb(path: &Path) -> Result<RgbImage, Box<dyn std::error::Error>> {
@@ -614,12 +708,22 @@ fn save_rgb_png(path: &Path, image: &RgbImage) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+struct CResult {
+    time: Duration,
+    bytes: u64,
+    /// Decoded RGB PSNR vs source (end-to-end, comparable across encoders).
+    rgb_psnr: Option<f64>,
+    /// Decoded luma-Y PSNR vs the source Y, in the same YCbCr space as the rust
+    /// `psnr_y` (luma-sensitive; not capped by 4:2:0 chroma subsampling).
+    y_psnr: Option<f64>,
+}
+
 fn run_c_bpgenc(
     bpgenc: &Path,
     png: &Path,
     out: &Path,
     args: &Args,
-) -> Result<(Duration, u64), Box<dyn std::error::Error>> {
+) -> Result<CResult, Box<dyn std::error::Error>> {
     let start = Instant::now();
     let mut cmd = Command::new(bpgenc);
     cmd.arg("-o")
@@ -665,11 +769,65 @@ fn run_c_bpgenc(
         )
         .into());
     }
-    Ok((elapsed, fs::metadata(out)?.len()))
+    let bytes = fs::metadata(out)?.len();
+    // Decode the C output and measure quality the same way the rust path is, so
+    // the numbers are directly comparable / BD-rateable:
+    //   - rgb_psnr: end-to-end decode→RGB vs source RGB (4:2:0 chroma-ceiling'd).
+    //   - y_psnr:   decoded luma vs the source luma plane (same conversion the
+    //               rust encoder uses), luma-sensitive — the right metric for
+    //               coefficient-coding work.
+    let (rgb_psnr, y_psnr) = match (load_rgb(png), fs::read(out)) {
+        (Ok(src), Ok(c_bpg)) => {
+            let rgb = decoded_rgb_psnr(&c_bpg, &src);
+            let y = c_decoded_y_psnr(&c_bpg, &src, args);
+            (rgb, y)
+        }
+        _ => (None, None),
+    };
+    Ok(CResult {
+        time: elapsed,
+        bytes,
+        rgb_psnr,
+        y_psnr,
+    })
+}
+
+/// Luma-Y PSNR of a decoded `.bpg` against the source luma, where the source Y is
+/// produced by the *same* RGB→YCbCr conversion the rust encoder uses. Both C and
+/// rust are decoded through the same (bpgdec-exact) decoder, so this is a fair,
+/// luma-sensitive comparison provided both encoders share libbpg's color matrix —
+/// which a near-lossless (QP1) sanity check confirms (C y_psnr there is ~60+ dB,
+/// not floored). Unlike RGB PSNR it is not capped by 4:2:0 chroma subsampling.
+fn c_decoded_y_psnr(bpg: &[u8], src: &RgbImage, args: &Args) -> Option<f64> {
+    let mut image = Image::from_rgb8(
+        &src.pixels,
+        src.width,
+        src.height,
+        ColorSpace::YCbCr,
+        false,
+        args.bit_depth,
+    );
+    match args.format {
+        FormatArg::Yuv420 => image.subsample_to_420(1),
+        FormatArg::Yuv422 => image.subsample_to_422(1),
+        FormatArg::Yuv444 => {}
+    }
+    let display_w = image.width as usize;
+    let display_h = image.height as usize;
+    let src_y = &image.planes[0].data;
+    let peak = ((1u32 << args.bit_depth) - 1) as f64;
+
+    let frame = bpg_decode::DecoderConfig::new().decode_to_frame(bpg).ok()?;
+    let dec_y = crop_plane(&frame.y_plane, frame.width as usize, display_w, display_h);
+    if dec_y.len() != src_y.len() {
+        return None;
+    }
+    Some(psnr(src_y, &dec_y, peak))
 }
 
 #[cfg(windows)]
 fn run_command_single_cpu(mut cmd: Command) -> Result<Output, Box<dyn std::error::Error>> {
+    use std::process::Stdio;
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = cmd.spawn()?;
     let handle = child.as_raw_handle();
@@ -693,91 +851,60 @@ struct RustResult {
     encode: Duration,
     bpg_bytes: usize,
     annexb_bytes: usize,
+    quality: Option<QualityMetrics>,
     ctu_count: u64,
     cu_trials: u64,
     cu_early_terminations: u64,
     cu_split_bound_aborts: u64,
     cu_force_leaf: u64,
-    tu_split_early_terminations: u64,
-    rmd_prunes: u64,
-    luma_candidate_expansions: u64,
-    chroma_candidate_expansions: u64,
-    partnxn_attempts: u64,
-    partnxn_skips: u64,
-    partnxn_wins: u64,
-    partnxn_losses: u64,
-    partnxn_cu_trials: u64,
-    partnxn_code_block_calls: u64,
-    trial_coded_blocks: u64,
-    final_coded_blocks: u64,
-    final_rdoq_blocks: u64,
-    trial_rdoq_blocks: u64,
-    best_tt_cheap_tu_decisions: u64,
-    best_tt_escalated_tu_decisions: u64,
-    best_tt_escalation_changed_winner: u64,
-    best_tt_full_trial_rdoq_blocks_saved: u64,
-    best_tt_exact_residual_estimates_saved: u64,
-    rdo2_chroma_scratch_candidates: u64,
-    rdo2_chroma_scratch_cheap_evals: u64,
-    rdo2_chroma_scratch_exact_evals: u64,
-    rdo2_chroma_scratch_exact_escalations: u64,
-    rdo2_chroma_scratch_changed_winner: u64,
-    rdo2_chroma_scratch_legacy_evals_skipped: u64,
-    rdo2_chroma_scratch_stacked_fallbacks: u64,
-    full_rd_close_calls: u64,
-    luma_close_call_escalations: u64,
-    luma_rough_predictions: u64,
-    chroma_rough_predictions: u64,
     code_block_calls: u64,
     forward_transforms: u64,
-    inverse_transforms: u64,
-    residual_bit_estimates: u64,
-    cache_builds: u64,
-    cache_fast_hits: u64,
-    cache_fallbacks: u64,
-    frame_snapshots: u64,
-    frame_restores: u64,
-    map_snapshots: u64,
-    map_restores: u64,
-    bytes_snapshotted: u64,
-    bytes_restored: u64,
-    phase_total_us: u64,
+    trial_coded_blocks: u64,
+    final_coded_blocks: u64,
+    trial_rdoq_blocks: u64,
+    final_rdoq_blocks: u64,
     phase_build_us: u64,
-    phase_parallel_restore_us: u64,
-    phase_deblock_us: u64,
-    phase_sao_decide_us: u64,
-    phase_sao_apply_us: u64,
     phase_write_us: u64,
+    bytes_restored: u64,
+    partnxn_attempts: u64,
+    partnxn_wins: u64,
     angular_exclusions: u64,
-    policy_angular_forced: u64,
-    policy_angular_guarded: u64,
-    policy_early_term_suppressed: u64,
-    region_class_counts: String,
-    luma_winner_rank_counts: String,
-    chroma_winner_rank_counts: String,
-    cu_leaf_wins_by_region: String,
-    cu_split_wins_by_region: String,
-    tu_leaf_wins_by_region: String,
-    tu_split_wins_by_region: String,
-    partnxn_wins_by_region: String,
+    angular_game_blocks: u64,
+    angular_iame_blocks: u64,
+    angular_modes_before: u64,
+    angular_modes_after: u64,
+    angular_modes_removed: u64,
+    /// StillSearch per-CTU work-ledger bucket call counts (summed over the
+    /// frame). Indexed by `WorkBucket` order: RoughLuma, LumaCheap, LumaExact,
+    /// TuLeaf, TuSplit, NxnRough, NxnBatch, ChromaRough, ChromaTrial, Rdoq,
+    /// RdoqTrial, ResidualPrice, FinalCommit, Writer, Deblock, Sao.
+    stillsearch_ledger: [u64; 16],
+    /// Optional StillSearch per-bucket wall-clock nanoseconds; nonzero only when
+    /// BPG_STILLSEARCH_PROFILE=1 is set. Same bucket order as `stillsearch_ledger`.
+    stillsearch_ledger_ns: [u64; 16],
+    /// True end-to-end RGB PSNR (decode `.bpg` → RGB vs source), comparable to the
+    /// C number from [`decoded_rgb_psnr`].
+    rgb_psnr: Option<f64>,
 }
 
 fn run_rust_encode(
     png: &Path,
     out: &Path,
+    effort: EffortArg,
     args: &Args,
 ) -> Result<RustResult, Box<dyn std::error::Error>> {
     if args.rust_single_thread {
         return with_env_var("BPG_ENC_THREADS", "1", || {
-            run_rust_encode_inner(png, out, args)
+            run_rust_encode_inner(png, out, effort, args)
         });
     }
-    run_rust_encode_inner(png, out, args)
+    run_rust_encode_inner(png, out, effort, args)
 }
 
 fn run_rust_encode_inner(
     png: &Path,
     out: &Path,
+    effort: EffortArg,
     args: &Args,
 ) -> Result<RustResult, Box<dyn std::error::Error>> {
     let total_start = Instant::now();
@@ -796,8 +923,25 @@ fn run_rust_encode_inner(
         FormatArg::Yuv422 => image.subsample_to_422(1),
         FormatArg::Yuv444 => {}
     }
+
+    // Save source YCbCr planes before CTU padding for quality measurement.
+    let display_w = image.width as usize;
+    let display_h = image.height as usize;
+    let (cw, ch) = args.format.chroma_subsampling(display_w, display_h);
+    let peak = ((1u32 << args.bit_depth) - 1) as f64;
+    let src_y = image.planes[0].data.clone();
+    let src_cb = image
+        .planes
+        .get(1)
+        .map_or(vec![0u16; cw * ch], |p| p.data.clone());
+    let src_cr = image
+        .planes
+        .get(2)
+        .map_or(vec![0u16; cw * ch], |p| p.data.clone());
+
     let prepare = prep_start.elapsed();
-    let backend = RustStillHevcEncoder::new(args.effort.into())
+    let backend = RustStillHevcEncoder::new(effort.into())
+        .with_adaptive_qp(args.adaptive_qp)
         .with_debug_stats(args.debug_stats)
         .with_sao(args.sao.into())
         .with_deblock(DeblockMode::On);
@@ -812,85 +956,140 @@ fn run_rust_encode_inner(
     let encode = encode_start.elapsed();
     fs::write(out, &bpg)?;
     let total = total_start.elapsed();
+
+    // True end-to-end RGB PSNR, measured identically to the C path (decode the
+    // written stream back to RGB and compare to the source) so they BD-rate.
+    let rgb_psnr = decoded_rgb_psnr(&bpg, &img);
+
     let last = backend
         .last_encode_stats()
         .ok_or("still265 did not publish last encode stats")?;
+
+    // Compute quality from reconstruction vs source.
+    let quality = backend.last_reconstruction().map(|recon| {
+        let y_stride = recon.width as usize;
+        let c_stride = (recon.width as usize).div_ceil(if args.format == FormatArg::Yuv444 {
+            1
+        } else {
+            2
+        });
+
+        // Crop reconstruction to display size.
+        let cropped_y = crop_plane(&recon.y_plane, y_stride, display_w, display_h);
+        let cropped_cb = crop_plane(&recon.cb_plane, c_stride, cw, ch);
+        let cropped_cr = crop_plane(&recon.cr_plane, c_stride, cw, ch);
+
+        let py = psnr(&src_y, &cropped_y, peak);
+        let pcb = psnr(&src_cb, &cropped_cb, peak);
+        let pcr = psnr(&src_cr, &cropped_cr, peak);
+
+        // Weighted PSNR-RGB: 6:1:1 for Y:Cb:Cr (industry convention for 4:2:0)
+        let psnr_rgb = if py.is_finite() && pcb.is_finite() && pcr.is_finite() {
+            -(10.0
+                * ((6.0 * 10.0_f64.powf(-py / 10.0)
+                    + 10.0_f64.powf(-pcb / 10.0)
+                    + 10.0_f64.powf(-pcr / 10.0))
+                    / 8.0)
+                    .log10())
+        } else {
+            py
+        };
+
+        QualityMetrics {
+            psnr_y: py,
+            psnr_cb: pcb,
+            psnr_cr: pcr,
+            psnr_rgb,
+        }
+    });
+
     Ok(RustResult {
         total,
         prepare,
         encode,
         bpg_bytes: bpg.len(),
         annexb_bytes: last.annexb_bytes,
+        quality,
         ctu_count: last.stats.ctu_count,
         cu_trials: last.stats.cu_trials,
         cu_early_terminations: last.stats.cu_early_terminations,
         cu_split_bound_aborts: last.stats.cu_split_bound_aborts,
         cu_force_leaf: last.stats.cu_force_leaf,
-        tu_split_early_terminations: last.stats.tu_split_early_terminations,
-        rmd_prunes: last.stats.rmd_prunes,
-        luma_candidate_expansions: last.stats.luma_candidate_expansions,
-        chroma_candidate_expansions: last.stats.chroma_candidate_expansions,
-        partnxn_attempts: last.stats.partnxn_attempts,
-        partnxn_skips: last.stats.partnxn_skips,
-        partnxn_wins: last.stats.partnxn_wins,
-        partnxn_losses: last.stats.partnxn_losses,
-        partnxn_cu_trials: last.stats.partnxn_cu_trials,
-        partnxn_code_block_calls: last.stats.partnxn_code_block_calls,
-        trial_coded_blocks: last.stats.trial_coded_blocks,
-        final_coded_blocks: last.stats.final_coded_blocks,
-        final_rdoq_blocks: last.stats.final_rdoq_blocks,
-        trial_rdoq_blocks: last.stats.trial_rdoq_blocks,
-        best_tt_cheap_tu_decisions: last.stats.best_tt_cheap_tu_decisions,
-        best_tt_escalated_tu_decisions: last.stats.best_tt_escalated_tu_decisions,
-        best_tt_escalation_changed_winner: last.stats.best_tt_escalation_changed_winner,
-        best_tt_full_trial_rdoq_blocks_saved: last.stats.best_tt_full_trial_rdoq_blocks_saved,
-        best_tt_exact_residual_estimates_saved: last.stats.best_tt_exact_residual_estimates_saved,
-        rdo2_chroma_scratch_candidates: last.stats.rdo2_chroma_scratch_candidates,
-        rdo2_chroma_scratch_cheap_evals: last.stats.rdo2_chroma_scratch_cheap_evals,
-        rdo2_chroma_scratch_exact_evals: last.stats.rdo2_chroma_scratch_exact_evals,
-        rdo2_chroma_scratch_exact_escalations: last.stats.rdo2_chroma_scratch_exact_escalations,
-        rdo2_chroma_scratch_changed_winner: last.stats.rdo2_chroma_scratch_changed_winner,
-        rdo2_chroma_scratch_legacy_evals_skipped: last
-            .stats
-            .rdo2_chroma_scratch_legacy_evals_skipped,
-        rdo2_chroma_scratch_stacked_fallbacks: last.stats.rdo2_chroma_scratch_stacked_fallbacks,
-        full_rd_close_calls: last.stats.full_rd_close_calls,
-        luma_close_call_escalations: last.stats.luma_close_call_escalations,
-        luma_rough_predictions: last.stats.luma_rough_predictions,
-        chroma_rough_predictions: last.stats.chroma_rough_predictions,
         code_block_calls: last.stats.code_block_calls,
         forward_transforms: last.stats.forward_transforms,
-        inverse_transforms: last.stats.inverse_transforms,
-        residual_bit_estimates: last.stats.residual_bit_estimates,
-        cache_builds: last.stats.cache_builds,
-        cache_fast_hits: last.stats.cache_fast_hits,
-        cache_fallbacks: last.stats.cache_fallbacks,
-        frame_snapshots: last.stats.frame_snapshots,
-        frame_restores: last.stats.frame_restores,
-        map_snapshots: last.stats.map_snapshots,
-        map_restores: last.stats.map_restores,
-        bytes_snapshotted: last.stats.bytes_snapshotted,
-        bytes_restored: last.stats.bytes_restored,
-        phase_total_us: last.stats.phase_total_us,
+        trial_coded_blocks: last.stats.trial_coded_blocks,
+        final_coded_blocks: last.stats.final_coded_blocks,
+        trial_rdoq_blocks: last.stats.trial_rdoq_blocks,
+        final_rdoq_blocks: last.stats.final_rdoq_blocks,
         phase_build_us: last.stats.phase_build_us,
-        phase_parallel_restore_us: last.stats.phase_parallel_restore_us,
-        phase_deblock_us: last.stats.phase_deblock_us,
-        phase_sao_decide_us: last.stats.phase_sao_decide_us,
-        phase_sao_apply_us: last.stats.phase_sao_apply_us,
         phase_write_us: last.stats.phase_write_us,
+        bytes_restored: last.stats.bytes_restored,
+        partnxn_attempts: last.stats.partnxn_attempts,
+        partnxn_wins: last.stats.partnxn_wins,
         angular_exclusions: last.stats.angular_exclusions,
-        policy_angular_forced: last.stats.policy_angular_forced,
-        policy_angular_guarded: last.stats.policy_angular_guarded,
-        policy_early_term_suppressed: last.stats.policy_early_term_suppressed,
-        region_class_counts: join_u64s(&last.stats.region_class_counts),
-        luma_winner_rank_counts: join_u64s(&last.stats.luma_winner_rank_counts),
-        chroma_winner_rank_counts: join_u64s(&last.stats.chroma_winner_rank_counts),
-        cu_leaf_wins_by_region: join_u64s(&last.stats.cu_leaf_wins_by_region),
-        cu_split_wins_by_region: join_u64s(&last.stats.cu_split_wins_by_region),
-        tu_leaf_wins_by_region: join_u64s(&last.stats.tu_leaf_wins_by_region),
-        tu_split_wins_by_region: join_u64s(&last.stats.tu_split_wins_by_region),
-        partnxn_wins_by_region: join_u64s(&last.stats.partnxn_wins_by_region),
+        angular_game_blocks: last.stats.rdo2_angular_game_blocks,
+        angular_iame_blocks: last.stats.rdo2_angular_iame_blocks,
+        angular_modes_before: last.stats.rdo2_angular_modes_before,
+        angular_modes_after: last.stats.rdo2_angular_modes_after,
+        angular_modes_removed: last.stats.rdo2_angular_modes_removed,
+        stillsearch_ledger: last.stats.stillsearch_ledger,
+        stillsearch_ledger_ns: last.stats.stillsearch_ledger_ns,
+        rgb_psnr,
     })
+}
+
+fn crop_plane(src: &[u16], stride: usize, width: usize, height: usize) -> Vec<u16> {
+    let mut out = Vec::with_capacity(width * height);
+    for y in 0..height {
+        let row = y * stride;
+        out.extend_from_slice(&src[row..row + width]);
+    }
+    out
+}
+
+/// Compute PSNR between two equal-length plane buffers.
+/// True end-to-end RGB PSNR: decode the encoded `.bpg` with our (bpgdec-exact)
+/// decoder to RGB8 and compare against the source PNG/JPEG RGB.
+///
+/// This is the fair cross-encoder metric: C bpgenc and still265 each pick their
+/// own internal RGB↔YCbCr conversion, so comparing reconstructed YCbCr against an
+/// encoder-internal source plane penalises whichever encoder's convention differs
+/// from the harness's. Measuring after a full decode back to display RGB — the
+/// pixels the user actually receives — removes that bias and lets the C and rust
+/// numbers be BD-rated against each other directly.
+fn decoded_rgb_psnr(bpg: &[u8], src: &RgbImage) -> Option<f64> {
+    let out = bpg_decode::DecoderConfig::new()
+        .decode(bpg, bpg_decode::PixelLayout::Rgb8)
+        .ok()?;
+    if out.width != src.width || out.height != src.height || out.data.len() != src.pixels.len() {
+        return None;
+    }
+    let mut sse = 0f64;
+    for (&a, &b) in out.data.iter().zip(src.pixels.iter()) {
+        let d = a as f64 - b as f64;
+        sse += d * d;
+    }
+    if sse == 0.0 {
+        return Some(f64::INFINITY);
+    }
+    let mse = sse / out.data.len() as f64;
+    Some(10.0 * (255.0 * 255.0 / mse).log10())
+}
+
+fn psnr(a: &[u16], b: &[u16], peak: f64) -> f64 {
+    if a.len() != b.len() {
+        return 0.0;
+    }
+    let mut sse = 0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let d = x as f64 - y as f64;
+        sse += d * d;
+    }
+    if sse == 0.0 {
+        return f64::INFINITY;
+    }
+    let mse = sse / a.len() as f64;
+    10.0 * (peak * peak / mse).log10()
 }
 
 fn with_env_var<T, F>(key: &str, value: &str, f: F) -> Result<T, Box<dyn std::error::Error>>
@@ -909,88 +1108,70 @@ where
 }
 
 fn write_csv_row(out: &mut File, row: &Row) -> Result<(), Box<dyn std::error::Error>> {
-    let fields = vec![
+    let q = row.quality.as_ref();
+    let qy = q.map_or(String::new(), |q| format!("{:.4}", q.psnr_y));
+    let qcb = q.map_or(String::new(), |q| format!("{:.4}", q.psnr_cb));
+    let qcr = q.map_or(String::new(), |q| format!("{:.4}", q.psnr_cr));
+    let qrgb = q.map_or(String::new(), |q| format!("{:.4}", q.psnr_rgb));
+    write!(
+        out,
+        "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        csv_field(&row.effort),
         csv_field(&row.source),
-        row.width.to_string(),
-        row.height.to_string(),
-        row.pixels.to_string(),
-        row.run.to_string(),
+        row.width,
+        row.height,
+        row.pixels,
+        row.run,
         opt_secs(row.c_total),
         row.c_bytes.map_or(String::new(), |v| v.to_string()),
-        format!("{:.6}", row.rust_total.as_secs_f64()),
-        format!("{:.6}", row.rust_prepare.as_secs_f64()),
-        format!("{:.6}", row.rust_encode.as_secs_f64()),
-        row.rust_bpg_bytes.to_string(),
-        row.rust_annexb_bytes.to_string(),
-        row.ctu_count.to_string(),
-        row.cu_trials.to_string(),
-        row.cu_early_terminations.to_string(),
-        row.cu_split_bound_aborts.to_string(),
-        row.cu_force_leaf.to_string(),
-        row.tu_split_early_terminations.to_string(),
-        row.rmd_prunes.to_string(),
-        row.luma_candidate_expansions.to_string(),
-        row.chroma_candidate_expansions.to_string(),
-        row.partnxn_attempts.to_string(),
-        row.partnxn_skips.to_string(),
-        row.partnxn_wins.to_string(),
-        row.partnxn_losses.to_string(),
-        row.partnxn_cu_trials.to_string(),
-        row.partnxn_code_block_calls.to_string(),
-        row.trial_coded_blocks.to_string(),
-        row.final_coded_blocks.to_string(),
-        row.final_rdoq_blocks.to_string(),
-        row.trial_rdoq_blocks.to_string(),
-        row.best_tt_cheap_tu_decisions.to_string(),
-        row.best_tt_escalated_tu_decisions.to_string(),
-        row.best_tt_escalation_changed_winner.to_string(),
-        row.best_tt_full_trial_rdoq_blocks_saved.to_string(),
-        row.best_tt_exact_residual_estimates_saved.to_string(),
-        row.rdo2_chroma_scratch_candidates.to_string(),
-        row.rdo2_chroma_scratch_cheap_evals.to_string(),
-        row.rdo2_chroma_scratch_exact_evals.to_string(),
-        row.rdo2_chroma_scratch_exact_escalations.to_string(),
-        row.rdo2_chroma_scratch_changed_winner.to_string(),
-        row.rdo2_chroma_scratch_legacy_evals_skipped.to_string(),
-        row.rdo2_chroma_scratch_stacked_fallbacks.to_string(),
-        row.full_rd_close_calls.to_string(),
-        row.luma_close_call_escalations.to_string(),
-        row.luma_rough_predictions.to_string(),
-        row.chroma_rough_predictions.to_string(),
-        row.code_block_calls.to_string(),
-        row.forward_transforms.to_string(),
-        row.inverse_transforms.to_string(),
-        row.residual_bit_estimates.to_string(),
-        row.cache_builds.to_string(),
-        row.cache_fast_hits.to_string(),
-        row.cache_fallbacks.to_string(),
-        row.frame_snapshots.to_string(),
-        row.frame_restores.to_string(),
-        row.map_snapshots.to_string(),
-        row.map_restores.to_string(),
-        row.bytes_snapshotted.to_string(),
-        row.bytes_restored.to_string(),
-        row.phase_total_us.to_string(),
-        row.phase_build_us.to_string(),
-        row.phase_parallel_restore_us.to_string(),
-        row.phase_deblock_us.to_string(),
-        row.phase_sao_decide_us.to_string(),
-        row.phase_sao_apply_us.to_string(),
-        row.phase_write_us.to_string(),
-        row.angular_exclusions.to_string(),
-        row.policy_angular_forced.to_string(),
-        row.policy_angular_guarded.to_string(),
-        row.policy_early_term_suppressed.to_string(),
-        csv_field(&row.region_class_counts),
-        csv_field(&row.luma_winner_rank_counts),
-        csv_field(&row.chroma_winner_rank_counts),
-        csv_field(&row.cu_leaf_wins_by_region),
-        csv_field(&row.cu_split_wins_by_region),
-        csv_field(&row.tu_leaf_wins_by_region),
-        csv_field(&row.tu_split_wins_by_region),
-        csv_field(&row.partnxn_wins_by_region),
-    ];
-    writeln!(out, "{}", fields.join(","))?;
+        row.rust_total.as_secs_f64(),
+        row.rust_prepare.as_secs_f64(),
+        row.rust_encode.as_secs_f64(),
+        row.rust_bpg_bytes,
+        row.rust_annexb_bytes,
+        qy,
+        qcb,
+        qcr,
+        qrgb,
+        row.ctu_count,
+        row.cu_trials,
+        row.cu_early_terminations,
+        row.cu_split_bound_aborts,
+        row.cu_force_leaf,
+        row.code_block_calls,
+        row.forward_transforms,
+        row.trial_coded_blocks,
+        row.final_coded_blocks,
+        row.trial_rdoq_blocks,
+        row.final_rdoq_blocks,
+        row.phase_build_us,
+        row.phase_write_us,
+        row.bytes_restored,
+        row.partnxn_attempts,
+        row.partnxn_wins,
+        row.angular_exclusions,
+        row.angular_game_blocks,
+        row.angular_iame_blocks,
+        row.angular_modes_before,
+        row.angular_modes_after,
+        row.angular_modes_removed,
+        row.c_rgb_psnr.map_or(String::new(), |p| format!("{p:.4}")),
+        row.rust_rgb_psnr.map_or(String::new(), |p| format!("{p:.4}")),
+        row.c_y_psnr.map_or(String::new(), |p| format!("{p:.4}")),
+    )?;
+    let ledger = row
+        .stillsearch_ledger
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let ledger_ns = row
+        .stillsearch_ledger_ns
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    writeln!(out, ",{ledger},{ledger_ns}")?;
     Ok(())
 }
 
@@ -1006,55 +1187,195 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-fn join_u64s(values: &[u64]) -> String {
-    values
-        .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(";")
-}
+/// Write a combined multi-effort summary table sorted by size then effort.
+fn write_combined_summary(
+    path: &Path,
+    rows: &[Row],
+    efforts: &[EffortArg],
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
 
-fn write_summary(path: &Path, rows: &[Row]) -> Result<(), Box<dyn std::error::Error>> {
     let mut out = File::create(path)?;
-    writeln!(out, "# High-resolution BPG timing summary")?;
+    writeln!(out, "# Multi-effort BPG comparison summary")?;
     writeln!(out)?;
     writeln!(
         out,
-        "| source | size | c total s | rust total s | rust encode s | rust/C total | build s | write s | restore GB | restore fanout s | encode s/MP | cu trials/MP | code blocks/MP |"
+        "Generated at QP={}, format={}, bit-depth={}, C -m {}, {} run(s) per case{}.",
+        args.qp,
+        args.format,
+        args.bit_depth,
+        args.compress_level,
+        args.runs,
+        if args.native {
+            ", native resolution"
+        } else {
+            ""
+        },
     )?;
-    writeln!(
-        out,
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
-    )?;
+    writeln!(out)?;
+
+    // Group rows by size.
+    let mut by_size: BTreeMap<(u32, u32), Vec<&Row>> = BTreeMap::new();
     for row in rows {
-        let mp = row.pixels as f64 / 1_000_000.0;
-        let ratio = match row.c_total {
-            Some(c) if c.as_secs_f64() > 0.0 => {
-                format!("{:.2}", row.rust_total.as_secs_f64() / c.as_secs_f64())
+        by_size
+            .entry((row.width, row.height))
+            .or_default()
+            .push(row);
+    }
+
+    for ((w, h), group) in &by_size {
+        let mp = (*w as f64 * *h as f64) / 1_000_000.0;
+        writeln!(out, "## {w}x{h} ({mp:.1} MP)")?;
+        writeln!(out)?;
+
+        // C bpgenc baseline (same for every effort row in this size group).
+        let c_row = group.iter().find(|r| r.c_total.is_some());
+        let c_rgb = c_row.and_then(|c| c.c_rgb_psnr);
+        let c_y = c_row.and_then(|c| c.c_y_psnr);
+        if let Some(c) = c_row {
+            if let (Some(t), Some(b)) = (c.c_total, c.c_bytes) {
+                let c_q = match (c_y, c_rgb) {
+                    (Some(y), Some(r)) => format!(", {y:.2} dB psnr_y / {r:.2} dB rgb(dec)"),
+                    _ => String::new(),
+                };
+                writeln!(
+                    out,
+                    "C bpgenc (-m {}): {:.3} s ({:.3} s/MP), {} bytes{}.",
+                    args.compress_level,
+                    t.as_secs_f64(),
+                    t.as_secs_f64() / mp,
+                    b,
+                    c_q,
+                )?;
+                writeln!(out)?;
             }
-            _ => String::new(),
-        };
-        let c_total = row
-            .c_total
-            .map_or(String::new(), |d| format!("{:.3}", d.as_secs_f64()));
+        }
+
+        // Both PSNR columns are decode-side and directly comparable to C:
+        // `psnr_y` is luma (decoded recon vs source Y — the metric for
+        // coefficient-coding work, not capped by 4:2:0 chroma); `rgb(dec)` is the
+        // end-to-end decode→RGB PSNR (chroma-ceiling'd at 4:2:0). `Δ.. vs C` is
+        // rust − C in each: positive = rust higher quality at this QP. Read with
+        // `vs C bytes` for RD position (true BD-rate needs a QP sweep).
         writeln!(
             out,
-            "| {} | {}x{} | {} | {:.3} | {:.3} | {} | {:.3} | {:.3} | {:.2} | {:.3} | {:.3} | {:.0} | {:.0} |",
-            row.source,
-            row.width,
-            row.height,
-            c_total,
-            row.rust_total.as_secs_f64(),
-            row.rust_encode.as_secs_f64(),
-            ratio,
-            row.phase_build_us as f64 / 1_000_000.0,
-            row.phase_write_us as f64 / 1_000_000.0,
-            row.bytes_restored as f64 / (1024.0 * 1024.0 * 1024.0),
-            row.phase_parallel_restore_us as f64 / 1_000_000.0,
-            row.rust_encode.as_secs_f64() / mp,
-            row.cu_trials as f64 / mp,
-            row.code_block_calls as f64 / mp,
+            "| effort | encode s | vs C time | bpg bytes | vs C bytes | psnr_y | Δpy vs C | rgb(dec) | Δrgb vs C | cu_trials |"
         )?;
+        writeln!(out, "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")?;
+
+        for effort in efforts {
+            let name = effort.as_str();
+            if let Some(row) = group.iter().find(|r| r.effort == name) {
+                let vs_c_time = row.c_total.map_or(String::new(), |c| {
+                    format!("{:.2}x", row.rust_encode.as_secs_f64() / c.as_secs_f64())
+                });
+                let vs_c_bytes = row.c_bytes.map_or(String::new(), |c| {
+                    if c > 0 {
+                        format!(
+                            "{:+.1}%",
+                            (row.rust_bpg_bytes as f64 / c as f64 - 1.0) * 100.0
+                        )
+                    } else {
+                        String::new()
+                    }
+                });
+
+                let q = row.quality.as_ref();
+                let py = q.map(|q| q.psnr_y);
+                let py_str = py.map_or(String::new(), |p| format!("{p:.2}"));
+                let dpy = match (py, c_y) {
+                    (Some(r), Some(c)) => format!("{:+.2}", r - c),
+                    _ => String::new(),
+                };
+                let rgb_dec = row
+                    .rust_rgb_psnr
+                    .map_or(String::new(), |p| format!("{p:.2}"));
+                let drgb = match (row.rust_rgb_psnr, c_rgb) {
+                    (Some(r), Some(c)) => format!("{:+.2}", r - c),
+                    _ => String::new(),
+                };
+                writeln!(
+                    out,
+                    "| {} | {:.3} | {} | {} | {} | {} | {} | {} | {} | {} |",
+                    name,
+                    row.rust_encode.as_secs_f64(),
+                    vs_c_time,
+                    row.rust_bpg_bytes,
+                    vs_c_bytes,
+                    py_str,
+                    dpy,
+                    rgb_dec,
+                    drgb,
+                    row.cu_trials,
+                )?;
+            }
+        }
+        writeln!(out)?;
     }
+
+    writeln!(out, "---")?;
+    writeln!(out)?;
+    writeln!(out, "## StillSearch work ledger (per-bucket call counts)")?;
+    writeln!(out)?;
+    writeln!(
+        out,
+        "Summed over the frame, for the first size group. These are the live \
+         StillSearch instrumentation buckets (`WorkBucket`); the old rdo2 \
+         work-volume columns are retired with that core. `cu_trials` and \
+         `partnxn_*` are the surviving CU-level counters.",
+    )?;
+    writeln!(out)?;
+
+    const BUCKETS: [&str; 16] = [
+        "RoughLuma",
+        "LumaCheap",
+        "LumaExact",
+        "TuLeaf",
+        "TuSplit",
+        "NxnRough",
+        "NxnBatch",
+        "ChromaRough",
+        "ChromaTrial",
+        "Rdoq",
+        "RdoqTrial",
+        "ResidualPrice",
+        "FinalCommit",
+        "Writer",
+        "Deblock",
+        "Sao",
+    ];
+
+    let first_size_key = by_size.keys().next();
+    if let Some(size_key) = first_size_key {
+        let group = &by_size[size_key];
+        writeln!(
+            out,
+            "| effort | cu_trials | partnxn_att | partnxn_win | {} |",
+            BUCKETS.join(" | "),
+        )?;
+        writeln!(
+            out,
+            "|---|---:|---:|---:|{}|",
+            "---:|".repeat(BUCKETS.len()),
+        )?;
+        for effort in efforts {
+            let name = effort.as_str();
+            if let Some(row) = group.iter().find(|r| r.effort == name) {
+                let ledger = row
+                    .stillsearch_ledger
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                writeln!(
+                    out,
+                    "| {} | {} | {} | {} | {} |",
+                    name, row.cu_trials, row.partnxn_attempts, row.partnxn_wins, ledger,
+                )?;
+            }
+        }
+    }
+    writeln!(out)?;
     Ok(())
 }

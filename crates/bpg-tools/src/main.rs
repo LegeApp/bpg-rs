@@ -9,7 +9,7 @@ use std::{fs::OpenOptions, io::Write};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use bpg_decode::{DecoderConfig, PixelLayout};
+use bpg_decode::{detect_container_kind, ContainerKind, DecodedFrame, DecoderConfig};
 use bpg_encode::{encode_still_image, EncoderTuning, HevcEncoder};
 use bpg_image::{ChromaFormat, ColorSpace, Image};
 use still265::backend::RustStillHevcEncoder;
@@ -26,14 +26,20 @@ struct Cli {
 enum Command {
     /// Encode a PNG or JPEG image to BPG.
     Encode(EncodeArgs),
-    /// Decode a still-image BPG to PNG.
+    /// Decode a still-image BPG or HEIC/HEIF to JPEG (default) or PNG.
     Decode(DecodeArgs),
 }
 
 /// CLI mirror of `still265::Effort` (HandBrake/x265-style ladder).
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum EffortArg {
+    Floor,
+    FloorPlus,
+    FloorPlus2,
+    FloorShallow,
     Fastest,
+    Slow,
+    SlowPlus,
     Fast,
     Balanced,
     Good,
@@ -45,6 +51,12 @@ enum EffortArg {
 impl From<EffortArg> for Effort {
     fn from(e: EffortArg) -> Self {
         match e {
+            EffortArg::Floor => Effort::Floor,
+            EffortArg::FloorPlus => Effort::FloorPlus,
+            EffortArg::FloorPlus2 => Effort::FloorPlus2,
+            EffortArg::FloorShallow => Effort::FloorShallow,
+            EffortArg::Slow => Effort::Slow,
+            EffortArg::SlowPlus => Effort::SlowPlus,
             EffortArg::Fastest => Effort::Fastest,
             EffortArg::Fast => Effort::Fast,
             EffortArg::Balanced => Effort::Balanced,
@@ -161,16 +173,37 @@ struct EncodeArgs {
 
 #[derive(clap::Args)]
 struct DecodeArgs {
-    /// Input BPG file.
+    /// Input BPG or HEIC/HEIF file (container is auto-detected).
     input: PathBuf,
 
-    /// Output PNG file.
+    /// Output image file. JPEG is the default — preserving the source's native
+    /// YCbCr color space with no RGB round-trip when it is BT.601 full-range
+    /// 8-bit (the BPG/JFIF common case). Use a `.png` extension to get a PNG
+    /// (the only path that converts to RGB).
     #[arg(short = 'o', long = "output")]
     output: PathBuf,
 
-    /// Decoded pixel layout before PNG encoding.
+    /// Decoded pixel layout for PNG output. Ignored for JPEG output.
     #[arg(long = "format", value_enum, default_value_t = DecodeFormat::Rgba)]
     format: DecodeFormat,
+
+    /// JPEG quality (1-100), only used when the output extension is .jpg/.jpeg.
+    #[arg(short = 'q', long = "quality", default_value_t = 90)]
+    quality: u8,
+
+    /// Chroma subsampling for JPEG output: `420` (default, smaller) or `444`
+    /// (full chroma). Ignored for PNG output and for grayscale frames.
+    #[arg(long = "jpeg-chroma", value_enum, default_value_t = JpegChroma::Yuv420)]
+    jpeg_chroma: JpegChroma,
+}
+
+/// Chroma subsampling selector for JPEG output.
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum JpegChroma {
+    #[value(name = "420")]
+    Yuv420,
+    #[value(name = "444")]
+    Yuv444,
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +226,10 @@ struct LoadedImage {
     color_type: ColorType,
     bit_depth: u8,
     pixels: Vec<u8>,
+    /// When true, `pixels` is interleaved BT.601 full-range `[Y, Cb, Cr]`
+    /// (chroma centered at 128), not RGB. Set only by `open_jpeg` for YCbCr
+    /// JPEGs so the encoder can ingest them without an RGB round-trip.
+    is_ycbcr: bool,
 }
 
 /// Read a PNG file using zune-png. Accepts Gray, GrayAlpha, RGB, RGBA at
@@ -233,16 +270,39 @@ fn open_png(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::E
         color_type,
         bit_depth,
         pixels,
+        is_ycbcr: false,
     })
 }
 
-/// Read a JPEG file using zune-jpeg. Always outputs 8-bit RGB.
+/// Read a JPEG file using zune-jpeg.
+///
+/// To preserve the source color space, we request zune's *native* output: for a
+/// normal YCbCr JPEG we ask for `ColorSpace::YCbCr` (zune copies the decoded
+/// BT.601 samples through with no RGB conversion — see zune-jpeg `worker.rs`),
+/// returning interleaved `[Y, Cb, Cr]` so the encoder can ingest it directly.
+/// Grayscale JPEGs come back as single-channel luma; CMYK/YCCK (rare) fall back
+/// to RGB. Output is always 8-bit (JPEG baseline).
 fn open_jpeg(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::Error>> {
+    use zune_core::colorspace::ColorSpace as ZColor;
     let data = std::fs::read(path)?;
+
+    // Peek at the JPEG's own colorspace so we can choose a no-conversion output.
+    let mut probe = zune_jpeg::JpegDecoder::new(&data);
+    probe
+        .decode_headers()
+        .map_err(|e| format!("JPEG header error: {e}"))?;
+    let input_cs = probe.get_input_colorspace();
+
+    let (out_cs, color_type, is_ycbcr) = match input_cs {
+        Some(ZColor::YCbCr) => (ZColor::YCbCr, ColorType::Rgb, true),
+        Some(ZColor::Luma) => (ZColor::Luma, ColorType::Gray, false),
+        // CMYK / YCCK / anything else: let zune convert to RGB.
+        _ => (ZColor::RGB, ColorType::Rgb, false),
+    };
+
     let mut decoder = zune_jpeg::JpegDecoder::new_with_options(
         &data,
-        zune_core::options::DecoderOptions::default()
-            .jpeg_set_out_colorspace(zune_core::colorspace::ColorSpace::RGB),
+        zune_core::options::DecoderOptions::default().jpeg_set_out_colorspace(out_cs),
     );
     let pixels = decoder
         .decode()
@@ -254,9 +314,10 @@ fn open_jpeg(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::
     Ok(LoadedImage {
         width,
         height,
-        color_type: ColorType::Rgb,
+        color_type,
         bit_depth: 8,
         pixels,
+        is_ycbcr,
     })
 }
 
@@ -548,51 +609,93 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let is_16bit = img.bit_depth == 16;
 
-    let mut image = match requested_format {
-        Format::Gray => {
-            if is_16bit {
-                let gray16 = extract_gray16(&img);
-                Image::from_luma16(
-                    &gray16,
-                    img.width,
-                    img.height,
-                    color_space,
-                    args.limited_range,
-                    args.bit_depth,
-                )
+    // YCbCr passthrough: a native-YCbCr JPEG (BT.601) encoded with the default
+    // YCbCr color space needs no RGB round-trip. Build a 4:4:4 image straight
+    // from the decoded planes; the requested chroma subsampling is applied below
+    // with the project's own Lanczos filter (same as the PNG path).
+    let use_ycbcr_passthrough = img.is_ycbcr
+        && matches!(args.color_space, CsArg::Ycbcr)
+        && requested_format != Format::Gray
+        && !is_16bit;
+    if img.is_ycbcr {
+        eprintln!(
+            "input: native YCbCr ({})",
+            if use_ycbcr_passthrough {
+                "passthrough, no RGB conversion"
             } else {
-                let gray8 = extract_gray8(&img);
-                Image::from_luma8(
-                    &gray8,
-                    img.width,
-                    img.height,
-                    color_space,
-                    args.limited_range,
-                    args.bit_depth,
-                )
+                "converted via RGB (non-default color space)"
             }
+        );
+    }
+
+    let mut image = if use_ycbcr_passthrough {
+        let n = (img.width as usize) * (img.height as usize);
+        let mut y = Vec::with_capacity(n);
+        let mut cb = Vec::with_capacity(n);
+        let mut cr = Vec::with_capacity(n);
+        for px in img.pixels.chunks_exact(3) {
+            y.push(px[0]);
+            cb.push(px[1]);
+            cr.push(px[2]);
         }
-        _ => {
-            if is_16bit {
-                let rgb16 = extract_rgb16(&img);
-                Image::from_rgb16(
-                    &rgb16,
-                    img.width,
-                    img.height,
-                    color_space,
-                    args.limited_range,
-                    args.bit_depth,
-                )
-            } else {
-                let rgb8 = extract_rgb8(&img);
-                Image::from_rgb8(
-                    &rgb8,
-                    img.width,
-                    img.height,
-                    color_space,
-                    args.limited_range,
-                    args.bit_depth,
-                )
+        Image::from_ycbcr_planes_u8(
+            &y,
+            &cb,
+            &cr,
+            img.width,
+            img.height,
+            ChromaFormat::Yuv444,
+            color_space,
+            args.limited_range,
+            args.bit_depth,
+        )
+    } else {
+        match requested_format {
+            Format::Gray => {
+                if is_16bit {
+                    let gray16 = extract_gray16(&img);
+                    Image::from_luma16(
+                        &gray16,
+                        img.width,
+                        img.height,
+                        color_space,
+                        args.limited_range,
+                        args.bit_depth,
+                    )
+                } else {
+                    let gray8 = extract_gray8(&img);
+                    Image::from_luma8(
+                        &gray8,
+                        img.width,
+                        img.height,
+                        color_space,
+                        args.limited_range,
+                        args.bit_depth,
+                    )
+                }
+            }
+            _ => {
+                if is_16bit {
+                    let rgb16 = extract_rgb16(&img);
+                    Image::from_rgb16(
+                        &rgb16,
+                        img.width,
+                        img.height,
+                        color_space,
+                        args.limited_range,
+                        args.bit_depth,
+                    )
+                } else {
+                    let rgb8 = extract_rgb8(&img);
+                    Image::from_rgb8(
+                        &rgb8,
+                        img.width,
+                        img.height,
+                        color_space,
+                        args.limited_range,
+                        args.bit_depth,
+                    )
+                }
             }
         }
     };
@@ -650,6 +753,8 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     std::fs::write(&args.output, &bpg)?;
+    // Flush the TU leaf-vs-split diagnostic CSV if BPG_TU_DIAG was set.
+    still265::tu_diag::flush();
     if let Some(target) = target_bytes {
         eprintln!(
             "wrote {} ({} bytes, effort {:?}, qp {} [target {} B], {:.2}s)",
@@ -728,68 +833,140 @@ fn encode_to_target(
 // Decode command
 // ---------------------------------------------------------------------------
 
-fn run_decode(args: &DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let data = std::fs::read(&args.input)?;
-    let layout = match args.format {
-        DecodeFormat::Rgb => PixelLayout::Rgb8,
-        DecodeFormat::Rgba => PixelLayout::Rgba8,
-        DecodeFormat::Bgr => PixelLayout::Bgr8,
-        DecodeFormat::Bgra => PixelLayout::Bgra8,
-    };
-    let decoded = DecoderConfig::new().decode(&data, layout)?;
-
-    match decoded.layout {
-        PixelLayout::Rgb8 => {
-            save_png(
-                &args.output,
-                decoded.width,
-                decoded.height,
-                ColorType::Rgb,
-                &decoded.data,
-            )?;
-        }
-        PixelLayout::Rgba8 => {
-            save_png(
-                &args.output,
-                decoded.width,
-                decoded.height,
-                ColorType::Rgba,
-                &decoded.data,
-            )?;
-        }
-        PixelLayout::Bgr8 => {
-            let mut data = decoded.data;
-            for px in data.chunks_exact_mut(3) {
-                px.swap(0, 2);
-            }
-            save_png(
-                &args.output,
-                decoded.width,
-                decoded.height,
-                ColorType::Rgb,
-                &data,
-            )?;
-        }
-        PixelLayout::Bgra8 => {
-            let mut data = decoded.data;
-            for px in data.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-            save_png(
-                &args.output,
-                decoded.width,
-                decoded.height,
-                ColorType::Rgba,
-                &data,
-            )?;
+/// Decode a BPG or HEIC/HEIF container to a raw YCbCr [`DecodedFrame`].
+/// Both paths keep the image in its native YCbCr color space; conversion to RGB
+/// happens only at the output edge (PNG, or the non-BT.601 JPEG fallback).
+fn decode_any_to_frame(data: &[u8]) -> Result<DecodedFrame, Box<dyn std::error::Error>> {
+    match detect_container_kind(data) {
+        ContainerKind::Bpg => Ok(DecoderConfig::new().decode_to_frame(data)?),
+        ContainerKind::Heif => Ok(bpg_decode::heic::decode_heic_to_frame(data)?),
+        ContainerKind::Unknown => {
+            Err("unrecognized input container (expected BPG or HEIC/HEIF)".into())
         }
     }
+}
 
+fn run_decode(args: &DecodeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let data = std::fs::read(&args.input)?;
+    let frame = decode_any_to_frame(&data)?;
+
+    // Output format by extension. JPEG is the default (native-YCbCr passthrough,
+    // no RGB round-trip); RGB conversion is reserved for explicit PNG output.
+    let out_ext = args
+        .output
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    if out_ext == "png" {
+        return save_frame_png(args, &frame);
+    }
+    save_frame_jpeg(args, &frame)
+}
+
+/// Write a decoded frame as PNG (RGB/RGBA). This is the RGB conversion path;
+/// `--format` selects the layout (BGR/BGRA are emitted as RGB/RGBA in the PNG).
+fn save_frame_png(
+    args: &DecodeArgs,
+    frame: &DecodedFrame,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let width = frame.cropped_width();
+    let height = frame.cropped_height();
+    let (color_type, data) = match args.format {
+        DecodeFormat::Rgb | DecodeFormat::Bgr => (ColorType::Rgb, frame.to_rgb()),
+        DecodeFormat::Rgba | DecodeFormat::Bgra => (ColorType::Rgba, frame.to_rgba()),
+    };
+    save_png(&args.output, width, height, color_type, &data)?;
+    eprintln!("wrote {} ({}x{})", args.output.display(), width, height);
+    Ok(())
+}
+
+/// Write a decoded frame as JPEG.
+///
+/// Color-space-preserving path: when the frame is BT.601 full-range 8-bit
+/// (matrix_coefficients 6, the BPG/HEIC default and what JFIF JPEG expects), the
+/// decoded YCbCr samples are written straight into the JPEG with no RGB
+/// conversion — Y/Cb/Cr → DCT directly. BT.709/BT.2020 or limited-range YCbCr
+/// frames are transcoded to JFIF (BT.601 full-range) **in the YCbCr domain**
+/// (`to_jfif_ycbcr444_8bit`), so the JPEG path still never materializes an RGB
+/// image; only exotic RGB-stored (matrix 0) or YCgCo (matrix 8) sources use the
+/// RGB output path.
+fn save_frame_jpeg(
+    args: &DecodeArgs,
+    frame: &DecodedFrame,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let width = frame.cropped_width();
+    let height = frame.cropped_height();
+    let quality = args.quality.clamp(1, 100);
+    // 4:2:0 JPEG unless 4:4:4 is requested; grayscale ignores this.
+    let downsample = matches!(args.jpeg_chroma, JpegChroma::Yuv420);
+
+    // BT.601 full-range 8-bit ⇒ native YCbCr passthrough (exact, no conversion).
+    let is_bt601 = matches!(frame.matrix_coeffs, 5 | 6);
+    let passthrough = is_bt601 && frame.full_range && frame.bit_depth == 8;
+    let is_gray = frame.chroma_format == 0;
+    let is_ycbcr = bpg_decode::is_ycbcr_matrix(frame.matrix_coeffs);
+
+    let mut out = Vec::new();
+    let mode: &str;
+    if is_gray {
+        // Monochrome: single-channel luma, no chroma at all. Limited-range luma
+        // is expanded to full range (JFIF) without touching RGB.
+        let luma = if passthrough {
+            mode = "gray passthrough";
+            frame.to_luma8()
+        } else {
+            mode = "gray (luma range transcode)";
+            frame.to_luma8_jfif()
+        };
+        let opts = toojpeg::EncodeOptions {
+            width,
+            height,
+            format: toojpeg::ImageFormat::Gray,
+            quality,
+            downsample: false,
+            ..Default::default()
+        };
+        toojpeg::encode_jpeg(&luma, opts, &mut out).map_err(|e| e.to_string())?;
+    } else if passthrough {
+        // 4:4:4/4:2:0/4:2:2 all yield full-res interleaved YCbCr here (4:2:2 is
+        // Lanczos-upsampled to 4:4:4 per the chosen design); JPEG then writes
+        // 4:2:0 or 4:4:4 per `--jpeg-chroma`.
+        let ycbcr = frame.to_ycbcr444_8bit();
+        toojpeg::encode_jpeg_ycbcr(&ycbcr, width, height, quality, downsample, &mut out)
+            .map_err(|e| e.to_string())?;
+        mode = "YCbCr passthrough";
+    } else if is_ycbcr {
+        // BT.709/BT.2020/limited/>8-bit: transcode to JFIF YCbCr in the YCbCr
+        // domain (no RGB image is ever formed).
+        let ycbcr = frame.to_jfif_ycbcr444_8bit();
+        toojpeg::encode_jpeg_ycbcr(&ycbcr, width, height, quality, downsample, &mut out)
+            .map_err(|e| e.to_string())?;
+        mode = "YCbCr transcode (→BT.601)";
+    } else {
+        // Exotic non-YCbCr sources (matrix 0 = RGB-stored, 8 = YCgCo): there is
+        // no YCbCr to preserve, so use the RGB output path.
+        let rgb = frame.to_rgb();
+        let opts = toojpeg::EncodeOptions {
+            width,
+            height,
+            format: toojpeg::ImageFormat::RGB,
+            quality,
+            downsample,
+            ..Default::default()
+        };
+        toojpeg::encode_jpeg(&rgb, opts, &mut out).map_err(|e| e.to_string())?;
+        mode = "RGB (non-YCbCr source)";
+    }
+
+    std::fs::write(&args.output, &out)?;
     eprintln!(
-        "wrote {} ({}x{})",
+        "wrote {} ({}x{}, JPEG q{}, {})",
         args.output.display(),
-        decoded.width,
-        decoded.height
+        width,
+        height,
+        quality,
+        mode
     );
     Ok(())
 }
@@ -819,7 +996,7 @@ fn append_debug_stats_csv(
     if write_header {
         writeln!(
             file,
-            "input,output,effort,qp,format,bit_depth,width,height,pixels,bpg_bytes,annexb_bytes,bpp,bytes_per_mp,encode_s,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,tu_split_early_terminations,rmd_prunes,luma_candidate_expansions,chroma_candidate_expansions,partnxn_attempts,partnxn_skips,partnxn_wins,partnxn_losses,partnxn_cu_trials,partnxn_code_block_calls,final_coded_blocks,trial_coded_blocks,trial_final_ratio,final_rdoq_blocks,trial_rdoq_blocks,rdoq_trial_final_ratio,best_tt_cheap_tu_decisions,best_tt_escalated_tu_decisions,best_tt_escalation_changed_winner,best_tt_full_trial_rdoq_blocks_saved,best_tt_exact_residual_estimates_saved,full_rd_close_calls,luma_close_call_escalations,luma_rough_predictions,chroma_rough_predictions,code_block_calls,code_block_per_final,forward_transforms,inverse_transforms,residual_bit_estimates,residual_estimates_per_final,cache_builds,cache_fast_hits,cache_fallbacks,frame_snapshots,frame_restores,map_snapshots,map_restores,bytes_snapshotted,bytes_restored,phase_total_us,phase_build_us,phase_parallel_restore_us,phase_deblock_us,phase_sao_decide_us,phase_sao_apply_us,phase_write_us,angular_exclusions,policy_angular_forced,policy_angular_guarded,policy_early_term_suppressed,region_class_counts,luma_winner_rank_counts,chroma_winner_rank_counts,cu_leaf_wins_by_region,cu_split_wins_by_region,tu_leaf_wins_by_region,tu_split_wins_by_region,partnxn_wins_by_region"
+            "input,output,effort,qp,format,bit_depth,width,height,pixels,bpg_bytes,annexb_bytes,bpp,bytes_per_mp,encode_s,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,floorplus_ctus,floorplus_repair_attempts,floorplus_enhanced_leaf_wins,floorplus_shallow_split_wins,floorplus_floor_leaf_kept,floorplus_repair_skips_no_residual,floorplus_repair_skips_low_cost,floorplus_bytes_saved_estimate,floorplus2_ctus,floorplus2_floor_kept,floorplus2_repair_attempts,floorplus2_bids_generated,floorplus2_bids_executed,floorplus2_bids_accepted,floorplus2_bids_rejected,floorplus2_enhanced_leaf_bids,floorplus2_enhanced_leaf_wins,floorplus2_split64_bids,floorplus2_split64_wins,floorplus2_child_repair_bids,floorplus2_child_repair_wins,floorplus2_repair_skips_no_residual,floorplus2_repair_skips_low_cost,floorplus2_odds_mode_k_sum,floorplus2_odds_mode_k_max,floorplus2_odds_bid_k_sum,floorplus2_odds_bid_k_max,floorplus2_bytes_saved_estimate,floorshallow_ctus,floorshallow_repair_attempts,floorshallow_enhanced_leaf_wins,floorshallow_enhanced_split_wins,floorshallow_floor_kept,floorshallow_repair_skips_no_residual,floorshallow_repair_skips_low_cost,floorshallow_bytes_saved_estimate,cu_force_leaf,tu_split_early_terminations,rmd_prunes,luma_candidate_expansions,chroma_candidate_expansions,partnxn_attempts,partnxn_skips,partnxn_wins,partnxn_losses,partnxn_cu_trials,partnxn_code_block_calls,final_coded_blocks,trial_coded_blocks,trial_final_ratio,final_rdoq_blocks,trial_rdoq_blocks,rdoq_trial_final_ratio,best_tt_cheap_tu_decisions,best_tt_escalated_tu_decisions,best_tt_escalation_changed_winner,best_tt_full_trial_rdoq_blocks_saved,best_tt_exact_residual_estimates_saved,full_rd_close_calls,luma_close_call_escalations,luma_rough_predictions,chroma_rough_predictions,code_block_calls,code_block_per_final,forward_transforms,inverse_transforms,residual_bit_estimates,residual_estimates_per_final,cache_builds,cache_fast_hits,cache_fallbacks,frame_snapshots,frame_restores,map_snapshots,map_restores,bytes_snapshotted,bytes_restored,phase_total_us,phase_build_us,phase_parallel_restore_us,phase_deblock_us,phase_sao_decide_us,phase_sao_apply_us,phase_write_us,angular_exclusions,rdo2_angular_exclusion_blocks,rdo2_angular_game_blocks,rdo2_angular_iame_blocks,rdo2_angular_modes_before,rdo2_angular_modes_after,rdo2_angular_modes_removed,policy_angular_forced,policy_angular_guarded,policy_early_term_suppressed,region_class_counts,luma_winner_rank_counts,chroma_winner_rank_counts,cu_leaf_wins_by_region,cu_split_wins_by_region,tu_leaf_wins_by_region,tu_split_wins_by_region,partnxn_wins_by_region"
         )?;
     }
 
@@ -850,6 +1027,42 @@ fn append_debug_stats_csv(
         stats.cu_trials.to_string(),
         stats.cu_early_terminations.to_string(),
         stats.cu_split_bound_aborts.to_string(),
+        stats.floorplus_ctus.to_string(),
+        stats.floorplus_repair_attempts.to_string(),
+        stats.floorplus_enhanced_leaf_wins.to_string(),
+        stats.floorplus_shallow_split_wins.to_string(),
+        stats.floorplus_floor_leaf_kept.to_string(),
+        stats.floorplus_repair_skips_no_residual.to_string(),
+        stats.floorplus_repair_skips_low_cost.to_string(),
+        stats.floorplus_bytes_saved_estimate.to_string(),
+        stats.floorplus2_ctus.to_string(),
+        stats.floorplus2_floor_kept.to_string(),
+        stats.floorplus2_repair_attempts.to_string(),
+        stats.floorplus2_bids_generated.to_string(),
+        stats.floorplus2_bids_executed.to_string(),
+        stats.floorplus2_bids_accepted.to_string(),
+        stats.floorplus2_bids_rejected.to_string(),
+        stats.floorplus2_enhanced_leaf_bids.to_string(),
+        stats.floorplus2_enhanced_leaf_wins.to_string(),
+        stats.floorplus2_split64_bids.to_string(),
+        stats.floorplus2_split64_wins.to_string(),
+        stats.floorplus2_child_repair_bids.to_string(),
+        stats.floorplus2_child_repair_wins.to_string(),
+        stats.floorplus2_repair_skips_no_residual.to_string(),
+        stats.floorplus2_repair_skips_low_cost.to_string(),
+        stats.floorplus2_odds_mode_k_sum.to_string(),
+        stats.floorplus2_odds_mode_k_max.to_string(),
+        stats.floorplus2_odds_bid_k_sum.to_string(),
+        stats.floorplus2_odds_bid_k_max.to_string(),
+        stats.floorplus2_bytes_saved_estimate.to_string(),
+        stats.floorshallow_ctus.to_string(),
+        stats.floorshallow_repair_attempts.to_string(),
+        stats.floorshallow_enhanced_leaf_wins.to_string(),
+        stats.floorshallow_enhanced_split_wins.to_string(),
+        stats.floorshallow_floor_kept.to_string(),
+        stats.floorshallow_repair_skips_no_residual.to_string(),
+        stats.floorshallow_repair_skips_low_cost.to_string(),
+        stats.floorshallow_bytes_saved_estimate.to_string(),
         stats.cu_force_leaf.to_string(),
         stats.tu_split_early_terminations.to_string(),
         stats.rmd_prunes.to_string(),
@@ -902,6 +1115,12 @@ fn append_debug_stats_csv(
         stats.phase_sao_apply_us.to_string(),
         stats.phase_write_us.to_string(),
         stats.angular_exclusions.to_string(),
+        stats.rdo2_angular_exclusion_blocks.to_string(),
+        stats.rdo2_angular_game_blocks.to_string(),
+        stats.rdo2_angular_iame_blocks.to_string(),
+        stats.rdo2_angular_modes_before.to_string(),
+        stats.rdo2_angular_modes_after.to_string(),
+        stats.rdo2_angular_modes_removed.to_string(),
         stats.policy_angular_forced.to_string(),
         stats.policy_angular_guarded.to_string(),
         stats.policy_early_term_suppressed.to_string(),
@@ -937,6 +1156,12 @@ fn join_u64s(values: &[u64]) -> String {
 
 fn effort_name(effort: EffortArg) -> &'static str {
     match effort {
+        EffortArg::Floor => "floor",
+        EffortArg::FloorPlus => "floor-plus",
+        EffortArg::FloorPlus2 => "floor-plus2",
+        EffortArg::FloorShallow => "floor-shallow",
+        EffortArg::Slow => "slow",
+        EffortArg::SlowPlus => "slow-plus",
         EffortArg::Fastest => "fastest",
         EffortArg::Fast => "fast",
         EffortArg::Balanced => "balanced",

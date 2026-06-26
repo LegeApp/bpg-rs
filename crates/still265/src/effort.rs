@@ -1,14 +1,26 @@
-//! Centralized search-effort templates and per-block budget resolution.
+//! Centralized search-effort templates and four-level pipeline configuration.
 //!
-//! This module is deliberately data-first: tiers describe search quantities and
-//! policies here, while the encoder consumes a resolved [`BlockSearchBudget`].
-//! Later decision-plan work can add cheaper trial implementations without
-//! scattering new `match Effort` branches through CU/TU/mode coding.
+//! The search pipeline has four explicit evaluation levels:
+//!
+//! ```text
+//! Level 0 — Rough    (SATD-based mode scoring, shortlist construction)
+//! Level 1 — Cheap    (hard-quant luma trials on a shortlist)
+//! Level 2 — Exact    (full RD search on promoted modes)
+//! Level 3 — Final    (winner-only RDOQ recode + syntax emission)
+//! ```
+//!
+//! Each level has its own policy struct and evidence types.  Presets (Fast / Slow /
+//! Placebo) assign specific budgets to each level — the pipeline itself stays the
+//! same.
 
 use std::fmt;
 
 use crate::preanalysis::{RegionClass, SearchPolicy};
-use crate::{is_reference_tier, Effort};
+use crate::{Effort, is_reference_tier};
+
+// ──────────────────────────────────────────────
+// Shared enums
+// ──────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EntropyContextMode {
@@ -32,47 +44,94 @@ pub enum RmdModeSet {
 }
 
 impl RmdModeSet {
+    /// Build the mode list for the RMD (rough mode decision) angular scan.
     pub fn modes(self, mpm: [u8; 3]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(35);
-        out.extend_from_slice(&mpm);
-        out.extend_from_slice(&[0, 1]);
-
+        let mut modes = Vec::with_capacity(35);
+        // Planar = mode 0, DC = mode 1
+        if self != RmdModeSet::MpmPlanarDcOnly {
+            modes.push(0);
+            modes.push(1);
+        }
         match self {
-            RmdModeSet::MpmPlanarDcOnly => {}
-            RmdModeSet::Step4 => out.extend_from_slice(&[2, 6, 10, 14, 18, 22, 26, 30, 34]),
-            RmdModeSet::Step3 => {
-                out.extend_from_slice(&[2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 34])
+            RmdModeSet::MpmPlanarDcOnly => {
+                // No angular modes. MPMs handle the rest.
             }
-            RmdModeSet::Step2 => out.extend_from_slice(&[
-                2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34,
-            ]),
-            RmdModeSet::Dense => out.extend_from_slice(&[
-                2, 4, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-                28, 30, 32, 34,
-            ]),
-            RmdModeSet::Exhaustive => out.extend(0..=34),
-            RmdModeSet::Progressive { .. } => {
-                // Dynamic progressive scoring is implemented in the encoder,
-                // where rough SATD scores are available. This static fallback is
-                // used only by generic callers.
-                out.extend_from_slice(&[
-                    2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34,
-                ]);
+            RmdModeSet::Step4 => {
+                for mode in (2..=34).step_by(4) {
+                    modes.push(mode);
+                }
+            }
+            RmdModeSet::Step3 => {
+                for mode in (2..=34).step_by(3) {
+                    modes.push(mode);
+                }
+            }
+            RmdModeSet::Step2 => {
+                for mode in (2..=34).step_by(2) {
+                    modes.push(mode);
+                }
+            }
+            RmdModeSet::Dense => {
+                for mode in 2..=34 {
+                    modes.push(mode);
+                }
+            }
+            RmdModeSet::Exhaustive => {
+                for mode in 0..=34 {
+                    modes.push(mode);
+                }
+            }
+            RmdModeSet::Progressive {
+                coarse_step,
+                top_regions,
+                refine_radius,
+            } => {
+                // Phase 1: coarse scan over the full angular range.
+                let coarse: Vec<u8> = (2..=34).step_by(coarse_step as usize).collect();
+                // Sort coarse modes by cost (placeholder — real sorting
+                // happens in the search; here we keep the physical order).
+                // The expensive step is to keep the top N regions.
+                let top_n = top_regions.min(3); // max 3 directional regions
+                let mut kept: Vec<u8> = Vec::new();
+                // Group into H (2–9), D (10–25), V (26–34).
+                for (lo, hi) in [(2u8, 9u8), (10, 25), (26, 34)] {
+                    let in_region: Vec<u8> = coarse
+                        .iter()
+                        .copied()
+                        .filter(|&m| m >= lo && m <= hi)
+                        .collect();
+                    if !in_region.is_empty() && kept.len() < top_n as usize {
+                        kept.extend(&in_region);
+                    }
+                }
+                // Fallback: if no coarse modes in top regions, keep best 2.
+                if kept.is_empty() {
+                    kept.extend(coarse.iter().take(2));
+                }
+                modes.extend(&kept);
+                // Phase 2: refine around kept modes.
+                if refine_radius > 0 {
+                    let refine_set: Vec<u8> = kept
+                        .iter()
+                        .flat_map(|&m| {
+                            let lo = m.saturating_sub(refine_radius).max(2);
+                            let hi = (m + refine_radius).min(34);
+                            (lo..=hi).filter(|&c| !modes.contains(&c))
+                        })
+                        .collect();
+                    // Add refinement modes in order, deduplicated.
+                    for m in refine_set {
+                        if !modes.contains(&m) {
+                            modes.push(m);
+                        }
+                    }
+                }
             }
         }
-
-        out.sort_unstable();
-        out.dedup();
-        out
+        // Always include MPM candidates (may be duplicate — caller deduplicates).
+        modes.extend_from_slice(&mpm);
+        modes
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrialQuality {
-    Rough,
-    FastRd,
-    FullRd,
-    Final,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,87 +151,31 @@ pub enum ComponentKind {
 }
 
 impl ComponentKind {
-    #[inline]
     pub fn from_c_idx(c_idx: u8) -> Self {
         match c_idx {
             0 => ComponentKind::Luma,
             1 => ComponentKind::ChromaCb,
-            2 => ComponentKind::ChromaCr,
-            _ => unreachable!("component index must be 0, 1, or 2"),
+            _ => ComponentKind::ChromaCr,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct RmdTemplate {
-    pub mode_set: RmdModeSet,
-    pub max_luma_rd_candidates: u8,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AngularFamily {
+    Horizontal,
+    Diagonal,
+    Vertical,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct LumaSearchTemplate {
-    pub trial_quality: TrialQuality,
-    pub chroma_during_luma_trials: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ChromaSearchTemplate {
-    pub trial_quality: TrialQuality,
-    pub max_rd_candidates: u8,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ResidualSearchTemplate {
-    pub rdoq_during_trials: bool,
-    pub exact_bits_during_trials: bool,
-    pub final_quality: TrialQuality,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct CuSplitTemplate {
-    pub default_search: SplitSearch,
-    pub early_terminate: CuEarlyTerminateRule,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct TuSplitTemplate {
-    pub default_search: SplitSearch,
-    pub zero_residual_early_terminate: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PreanalysisTemplate {
-    pub class_steering: bool,
-    pub allow_candidate_expansion: bool,
-    pub importance_rmd_prune_factor: Option<f64>,
-    pub importance_force_leaf: bool,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct EffortTemplate {
-    pub name: Effort,
-    pub reference: bool,
-    pub entropy_context: EntropyContextMode,
-    pub parallel_analysis: bool,
-    pub rmd: RmdTemplate,
-    pub luma: LumaSearchTemplate,
-    pub chroma: ChromaSearchTemplate,
-    pub residual: ResidualSearchTemplate,
-    pub cu_split: CuSplitTemplate,
-    pub tu_split: TuSplitTemplate,
-    pub preanalysis: PreanalysisTemplate,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct BlockDesc {
-    pub x: u32,
-    pub y: u32,
-    pub log2_size: u8,
-    pub qp: i32,
-    pub region: RegionClass,
-    pub importance_q8: u16,
-    pub component: ComponentKind,
-    pub policy: SearchPolicy,
+impl AngularFamily {
+    pub fn classify(mode: u8) -> Option<Self> {
+        match mode {
+            2..=9 => Some(AngularFamily::Horizontal),
+            10..=25 => Some(AngularFamily::Diagonal),
+            26..=34 => Some(AngularFamily::Vertical),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,49 +186,1101 @@ pub enum CuEarlyTerminateRule {
     Fastest,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct RdoqPassBudget {
-    effort: Effort,
-    qp: i32,
+// ──────────────────────────────────────────────
+// RDOQ trial policy
+// ──────────────────────────────────────────────
+
+/// Controls whether analysis-stage RDOQ trials are run on exact candidates.
+///
+/// x265's `--rdoq-level=1` applies RDOQ during the search (not just at final
+/// write).  This enum controls the same boundary: RDOQ should influence mode
+/// and TU split ranking, not just final coefficient rounding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrialRdoqMode {
+    Off,
+    ExactOnly,
+    ExactCloseOnly,
+    CheapCloseAndExact,
+    PlaceboAllExact,
 }
 
-impl RdoqPassBudget {
-    pub fn passes(self, log2_size: u8, _component: ComponentKind, nnz: u32) -> u8 {
-        match self.effort {
-            Effort::Fastest | Effort::Fast => 0,
-            Effort::Balanced => {
-                if self.qp < 38 && log2_size <= 3 && nnz <= 32 {
-                    1
-                } else {
-                    0
-                }
-            }
-            Effort::Good => {
-                if self.qp >= 44 {
-                    0
-                } else if self.qp >= 38 {
-                    if log2_size <= 3 && nnz <= 32 {
-                        1
-                    } else {
-                        0
-                    }
-                } else if log2_size <= 4 && nnz <= 64 {
-                    1
-                } else {
-                    0
-                }
-            }
-            Effort::Best | Effort::Placebo | Effort::Reference => {
-                if log2_size <= 4 && nnz <= 128 {
-                    2
-                } else {
-                    1
-                }
-            }
+/// Policy for analysis-stage RDOQ trials.
+#[derive(Clone, Copy, Debug)]
+pub struct RdoqTrialPolicy {
+    pub mode: TrialRdoqMode,
+    /// Re-run RDOQ if a candidate is within this cost ratio of the best
+    /// hard-quant candidate (only meaningful in `ExactCloseOnly` / `CheapCloseAndExact`).
+    pub close_margin: f64,
+    /// Maximum RDOQ trial candidates per luma mode search.
+    pub max_rdoq_modes: u8,
+    /// RDOQ level (1 = coefficient-level rounding only).
+    pub level: u8,
+}
+
+// ──────────────────────────────────────────────
+// TU split policy
+// ──────────────────────────────────────────────
+
+/// How the exact stage explores the residual quad-tree (TU split).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TuSplitMode {
+    Disabled,
+    LeafFirstEarlyTerminate,
+    EvaluateBoth,
+    ForceSplit,
+}
+
+/// Configuration for exact-stage TU split search.
+#[derive(Clone, Copy, Debug)]
+pub struct TuExactPolicy {
+    pub split_mode: TuSplitMode,
+    pub max_extra_depth: u8,
+    pub min_split_log2: u8,
+    /// Test split after leaf unless leaf is clearly terminal.
+    pub leaf_first: bool,
+    /// For Fast only.
+    pub zero_residual_early_terminate: bool,
+    pub low_residual_early_terminate: bool,
+    pub low_residual_bits_per_px: f64,
+    pub low_distortion_per_px: f64,
+    /// For Slow/Placebo — apply RDOQ during split evaluation.
+    pub rdoq_split_trials: bool,
+}
+
+// ──────────────────────────────────────────────
+// Core level enums
+// ──────────────────────────────────────────────
+
+/// Identifies which search level the engine is currently executing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchLevel {
+    Rough,
+    Cheap,
+    Exact,
+    Final,
+}
+
+/// Whether a trial evaluates only luma or full luma+chroma.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentScope {
+    LumaOnly,
+    FullComponents,
+}
+
+/// Quantizer mode for a trial pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrialQuant {
+    HardQuant,
+    Rdoq,
+}
+
+/// How residual bits are priced during RD cost computation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResidualPriceLevel {
+    None,
+    Approx,
+    Exact,
+}
+
+/// When chroma is evaluated relative to luma mode search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChromaTiming {
+    Never,
+    WinnerOnly,
+    DuringExactTrials,
+}
+
+// ══════════════════════════════════════════════
+// Level 0 — Rough
+// ══════════════════════════════════════════════
+
+/// Configuration for the rough SATD-based mode scoring pass.
+#[derive(Clone, Copy, Debug)]
+pub struct RoughLumaPolicy {
+    pub mode_set: RmdModeSet,
+    pub score_all_modes: bool,
+    pub use_mode_bits: bool,
+    pub angular_family_detection: bool,
+}
+
+/// Evidence collected during the rough pass.
+///
+/// The rough pass scores available intra modes by SATD cost and classifies
+/// them into families.  Downstream stages consume this evidence to build
+/// the shortlist and later the exact promotion set.
+#[derive(Clone, Debug)]
+pub struct RoughBlockEvidence {
+    /// Best-scoring mode overall.
+    pub best_global: u8,
+    /// Best planar (0) or DC (1) mode, if either beat the angular modes.
+    pub best_planar_dc: Option<u8>,
+    /// Best angular mode (2–34), if any angular was scored.
+    pub best_angular: Option<u8>,
+    /// Best angular per family (H/D/V).
+    pub best_angular_by_family: [Option<u8>; 3],
+    /// Full rough-cost list for all scored modes.
+    pub rough_costs: Vec<ModeCost>,
+    /// SATD cost of the best mode (used for split/NxN gating).
+    pub best_satd: f64,
+    /// Block activity / variance measure.
+    pub activity: u32,
+    /// Source sample range (max − min).
+    pub range: u16,
+    /// Directional energy strength.
+    pub directional_strength: u32,
+}
+
+/// A single mode scored during the rough pass.
+#[derive(Clone, Copy, Debug)]
+pub struct ModeCost {
+    pub mode: u8,
+    pub cost: f64,
+    pub satd: u32,
+    pub class: ModeClass,
+    pub family: Option<AngularFamily>,
+}
+
+/// Classification of an intra mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeClass {
+    Planar,
+    Dc,
+    Angular,
+}
+
+// ══════════════════════════════════════════════
+// Level 1 — Cheap
+// ══════════════════════════════════════════════
+
+/// Configuration for the cheap luma-only trial pass.
+#[derive(Clone, Copy, Debug)]
+pub struct CheapLumaPolicy {
+    pub enabled: bool,
+    pub max_ranked_modes: u8,
+    pub scope: ComponentScope,
+    pub allow_optional_tu_split: bool,
+    pub residual_price: ResidualPriceLevel,
+    pub quant: TrialQuant,
+    /// When true, the cheap pass adds an approximate chroma SATD cost so that
+    /// the cheap ranking better predicts the full-RDO winner, matching x265's
+    /// leaf-RDO signal and allowing `max_exact_modes` to be set as low as 1.
+    pub chroma_satd_in_cheap: bool,
+}
+
+/// Result of a cheap (hard-quant, luma-only) trial.
+#[derive(Clone, Copy, Debug)]
+pub struct CheapMode {
+    pub mode: u8,
+    pub cost: f64,
+    pub luma_cbf: bool,
+    pub residual_bits: u64,
+    pub distortion: u64,
+    pub rough_rank: usize,
+}
+
+// ══════════════════════════════════════════════
+// Level 2 — Exact
+// ══════════════════════════════════════════════
+
+/// Whether the exact TT search pass runs after cheap ranking.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExactUsage {
+    /// Skip exact entirely; use the cheap winner's plan directly.
+    /// RDOQ finalization recodes the coefficients.
+    Disabled,
+    /// Run exact only for modes promoted from cheap ranking.
+    PromotedModes,
+    /// Run exact for the full shortlist (bypass cheap ranking).
+    AllShortlist,
+}
+
+/// Configuration for the exact RD search pass on promoted modes.
+#[derive(Clone, Copy, Debug)]
+pub struct ExactLumaPolicy {
+    pub max_modes: u8,
+    pub scope: ComponentScope,
+    pub residual_price: ResidualPriceLevel,
+    pub quant: TrialQuant,
+    pub promote: ExactPromotionPolicy,
+    /// Controls whether the exact pass runs at all after cheap ranking.
+    pub exact_usage: ExactUsage,
+}
+
+/// Controls which modes are promoted from the shortlist (and optional
+/// cheap ranking) into the exact pass.
+#[derive(Clone, Copy, Debug)]
+pub struct ExactPromotionPolicy {
+    pub max_exact_modes: u8,
+    pub include_cheap_winner: bool,
+    pub include_best_rough_angular_if_pd_wins_cheap: bool,
+    pub include_best_rough_pd_if_angular_wins_cheap: bool,
+    pub cheap_close_margin: f64,
+}
+
+impl ExactPromotionPolicy {
+    pub const fn all_shortlist() -> Self {
+        Self {
+            max_exact_modes: 255,
+            include_cheap_winner: false,
+            include_best_rough_angular_if_pd_wins_cheap: false,
+            include_best_rough_pd_if_angular_wins_cheap: false,
+            cheap_close_margin: 1.0,
         }
     }
 }
 
+/// The winner of the exact search pass for one CU.
+///
+/// `Tt` is the transform-tree plan type (e.g. [`crate::plan::TtPlan`]).
+/// `Saved` is the detached reconstruction overlay for the block.
+#[derive(Clone, Debug)]
+pub struct ExactModeWinner<Tt, Saved> {
+    pub mode: u8,
+    pub tt: Tt,
+    pub recon: Saved,
+    pub cost: f64,
+}
+
+// ══════════════════════════════════════════════
+// Level 3 — Final
+// ══════════════════════════════════════════════
+
+/// Configuration for the winner-only RDOQ finalization pass.
+#[derive(Clone, Copy, Debug)]
+pub struct FinalSearchPolicy {
+    pub quant: TrialQuant,
+    pub residual_price: ResidualPriceLevel,
+    pub rdoq_final: bool,
+    pub sign_data_hiding: bool,
+}
+
+// ══════════════════════════════════════════════
+// Pipeline policy structs
+// ══════════════════════════════════════════════
+
+/// Controls the representation-aware shortlist built from rough evidence.
+#[derive(Clone, Copy, Debug)]
+pub struct LumaShortlistPolicy {
+    pub max_modes: u8,
+    pub include_best_global: bool,
+    pub include_best_planar_dc: bool,
+    pub include_best_angular: bool,
+    pub include_mpm: bool,
+    pub angular_family_slots: u8,
+    pub angular_neighbor_radius: u8,
+}
+
+/// Full luma search funnel policy (rough → shortlist → cheap → exact).
+#[derive(Clone, Copy, Debug)]
+pub struct LumaSearchPolicy {
+    pub rough: RoughLumaPolicy,
+    pub shortlist: LumaShortlistPolicy,
+    pub cheap: CheapLumaPolicy,
+    pub exact: ExactLumaPolicy,
+}
+
+/// Transform-tree (TU) search policy.
+#[derive(Clone, Copy, Debug)]
+pub struct TuSearchPolicy {
+    pub min_split_log2: u8,
+    pub leaf_first: bool,
+    pub split_search: SplitSearch,
+    pub zero_residual_early_terminate: bool,
+    pub low_residual_early_terminate: bool,
+    pub low_residual_bits_per_px: f64,
+    pub low_distortion_per_px: f64,
+}
+
+/// Coding-unit (CU) search policy.
+#[derive(Clone, Copy, Debug)]
+pub struct CuSearchPolicy {
+    pub split_search: SplitSearch,
+    pub early_terminate: CuEarlyTerminateRule,
+    pub use_preanalysis_force_leaf: bool,
+    pub use_preanalysis_force_split: bool,
+    pub leaf_first: bool,
+}
+
+/// PartNxN search policy.
+#[derive(Clone, Copy, Debug)]
+pub struct NxnSearchPolicy {
+    pub enabled: bool,
+    pub rough_gate_enabled: bool,
+    pub rough_satd_threshold: f64,
+    pub require_directional_or_texture: bool,
+    pub exact_eval: bool,
+}
+
+/// Chroma mode/timing policy.
+#[derive(Clone, Copy, Debug)]
+pub struct ChromaSearchPolicy {
+    pub timing: ChromaTiming,
+    pub max_candidates: u8,
+    pub residual_price: ResidualPriceLevel,
+    pub quant: TrialQuant,
+}
+
+/// Pre-analysis steering for per-block decision making.
+#[derive(Clone, Copy, Debug)]
+pub struct PreanalysisTemplate {
+    pub class_steering: bool,
+    pub allow_candidate_expansion: bool,
+    pub importance_rmd_prune_factor: Option<f64>,
+    pub importance_force_leaf: bool,
+}
+
+impl PreanalysisTemplate {
+    pub const fn oracle_disabled() -> Self {
+        Self {
+            class_steering: false,
+            allow_candidate_expansion: false,
+            importance_rmd_prune_factor: None,
+            importance_force_leaf: false,
+        }
+    }
+}
+
+// ══════════════════════════════════════════════
+// EffortTemplate — composable preset
+// ══════════════════════════════════════════════
+
+#[derive(Clone, Copy, Debug)]
+pub struct EffortTemplate {
+    pub name: Effort,
+    pub oracle: bool,
+    pub entropy_context: EntropyContextMode,
+    pub parallel_analysis: bool,
+
+    pub luma: LumaSearchPolicy,
+    pub tu: TuSearchPolicy,
+    pub tu_exact: TuExactPolicy,
+    pub cu: CuSearchPolicy,
+    pub nxn: NxnSearchPolicy,
+    pub chroma: ChromaSearchPolicy,
+    pub final_pass: FinalSearchPolicy,
+    pub rdoq_trials: RdoqTrialPolicy,
+
+    pub preanalysis: PreanalysisTemplate,
+}
+
+impl EffortTemplate {
+    /// True if this template is a reference/oracle tier.
+    pub fn is_reference(&self) -> bool {
+        matches!(self.name, Effort::Placebo | Effort::Reference)
+    }
+}
+
+// ══════════════════════════════════════════════
+// Canonical mapping & template selection
+// ══════════════════════════════════════════════
+
+/// Map the old wide `Effort` enum to the three canonical presets.
+pub fn canonical_effort(e: Effort) -> Effort {
+    match e {
+        Effort::Floor
+        | Effort::FloorPlus
+        | Effort::FloorPlus2
+        | Effort::FloorShallow
+        | Effort::Fastest
+        | Effort::Fast
+        | Effort::FastAdaptive => Effort::Fast,
+        Effort::Slow | Effort::SlowPlus | Effort::Balanced | Effort::Good | Effort::Best => {
+            Effort::Slow
+        }
+        Effort::Placebo | Effort::Reference => Effort::Placebo,
+    }
+}
+
+/// Return the canonical template for a given effort.
+/// All old effort names map to one of FAST / SLOW / PLACEBO.
+#[inline]
+pub fn template(effort: Effort) -> &'static EffortTemplate {
+    match canonical_effort(effort) {
+        Effort::Fast => &FAST,
+        Effort::Slow => &SLOW,
+        Effort::Placebo => &PLACEBO,
+        _ => unreachable!(),
+    }
+}
+
+// ══════════════════════════════════════════════
+// Three canonical presets
+// ══════════════════════════════════════════════
+
+/// Fast — minimalistic robust preset for quick / bulk encodes.
+///
+/// Same staged pipeline as Slow, but spends work only where
+/// evidence is strong.  The cheap winner normally decides exact
+/// promotion; a second mode is tried only if it is category-different
+/// (planar/DC vs angular) and within 5 % cost margin.
+///
+/// Target: old minimal-search speed with corrected architecture.
+///
+/// Do not tune this by trying to match Slow.  Fast is allowed to
+/// give up the last 5-10 % of compression — it is designed to avoid
+/// search volume, not to chase oracle quality.
+///
+/// ### Key budgets (from presets2.md)
+/// - Shortlist: 4-5 modes, protect best global/angular/planar/MPM, no family diversity.
+/// - Exact: 1 mode, rarely 2 (close category-different challenger only).
+/// - TU: leaf-first, aggressive zero/low-residual early terminate.
+/// - CU: leaf-first, aggressive early terminate, preanalysis force-leaf on smooth.
+/// - NxN: strongly gated (directional/texture required, rough SATD ≥ 1000).
+/// - Chroma: winner-only, one candidate, approx residual pricing.
+/// - Final: RDOQ finalization always on.
+pub(crate) static FAST: EffortTemplate = EffortTemplate {
+    name: Effort::Fast,
+    oracle: false,
+    entropy_context: EntropyContextMode::Running,
+    parallel_analysis: true,
+
+    luma: LumaSearchPolicy {
+        rough: RoughLumaPolicy {
+            // Step-4 coarse angular scan + Planar/DC.  The coarse grid
+            // (every 4th angular mode) catches directional trends without
+            // scoring all 33 angular modes.  MPMs are still added later.
+            mode_set: RmdModeSet::Step4,
+            score_all_modes: true,
+            use_mode_bits: true,
+            angular_family_detection: true,
+        },
+        shortlist: LumaShortlistPolicy {
+            max_modes: 5,
+            include_best_global: true,
+            include_best_planar_dc: true,
+            include_best_angular: true,
+            include_mpm: true,
+            angular_family_slots: 0,
+            angular_neighbor_radius: 0,
+        },
+        cheap: CheapLumaPolicy {
+            enabled: true,
+            max_ranked_modes: 4,
+            scope: ComponentScope::LumaOnly,
+            allow_optional_tu_split: false,
+            residual_price: ResidualPriceLevel::Approx,
+            quant: TrialQuant::HardQuant,
+            chroma_satd_in_cheap: false,
+        },
+        exact: ExactLumaPolicy {
+            max_modes: 2,
+            scope: ComponentScope::LumaOnly,
+            residual_price: ResidualPriceLevel::Approx,
+            quant: TrialQuant::HardQuant,
+            promote: ExactPromotionPolicy {
+                max_exact_modes: 1,
+                include_cheap_winner: true,
+                include_best_rough_angular_if_pd_wins_cheap: false,
+                include_best_rough_pd_if_angular_wins_cheap: false,
+                cheap_close_margin: 1.05,
+            },
+            exact_usage: ExactUsage::Disabled,
+        },
+    },
+
+    tu: TuSearchPolicy {
+        min_split_log2: 3,
+        leaf_first: true,
+        split_search: SplitSearch::PreferLeaf,
+        zero_residual_early_terminate: true,
+        low_residual_early_terminate: true,
+        low_residual_bits_per_px: 0.05,
+        low_distortion_per_px: 1.0,
+    },
+
+    tu_exact: TuExactPolicy {
+        split_mode: TuSplitMode::LeafFirstEarlyTerminate,
+        max_extra_depth: 1,
+        min_split_log2: 3,
+        leaf_first: true,
+        zero_residual_early_terminate: true,
+        low_residual_early_terminate: true,
+        low_residual_bits_per_px: 0.05,
+        low_distortion_per_px: 1.0,
+        rdoq_split_trials: false,
+    },
+
+    cu: CuSearchPolicy {
+        split_search: SplitSearch::PreferLeaf,
+        early_terminate: CuEarlyTerminateRule::Fast,
+        use_preanalysis_force_leaf: true,
+        use_preanalysis_force_split: false,
+        leaf_first: true,
+    },
+
+    nxn: NxnSearchPolicy {
+        enabled: true,
+        rough_gate_enabled: true,
+        rough_satd_threshold: 1000.0,
+        require_directional_or_texture: true,
+        exact_eval: true,
+    },
+
+    chroma: ChromaSearchPolicy {
+        timing: ChromaTiming::WinnerOnly,
+        max_candidates: 1,
+        residual_price: ResidualPriceLevel::Approx,
+        quant: TrialQuant::HardQuant,
+    },
+
+    final_pass: FinalSearchPolicy {
+        quant: TrialQuant::Rdoq,
+        residual_price: ResidualPriceLevel::Exact,
+        rdoq_final: true,
+        sign_data_hiding: true,
+    },
+
+    rdoq_trials: RdoqTrialPolicy {
+        mode: TrialRdoqMode::Off,
+        close_margin: 1.00,
+        max_rdoq_modes: 0,
+        level: 0,
+    },
+
+    preanalysis: PreanalysisTemplate {
+        class_steering: true,
+        allow_candidate_expansion: false,
+        importance_rmd_prune_factor: Some(0.8),
+        importance_force_leaf: true,
+    },
+};
+
+/// Slow — main quality / archival preset.
+
+/// Same staged pipeline as Fast, but spends precise work broadly
+/// enough to recover most of the last 5-10 % of compression that
+/// Placebo achieves.  Uses x265-like selective refinement: cheap
+/// work broadly, exact work narrowly.
+///
+/// Target: near-Placebo output at a fraction of the cost.
+/// Validate by oracle miss counters, not by PSNR at fixed QP alone.
+///
+/// ### Key budgets (from presets2.md)
+/// - Shortlist: 7-8 modes, protect representation + 1-2 family diversity slots.
+/// - Exact: 3-4 modes including category challengers (within 10 % margin).
+/// - TU: leaf-first, conservative zero/low-residual early terminate.
+/// - CU: leaf-first, conservative early terminate, preanalysis hints only with strong evidence.
+/// - NxN: enabled with light rough gate (SATD > 0), no directional requirement.
+/// - Chroma: winner-only, up to 2 candidates, exact residual pricing.
+/// - Final: RDOQ finalization always on.
+pub(crate) static SLOW: EffortTemplate = EffortTemplate {
+    name: Effort::Slow,
+    oracle: false,
+    entropy_context: EntropyContextMode::Running,
+    parallel_analysis: true,
+
+    luma: LumaSearchPolicy {
+        rough: RoughLumaPolicy {
+            mode_set: RmdModeSet::Step4,
+            score_all_modes: true,
+            use_mode_bits: true,
+            angular_family_detection: true,
+        },
+        shortlist: LumaShortlistPolicy {
+            max_modes: 8,
+            include_best_global: true,
+            include_best_planar_dc: true,
+            include_best_angular: true,
+            include_mpm: true,
+            angular_family_slots: 2,
+            angular_neighbor_radius: 1,
+        },
+        cheap: CheapLumaPolicy {
+            enabled: true,
+            max_ranked_modes: 1,
+            scope: ComponentScope::LumaOnly,
+            allow_optional_tu_split: false,
+            residual_price: ResidualPriceLevel::Approx,
+            quant: TrialQuant::HardQuant,
+            // Chroma SATD cost in the cheap pass makes the ranking accurate
+            // enough to trust exactly 1 promoted mode to the exact pass,
+            // matching x265's leaf-RDO economy.
+            chroma_satd_in_cheap: false,
+        },
+        exact: ExactLumaPolicy {
+            max_modes: 4,
+            scope: ComponentScope::LumaOnly,
+            residual_price: ResidualPriceLevel::Exact,
+            quant: TrialQuant::HardQuant,
+            promote: ExactPromotionPolicy {
+                max_exact_modes: 1,
+                include_cheap_winner: true,
+                include_best_rough_angular_if_pd_wins_cheap: false,
+                include_best_rough_pd_if_angular_wins_cheap: false,
+                cheap_close_margin: 1.10,
+            },
+            exact_usage: ExactUsage::Disabled,
+        },
+    },
+
+    tu: TuSearchPolicy {
+        min_split_log2: 3,
+        leaf_first: true,
+        split_search: SplitSearch::EvaluateBoth,
+        zero_residual_early_terminate: true,
+        low_residual_early_terminate: true,
+        low_residual_bits_per_px: 0.02,
+        low_distortion_per_px: 0.5,
+    },
+
+    tu_exact: TuExactPolicy {
+        split_mode: TuSplitMode::EvaluateBoth,
+        max_extra_depth: 2, // Must not exceed MAX_INTRA_TT_DEPTH (2) — the write path uses that constant.
+        min_split_log2: 3,
+        leaf_first: true,
+        zero_residual_early_terminate: true,
+        low_residual_early_terminate: true,
+        low_residual_bits_per_px: 0.015,
+        low_distortion_per_px: 0.35,
+        rdoq_split_trials: false,
+    },
+
+    cu: CuSearchPolicy {
+        split_search: SplitSearch::EvaluateBoth,
+        early_terminate: CuEarlyTerminateRule::Balanced,
+        use_preanalysis_force_leaf: true,
+        use_preanalysis_force_split: true,
+        leaf_first: true,
+    },
+
+    nxn: NxnSearchPolicy {
+        enabled: true,
+        rough_gate_enabled: true,
+        rough_satd_threshold: 4000.0,
+        require_directional_or_texture: false,
+        exact_eval: true,
+    },
+
+    chroma: ChromaSearchPolicy {
+        timing: ChromaTiming::WinnerOnly,
+        max_candidates: 2,
+        residual_price: ResidualPriceLevel::Exact,
+        quant: TrialQuant::HardQuant,
+    },
+
+    final_pass: FinalSearchPolicy {
+        quant: TrialQuant::Rdoq,
+        residual_price: ResidualPriceLevel::Exact,
+        rdoq_final: true,
+        sign_data_hiding: true,
+    },
+
+    rdoq_trials: RdoqTrialPolicy {
+        mode: TrialRdoqMode::Off,
+        close_margin: 1.00,
+        max_rdoq_modes: 0,
+        level: 0,
+    },
+
+    preanalysis: PreanalysisTemplate {
+        class_steering: true,
+        allow_candidate_expansion: true,
+        importance_rmd_prune_factor: None,
+        importance_force_leaf: false,
+    },
+};
+
+/// Placebo — oracle / reference preset.
+///
+/// Answers the question: "What would the staged architecture choose
+/// if pruning were mostly disabled?"  Not intended for normal encode
+/// speed.  Used to validate Slow and measure what pruning misses.
+///
+/// All pruning mechanisms are disabled through policy (not through
+/// separate code paths) so Slow and Fast can be validated against it.
+///
+/// ### Key budgets (from presets2.md)
+/// - Shortlist: 12+ modes, full representation + family diversity.
+/// - Cheap: disabled (diagnostic only).
+/// - Exact: all shortlisted modes, full components (luma + chroma).
+/// - TU: leaf-first OK but no early termination; split evaluated when legal.
+/// - CU: no early termination; leaf and split both evaluated when legal.
+/// - NxN: evaluated whenever legal.
+/// - Chroma: during exact trials.
+/// - Final: RDOQ finalization always on.
+pub(crate) static PLACEBO: EffortTemplate = EffortTemplate {
+    name: Effort::Placebo,
+    oracle: true,
+    entropy_context: EntropyContextMode::FrozenSliceInit,
+    parallel_analysis: true,
+
+    luma: LumaSearchPolicy {
+        rough: RoughLumaPolicy {
+            mode_set: RmdModeSet::Exhaustive,
+            score_all_modes: true,
+            use_mode_bits: true,
+            angular_family_detection: true,
+        },
+        shortlist: LumaShortlistPolicy {
+            max_modes: 12,
+            include_best_global: true,
+            include_best_planar_dc: true,
+            include_best_angular: true,
+            include_mpm: true,
+            angular_family_slots: 3,
+            angular_neighbor_radius: 2,
+        },
+        cheap: CheapLumaPolicy {
+            enabled: false,
+            max_ranked_modes: 0,
+            scope: ComponentScope::LumaOnly,
+            allow_optional_tu_split: false,
+            residual_price: ResidualPriceLevel::Approx,
+            quant: TrialQuant::HardQuant,
+            chroma_satd_in_cheap: false,
+        },
+        exact: ExactLumaPolicy {
+            max_modes: 12,
+            scope: ComponentScope::FullComponents,
+            residual_price: ResidualPriceLevel::Exact,
+            quant: TrialQuant::HardQuant,
+            promote: ExactPromotionPolicy::all_shortlist(),
+            exact_usage: ExactUsage::AllShortlist,
+        },
+    },
+
+    tu: TuSearchPolicy {
+        min_split_log2: 3,
+        leaf_first: true,
+        split_search: SplitSearch::EvaluateBoth,
+        zero_residual_early_terminate: false,
+        low_residual_early_terminate: false,
+        low_residual_bits_per_px: 0.0,
+        low_distortion_per_px: 0.0,
+    },
+
+    tu_exact: TuExactPolicy {
+        split_mode: TuSplitMode::EvaluateBoth,
+        max_extra_depth: 2,
+        min_split_log2: 3,
+        leaf_first: true,
+        zero_residual_early_terminate: false,
+        low_residual_early_terminate: false,
+        low_residual_bits_per_px: 0.0,
+        low_distortion_per_px: 0.0,
+        rdoq_split_trials: true,
+    },
+
+    cu: CuSearchPolicy {
+        split_search: SplitSearch::EvaluateBoth,
+        early_terminate: CuEarlyTerminateRule::Disabled,
+        use_preanalysis_force_leaf: false,
+        use_preanalysis_force_split: false,
+        leaf_first: true,
+    },
+
+    nxn: NxnSearchPolicy {
+        enabled: true,
+        rough_gate_enabled: false,
+        rough_satd_threshold: 0.0,
+        require_directional_or_texture: false,
+        exact_eval: true,
+    },
+
+    chroma: ChromaSearchPolicy {
+        timing: ChromaTiming::DuringExactTrials,
+        max_candidates: 3,
+        residual_price: ResidualPriceLevel::Exact,
+        quant: TrialQuant::HardQuant,
+    },
+
+    final_pass: FinalSearchPolicy {
+        quant: TrialQuant::Rdoq,
+        residual_price: ResidualPriceLevel::Exact,
+        rdoq_final: true,
+        sign_data_hiding: true,
+    },
+
+    rdoq_trials: RdoqTrialPolicy {
+        mode: TrialRdoqMode::Off,
+        close_margin: 999.0,
+        max_rdoq_modes: 0,
+        level: 1,
+    },
+
+    preanalysis: PreanalysisTemplate::oracle_disabled(),
+};
+
+// ══════════════════════════════════════════════
+// Constants
+// ══════════════════════════════════════════════
+
+const FORCE_LEAF_IMPORTANCE: u16 = 24;
+const FORCE_SPLIT_IMPORTANCE: u16 = 224;
+const CLOSE_CALL_MARGIN: f64 = 0.02;
+
+// ══════════════════════════════════════════════
+// Policy resolution (template → BlockSearchBudget)
+// ══════════════════════════════════════════════
+
+impl EffortTemplate {
+    pub fn resolve_policy(&self, region: RegionClass, importance_q8: u16) -> SearchPolicy {
+        let preanalysis = self.preanalysis;
+        if self.is_reference() {
+            return crate::preanalysis::INERT;
+        }
+
+        let mut policy = if preanalysis.class_steering {
+            policy_for(region)
+        } else {
+            crate::preanalysis::INERT
+        };
+
+        if !preanalysis.allow_candidate_expansion {
+            policy.luma_rd_bias = policy.luma_rd_bias.min(0);
+            policy.chroma_rd_bias = policy.chroma_rd_bias.min(0);
+        }
+
+        policy.rmd_prune_factor = preanalysis.importance_rmd_prune_factor;
+        if preanalysis.importance_force_leaf && importance_q8 < FORCE_LEAF_IMPORTANCE {
+            policy.force_leaf = true;
+        }
+        if matches!(region, RegionClass::TextLike) && importance_q8 >= FORCE_SPLIT_IMPORTANCE {
+            policy.force_split = true;
+        }
+
+        policy
+    }
+
+    pub fn resolve(&self, desc: BlockDesc) -> BlockSearchBudget {
+        let policy = desc.policy;
+        let effective = qp_budget_effort(self.name, desc.qp);
+        let effective_template = template(effective);
+        let rmd_mode_set = effective_template.luma.rough.mode_set;
+        let base_luma = self.luma_rd_candidates_base(desc.log2_size, desc.qp);
+        let luma_rd_cap = match canonical_effort(self.name) {
+            Effort::Placebo => self.luma.exact.max_modes,
+            Effort::Slow => 8,
+            _ => 4,
+        };
+        let luma_rd_candidates =
+            (base_luma as i8 + policy.luma_rd_bias).clamp(1, luma_rd_cap as i8) as u8;
+        let base_chroma = self.chroma_rd_candidates_base(desc.qp);
+        let chroma_min = if base_chroma == 0 { 0 } else { 1 };
+        let chroma_rd_candidates =
+            (base_chroma as i8 + policy.chroma_rd_bias).clamp(chroma_min, 5) as u8;
+        let split_policy = if policy.force_leaf {
+            SplitSearch::ForceLeaf
+        } else if policy.force_split {
+            SplitSearch::ForceSplit
+        } else if policy.prefer_split {
+            SplitSearch::PreferSplit
+        } else {
+            self.cu.split_search
+        };
+
+        let canonical = canonical_effort(self.name);
+        let zero_residual_tu_early_terminate = match canonical {
+            Effort::Fast => true,
+            Effort::Slow => desc.qp >= 38,
+            Effort::Placebo => false,
+            _ => false,
+        };
+
+        let tu_split = if canonical == Effort::Placebo {
+            self.tu.split_search
+        } else if zero_residual_tu_early_terminate {
+            SplitSearch::PreferLeaf
+        } else if matches!(
+            split_policy,
+            SplitSearch::ForceSplit | SplitSearch::PreferSplit
+        ) {
+            split_policy
+        } else {
+            self.tu.split_search
+        };
+
+        BlockSearchBudget {
+            effort: self.name,
+            angular_prune: policy.angular_prune,
+            angular_prune_var_threshold_8bit: angular_prune_var_threshold_8bit(self.name),
+            rmd_mode_set,
+            luma_rd_candidates_base: base_luma,
+            luma_rd_candidates,
+            chroma_rd_candidates_base: base_chroma,
+            chroma_rd_candidates,
+            luma_trial_quality: if canonical_effort(self.name) == Effort::Placebo {
+                TrialQuality::Final
+            } else if canonical_effort(self.name) == Effort::Slow
+                && self.luma.exact.residual_price == ResidualPriceLevel::Exact
+            {
+                TrialQuality::FullRd
+            } else {
+                TrialQuality::FastRd
+            },
+            chroma_trial_quality: if canonical_effort(self.name) == Effort::Placebo {
+                TrialQuality::Final
+            } else {
+                TrialQuality::FastRd
+            },
+            final_quality: TrialQuality::Final,
+            cu_split: split_policy,
+            tu_split,
+            close_call_margin: CLOSE_CALL_MARGIN,
+            exact_residual_bits_for_trials: matches!(
+                effective_template.luma.exact.residual_price,
+                ResidualPriceLevel::Exact
+            ),
+            rdoq_for_trials: false,
+            rdoq_pass_budget: RdoqPassBudget {
+                effort: self.name,
+                qp: desc.qp,
+                canonical: canonical_effort(self.name),
+            },
+            cu_early_terminate: self.cu.early_terminate,
+            zero_residual_tu_early_terminate,
+            rmd_prune_factor: policy.rmd_prune_factor,
+            allow_cu_early_terminate: policy.allow_early_term,
+        }
+    }
+
+    fn luma_rd_candidates_base(&self, log2_size: u8, qp: i32) -> u8 {
+        if self.is_reference() {
+            return self.luma.exact.max_modes;
+        }
+        match canonical_effort(self.name) {
+            Effort::Fast => {
+                if log2_size >= 4 {
+                    self.luma.exact.max_modes
+                } else {
+                    1
+                }
+            }
+            Effort::Slow => {
+                if qp >= 44 {
+                    1
+                } else if qp >= 38 {
+                    2
+                } else {
+                    self.luma.exact.max_modes
+                }
+            }
+            Effort::Placebo => self.luma.exact.max_modes,
+            _ => self.luma.exact.max_modes,
+        }
+    }
+
+    fn chroma_rd_candidates_base(&self, qp: i32) -> u8 {
+        match canonical_effort(self.name) {
+            Effort::Fast => self.chroma.max_candidates,
+            Effort::Slow => {
+                if qp >= 44 {
+                    1
+                } else if qp >= 38 {
+                    2
+                } else {
+                    self.chroma.max_candidates
+                }
+            }
+            Effort::Placebo => self.chroma.max_candidates,
+            _ => self.chroma.max_candidates,
+        }
+    }
+}
+
+// ──────────────────────────────────────────────
+// QP-dependent effort downgrade
+// ──────────────────────────────────────────────
+
+/// Apply QP-dependent effort downgrading for per-CU budget resolution.
+#[inline]
+fn qp_budget_effort(effort: Effort, qp: i32) -> Effort {
+    if is_reference_tier(effort) {
+        return effort;
+    }
+    match (canonical_effort(effort), qp) {
+        (Effort::Slow, q) if q >= 44 => Effort::Fast,
+        (Effort::Slow, q) if q >= 38 => Effort::Fast,
+        (Effort::Fast, q) if q >= 38 => Effort::Fast,
+        _ => effort,
+    }
+}
+
+#[inline]
+fn angular_prune_var_threshold_8bit(effort: Effort) -> Option<i64> {
+    match canonical_effort(effort) {
+        Effort::Fast => Some(32),
+        Effort::Slow => None,
+        Effort::Placebo => None,
+        _ => unreachable!(),
+    }
+}
+
+// ──────────────────────────────────────────────
+// policy_for() — preanalysis region-to-policy
+// ──────────────────────────────────────────────
+
+fn policy_for(class: RegionClass) -> SearchPolicy {
+    match class {
+        RegionClass::Flat | RegionClass::Gradient => SearchPolicy {
+            angular_prune: Some(true),
+            allow_early_term: true,
+            luma_rd_bias: -1,
+            chroma_rd_bias: 0,
+            ..crate::preanalysis::INERT
+        },
+        RegionClass::DirectionalEdge => SearchPolicy {
+            angular_prune: Some(false),
+            allow_early_term: false,
+            luma_rd_bias: 0,
+            chroma_rd_bias: 0,
+            prefer_split: true,
+            ..crate::preanalysis::INERT
+        },
+        RegionClass::TextLike => SearchPolicy {
+            angular_prune: Some(false),
+            allow_early_term: false,
+            luma_rd_bias: 1,
+            chroma_rd_bias: 0,
+            prefer_split: true,
+            ..crate::preanalysis::INERT
+        },
+        RegionClass::Texture => SearchPolicy {
+            angular_prune: None,
+            allow_early_term: true,
+            luma_rd_bias: 0,
+            chroma_rd_bias: 0,
+            ..crate::preanalysis::INERT
+        },
+        RegionClass::Noisy => SearchPolicy {
+            angular_prune: Some(true),
+            allow_early_term: true,
+            luma_rd_bias: 0,
+            chroma_rd_bias: 0,
+            ..crate::preanalysis::INERT
+        },
+        RegionClass::ChromaCritical => SearchPolicy {
+            angular_prune: None,
+            allow_early_term: true,
+            luma_rd_bias: 0,
+            chroma_rd_bias: 1,
+            ..crate::preanalysis::INERT
+        },
+    }
+}
+
+// ══════════════════════════════════════════════
+// Legacy compatibility wrappers
+// ══════════════════════════════════════════════
+
+/// Quality/fidelity of a trial evaluation.
+///
+/// Kept for backward compat with `BlockPlan` and `eval.rs`; the new template
+/// system controls trial quality through `TrialQuant` + `ResidualPriceLevel`
+/// instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrialQuality {
+    Rough,
+    FastRd,
+    FullRd,
+    Final,
+}
+
+/// Resolved per-block search budget.
+///
+/// Produced by [`EffortTemplate::resolve`] and consumed by the stillsearch
+/// engine.  This is a legacy compatibility type — new code should read the
+/// template fields directly.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockSearchBudget {
     pub effort: Effort,
@@ -333,584 +1388,44 @@ impl BlockSearchBudget {
     }
 }
 
-impl EffortTemplate {
-    pub fn resolve_policy(&self, region: RegionClass, importance_q8: u16) -> SearchPolicy {
-        let preanalysis = self.preanalysis;
-        if self.reference {
-            return crate::preanalysis::INERT;
-        }
+/// RDOQ pass budget per-block.
+#[derive(Clone, Copy, Debug)]
+pub struct RdoqPassBudget {
+    effort: Effort,
+    qp: i32,
+    pub(crate) canonical: Effort,
+}
 
-        let mut policy = if preanalysis.class_steering {
-            policy_for(region)
-        } else {
-            crate::preanalysis::INERT
-        };
-
-        if !preanalysis.allow_candidate_expansion {
-            policy.luma_rd_bias = policy.luma_rd_bias.min(0);
-            policy.chroma_rd_bias = policy.chroma_rd_bias.min(0);
-        }
-
-        policy.rmd_prune_factor = preanalysis.importance_rmd_prune_factor;
-        if preanalysis.importance_force_leaf && importance_q8 < FORCE_LEAF_IMPORTANCE {
-            policy.force_leaf = true;
-        }
-        if matches!(region, RegionClass::TextLike) && importance_q8 >= FORCE_SPLIT_IMPORTANCE {
-            policy.force_split = true;
-        }
-
-        policy
-    }
-
-    pub fn resolve(&self, desc: BlockDesc) -> BlockSearchBudget {
-        let policy = desc.policy;
-        let effective = qp_budget_effort(self.name, desc.qp);
-        let effective_template = template(effective);
-        let rmd_mode_set = effective_template.rmd.mode_set;
-        let base_luma = self.luma_rd_candidates_base(desc.log2_size, desc.qp);
-        let luma_rd_cap = if self.name == Effort::Best { 9 } else { 4 };
-        let luma_rd_candidates =
-            (base_luma as i8 + policy.luma_rd_bias).clamp(1, luma_rd_cap) as u8;
-        let base_chroma = self.chroma_rd_candidates_base(desc.qp);
-        let chroma_min = if base_chroma == 0 { 0 } else { 1 };
-        let chroma_rd_candidates =
-            (base_chroma as i8 + policy.chroma_rd_bias).clamp(chroma_min, 5) as u8;
-        let split_policy = if policy.force_leaf {
-            SplitSearch::ForceLeaf
-        } else if policy.force_split {
-            SplitSearch::ForceSplit
-        } else if policy.prefer_split {
-            SplitSearch::PreferSplit
-        } else {
-            self.cu_split.default_search
-        };
-        let zero_residual_tu_early_terminate = match self.name {
-            Effort::Fastest | Effort::Fast => true,
-            Effort::Balanced => desc.qp >= 38,
-            Effort::Good | Effort::Best | Effort::Placebo | Effort::Reference => false,
-        };
-
-        BlockSearchBudget {
-            effort: self.name,
-            angular_prune: policy.angular_prune,
-            angular_prune_var_threshold_8bit: angular_prune_var_threshold_8bit(self.name),
-            rmd_mode_set,
-            luma_rd_candidates_base: base_luma,
-            luma_rd_candidates,
-            chroma_rd_candidates_base: base_chroma,
-            chroma_rd_candidates,
-            luma_trial_quality: effective_template.luma.trial_quality,
-            chroma_trial_quality: effective_template.chroma.trial_quality,
-            final_quality: effective_template.residual.final_quality,
-            cu_split: split_policy,
-            tu_split: if self.name == Effort::Fastest && desc.log2_size <= 4 {
-                SplitSearch::ForceLeaf
-            } else if zero_residual_tu_early_terminate {
-                SplitSearch::PreferLeaf
-            } else if matches!(
-                split_policy,
-                SplitSearch::ForceSplit | SplitSearch::PreferSplit
-            ) {
-                split_policy
-            } else {
-                self.tu_split.default_search
-            },
-            close_call_margin: CLOSE_CALL_MARGIN,
-            exact_residual_bits_for_trials: effective_template.residual.exact_bits_during_trials,
-            rdoq_for_trials: effective_template.residual.rdoq_during_trials,
-            rdoq_pass_budget: RdoqPassBudget {
-                effort: self.name,
-                qp: desc.qp,
-            },
-            cu_early_terminate: self.cu_split.early_terminate,
-            zero_residual_tu_early_terminate,
-            rmd_prune_factor: policy.rmd_prune_factor,
-            allow_cu_early_terminate: policy.allow_early_term,
-        }
-    }
-
-    fn luma_rd_candidates_base(&self, log2_size: u8, qp: i32) -> u8 {
-        if self.reference {
-            return self.rmd.max_luma_rd_candidates;
-        }
-
-        match self.name {
-            Effort::Fast => {
-                if log2_size >= 4 {
-                    self.rmd.max_luma_rd_candidates
-                } else {
-                    1
-                }
-            }
-            Effort::Balanced => {
-                if qp >= 38 {
+impl RdoqPassBudget {
+    pub fn passes(self, log2_size: u8, _component: ComponentKind, nnz: u32) -> u8 {
+        match self.canonical {
+            Effort::Fast => 0,
+            Effort::Slow => {
+                if self.qp < 38 {
+                    if log2_size <= 4 && nnz <= 64 { 1 } else { 0 }
+                } else if self.qp >= 44 {
+                    0
+                } else if log2_size <= 3 && nnz <= 32 {
                     1
                 } else {
-                    self.rmd.max_luma_rd_candidates
+                    0
                 }
             }
-            Effort::Good => {
-                if qp >= 44 {
-                    1
-                } else if qp >= 38 {
+            Effort::Placebo => {
+                if log2_size <= 4 && nnz <= 128 {
                     2
                 } else {
-                    self.rmd.max_luma_rd_candidates
-                }
-            }
-            Effort::Fastest | Effort::Best | Effort::Placebo | Effort::Reference => {
-                self.rmd.max_luma_rd_candidates
-            }
-        }
-    }
-
-    fn chroma_rd_candidates_base(&self, qp: i32) -> u8 {
-        match self.name {
-            Effort::Good => {
-                if qp >= 44 {
                     1
-                } else if qp >= 38 {
-                    2
-                } else {
-                    self.chroma.max_rd_candidates
                 }
             }
-            Effort::Fastest
-            | Effort::Fast
-            | Effort::Balanced
-            | Effort::Best
-            | Effort::Placebo
-            | Effort::Reference => self.chroma.max_rd_candidates,
+            _ => 0,
         }
     }
 }
 
-const FORCE_LEAF_IMPORTANCE: u16 = 24;
-const FORCE_SPLIT_IMPORTANCE: u16 = 224;
-const CLOSE_CALL_MARGIN: f64 = 0.02;
-
-fn policy_for(class: RegionClass) -> SearchPolicy {
-    match class {
-        RegionClass::Flat | RegionClass::Gradient => SearchPolicy {
-            angular_prune: Some(true),
-            allow_early_term: true,
-            luma_rd_bias: -1,
-            chroma_rd_bias: 0,
-            ..crate::preanalysis::INERT
-        },
-        RegionClass::DirectionalEdge => SearchPolicy {
-            angular_prune: Some(false),
-            allow_early_term: false,
-            luma_rd_bias: 0,
-            chroma_rd_bias: 0,
-            prefer_split: true,
-            ..crate::preanalysis::INERT
-        },
-        RegionClass::TextLike => SearchPolicy {
-            angular_prune: Some(false),
-            allow_early_term: false,
-            luma_rd_bias: 1,
-            chroma_rd_bias: 0,
-            prefer_split: true,
-            ..crate::preanalysis::INERT
-        },
-        RegionClass::Texture => SearchPolicy {
-            angular_prune: None,
-            allow_early_term: true,
-            luma_rd_bias: 0,
-            chroma_rd_bias: 0,
-            ..crate::preanalysis::INERT
-        },
-        RegionClass::Noisy => SearchPolicy {
-            angular_prune: Some(true),
-            allow_early_term: true,
-            luma_rd_bias: 0,
-            chroma_rd_bias: 0,
-            ..crate::preanalysis::INERT
-        },
-        RegionClass::ChromaCritical => SearchPolicy {
-            angular_prune: None,
-            allow_early_term: true,
-            luma_rd_bias: 0,
-            chroma_rd_bias: 1,
-            ..crate::preanalysis::INERT
-        },
-    }
-}
-
-static FASTEST: EffortTemplate = EffortTemplate {
-    name: Effort::Fastest,
-    reference: false,
-    entropy_context: EntropyContextMode::Running,
-    parallel_analysis: false,
-    rmd: RmdTemplate {
-        mode_set: RmdModeSet::Progressive {
-            coarse_step: 8,
-            top_regions: 1,
-            refine_radius: 1,
-        },
-        max_luma_rd_candidates: 1,
-    },
-    luma: LumaSearchTemplate {
-        trial_quality: TrialQuality::FastRd,
-        chroma_during_luma_trials: false,
-    },
-    chroma: ChromaSearchTemplate {
-        trial_quality: TrialQuality::FastRd,
-        max_rd_candidates: 0,
-    },
-    residual: ResidualSearchTemplate {
-        rdoq_during_trials: false,
-        exact_bits_during_trials: false,
-        final_quality: TrialQuality::Final,
-    },
-    cu_split: CuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        early_terminate: CuEarlyTerminateRule::Fastest,
-    },
-    tu_split: TuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        zero_residual_early_terminate: true,
-    },
-    preanalysis: PreanalysisTemplate {
-        class_steering: false,
-        allow_candidate_expansion: false,
-        importance_rmd_prune_factor: Some(1.10),
-        importance_force_leaf: true,
-    },
-};
-
-static FAST: EffortTemplate = EffortTemplate {
-    name: Effort::Fast,
-    reference: false,
-    entropy_context: EntropyContextMode::Running,
-    parallel_analysis: false,
-    rmd: RmdTemplate {
-        mode_set: RmdModeSet::Progressive {
-            coarse_step: 4,
-            top_regions: 1,
-            refine_radius: 1,
-        },
-        max_luma_rd_candidates: 2,
-    },
-    luma: LumaSearchTemplate {
-        trial_quality: TrialQuality::FastRd,
-        chroma_during_luma_trials: false,
-    },
-    chroma: ChromaSearchTemplate {
-        trial_quality: TrialQuality::FastRd,
-        max_rd_candidates: 1,
-    },
-    residual: ResidualSearchTemplate {
-        rdoq_during_trials: false,
-        exact_bits_during_trials: false,
-        final_quality: TrialQuality::Final,
-    },
-    cu_split: CuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        early_terminate: CuEarlyTerminateRule::Fast,
-    },
-    tu_split: TuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        zero_residual_early_terminate: true,
-    },
-    preanalysis: PreanalysisTemplate {
-        class_steering: true,
-        allow_candidate_expansion: false,
-        importance_rmd_prune_factor: Some(1.10),
-        importance_force_leaf: true,
-    },
-};
-
-static BALANCED: EffortTemplate = EffortTemplate {
-    name: Effort::Balanced,
-    reference: false,
-    entropy_context: EntropyContextMode::Running,
-    parallel_analysis: false,
-    rmd: RmdTemplate {
-        mode_set: RmdModeSet::Progressive {
-            coarse_step: 4,
-            top_regions: 2,
-            refine_radius: 2,
-        },
-        max_luma_rd_candidates: 2,
-    },
-    luma: LumaSearchTemplate {
-        trial_quality: TrialQuality::FastRd,
-        chroma_during_luma_trials: false,
-    },
-    chroma: ChromaSearchTemplate {
-        trial_quality: TrialQuality::FastRd,
-        max_rd_candidates: 1,
-    },
-    residual: ResidualSearchTemplate {
-        rdoq_during_trials: false,
-        exact_bits_during_trials: false,
-        final_quality: TrialQuality::Final,
-    },
-    cu_split: CuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        early_terminate: CuEarlyTerminateRule::Balanced,
-    },
-    tu_split: TuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        zero_residual_early_terminate: false,
-    },
-    preanalysis: PreanalysisTemplate {
-        class_steering: true,
-        allow_candidate_expansion: false,
-        importance_rmd_prune_factor: Some(1.10),
-        importance_force_leaf: true,
-    },
-};
-
-static GOOD: EffortTemplate = EffortTemplate {
-    name: Effort::Good,
-    reference: false,
-    entropy_context: EntropyContextMode::Running,
-    parallel_analysis: false,
-    rmd: RmdTemplate {
-        mode_set: RmdModeSet::Progressive {
-            coarse_step: 3,
-            top_regions: 3,
-            refine_radius: 2,
-        },
-        max_luma_rd_candidates: 3,
-    },
-    luma: LumaSearchTemplate {
-        trial_quality: TrialQuality::FullRd,
-        chroma_during_luma_trials: false,
-    },
-    chroma: ChromaSearchTemplate {
-        trial_quality: TrialQuality::FullRd,
-        max_rd_candidates: 3,
-    },
-    residual: ResidualSearchTemplate {
-        rdoq_during_trials: true,
-        exact_bits_during_trials: true,
-        final_quality: TrialQuality::Final,
-    },
-    cu_split: CuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        early_terminate: CuEarlyTerminateRule::Disabled,
-    },
-    tu_split: TuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        zero_residual_early_terminate: false,
-    },
-    preanalysis: PreanalysisTemplate {
-        class_steering: true,
-        allow_candidate_expansion: true,
-        importance_rmd_prune_factor: Some(1.10),
-        importance_force_leaf: true,
-    },
-};
-
-static BEST: EffortTemplate = EffortTemplate {
-    name: Effort::Best,
-    reference: false,
-    entropy_context: EntropyContextMode::Running,
-    parallel_analysis: false,
-    rmd: RmdTemplate {
-        mode_set: RmdModeSet::Exhaustive,
-        max_luma_rd_candidates: 8,
-    },
-    luma: LumaSearchTemplate {
-        trial_quality: TrialQuality::FullRd,
-        chroma_during_luma_trials: false,
-    },
-    chroma: ChromaSearchTemplate {
-        trial_quality: TrialQuality::FullRd,
-        max_rd_candidates: 5,
-    },
-    residual: ResidualSearchTemplate {
-        rdoq_during_trials: true,
-        exact_bits_during_trials: true,
-        final_quality: TrialQuality::Final,
-    },
-    cu_split: CuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        early_terminate: CuEarlyTerminateRule::Disabled,
-    },
-    tu_split: TuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        zero_residual_early_terminate: false,
-    },
-    preanalysis: PreanalysisTemplate {
-        class_steering: false,
-        allow_candidate_expansion: false,
-        importance_rmd_prune_factor: None,
-        importance_force_leaf: false,
-    },
-};
-
-/// `Best` with the `Placebo` frozen-slice-init CTU-wavefront parallel path
-/// (`encode_slice_data_parallel`). Identical search budget to `BEST`; only the
-/// entropy-context mode (frozen vs running) and `parallel_analysis` differ, so
-/// output drifts ~0.1% from serial `Best` (same rationale that lets `Placebo`
-/// differ from `Reference`). Selected by default for `Best`
-/// (`BPG_BEST2_PARALLEL=0` reverts to serial). Keeps `name: Effort::Best` so
-/// all `Best` search levers still apply.
-pub(crate) static BEST_PARALLEL: EffortTemplate = EffortTemplate {
-    name: Effort::Best,
-    reference: false,
-    entropy_context: EntropyContextMode::FrozenSliceInit,
-    parallel_analysis: true,
-    rmd: RmdTemplate {
-        mode_set: RmdModeSet::Exhaustive,
-        max_luma_rd_candidates: 8,
-    },
-    luma: LumaSearchTemplate {
-        trial_quality: TrialQuality::FullRd,
-        chroma_during_luma_trials: false,
-    },
-    chroma: ChromaSearchTemplate {
-        trial_quality: TrialQuality::FullRd,
-        max_rd_candidates: 5,
-    },
-    residual: ResidualSearchTemplate {
-        rdoq_during_trials: true,
-        exact_bits_during_trials: true,
-        final_quality: TrialQuality::Final,
-    },
-    cu_split: CuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        early_terminate: CuEarlyTerminateRule::Disabled,
-    },
-    tu_split: TuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        zero_residual_early_terminate: false,
-    },
-    preanalysis: PreanalysisTemplate {
-        class_steering: false,
-        allow_candidate_expansion: false,
-        importance_rmd_prune_factor: None,
-        importance_force_leaf: false,
-    },
-};
-
-static PLACEBO: EffortTemplate = EffortTemplate {
-    name: Effort::Placebo,
-    reference: true,
-    entropy_context: EntropyContextMode::FrozenSliceInit,
-    parallel_analysis: true,
-    rmd: RmdTemplate {
-        mode_set: RmdModeSet::Exhaustive,
-        max_luma_rd_candidates: 3,
-    },
-    luma: LumaSearchTemplate {
-        trial_quality: TrialQuality::Final,
-        chroma_during_luma_trials: true,
-    },
-    chroma: ChromaSearchTemplate {
-        trial_quality: TrialQuality::Final,
-        max_rd_candidates: 5,
-    },
-    residual: ResidualSearchTemplate {
-        rdoq_during_trials: true,
-        exact_bits_during_trials: true,
-        final_quality: TrialQuality::Final,
-    },
-    cu_split: CuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        early_terminate: CuEarlyTerminateRule::Disabled,
-    },
-    tu_split: TuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        zero_residual_early_terminate: false,
-    },
-    preanalysis: PreanalysisTemplate {
-        class_steering: false,
-        allow_candidate_expansion: false,
-        importance_rmd_prune_factor: None,
-        importance_force_leaf: false,
-    },
-};
-
-static REFERENCE: EffortTemplate = EffortTemplate {
-    name: Effort::Reference,
-    reference: true,
-    entropy_context: EntropyContextMode::Running,
-    parallel_analysis: false,
-    rmd: RmdTemplate {
-        mode_set: RmdModeSet::Exhaustive,
-        max_luma_rd_candidates: 3,
-    },
-    luma: LumaSearchTemplate {
-        trial_quality: TrialQuality::Final,
-        chroma_during_luma_trials: true,
-    },
-    chroma: ChromaSearchTemplate {
-        trial_quality: TrialQuality::Final,
-        max_rd_candidates: 5,
-    },
-    residual: ResidualSearchTemplate {
-        rdoq_during_trials: true,
-        exact_bits_during_trials: true,
-        final_quality: TrialQuality::Final,
-    },
-    cu_split: CuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        early_terminate: CuEarlyTerminateRule::Disabled,
-    },
-    tu_split: TuSplitTemplate {
-        default_search: SplitSearch::EvaluateBoth,
-        zero_residual_early_terminate: false,
-    },
-    preanalysis: PreanalysisTemplate {
-        class_steering: false,
-        allow_candidate_expansion: false,
-        importance_rmd_prune_factor: None,
-        importance_force_leaf: false,
-    },
-};
-
-#[inline]
-pub fn template(effort: Effort) -> &'static EffortTemplate {
-    match effort {
-        Effort::Fastest => &FASTEST,
-        Effort::Fast => &FAST,
-        Effort::Balanced => &BALANCED,
-        Effort::Good => &GOOD,
-        Effort::Best => &BEST,
-        Effort::Placebo => &PLACEBO,
-        Effort::Reference => &REFERENCE,
-    }
-}
-
-#[inline]
-pub fn select_rdoq_single_scan(effort: Effort) -> bool {
-    match std::env::var("BPG_RDOQ_SINGLESCAN").ok().as_deref() {
-        Some("0") => false,
-        Some(_) => true,
-        None => !is_reference_tier(effort),
-    }
-}
-
-#[inline]
-fn angular_prune_var_threshold_8bit(effort: Effort) -> Option<i64> {
-    match effort {
-        Effort::Fastest => Some(128),
-        Effort::Fast => Some(32),
-        Effort::Balanced => Some(8),
-        Effort::Good | Effort::Best | Effort::Placebo | Effort::Reference => None,
-    }
-}
-
-#[inline]
-fn qp_budget_effort(effort: Effort, qp: i32) -> Effort {
-    if is_reference_tier(effort) {
-        return effort;
-    }
-    match (effort, qp) {
-        (Effort::Good, q) if q >= 44 => Effort::Fast,
-        (Effort::Good, q) if q >= 38 => Effort::Balanced,
-        (Effort::Balanced, q) if q >= 44 => Effort::Fastest,
-        (Effort::Balanced, q) if q >= 38 => Effort::Fast,
-        (Effort::Fast, q) if q >= 38 => Effort::Fastest,
-        _ => effort,
-    }
-}
+// ══════════════════════════════════════════════
+// Debug display
+// ══════════════════════════════════════════════
 
 pub fn describe_effort(effort: Effort, qp: i32) -> EffortDescription {
     let t = template(effort);
@@ -918,6 +1433,7 @@ pub fn describe_effort(effort: Effort, qp: i32) -> EffortDescription {
     let flat_low_importance = t.resolve(describe_block_desc(t, qp, RegionClass::Flat, 0));
     EffortDescription {
         template: t,
+        original_effort: effort,
         texture,
         flat_low_importance,
         qp,
@@ -942,8 +1458,22 @@ fn describe_block_desc(
     }
 }
 
+/// Per-block descriptor fed into the budget resolution logic.
+#[derive(Clone, Copy, Debug)]
+pub struct BlockDesc {
+    pub x: u32,
+    pub y: u32,
+    pub log2_size: u8,
+    pub qp: i32,
+    pub region: RegionClass,
+    pub importance_q8: u16,
+    pub component: ComponentKind,
+    pub policy: SearchPolicy,
+}
+
 pub struct EffortDescription {
     template: &'static EffortTemplate,
+    original_effort: Effort,
     texture: BlockSearchBudget,
     flat_low_importance: BlockSearchBudget,
     qp: i32,
@@ -954,7 +1484,7 @@ impl fmt::Display for EffortDescription {
         writeln!(
             f,
             "effort: {:?}  entropy: {:?}  parallel_analysis: {}",
-            self.template.name, self.template.entropy_context, self.template.parallel_analysis
+            self.original_effort, self.template.entropy_context, self.template.parallel_analysis
         )?;
         writeln!(f, "  neutral texture budget:")?;
         write_budget(f, self.qp, self.texture)?;

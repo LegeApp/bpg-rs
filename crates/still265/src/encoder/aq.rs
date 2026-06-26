@@ -6,10 +6,10 @@
 //! mirror matches `bpg-hevc-decode::hevc::ctu::decode_quantization_parameters`.
 
 use crate::cabac::CabacEncoder;
-use crate::contexts::{ctx, Contexts};
+use crate::contexts::{Contexts, ctx};
 use bpg_bitstream::BitWriter;
 
-use super::types::{chroma_qp_from_luma, QG_LOG2};
+use super::types::{QG_LOG2, chroma_qp_from_luma};
 
 /// Adaptive-quantization writer state — the encoder-side mirror of the decoder's
 /// `decode_quantization_parameters` QP-prediction machine
@@ -149,8 +149,8 @@ impl<'a> super::Encoder<'a> {
         let target = self.aq_qg_target(x0, y0);
         let off = self.aq.qp_bd_offset;
         self.cur_qp_y = target + off;
-        let qpi_c = target.clamp(-off, 57);
-        self.cur_qp_c = chroma_qp_from_luma(qpi_c) + off;
+        let qpi_c = (target + crate::chroma_qp_offset() as i32).clamp(-off, 57);
+        self.cur_qp_c = chroma_qp_from_luma(qpi_c, self.cat) + off;
     }
 
     /// Read a neighbour CU's resolved `QpY` (without offset) from the per-4x4 QP

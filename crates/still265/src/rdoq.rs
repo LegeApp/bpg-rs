@@ -28,14 +28,20 @@
 //!   corpus (occasional sub-1% local loss from the frozen-context estimate).
 
 use crate::cabac::CabacEstimator;
-use crate::contexts::{ctx, Contexts};
-use crate::residual::{calc_sig_coeff_flag_ctx, get_scan_4x4, get_scan_sub_block, ScanOrder};
+use crate::contexts::{Contexts, ctx};
+use crate::residual::{ScanOrder, calc_sig_coeff_flag_ctx, get_scan_4x4, get_scan_sub_block};
 use crate::transform::DequantParams;
 
 /// x265 `g_quantScales` (forward quant scale per `qp % 6`).
 const QUANT_SCALE: [i64; 6] = [26214, 23302, 20560, 18396, 16384, 14564];
 const MAX_TR_DYNAMIC_RANGE: i32 = 15;
 const QUANT_SHIFT: i32 = 14;
+/// x265 `SCALE_BITS`: the bit-shift used to scale coefficient-domain
+/// distortion into pixel-domain SSE (see `transform.rs` for derivation).
+/// Without this scaling, the CABAC-bit term dominates the RD cost and
+/// RDOQ aggressively zeroes coefficients (32×–2048× too few bits for
+/// 8-bit 4×4–32×32 transforms).
+const SCALE_BITS: i32 = 15;
 
 /// One bypass bin in 1/32768-bit units.
 const BYPASS_BITS: u64 = CabacEstimator::SCALE;
@@ -234,7 +240,11 @@ pub fn rdoq_single_scan_into<'scratch>(
     let round = 1i64 << (qbits - 1); // round-to-nearest center for the candidate level
 
     let dq = DequantParams::new(log2_size, qp, bit_depth);
-    let lam = lambda / CabacEstimator::SCALE as f64;
+    // Scale lambda from pixel-domain SSE to coefficient-domain SSE:
+    // coefficient-domain distortion needs `lambda / 2^scaleBits` to match
+    // x265's approach of scaling the coefficient squared error up instead.
+    let scale_bits = SCALE_BITS - 2 * transform_shift;
+    let lam = lambda / (CabacEstimator::SCALE as f64 * (1u64 << scale_bits as u32) as f64);
     let bits = |ci: usize, bin: u8| -> u64 { ctxs.models[ci].entropy_bits(bin) as u64 };
 
     // Frozen representative greater1/greater2 contexts (greater1_ctx = 1, first
@@ -335,11 +345,7 @@ pub fn rdoq_single_scan_into<'scratch>(
                 let c1c2idx =
                     (if c1_idx < 8 { 1u32 } else { 0 }) + (if c2_idx == 0 { 2 } else { 0 });
                 let base_level = if c1_idx < 8 {
-                    if c2_idx == 0 {
-                        3
-                    } else {
-                        2
-                    }
+                    if c2_idx == 0 { 3 } else { 2 }
                 } else {
                     1
                 };

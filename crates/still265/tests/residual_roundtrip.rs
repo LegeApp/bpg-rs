@@ -7,14 +7,14 @@
 
 use bpg_bitstream::BitWriter;
 use bpg_hevc_decode::hevc::cabac::{
-    context::NUM_CONTEXTS, CabacDecoder, ContextModel as DecCtx, INIT_VALUES,
+    CabacDecoder, ContextModel as DecCtx, INIT_VALUES, context::NUM_CONTEXTS,
 };
-use bpg_hevc_decode::hevc::residual::{decode_residual, ScanOrder as DecScan};
+use bpg_hevc_decode::hevc::residual::{ScanOrder as DecScan, decode_residual};
 use still265::cabac::CabacEncoder;
 use still265::contexts::Contexts;
 use still265::residual::{
-    encode_residual, estimate_residual_bits, estimate_residual_bits_into, ResidualPricingScratch,
-    ScanOrder,
+    ResidualPricingScratch, ScanOrder, encode_residual, estimate_residual_bits,
+    estimate_residual_bits_into,
 };
 
 const SLICE_QP: i32 = 32;

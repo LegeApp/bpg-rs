@@ -6,20 +6,21 @@
 //! emit functions, matching the decode order in `bpg-hevc-decode::hevc::ctu`.
 
 use bpg_bitstream::BitWriter;
-use bpg_hevc_decode::hevc::sao::SaoMap;
 use bpg_hevc_decode::DecodedFrame;
+use bpg_hevc_decode::hevc::sao::SaoMap;
 
 use crate::cabac::CabacEncoder;
-use crate::contexts::{ctx, Contexts};
+use crate::contexts::{Contexts, ctx};
 use crate::residual::{encode_residual, get_scan_order};
 use crate::sao;
 
-use super::aq::encode_cu_qp_delta;
-use super::types::{
-    chroma_pred_mode, decode_second_cbf, has_chroma_tb, CtuBuild, CuLeaf, CuNode, NxnInfo, Tt,
-    CHROMA_DM_IDX, CTB_LOG2, MAX_INTRA_TT_DEPTH, MAX_TB_LOG2, MIN_TB_LOG2,
-};
 use super::Encoder;
+use super::aq::encode_cu_qp_delta;
+use super::syntax::{CuLeaf, CuNode, NxnInfo, Tt};
+use super::types::{
+    CHROMA_DM_IDX, CTB_LOG2, MAX_INTRA_TT_DEPTH, MAX_TB_LOG2, MIN_TB_LOG2, chroma_pred_mode,
+    decode_second_cbf, has_chroma_tb,
+};
 
 /// Emit `prev_intra_luma_pred_flag` + `mpm_idx`/`rem_intra_luma_pred_mode` for
 /// a chosen luma `mode`, mirroring the decoder's MPM derivation.
@@ -65,8 +66,8 @@ pub(super) fn write_intra_luma_mode(
 
 /// Emit an 8x8 `PartNxN` CU: `part_mode=0`, four `prev_intra_luma_pred_flag`
 /// (all context bins first), then four `mpm_idx`/`rem` (bypass), one chroma
-/// mode, and the forced-split transform tree. Mirrors the decoder's
-/// `decode_coding_unit` `PartNxN` branch exactly.
+/// mode (or four per-PU chroma modes for 4:4:4), and the forced-split transform
+/// tree. Mirrors the decoder's `decode_coding_unit` `PartNxN` branch exactly.
 #[allow(clippy::too_many_arguments)]
 fn write_cu_nxn(
     state: &mut Encoder<'_>,
@@ -130,7 +131,11 @@ fn write_cu_nxn(
         }
     }
 
-    if state.cat != 0 {
+    if state.cat == 3 {
+        for pu in 0..4 {
+            write_intra_chroma_mode(enc, w, ctxs, nxn.chroma_mode_idx[pu]);
+        }
+    } else if state.cat != 0 {
         write_intra_chroma_mode(enc, w, ctxs, leaf.chroma_mode_idx);
     }
     let cat = state.cat;
@@ -243,9 +248,17 @@ pub(super) fn write_tt(
                     let scan = get_scan_order(c.log2_size, c.chroma_mode, 1, cat);
                     encode_residual(enc, w, ctxs, &c.cb.levels, c.log2_size, 1, scan, sdh);
                 }
+                if c.cb1.cbf {
+                    let scan = get_scan_order(c.log2_size, c.chroma_mode, 1, cat);
+                    encode_residual(enc, w, ctxs, &c.cb1.levels, c.log2_size, 1, scan, sdh);
+                }
                 if c.cr.cbf {
                     let scan = get_scan_order(c.log2_size, c.chroma_mode, 2, cat);
                     encode_residual(enc, w, ctxs, &c.cr.levels, c.log2_size, 2, scan, sdh);
+                }
+                if c.cr1.cbf {
+                    let scan = get_scan_order(c.log2_size, c.chroma_mode, 2, cat);
+                    encode_residual(enc, w, ctxs, &c.cr1.levels, c.log2_size, 2, scan, sdh);
                 }
             }
         }
@@ -430,7 +443,15 @@ pub(super) fn write_coding_quadtree(
     log2_cb_size: u8,
     ct_depth: u8,
 ) -> CuNode {
-    let cu = state.build_cu(x0, y0, log2_cb_size, ct_depth, ctxs);
+    let price_ctx = ctxs.clone();
+    let cu = super::stillsearch::StillSearch::new(state.bit_depth).build_ctu(
+        state,
+        &price_ctx,
+        x0,
+        y0,
+        log2_cb_size,
+        ct_depth,
+    );
     state.record_analysis_cache_cu_node(&cu, x0, y0, log2_cb_size, ct_depth);
     if state.deblock {
         let (display_width, display_height) = (state.display_width, state.display_height);
@@ -536,185 +557,20 @@ pub(super) fn mark_tt_deblock(
     }
 }
 
-/// Worker-thread budget for the parallel `Placebo` analysis. `BPG_ENC_THREADS`
-/// overrides it (set to 1 for the determinism oracle).
+/// Worker-thread budget retained for CLI compatibility; StillSearch skeleton
+/// forces serial CTU build until overlay worker-merge exists.
 pub(super) fn parallel_thread_count() -> usize {
-    if let Ok(v) = std::env::var("BPG_ENC_THREADS") {
-        if let Ok(n) = v.parse::<usize>() {
-            return n.max(1);
-        }
-    }
-    std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
+    1
 }
 
-/// `Placebo`-tier encode: CTU-wavefront-**parallel** analysis followed by a serial
-/// CABAC write.
-/// Build every CTU's coding-tree (CTU-wavefront-parallel analysis), reconstruct
-/// into `state.frame`, mark deblock edges, and return the per-CTU `CuNode`
-/// trees in raster order. The serial CABAC write is a separate pass
-/// ([`write_slice_from_trees`]) so SAO can be decided on the deblocked
-/// reconstruction *between* build and write (no second RDO pass).
+/// StillSearch skeleton: parallel snapshot/restore analysis is disabled. Build
+/// serially so the shared reconstructed frame is committed exactly once in CTU
+/// order.
 pub(super) fn build_slice_trees_parallel(
     state: &mut Encoder<'_>,
     slice_qp_y: i32,
 ) -> Vec<Option<CuNode>> {
-    let ctb = 1u32 << CTB_LOG2;
-    let ctbs_x = state.display_width.div_ceil(ctb);
-    let ctbs_y = state.display_height.div_ceil(ctb);
-    let n_ctus = (ctbs_x * ctbs_y) as usize;
-
-    let slice_init = Contexts::new(slice_qp_y);
-    let wpp = state.best2_wpp;
-    // WPP analysis-context propagation: `row_ctx[cy]` is the context the next
-    // (left-to-right) CTU of row `cy` is priced against. Row 0 starts from the
-    // slice-init context; lower rows are seeded from the row above's CTU at
-    // `sync_cx` (HEVC WPP: 2nd CTU, index 1). When `wpp` is off (Placebo), every
-    // CTU is priced against the cold slice-init context (the original frozen
-    // behavior; byte-identical because the priced context is the same value).
-    let sync_cx = if ctbs_x > 1 { 1 } else { 0 };
-    let mut row_ctx: Vec<Contexts> = vec![slice_init.clone(); ctbs_y.max(1) as usize];
-
-    let n_threads = parallel_thread_count().min(ctbs_y.max(1) as usize).max(1);
-    let mut workers: Vec<Encoder<'_>> = (0..n_threads).map(|_| state.fork_worker()).collect();
-    let mut trees: Vec<Option<CuNode>> = (0..n_ctus).map(|_| None).collect();
-
-    let max_t = (ctbs_x - 1) + 2 * (ctbs_y - 1);
-    for t in 0..=max_t {
-        let mut step: Vec<(u32, u32)> = Vec::new();
-        for cy in 0..ctbs_y {
-            if 2 * cy > t {
-                break;
-            }
-            let cx = t - 2 * cy;
-            if cx < ctbs_x {
-                step.push((cx, cy));
-            }
-        }
-        if step.is_empty() {
-            continue;
-        }
-
-        // Snapshot the pricing context for each CTU in this diagonal *before* the
-        // parallel build (the merge below mutates `row_ctx`).
-        let step_ctx: Vec<Contexts> = step
-            .iter()
-            .map(|&(_, cy)| {
-                if wpp {
-                    row_ctx[cy as usize].clone()
-                } else {
-                    slice_init.clone()
-                }
-            })
-            .collect();
-
-        let n_used = n_threads.min(step.len());
-        let chunk_len = step.len().div_ceil(n_used);
-
-        let results: Vec<Vec<CtuBuild>> = std::thread::scope(|s| {
-            let mut handles = Vec::new();
-            for (worker, (chunk, cchunk)) in workers
-                .iter_mut()
-                .zip(step.chunks(chunk_len).zip(step_ctx.chunks(chunk_len)))
-            {
-                handles.push(s.spawn(move || {
-                    let mut out = Vec::with_capacity(chunk.len());
-                    for (i, &(cx, cy)) in chunk.iter().enumerate() {
-                        let x0 = cx * ctb;
-                        let y0 = cy * ctb;
-                        let cu = worker.build_cu(x0, y0, CTB_LOG2, 0, &cchunk[i]);
-                        let fsnap = worker.snapshot_frame_region(x0, y0, CTB_LOG2);
-                        let msnap = worker.snapshot_mode_region(x0, y0, CTB_LOG2);
-                        let csnap = worker.snapshot_ct_depth_region(x0, y0, CTB_LOG2);
-                        out.push(CtuBuild {
-                            cx,
-                            cy,
-                            cu,
-                            fsnap,
-                            msnap,
-                            csnap,
-                        });
-                    }
-                    out
-                }));
-            }
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let restore_start = std::time::Instant::now();
-        for builds in results {
-            for b in builds {
-                state.restore_frame_region(&b.fsnap);
-                state.restore_mode_region(&b.msnap);
-                state.restore_ct_depth_region(&b.csnap);
-                for w in workers.iter_mut() {
-                    w.restore_frame_region(&b.fsnap);
-                    w.restore_mode_region(&b.msnap);
-                    w.restore_ct_depth_region(&b.csnap);
-                }
-                trees[(b.cy * ctbs_x + b.cx) as usize] = Some(b.cu);
-            }
-        }
-        state.stats.phase_parallel_restore_us += restore_start.elapsed().as_micros() as u64;
-
-        // WPP: evolve each row's pricing context through the CTU just built (in
-        // raster-within-row order — one CTU per row per diagonal), and seed the
-        // row below at the sync column. Done serially after the barrier so the
-        // propagation is deterministic regardless of thread count.
-        if wpp {
-            let mut sw = BitWriter::new();
-            let mut se = CabacEncoder::new();
-            for &(cx, cy) in &step {
-                let cu = trees[(cy * ctbs_x + cx) as usize]
-                    .as_ref()
-                    .expect("CTU built this step");
-                write_cu(
-                    state,
-                    &mut se,
-                    &mut sw,
-                    &mut row_ctx[cy as usize],
-                    cu,
-                    cx * ctb,
-                    cy * ctb,
-                    CTB_LOG2,
-                    0,
-                );
-                if cx == sync_cx && cy + 1 < ctbs_y {
-                    row_ctx[(cy + 1) as usize] = row_ctx[cy as usize].clone();
-                }
-            }
-        }
-    }
-
-    for w in &workers {
-        state.stats.merge(&w.stats);
-        if state.prof.on {
-            state.prof.snapshot += w.prof.snapshot;
-            state.prof.code_block += w.prof.code_block;
-            state.prof.residual_bits += w.prof.residual_bits;
-            state.prof.rdoq += w.prof.rdoq;
-            state.prof.eval_predict += w.prof.eval_predict;
-            state.prof.eval_transform += w.prof.eval_transform;
-            state.prof.eval_quant_rdoq += w.prof.eval_quant_rdoq;
-            state.prof.eval_recon += w.prof.eval_recon;
-            state.prof.eval_residual_price += w.prof.eval_residual_price;
-            state.prof.rough_search += w.prof.rough_search;
-        }
-    }
-
-    if state.deblock {
-        let (dw, dh) = (state.display_width, state.display_height);
-        for cy in 0..ctbs_y {
-            for cx in 0..ctbs_x {
-                if let Some(cu) = &trees[(cy * ctbs_x + cx) as usize] {
-                    mark_cu_deblock(&mut state.frame, cu, cx * ctb, cy * ctb, CTB_LOG2, dw, dh);
-                }
-            }
-        }
-    }
-
-    trees
+    build_slice_trees_serial(state, slice_qp_y)
 }
 
 /// Serial CABAC write of pre-built CTU trees, optionally prefixing each CTU
@@ -722,59 +578,170 @@ pub(super) fn build_slice_trees_parallel(
 /// `CuNode` coefficients/modes and evolves the CABAC contexts but does **not**
 /// touch `state.frame`, so the caller may deblock + decide SAO on the
 /// reconstruction before calling this.
+/// Serialize the per-CTU trees into the slice's CABAC `slice_data()`. Returns
+/// the bytes and the per-tile entry-point byte sizes (`entry_point_offset[i]`
+/// for substreams `0..num_tiles-1`; empty when tiles are disabled).
+///
+/// When tiles are active, each tile is coded as an independent byte-aligned
+/// substream (fresh CABAC engine + slice-init contexts, matching the decoder's
+/// per-tile reset), then the substreams are concatenated — the HM/x265 method,
+/// which guarantees byte-aligned substream boundaries.
 pub(super) fn write_slice_from_trees(
     state: &mut Encoder<'_>,
     trees: &[Option<CuNode>],
     sao_map: Option<&SaoMap>,
     slice_qp_y: i32,
-) -> Vec<u8> {
+) -> (Vec<u8>, Vec<u32>) {
     let ctb = 1u32 << CTB_LOG2;
     let ctbs_x = state.display_width.div_ceil(ctb);
     let ctbs_y = state.display_height.div_ceil(ctb);
-
-    let mut w = BitWriter::new();
-    let mut enc = CabacEncoder::new();
-    let mut ctxs = Contexts::new(slice_qp_y);
     let total = (ctbs_x * ctbs_y) as u32;
-    let mut done = 0u32;
-    for cy in 0..ctbs_y {
-        for cx in 0..ctbs_x {
-            state.stats.ctu_count += 1;
-            if let Some(sao_map) = sao_map {
-                sao::write_sao(
-                    &mut enc,
-                    &mut w,
-                    &mut ctxs,
-                    sao_map,
-                    cx,
-                    cy,
-                    true,
-                    state.cat != 0,
-                    state.bit_depth,
+
+    if state.tile_grid.is_single() {
+        let mut w = BitWriter::new();
+        let mut enc = CabacEncoder::new();
+        let mut ctxs = Contexts::new(slice_qp_y);
+        let mut done = 0u32;
+        for cy in 0..ctbs_y {
+            for cx in 0..ctbs_x {
+                write_one_ctu_from_trees(
+                    state, &mut enc, &mut w, &mut ctxs, trees, sao_map, cx, cy, ctbs_x, ctb,
                 );
+                done += 1;
+                enc.encode_bin_trm(&mut w, (done == total) as u8);
             }
-            let cu = trees[(cy * ctbs_x + cx) as usize]
-                .as_ref()
-                .expect("every CTU built");
-            write_cu(
-                state,
-                &mut enc,
-                &mut w,
-                &mut ctxs,
-                cu,
-                cx * ctb,
-                cy * ctb,
-                CTB_LOG2,
-                0,
-            );
-            done += 1;
-            enc.encode_bin_trm(&mut w, (done == total) as u8);
         }
+        enc.finish(&mut w);
+        w.write_bit(1);
+        w.byte_align();
+        return (w.into_bytes(), Vec::new());
     }
-    enc.finish(&mut w);
-    w.write_bit(1);
-    w.byte_align();
-    w.into_bytes()
+
+    // Tiled: one independent byte-aligned substream per tile.
+    let num_tiles = state.tile_grid.num_tiles();
+    let bounds: Vec<(u32, u32, u32, u32)> = (0..num_tiles)
+        .map(|t| state.tile_grid.tile_ctb_bounds(t))
+        .collect();
+    let mut substreams: Vec<Vec<u8>> = Vec::with_capacity(num_tiles as usize);
+    let mut done = 0u32;
+    for (t, &(cx0, cy0, cx1, cy1)) in bounds.iter().enumerate() {
+        let mut w = BitWriter::new();
+        let mut enc = CabacEncoder::new();
+        let mut ctxs = Contexts::new(slice_qp_y);
+        for cy in cy0..cy1 {
+            for cx in cx0..cx1 {
+                write_one_ctu_from_trees(
+                    state, &mut enc, &mut w, &mut ctxs, trees, sao_map, cx, cy, ctbs_x, ctb,
+                );
+                done += 1;
+                // end_of_slice_segment_flag: 1 only for the final CTU of the slice.
+                enc.encode_bin_trm(&mut w, (done == total) as u8);
+            }
+        }
+        if t + 1 < num_tiles as usize {
+            // end_of_sub_stream_one_bit (= 1) then byte_alignment(): an
+            // alignment_bit_equal_to_one followed by zero bits to the byte
+            // boundary. The leading 1 bit is mandatory — omitting it loses a
+            // whole byte whenever `finish()` ends byte-aligned, desyncing the
+            // next substream.
+            enc.encode_bin_trm(&mut w, 1);
+            enc.finish(&mut w);
+            w.write_bit(1);
+            w.byte_align();
+        } else {
+            // Final substream: rbsp_slice_segment_trailing_bits.
+            enc.finish(&mut w);
+            w.write_bit(1);
+            w.byte_align();
+        }
+        substreams.push(w.into_bytes());
+    }
+
+    let entry_sizes = tile_entry_offsets(&substreams);
+    if std::env::var_os("BPG_TILE_DEBUG").is_some() {
+        let sizes: Vec<usize> = substreams.iter().map(|s| s.len()).collect();
+        eprintln!(
+            "TILE_DEBUG: num_tiles={num_tiles} bounds={bounds:?} rbsp_sizes={sizes:?} entry_offsets={entry_sizes:?}"
+        );
+    }
+    let mut out = Vec::new();
+    for s in &substreams {
+        out.extend_from_slice(s);
+    }
+    (out, entry_sizes)
+}
+
+/// Compute `entry_point_offset[i]` for tile substreams. Per H.265, the offset is
+/// the byte length of each substream **in the NAL unit** — i.e. including the
+/// emulation_prevention_three_bytes (0x03) that `write_annexb_nal` will insert,
+/// not the raw RBSP length. The zero-run is carried continuously across
+/// substreams (matching the single de-emulation pass the decoder performs); the
+/// run starts at 0 because the slice header always ends in a non-zero byte
+/// (`alignment_bit_equal_to_one`). Offsets are returned for substreams
+/// `0..n-1` (the last substream's size is implicit).
+fn tile_entry_offsets(substreams: &[Vec<u8>]) -> Vec<u32> {
+    let n = substreams.len();
+    if n <= 1 {
+        return Vec::new();
+    }
+    let mut offsets = Vec::with_capacity(n - 1);
+    let mut zeros = 0u32;
+    for s in &substreams[..n - 1] {
+        let mut nal_len = 0u32;
+        for &b in s {
+            if zeros >= 2 && b <= 0x03 {
+                nal_len += 1; // emulation_prevention_three_byte
+                zeros = 0;
+            }
+            nal_len += 1;
+            if b == 0 {
+                zeros += 1;
+            } else {
+                zeros = 0;
+            }
+        }
+        offsets.push(nal_len);
+    }
+    offsets
+}
+
+/// Write SAO syntax (if any) and the CU quadtree for one CTU from the prebuilt
+/// trees. Shared by the single-substream and tiled paths.
+#[allow(clippy::too_many_arguments)]
+fn write_one_ctu_from_trees(
+    state: &mut Encoder<'_>,
+    enc: &mut CabacEncoder,
+    w: &mut BitWriter,
+    ctxs: &mut Contexts,
+    trees: &[Option<CuNode>],
+    sao_map: Option<&SaoMap>,
+    cx: u32,
+    cy: u32,
+    ctbs_x: u32,
+    ctb: u32,
+) {
+    state.stats.ctu_count += 1;
+    if let Some(sao_map) = sao_map {
+        let left_merge_avail = cx > 0 && state.tile_grid.same_tile_ctb(cx - 1, cy, cx, cy);
+        let up_merge_avail = cy > 0 && state.tile_grid.same_tile_ctb(cx, cy - 1, cx, cy);
+        sao::write_sao(
+            enc,
+            w,
+            ctxs,
+            sao_map,
+            cx,
+            cy,
+            left_merge_avail,
+            up_merge_avail,
+            true,
+            state.cat != 0,
+            state.bit_depth,
+        );
+    }
+    let cu = trees[(cy * ctbs_x + cx) as usize]
+        .as_ref()
+        .expect("every CTU built");
+    write_cu(state, enc, w, ctxs, cu, cx * ctb, cy * ctb, CTB_LOG2, 0);
 }
 
 /// Encode `slice_segment_data()` for every CTU, optionally with SAO syntax.
@@ -795,6 +762,19 @@ pub(super) fn encode_slice_data_capture(
     slice_qp_y: i32,
     mut capture: Option<&mut Vec<Option<CuNode>>>,
 ) -> Vec<u8> {
+    // This serial path emits a single CABAC substream in raster order with no
+    // per-tile context reset or entry-point offsets. It is only ever selected
+    // when tiles are disabled (see `params::tile_capable`: tiles require SAO or
+    // parallel analysis, both of which route through `write_slice_from_trees`).
+    // Assert that invariant so a future routing change can't silently produce a
+    // PPS that declares tiles the slice data doesn't carry.
+    debug_assert!(
+        state.tile_grid.is_single(),
+        "serial slice encode cannot emit a multi-tile partition ({} tiles); \
+         tiled encodes must use write_slice_from_trees",
+        state.tile_grid.num_tiles()
+    );
+
     let mut w = BitWriter::new();
     let mut enc = CabacEncoder::new();
     let mut ctxs = Contexts::new(slice_qp_y);
@@ -816,6 +796,11 @@ pub(super) fn encode_slice_data_capture(
             state.stats.ctu_count += 1;
 
             if let Some(sao_map) = sao_map {
+                // Single-tile path (see the `is_single` assert above), so these
+                // reduce to `cx > 0` / `cy > 0`; derived via the grid anyway so
+                // the merge-availability rule stays correct in one place.
+                let left_merge_avail = cx > 0 && state.tile_grid.same_tile_ctb(cx - 1, cy, cx, cy);
+                let up_merge_avail = cy > 0 && state.tile_grid.same_tile_ctb(cx, cy - 1, cx, cy);
                 sao::write_sao(
                     &mut enc,
                     &mut w,
@@ -823,6 +808,8 @@ pub(super) fn encode_slice_data_capture(
                     sao_map,
                     cx,
                     cy,
+                    left_merge_avail,
+                    up_merge_avail,
                     true,
                     state.cat != 0,
                     state.bit_depth,

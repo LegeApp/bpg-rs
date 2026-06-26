@@ -1,17 +1,41 @@
-//! SIMD-accelerated YCbCr→RGB color conversion
+//! YCbCr→RGB color conversion and chroma upsampling.
 //!
-//! Uses archmage for safe runtime dispatch across x86 (AVX2) with
-//! scalar fallback on other platforms.
-
-use archmage::incant;
-use archmage::prelude::*;
-
-// Explicit imports for safe SIMD load/store (can't glob-import alongside core::arch)
-#[cfg(target_arch = "x86_64")]
-use safe_unaligned_simd::x86_64::{_mm_loadu_si64, _mm_loadu_si128, _mm256_storeu_si256};
+//! Coefficients and the Lanczos upsampling filter are derived to be bit-exact
+//! with libbpg/bpgdec (see [`get_coefficients`], [`upsample_chroma_420`], and
+//! [`upsample_chroma_422`]).
 
 fn lrint(x: f64) -> i32 {
     x.round_ties_even() as i32
+}
+
+/// Apply `f(row_index, row_slice)` to each `row_len`-element row of `buf`. With
+/// the `rayon` feature the rows are processed in parallel across cores;
+/// otherwise sequentially. Rows are independent, so the result is identical
+/// either way. This is the data-parallel lever for the color-output kernels:
+/// for cross-channel per-pixel conversions (YCbCr→RGB) lane-wise SIMD helps
+/// little, but distributing whole rows across cores does.
+#[inline]
+pub(crate) fn for_each_row<T, F>(buf: &mut [T], row_len: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync + Send,
+{
+    if row_len == 0 {
+        return;
+    }
+    #[cfg(feature = "rayon")]
+    {
+        use rayon::prelude::*;
+        buf.par_chunks_mut(row_len)
+            .enumerate()
+            .for_each(|(i, r)| f(i, r));
+    }
+    #[cfg(not(feature = "rayon"))]
+    {
+        buf.chunks_mut(row_len)
+            .enumerate()
+            .for_each(|(i, r)| f(i, r));
+    }
 }
 
 #[inline]
@@ -74,374 +98,465 @@ pub fn ycbcr_pixel_to_rgb(
     full_range: bool,
     matrix_coeffs: u8,
 ) -> (u8, u8, u8) {
-    let cb = cb_val - 128;
-    let cr = cr_val - 128;
-    if full_range {
-        let (cr_r, cb_g, cr_g, cb_b) = match matrix_coeffs {
-            1 => (403, -48, -120, 475),
-            9 => (377, -42, -146, 482),
-            _ => (359, -88, -183, 454),
-        };
-        let r = y_val + ((cr_r * cr + 128) >> 8);
-        let g = y_val + ((cb_g * cb + cr_g * cr + 128) >> 8);
-        let b = y_val + ((cb_b * cb + 128) >> 8);
-        (
-            r.clamp(0, 255) as u8,
-            g.clamp(0, 255) as u8,
-            b.clamp(0, 255) as u8,
-        )
-    } else {
-        let (cr_r, cb_g, cr_g, cb_b) = match matrix_coeffs {
-            1 => (14744, -1754, -4383, 17373),
-            9 => (13806, -1541, -5349, 17615),
-            _ => (13126, -3222, -6686, 16591),
-        };
-        let yv = (y_val - 16) * 9576;
-        let r = (yv + cr_r * cr + 4096) >> 13;
-        let g = (yv + cb_g * cb + cr_g * cr + 4096) >> 13;
-        let b = (yv + cb_b * cb + 4096) >> 13;
-        (
-            r.clamp(0, 255) as u8,
-            g.clamp(0, 255) as u8,
-            b.clamp(0, 255) as u8,
-        )
-    }
-}
-
-/// Get color matrix coefficients for YCbCr→RGB conversion.
-///
-/// Returns (cr_r, cb_g, cr_g, cb_b, y_bias, y_scale, rounding, shift_bits).
-/// Full-range uses ×256 fixed-point, limited-range uses ×8192.
-#[inline]
-fn get_coefficients(
-    full_range: bool,
-    matrix_coeffs: u8,
-) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
-    if full_range {
-        let (cr_r, cb_g, cr_g, cb_b) = match matrix_coeffs {
-            1 => (403, -48, -120, 475), // BT.709
-            9 => (377, -42, -146, 482), // BT.2020
-            _ => (359, -88, -183, 454), // BT.601
-        };
-        (cr_r, cb_g, cr_g, cb_b, 0, 256, 128, 8)
-    } else {
-        let (cr_r, cb_g, cr_g, cb_b) = match matrix_coeffs {
-            1 => (14744, -1754, -4383, 17373), // BT.709
-            9 => (13806, -1541, -5349, 17615), // BT.2020
-            _ => (13126, -3222, -6686, 16591), // BT.601
-        };
-        (cr_r, cb_g, cr_g, cb_b, 16, 9576, 4096, 13)
-    }
-}
-
-/// Convert 4:2:0 YCbCr planes to interleaved RGB bytes.
-///
-/// Dispatches to AVX2 when available, scalar fallback otherwise.
-/// Writes exactly `(y_end - y_start) * (x_end - x_start) * 3` bytes to `rgb`.
-#[allow(clippy::too_many_arguments)]
-pub fn convert_420_to_rgb(
-    y_plane: &[u16],
-    cb_plane: &[u16],
-    cr_plane: &[u16],
-    y_stride: usize,
-    c_stride: usize,
-    y_start: u32,
-    y_end: u32,
-    x_start: u32,
-    x_end: u32,
-    shift: u32,
-    full_range: bool,
-    matrix_coeffs: u8,
-    rgb: &mut [u8],
-) {
-    incant!(
-        convert_420_to_rgb(
-            y_plane,
-            cb_plane,
-            cr_plane,
-            y_stride,
-            c_stride,
-            y_start,
-            y_end,
-            x_start,
-            x_end,
-            shift,
-            full_range,
-            matrix_coeffs,
-            rgb
-        ),
-        [v3]
-    )
-}
-
-/// Scalar YCbCr→RGB conversion (fallback for all platforms)
-#[allow(clippy::too_many_arguments)]
-fn convert_420_to_rgb_scalar(
-    _token: ScalarToken,
-    y_plane: &[u16],
-    cb_plane: &[u16],
-    cr_plane: &[u16],
-    y_stride: usize,
-    c_stride: usize,
-    y_start: u32,
-    y_end: u32,
-    x_start: u32,
-    x_end: u32,
-    shift: u32,
-    full_range: bool,
-    matrix_coeffs: u8,
-    rgb: &mut [u8],
-) {
     let (cr_r, cb_g, cr_g, cb_b, y_bias, y_scale, rnd, shr) =
         get_coefficients(full_range, matrix_coeffs);
-
-    let mut out_idx = 0;
-    for y in y_start..y_end {
-        let y_row = y as usize * y_stride;
-        let c_row = (y as usize / 2) * c_stride;
-        for x in x_start..x_end {
-            let y_val = (y_plane[y_row + x as usize] >> shift) as i32;
-            let cx = x as usize / 2;
-            let c_idx = c_row + cx;
-            let cb_val = (cb_plane[c_idx] >> shift) as i32;
-            let cr_val = (cr_plane[c_idx] >> shift) as i32;
-
-            let cb = cb_val - 128;
-            let cr = cr_val - 128;
-            let yv = (y_val - y_bias) * y_scale;
-            let r = (yv + cr_r * cr + rnd) >> shr;
-            let g = (yv + cb_g * cb + cr_g * cr + rnd) >> shr;
-            let b = (yv + cb_b * cb + rnd) >> shr;
-
-            rgb[out_idx] = r.clamp(0, 255) as u8;
-            rgb[out_idx + 1] = g.clamp(0, 255) as u8;
-            rgb[out_idx + 2] = b.clamp(0, 255) as u8;
-            out_idx += 3;
-        }
-    }
-}
-
-/// AVX2 YCbCr→RGB conversion — processes 8 pixels per iteration
-#[arcane]
-#[allow(clippy::too_many_arguments)]
-fn convert_420_to_rgb_v3(
-    _token: X64V3Token,
-    y_plane: &[u16],
-    cb_plane: &[u16],
-    cr_plane: &[u16],
-    y_stride: usize,
-    c_stride: usize,
-    y_start: u32,
-    y_end: u32,
-    x_start: u32,
-    x_end: u32,
-    shift: u32,
-    full_range: bool,
-    matrix_coeffs: u8,
-    rgb: &mut [u8],
-) {
-    let (cr_r, cb_g, cr_g, cb_b, y_bias, y_scale, rnd, shr) =
-        get_coefficients(full_range, matrix_coeffs);
-
-    // Coefficient vectors (hoisted out of loop)
-    let cr_r_v = _mm256_set1_epi32(cr_r);
-    let cb_g_v = _mm256_set1_epi32(cb_g);
-    let cr_g_v = _mm256_set1_epi32(cr_g);
-    let cb_b_v = _mm256_set1_epi32(cb_b);
-    let y_bias_v = _mm256_set1_epi32(y_bias);
-    let y_scale_v = _mm256_set1_epi32(y_scale);
-    let rnd_v = _mm256_set1_epi32(rnd);
-    let bias128_v = _mm256_set1_epi32(128);
-    let zero = _mm256_setzero_si256();
-    let max255 = _mm256_set1_epi32(255);
-    let shr_v = _mm_cvtsi32_si128(shr);
-    let shift_v = _mm_cvtsi32_si128(shift as i32);
-    let needs_shift = shift > 0;
-
-    // Shuffle mask: interleave packed [R0..R3, G0..G3, B0..B3, 0000] per lane
-    // into [R0,G0,B0, R1,G1,B1, R2,G2,B2, R3,G3,B3, 0000]
-    let shuffle = _mm256_setr_epi8(
-        0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11, -1, -1, -1, -1, 0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11,
-        -1, -1, -1, -1,
-    );
-
-    // Align SIMD start to even x for 4:2:0 chroma alignment
-    let x_simd_start = x_start.next_multiple_of(2);
-    let row_pixels = x_end.saturating_sub(x_simd_start) as usize;
-    let simd_count = (row_pixels / 8) * 8;
-    let x_simd_end = x_simd_start + simd_count as u32;
-
-    let mut out_idx = 0;
-
-    for y in y_start..y_end {
-        let y_row = y as usize * y_stride;
-        let c_row = (y as usize / 2) * c_stride;
-
-        // Scalar prefix: handle odd x_start (0 or 1 pixel)
-        for x in x_start..x_simd_start.min(x_end) {
-            scalar_pixel(
-                y_plane,
-                cb_plane,
-                cr_plane,
-                y_row,
-                c_row,
-                x as usize,
-                shift,
-                y_bias,
-                y_scale,
-                cr_r,
-                cb_g,
-                cr_g,
-                cb_b,
-                rnd,
-                shr,
-                rgb,
-                &mut out_idx,
-            );
-        }
-
-        // SIMD: 8 pixels per iteration
-        let mut x = x_simd_start as usize;
-        let x_end_simd = x_simd_end as usize;
-        while x < x_end_simd {
-            let cx = x / 2;
-
-            // Load 8 Y values (u16) → zero-extend to 8×i32
-            let y_arr: &[u16; 8] = (&y_plane[y_row + x..y_row + x + 8]).try_into().unwrap();
-            let y_raw = _mm_loadu_si128(y_arr);
-            let mut y_i32 = _mm256_cvtepu16_epi32(y_raw);
-
-            // Load 4 Cb/Cr values, duplicate each for 4:2:0 → 8×i32
-            let cb_arr: &[u16; 4] = (&cb_plane[c_row + cx..c_row + cx + 4]).try_into().unwrap();
-            let cr_arr: &[u16; 4] = (&cr_plane[c_row + cx..c_row + cx + 4]).try_into().unwrap();
-            let cb_raw = _mm_loadu_si64(cb_arr);
-            let cr_raw = _mm_loadu_si64(cr_arr);
-            let cb_dup = _mm_unpacklo_epi16(cb_raw, cb_raw);
-            let cr_dup = _mm_unpacklo_epi16(cr_raw, cr_raw);
-            let mut cb_i32 = _mm256_cvtepu16_epi32(cb_dup);
-            let mut cr_i32 = _mm256_cvtepu16_epi32(cr_dup);
-
-            // 10-bit → 8-bit shift
-            if needs_shift {
-                y_i32 = _mm256_srl_epi32(y_i32, shift_v);
-                cb_i32 = _mm256_srl_epi32(cb_i32, shift_v);
-                cr_i32 = _mm256_srl_epi32(cr_i32, shift_v);
-            }
-
-            // Fixed-point YCbCr → RGB
-            let yv = _mm256_mullo_epi32(_mm256_sub_epi32(y_i32, y_bias_v), y_scale_v);
-            let cb_adj = _mm256_sub_epi32(cb_i32, bias128_v);
-            let cr_adj = _mm256_sub_epi32(cr_i32, bias128_v);
-
-            let r = _mm256_sra_epi32(
-                _mm256_add_epi32(
-                    _mm256_add_epi32(yv, _mm256_mullo_epi32(cr_r_v, cr_adj)),
-                    rnd_v,
-                ),
-                shr_v,
-            );
-            let g = _mm256_sra_epi32(
-                _mm256_add_epi32(
-                    _mm256_add_epi32(
-                        _mm256_add_epi32(yv, _mm256_mullo_epi32(cb_g_v, cb_adj)),
-                        _mm256_mullo_epi32(cr_g_v, cr_adj),
-                    ),
-                    rnd_v,
-                ),
-                shr_v,
-            );
-            let b = _mm256_sra_epi32(
-                _mm256_add_epi32(
-                    _mm256_add_epi32(yv, _mm256_mullo_epi32(cb_b_v, cb_adj)),
-                    rnd_v,
-                ),
-                shr_v,
-            );
-
-            // Clamp [0, 255]
-            let r = _mm256_min_epi32(_mm256_max_epi32(r, zero), max255);
-            let g = _mm256_min_epi32(_mm256_max_epi32(g, zero), max255);
-            let b = _mm256_min_epi32(_mm256_max_epi32(b, zero), max255);
-
-            // Pack i32→i16→u8: each lane gets [r0-3, g0-3, b0-3, 0000]
-            let rg = _mm256_packs_epi32(r, g);
-            let bz = _mm256_packs_epi32(b, zero);
-            let packed = _mm256_packus_epi16(rg, bz);
-            let interleaved = _mm256_shuffle_epi8(packed, shuffle);
-
-            // Extract 12 bytes from each 128-bit lane → 24 bytes total
-            let mut buf = [0u8; 32];
-            _mm256_storeu_si256(&mut buf, interleaved);
-            rgb[out_idx..out_idx + 12].copy_from_slice(&buf[..12]);
-            rgb[out_idx + 12..out_idx + 24].copy_from_slice(&buf[16..28]);
-            out_idx += 24;
-
-            x += 8;
-        }
-
-        // Scalar tail: remaining 0–7 pixels
-        for x in x_simd_end..x_end {
-            scalar_pixel(
-                y_plane,
-                cb_plane,
-                cr_plane,
-                y_row,
-                c_row,
-                x as usize,
-                shift,
-                y_bias,
-                y_scale,
-                cr_r,
-                cb_g,
-                cr_g,
-                cb_b,
-                rnd,
-                shr,
-                rgb,
-                &mut out_idx,
-            );
-        }
-    }
-}
-
-/// Convert a single 4:2:0 pixel (shared between SIMD prefix/tail and scalar path)
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // only used from #[arcane] AVX2 path
-fn scalar_pixel(
-    y_plane: &[u16],
-    cb_plane: &[u16],
-    cr_plane: &[u16],
-    y_row: usize,
-    c_row: usize,
-    x: usize,
-    shift: u32,
-    y_bias: i32,
-    y_scale: i32,
-    cr_r: i32,
-    cb_g: i32,
-    cr_g: i32,
-    cb_b: i32,
-    rnd: i32,
-    shr: i32,
-    rgb: &mut [u8],
-    out_idx: &mut usize,
-) {
-    let y_val = (y_plane[y_row + x] >> shift) as i32;
-    let cx = x / 2;
-    let c_idx = c_row + cx;
-    let cb_val = (cb_plane[c_idx] >> shift) as i32;
-    let cr_val = (cr_plane[c_idx] >> shift) as i32;
-
     let cb = cb_val - 128;
     let cr = cr_val - 128;
     let yv = (y_val - y_bias) * y_scale;
     let r = (yv + cr_r * cr + rnd) >> shr;
     let g = (yv + cb_g * cb + cr_g * cr + rnd) >> shr;
     let b = (yv + cb_b * cb + rnd) >> shr;
+    (
+        r.clamp(0, 255) as u8,
+        g.clamp(0, 255) as u8,
+        b.clamp(0, 255) as u8,
+    )
+}
 
-    rgb[*out_idx] = r.clamp(0, 255) as u8;
-    rgb[*out_idx + 1] = g.clamp(0, 255) as u8;
-    rgb[*out_idx + 2] = b.clamp(0, 255) as u8;
-    *out_idx += 3;
+/// libbpg's 7-tap phase-0.5 Lanczos interpolation kernel (`IP1C0..IP1C6`), used
+/// for 4:2:0 chroma upsampling on the normal `BPG_FORMAT_420` path (`c_h_phase=1`,
+/// chroma sited at the centre of the 2×2 luma quad). Coefficients sum to 64. The
+/// *even* output sample uses the reversed pattern (C6..C0) and the *odd* output
+/// uses the forward pattern (C0..C6) — see libbpg `interp2p1_simple`.
+const LANCZOS_P1: [i32; 7] = [-1, 4, -10, 57, 18, -6, 2];
+
+/// `LANCZOS_P1` reversed (C6..C0). The *even* output phase uses the reversed
+/// pattern; hoisting this choice out of the 7-tap inner loop (instead of a
+/// per-tap `if even`) removes a branch from the hot path and lets the compiler
+/// autovectorize the accumulation. Bit-identical to the per-tap selection.
+const LANCZOS_P1_REV: [i32; 7] = [2, -6, 18, 57, -10, 4, -1];
+
+/// Upsample a half-resolution 4:2:0 chroma plane to full luma resolution using
+/// libbpg's separable 7-tap phase-0.5 Lanczos filter — bit-exact with bpgdec.
+///
+/// `src` holds `h2` rows of stride `c_stride` (only the first `w2` columns are
+/// meaningful); samples are downshifted by `shift` to 8-bit during the gather, so
+/// the returned `out_w * out_h` plane (row-major, stride `out_w`) is 8-bit and
+/// downstream conversion must not shift it again. Edges are clamped (replicated),
+/// matching libbpg's `interp2_h`/`interp2_vh` padding.
+pub fn upsample_chroma_420(
+    src: &[u16],
+    w2: usize,
+    h2: usize,
+    c_stride: usize,
+    out_w: usize,
+    out_h: usize,
+    shift: u32,
+) -> Vec<u16> {
+    // Vertical pass → (w2 × out_h) intermediate, held at the ~×64 filter scale
+    // (8-bit input means no rounding/downshift here, exactly as interp2_vh).
+    // Output rows are independent → parallelized by `for_each_row`.
+    let mut vtmp = vec![0i32; w2 * out_h];
+    for_each_row(&mut vtmp, w2, |y, vrow| {
+        let y2 = (y >> 1) as isize;
+        let even = (y & 1) == 0;
+        let mut rows = [0usize; 7];
+        for (k, r) in rows.iter_mut().enumerate() {
+            let ry = (y2 + k as isize - 3).clamp(0, h2 as isize - 1) as usize;
+            *r = ry * c_stride;
+        }
+        let coeffs = if even { &LANCZOS_P1_REV } else { &LANCZOS_P1 };
+        vertical_pass_row(src, &rows, coeffs, shift, vrow);
+    });
+    // Horizontal pass → (out_w × out_h). The second ×64 stage combines with the
+    // vertical one for an overall /4096 (>>12, +2048 rounding), then clamp to 8-bit.
+    let mut out = vec![0u16; out_w * out_h];
+    for_each_row(&mut out, out_w, |y, orow| {
+        let vrow = y * w2;
+        for x in 0..out_w {
+            let x2 = (x >> 1) as isize;
+            let coeffs = if (x & 1) == 0 {
+                &LANCZOS_P1_REV
+            } else {
+                &LANCZOS_P1
+            };
+            let mut acc = 0i32;
+            for k in 0..7 {
+                let cx = (x2 + k as isize - 3).clamp(0, w2 as isize - 1) as usize;
+                acc += vtmp[vrow + cx] * coeffs[k];
+            }
+            orow[x] = ((acc + 2048) >> 12).clamp(0, 255) as u16;
+        }
+    });
+    out
+}
+
+/// One row of the 4:2:0 separable-Lanczos **vertical** pass: for each output
+/// column `x`, accumulate `sum_k (src[rows[k] + x] >> shift) * coeffs[k]`. The
+/// columns are contiguous in `src`, so with the `wide-simd` feature this is the
+/// one chroma kernel that vectorizes cleanly (gather-free); the scalar path is
+/// the bit-exact reference and the SIMD path performs the identical integer
+/// multiply-accumulate, lane for lane.
+#[inline]
+fn vertical_pass_row(
+    src: &[u16],
+    rows: &[usize; 7],
+    coeffs: &[i32; 7],
+    shift: u32,
+    out: &mut [i32],
+) {
+    let w2 = out.len();
+    #[cfg(feature = "wide-simd")]
+    {
+        use wide::i32x8;
+        let cvec: [i32x8; 7] = core::array::from_fn(|k| i32x8::splat(coeffs[k]));
+        let mut x = 0;
+        while x + 8 <= w2 {
+            let mut acc = i32x8::ZERO;
+            for k in 0..7 {
+                let base = rows[k] + x;
+                let lanes: [i32; 8] = core::array::from_fn(|i| (src[base + i] >> shift) as i32);
+                acc += i32x8::from(lanes) * cvec[k];
+            }
+            out[x..x + 8].copy_from_slice(&acc.to_array());
+            x += 8;
+        }
+        while x < w2 {
+            let mut acc = 0i32;
+            for k in 0..7 {
+                acc += (src[rows[k] + x] >> shift) as i32 * coeffs[k];
+            }
+            out[x] = acc;
+            x += 1;
+        }
+    }
+    #[cfg(not(feature = "wide-simd"))]
+    {
+        for x in 0..w2 {
+            let mut acc = 0i32;
+            for k in 0..7 {
+                acc += (src[rows[k] + x] >> shift) as i32 * coeffs[k];
+            }
+            out[x] = acc;
+        }
+    }
+}
+
+/// Upsample a half-horizontal-resolution 4:2:2 chroma plane to full luma width
+/// using libbpg's 7-tap phase-0.5 Lanczos filter (`interp2_h` with
+/// `c_h_phase=1`, the normal JPEG/BPG 4:2:2 siting).
+///
+/// This is the horizontal half of [`upsample_chroma_420`]: rows are copied
+/// one-for-one, only columns are interpolated. Samples are downshifted to 8-bit
+/// during the gather so the returned `out_w * out_h` plane is ready for the
+/// fixed 8-bit RGB conversion path.
+pub fn upsample_chroma_422(
+    src: &[u16],
+    w2: usize,
+    h: usize,
+    c_stride: usize,
+    out_w: usize,
+    out_h: usize,
+    shift: u32,
+) -> Vec<u16> {
+    let mut out = vec![0u16; out_w * out_h];
+    if w2 == 0 || h == 0 {
+        return out;
+    }
+    for_each_row(&mut out, out_w, |y, orow| {
+        let sy = y.min(h - 1);
+        let srow = sy * c_stride;
+        for x in 0..out_w {
+            let x2 = (x >> 1) as isize;
+            let coeffs = if (x & 1) == 0 {
+                &LANCZOS_P1_REV
+            } else {
+                &LANCZOS_P1
+            };
+            let mut acc = 0i32;
+            for k in 0..7 {
+                let cx = (x2 + k as isize - 3).clamp(0, w2 as isize - 1) as usize;
+                acc += (src[srow + cx] >> shift) as i32 * coeffs[k];
+            }
+            orow[x] = ((acc + 32) >> 6).clamp(0, 255) as u16;
+        }
+    });
+    out
+}
+
+/// Get color matrix coefficients for YCbCr→RGB conversion.
+///
+/// Returns (cr_r, cb_g, cr_g, cb_b, y_bias, y_scale, rounding, shift_bits) for
+/// the fixed-point pixel formula
+///   yv = (y - y_bias) * y_scale
+///   r  = (yv + cr_r*(cr-128) + rnd) >> shr
+///   g  = (yv + cb_g*(cb-128) + cr_g*(cr-128) + rnd) >> shr
+///   b  = (yv + cb_b*(cb-128) + rnd) >> shr
+///
+/// Coefficients are derived exactly as libbpg's `convert_init`
+/// (30 - out_bit_depth = 22-bit fixed point for 8-bit output) so our output is
+/// bit-exact with bpgdec. `cb_g`/`cr_g` are returned negated (libbpg stores them
+/// positive and subtracts; we add). Computed for 8-bit in/out — chroma/luma are
+/// downshifted to 8-bit before this call.
+#[inline]
+fn get_coefficients(
+    full_range: bool,
+    matrix_coeffs: u8,
+) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
+    const C_SHIFT: i32 = 22; // 30 - out_bit_depth(8)
+    const PIXEL_MAX: f64 = 255.0; // (1 << 8) - 1, in == out == 8 bit
+    let scale = (1i64 << C_SHIFT) as f64;
+    let mult = PIXEL_MAX * scale / PIXEL_MAX; // == scale
+    let (mult_y, mult_c) = if full_range {
+        (mult, mult)
+    } else {
+        (PIXEL_MAX * scale / 219.0, PIXEL_MAX * scale / 224.0)
+    };
+    let (k_r, k_b) = match matrix_coeffs {
+        1 => (0.2126, 0.0722), // BT.709
+        9 => (0.2627, 0.0593), // BT.2020
+        _ => (0.299, 0.114),   // BT.601
+    };
+    let cr_r = lrint(2.0 * (1.0 - k_r) * mult_c);
+    let cb_g = lrint(2.0 * k_b * (1.0 - k_b) / (1.0 - k_b - k_r) * mult_c);
+    let cr_g = lrint(2.0 * k_r * (1.0 - k_r) / (1.0 - k_b - k_r) * mult_c);
+    let cb_b = lrint(2.0 * (1.0 - k_b) * mult_c);
+    let c_one = lrint(mult);
+    let c_rnd = 1 << (C_SHIFT - 1);
+    let (y_bias, y_scale) = if full_range {
+        (0, c_one)
+    } else {
+        (16, lrint(mult_y))
+    };
+    (cr_r, -cb_g, -cr_g, cb_b, y_bias, y_scale, c_rnd, C_SHIFT)
+}
+
+/// True for the `matrix_coefficients` values that [`transcode_to_jfif_ycbcr`]
+/// can convert directly in the YCbCr domain (BT.601 525/625, BT.709, BT.2020
+/// non-constant-luma). RGB-stored (0) and YCgCo (8) are not YCbCr matrices and
+/// must use the RGB output path.
+pub fn is_ycbcr_matrix(matrix_coeffs: u8) -> bool {
+    matches!(matrix_coeffs, 1 | 4 | 5 | 6 | 7 | 9)
+}
+
+/// Source YCbCr (8-bit samples) → RGB at 8-bit scale **without** the [0,255]
+/// clamp, using the same tested fixed-point inverse as [`ycbcr_pixel_to_rgb`].
+/// Skipping the clamp means a subsequent re-encode to a different YCbCr matrix
+/// loses nothing to gamut clipping. Valid only for [`is_ycbcr_matrix`] inputs.
+#[inline]
+fn ycbcr_to_rgb_unclamped(
+    y8: i32,
+    cb8: i32,
+    cr8: i32,
+    full_range: bool,
+    matrix_coeffs: u8,
+) -> (i32, i32, i32) {
+    let (cr_r, cb_g, cr_g, cb_b, y_bias, y_scale, rnd, shr) =
+        get_coefficients(full_range, matrix_coeffs);
+    let cb = cb8 - 128;
+    let cr = cr8 - 128;
+    let yv = (y8 - y_bias) * y_scale;
+    let r = (yv + cr_r * cr + rnd) >> shr;
+    let g = (yv + cb_g * cb + cr_g * cr + rnd) >> shr;
+    let b = (yv + cb_b * cb + rnd) >> shr;
+    (r, g, b)
+}
+
+/// RGB (8-bit scale, may fall outside [0,255]) → JFIF (BT.601 full-range) 8-bit
+/// YCbCr — the color space baseline JPEG/JFIF mandates. Uses the standard JFIF
+/// forward matrix (identical coefficients to TooJpeg's `rgb2y/rgb2cb/rgb2cr`).
+#[inline]
+fn rgb_to_jfif_ycbcr(r: i32, g: i32, b: i32) -> (u8, u8, u8) {
+    let (rf, gf, bf) = (r as f32, g as f32, b as f32);
+    let y = 0.299 * rf + 0.587 * gf + 0.114 * bf;
+    let cb = -0.168_736 * rf - 0.331_264 * gf + 0.5 * bf + 128.0;
+    let cr = 0.5 * rf - 0.418_688 * gf - 0.081_312 * bf + 128.0;
+    let clamp8 = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    (clamp8(y), clamp8(cb), clamp8(cr))
+}
+
+/// Transcode one 8-bit source YCbCr sample to JFIF (BT.601 full-range) 8-bit
+/// YCbCr, the JPEG baseline. This is the color-space-preserving alternative to a
+/// full RGB output buffer for re-encoding BT.709/BT.2020/limited-range frames to
+/// JPEG: the RGB triple exists only transiently and unclamped, so the only loss
+/// versus a perfect transform is final 8-bit YCbCr rounding (no gamut clipping,
+/// no RGB byte round-trip). Equivalent in result to the RGB path for in-gamut
+/// pixels; never materializes a clamped RGB image.
+#[inline]
+pub fn transcode_to_jfif_ycbcr(
+    y8: i32,
+    cb8: i32,
+    cr8: i32,
+    full_range: bool,
+    matrix_coeffs: u8,
+) -> (u8, u8, u8) {
+    let (r, g, b) = ycbcr_to_rgb_unclamped(y8, cb8, cr8, full_range, matrix_coeffs);
+    rgb_to_jfif_ycbcr(r, g, b)
+}
+
+/// Scale a single luma sample at the frame's native `bit_depth` to a full-range
+/// 8-bit value (JFIF expects full-range luma). For full-range 8-bit input this
+/// is a clamp; for limited range it expands 16..235 → 0..255. Used for the
+/// grayscale JPEG path.
+pub fn luma_to_jfif_8bit(v: i32, bit_depth: u8, full_range: bool) -> u8 {
+    scale_component_to_u8(v, bit_depth, full_range)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsample_flat_plane_is_constant() {
+        // A flat chroma plane must upsample to the same constant everywhere: the
+        // 7 taps sum to 64, so two stages (/64 each, +2048 rounding >>12) recover
+        // the input value exactly, including the replicated edges.
+        let (w2, h2) = (5usize, 4usize);
+        let src = vec![137u16; w2 * h2];
+        let out = upsample_chroma_420(&src, w2, h2, w2, w2 * 2, h2 * 2, 0);
+        assert!(out.iter().all(|&v| v == 137), "flat plane changed value");
+        assert_eq!(out.len(), (w2 * 2) * (h2 * 2));
+    }
+
+    #[test]
+    fn upsample_matches_libbpg_kernel_on_a_ramp() {
+        // 1-D horizontal check against a hand-evaluated libbpg interp2p1 step.
+        // Single row [0, 64, 128, 192] → 8 output samples. Interior sample x=2
+        // (even, centred on src col 1) uses reversed taps C6..C0 over clamped
+        // cols [-2..4]→[0,0,0,1,2,3,3]; x=3 (odd) uses C0..C6 over the same.
+        let src = [0u16, 64, 128, 192];
+        let out = upsample_chroma_420(&src, 4, 1, 4, 8, 2, 0);
+        let c = LANCZOS_P1; // [-1,4,-10,57,18,-6,2]
+        let col = |i: isize| src[i.clamp(0, 3) as usize] as i32;
+        // x=2: x2=1, even → reversed taps over cols (1-3..1+3)
+        let even = (0..7)
+            .map(|k| col(1 + k as isize - 3) * c[6 - k])
+            .sum::<i32>();
+        let exp2 = (((even * 64) + 2048) >> 12).clamp(0, 255) as u16;
+        // x=3: x2=1, odd → forward taps
+        let odd = (0..7).map(|k| col(1 + k as isize - 3) * c[k]).sum::<i32>();
+        let exp3 = (((odd * 64) + 2048) >> 12).clamp(0, 255) as u16;
+        assert_eq!(out[2], exp2);
+        assert_eq!(out[3], exp3);
+        // Endpoints stay within range and near the clamped edges.
+        assert!(out[0] <= 16 && out[7] >= 176);
+    }
+
+    #[test]
+    fn upsample_422_matches_horizontal_libbpg_kernel_on_a_ramp() {
+        let src = [0u16, 64, 128, 192];
+        let out = upsample_chroma_422(&src, 4, 1, 4, 8, 1, 0);
+        let c = LANCZOS_P1;
+        let col = |i: isize| src[i.clamp(0, 3) as usize] as i32;
+        let even = (0..7)
+            .map(|k| col(1 + k as isize - 3) * c[6 - k])
+            .sum::<i32>();
+        let odd = (0..7).map(|k| col(1 + k as isize - 3) * c[k]).sum::<i32>();
+        assert_eq!(out[2], ((even + 32) >> 6).clamp(0, 255) as u16);
+        assert_eq!(out[3], ((odd + 32) >> 6).clamp(0, 255) as u16);
+    }
+
+    /// Independent scalar reference for the full 4:2:0 separable filter, written
+    /// without the parity-hoist or SIMD, used to prove the production kernel is
+    /// bit-identical. Under `--features wide-simd` this exercises the `wide`
+    /// vertical pass (input is wide enough to fill 8-lane vectors).
+    fn reference_420(src: &[u16], w2: usize, h2: usize, shift: u32) -> Vec<u16> {
+        let c = LANCZOS_P1;
+        let out_w = w2 * 2;
+        let out_h = h2 * 2;
+        let mut vtmp = vec![0i32; w2 * out_h];
+        for y in 0..out_h {
+            let y2 = (y >> 1) as isize;
+            let even = (y & 1) == 0;
+            for x in 0..w2 {
+                let mut acc = 0i32;
+                for k in 0..7 {
+                    let ry = (y2 + k as isize - 3).clamp(0, h2 as isize - 1) as usize;
+                    let s = (src[ry * w2 + x] >> shift) as i32;
+                    acc += s * if even { c[6 - k] } else { c[k] };
+                }
+                vtmp[y * w2 + x] = acc;
+            }
+        }
+        let mut out = vec![0u16; out_w * out_h];
+        for y in 0..out_h {
+            for x in 0..out_w {
+                let x2 = (x >> 1) as isize;
+                let even = (x & 1) == 0;
+                let mut acc = 0i32;
+                for k in 0..7 {
+                    let cx = (x2 + k as isize - 3).clamp(0, w2 as isize - 1) as usize;
+                    acc += vtmp[y * w2 + cx] * if even { c[6 - k] } else { c[k] };
+                }
+                out[y * out_w + x] = ((acc + 2048) >> 12).clamp(0, 255) as u16;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn transcode_bt601_full_range_is_near_identity() {
+        // BT.601 full-range → RGB → JFIF(BT.601 full-range) round-trips to itself
+        // (within float rounding) since source and dest matrices are identical.
+        for y in (0..=255).step_by(17) {
+            for cb in (0..=255).step_by(51) {
+                for cr in (0..=255).step_by(51) {
+                    let (yy, ccb, ccr) = transcode_to_jfif_ycbcr(y, cb, cr, true, 6);
+                    assert!((yy as i32 - y).abs() <= 1, "Y {y}->{yy}");
+                    assert!((ccb as i32 - cb).abs() <= 1, "Cb {cb}->{ccb}");
+                    assert!((ccr as i32 - cr).abs() <= 1, "Cr {cr}->{ccr}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn transcode_matches_explicit_rgb_path() {
+        // The YCbCr-domain transcode must agree with the explicit
+        // YCbCr→RGB(clamped)→JFIF path for in-gamut samples (≤1 LSB), proving it
+        // is a faithful, lossless-where-it-counts replacement for the RGB route.
+        let jfif = |r: i32, g: i32, b: i32| {
+            let (rf, gf, bf) = (r as f32, g as f32, b as f32);
+            let y = 0.299 * rf + 0.587 * gf + 0.114 * bf;
+            let cb = -0.168_736 * rf - 0.331_264 * gf + 0.5 * bf + 128.0;
+            let cr = 0.5 * rf - 0.418_688 * gf - 0.081_312 * bf + 128.0;
+            (
+                y.round().clamp(0.0, 255.0) as i32,
+                cb.round().clamp(0.0, 255.0) as i32,
+                cr.round().clamp(0.0, 255.0) as i32,
+            )
+        };
+        let mut checked = 0;
+        for &mc in &[1u8, 6, 9] {
+            for &fr in &[true, false] {
+                for y in (16..=240).step_by(16) {
+                    for cb in (16..=240).step_by(16) {
+                        for cr in (16..=240).step_by(16) {
+                            // Only compare where RGB is in-gamut: out-of-[0,255]
+                            // is exactly where the clamping RGB path is *lossy*
+                            // and the transcode (intentionally) preserves more.
+                            let (ur, ug, ub) = ycbcr_to_rgb_unclamped(y, cb, cr, fr, mc);
+                            if [ur, ug, ub].iter().any(|&v| !(0..=255).contains(&v)) {
+                                continue;
+                            }
+                            let (er, eg, eb) = jfif(ur, ug, ub);
+                            let (ty, tcb, tcr) = transcode_to_jfif_ycbcr(y, cb, cr, fr, mc);
+                            assert!((ty as i32 - er).abs() <= 1, "Y mc={mc} fr={fr}");
+                            assert!((tcb as i32 - eg).abs() <= 1, "Cb mc={mc} fr={fr}");
+                            assert!((tcr as i32 - eb).abs() <= 1, "Cr mc={mc} fr={fr}");
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            checked > 1000,
+            "too few in-gamut samples checked: {checked}"
+        );
+    }
+
+    #[test]
+    fn upsample_420_bit_identical_to_reference_on_wide_block() {
+        // 40×6 chroma block (w2=40 > 8 lanes) with a deterministic pattern, so
+        // the SIMD vertical pass and its scalar tail are both exercised.
+        let (w2, h2) = (40usize, 6usize);
+        let mut src = vec![0u16; w2 * h2];
+        for (i, s) in src.iter_mut().enumerate() {
+            *s = ((i * 37 + 11) % 256) as u16;
+        }
+        let got = upsample_chroma_420(&src, w2, h2, w2, w2 * 2, h2 * 2, 0);
+        let want = reference_420(&src, w2, h2, 0);
+        assert_eq!(got, want, "production 4:2:0 kernel diverged from reference");
+    }
 }

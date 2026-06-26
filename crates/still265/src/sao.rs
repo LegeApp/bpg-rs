@@ -17,7 +17,7 @@ use bpg_bitstream::BitWriter;
 use bpg_hevc_decode::hevc::sao::SaoMap;
 
 use crate::cabac::CabacEncoder;
-use crate::contexts::{ctx, Contexts};
+use crate::contexts::{Contexts, ctx};
 
 /// Edge-offset neighbour direction pairs `(dx0, dy0, dx1, dy1)` for each
 /// `eo_class`, duplicated from the private `EO_OFFSETS` table in
@@ -199,6 +199,7 @@ fn encode_sao_type_idx(
 /// documented in the module docs (`sao_type_idx[1] == sao_type_idx[2]`,
 /// `sao_eo_class[1] == sao_eo_class[2]`, types limited to 0/1/2).
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 pub fn write_sao(
     enc: &mut CabacEncoder,
     w: &mut BitWriter,
@@ -206,6 +207,13 @@ pub fn write_sao(
     sao_map: &SaoMap,
     x_ctb: u32,
     y_ctb: u32,
+    // Whether the left/above CTB is a legal merge source: it must exist *and*
+    // lie in the same tile (and slice) as the current CTB. The decoder only
+    // reads `sao_merge_left_flag`/`sao_merge_up_flag` when this holds (H.265
+    // 7.3.8.3); emitting the flag at a tile/slice boundary the decoder treats
+    // as unavailable desyncs CABAC for the rest of that substream.
+    left_merge_avail: bool,
+    up_merge_avail: bool,
     slice_sao_luma: bool,
     slice_sao_chroma: bool,
     bit_depth: u8,
@@ -214,14 +222,14 @@ pub fn write_sao(
 
     // sao_merge_left_flag / sao_merge_up_flag. Merge is legal when the final
     // parameters are identical to the neighbour; no component syntax follows.
-    if x_ctb > 0 {
+    if left_merge_avail {
         let merge_left = sao_map.get(x_ctb - 1, y_ctb) == info;
         enc.encode_bin(w, merge_left as u8, ctxs.get(ctx::SAO_MERGE_FLAG));
         if merge_left {
             return;
         }
     }
-    if y_ctb > 0 {
+    if up_merge_avail {
         let merge_up = sao_map.get(x_ctb, y_ctb - 1) == info;
         enc.encode_bin(w, merge_up as u8, ctxs.get(ctx::SAO_MERGE_FLAG));
         if merge_up {

@@ -64,7 +64,7 @@ fn get_inv_angle(mode: u8) -> i32 {
     }
 }
 
-/// Perform intra prediction for a block
+/// Perform intra prediction for a block, writing the result into `frame`.
 pub fn predict_intra(
     frame: &mut DecodedFrame,
     x: u32,
@@ -74,7 +74,7 @@ pub fn predict_intra(
     c_idx: u8, // 0=Y, 1=Cb, 2=Cr
     strong_intra_smoothing_enabled: bool,
 ) {
-    let (border, border_center, size, bit_depth) = collect_prediction_border(
+    predict_intra_with_reader(
         frame,
         x,
         y,
@@ -82,6 +82,35 @@ pub fn predict_intra(
         mode,
         c_idx,
         strong_intra_smoothing_enabled,
+        |_, _, _| None,
+    );
+}
+
+/// Like [`predict_intra`] but lets the caller override reference-border reads.
+/// Returning `Some(UNINIT_SAMPLE)` forces a reference sample unavailable — used
+/// for tile boundaries (cross-tile reference samples are not available).
+#[allow(clippy::too_many_arguments)]
+pub fn predict_intra_with_reader<F>(
+    frame: &mut DecodedFrame,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    mode: IntraPredMode,
+    c_idx: u8,
+    strong_intra_smoothing_enabled: bool,
+    mut sample_reader: F,
+) where
+    F: FnMut(u8, u32, u32) -> Option<u16>,
+{
+    let (border, border_center, size, bit_depth) = collect_prediction_border_with_reader(
+        frame,
+        x,
+        y,
+        log2_size,
+        mode,
+        c_idx,
+        strong_intra_smoothing_enabled,
+        &mut sample_reader,
     );
     // Resolve plane once to avoid per-pixel match on c_idx
     let (plane, stride) = frame.plane_mut(c_idx);
@@ -180,49 +209,6 @@ pub fn predict_intra_into_with_reader<F>(
     );
 }
 
-fn collect_prediction_border(
-    frame: &DecodedFrame,
-    x: u32,
-    y: u32,
-    log2_size: u8,
-    mode: IntraPredMode,
-    c_idx: u8,
-    strong_intra_smoothing_enabled: bool,
-) -> ([i32; 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1], usize, u32, u8) {
-    let size = 1u32 << log2_size;
-    let bit_depth = frame.bit_depth;
-    let chroma_format = frame.chroma_format;
-
-    let mut border = [0i32; 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1];
-    let border_center = 2 * MAX_INTRA_PRED_BLOCK_SIZE;
-    fill_border_samples_with_reader(
-        frame,
-        x,
-        y,
-        size,
-        c_idx,
-        &mut border,
-        border_center,
-        &mut |_, _, _| None,
-    );
-
-    // Reference sample filtering (H.265 8.4.4.2.3)
-    // Only applied for luma, or for chroma in 4:4:4 format
-    if c_idx == 0 || chroma_format == 3 {
-        intra_prediction_sample_filtering(
-            &mut border,
-            border_center,
-            size as usize,
-            c_idx,
-            mode.as_u8(),
-            strong_intra_smoothing_enabled,
-            bit_depth as usize,
-        );
-    }
-
-    (border, border_center, size, bit_depth)
-}
-
 fn collect_prediction_border_with_reader<F>(
     frame: &DecodedFrame,
     x: u32,
@@ -293,6 +279,57 @@ pub fn build_reference_borders(
 
     let mut unfiltered = [0i32; INTRA_BORDER_LEN];
     fill_border_samples(frame, x, y, size, c_idx, &mut unfiltered, center);
+
+    let mut filtered = unfiltered;
+    if (c_idx == 0 || chroma_format == 3) && size > 4 {
+        apply_reference_filter(
+            &mut filtered,
+            center,
+            size as usize,
+            c_idx,
+            strong_intra_smoothing_enabled,
+            bit_depth as usize,
+        );
+    }
+
+    (unfiltered, filtered, center, bit_depth)
+}
+
+/// Overlay-aware variant of [`build_reference_borders`]: identical output, but
+/// reference samples are read through `sample_reader` first (returning `None`
+/// falls back to the committed frame, `Some(UNINIT_SAMPLE)` forces the
+/// unavailable-edge path). This lets the encoder build the batch-predict borders
+/// once from its CTU-local recon overlay, matching what repeated
+/// [`predict_intra_into_with_reader`] calls would have seen per mode.
+#[allow(clippy::type_complexity)]
+pub fn build_reference_borders_with_reader<F>(
+    frame: &DecodedFrame,
+    x: u32,
+    y: u32,
+    log2_size: u8,
+    c_idx: u8,
+    strong_intra_smoothing_enabled: bool,
+    mut sample_reader: F,
+) -> ([i32; INTRA_BORDER_LEN], [i32; INTRA_BORDER_LEN], usize, u8)
+where
+    F: FnMut(u8, u32, u32) -> Option<u16>,
+{
+    let size = 1u32 << log2_size;
+    let bit_depth = frame.bit_depth;
+    let chroma_format = frame.chroma_format;
+    let center = INTRA_BORDER_CENTER;
+
+    let mut unfiltered = [0i32; INTRA_BORDER_LEN];
+    fill_border_samples_with_reader(
+        frame,
+        x,
+        y,
+        size,
+        c_idx,
+        &mut unfiltered,
+        center,
+        &mut sample_reader,
+    );
 
     let mut filtered = unfiltered;
     if (c_idx == 0 || chroma_format == 3) && size > 4 {
