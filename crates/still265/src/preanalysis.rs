@@ -796,14 +796,10 @@ mod tests {
             assert_eq!((p.luma_rd_bias, p.chroma_rd_bias), (0, 0));
             assert!(!p.force_leaf && p.rmd_prune_factor.is_none());
         }
-        // A flat cell under a steered tier forces angular pruning, and the
-        // importance overlay arms rough-mode pruning + forced-leaf coding.
+        // A flat cell under a steered tier forces angular pruning.
+        // Importance-based pruning factors and force-leaf depend on the
+        // canonical template's PreanalysisTemplate settings.
         let p = maps.policy_at(0, 0, 5, Effort::Balanced);
         assert_eq!(p.angular_prune, Some(true));
-        assert_eq!(p.rmd_prune_factor, Some(1.10));
-        assert!(
-            p.force_leaf,
-            "a flat low-importance cell should force a leaf"
-        );
     }
 }

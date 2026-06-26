@@ -90,6 +90,13 @@ impl TtPlan {
         }
     }
 
+    pub(super) fn cbf_luma(&self) -> bool {
+        match self {
+            TtPlan::Split { kids, .. } => kids.iter().any(TtPlan::cbf_luma),
+            TtPlan::Leaf(l) => l.luma.cbf,
+        }
+    }
+
     pub(super) fn cbf_cr1(&self) -> bool {
         match self {
             TtPlan::Split { cbf_cr1, .. } => *cbf_cr1,

@@ -118,6 +118,28 @@ where
         self.workspace
             .ledger
             .merge_wall_ns_into(&mut state.stats.stillsearch_ledger_ns);
+        state.stats.substage_predict_ns = state
+            .stats
+            .substage_predict_ns
+            .saturating_add(self.workspace.substage.predict_ns);
+        state.stats.substage_forward_xform_ns = state
+            .stats
+            .substage_forward_xform_ns
+            .saturating_add(self.workspace.substage.forward_xform_ns);
+        state.stats.substage_quant_ns = state
+            .stats
+            .substage_quant_ns
+            .saturating_add(self.workspace.substage.quant_ns);
+        state.stats.substage_recon_dist_ns = state
+            .stats
+            .substage_recon_dist_ns
+            .saturating_add(self.workspace.substage.recon_dist_ns);
+        state.stats.substage_residual_price_ns = state
+            .stats
+            .substage_residual_price_ns
+            .saturating_add(self.workspace.substage.residual_price_ns);
+        state.stats.substage_calls += self.workspace.substage.calls;
+        state.stats.tu_split_early_terminations += self.workspace.tu_split_early_terminations;
         cu
     }
 }
@@ -190,8 +212,6 @@ where
         tmp_u16.resize(n, 0);
         self.predict_into(state, x0, y0, log2_size, c_idx, mode, tmp_u16);
         debug_assert!(dst.len() >= n);
-        for i in 0..n {
-            dst[i] = tmp_u16[i].min(u8::MAX as u16) as u8;
-        }
+        crate::primitives::narrow_u16_to_u8(tmp_u16, dst, n);
     }
 }

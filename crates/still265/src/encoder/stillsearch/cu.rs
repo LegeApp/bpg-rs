@@ -2,6 +2,7 @@
 
 use crate::cabac::CabacEstimator;
 use crate::contexts::ctx;
+use crate::effort::{CuEarlyTerminateRule, SplitSearch};
 use crate::encoder::Encoder;
 use crate::plan::DecisionConfidence;
 
@@ -46,6 +47,52 @@ where
         let mark0 = self.overlay.mark();
         let (leaf_plan, leaf_cost) = self.decide_cu_leaf(state, x0, y0, log2_cb_size, ct_depth);
         let leaf_saved = self.overlay.detach_from(mark0);
+
+        // CU early termination: skip split evaluation when the leaf is
+        // good enough.  Evidence includes luma residual presence, source
+        // activity, and the effort template's aggressiveness.
+        let cu_policy = &state.effort_template.cu;
+        let leaf_has_residual = match &leaf_plan {
+            CuPlan::Leaf(l) => l.tt.cbf_luma(),
+            _ => true,
+        };
+
+        let should_skip_split = match cu_policy.early_terminate {
+            CuEarlyTerminateRule::Disabled => false,
+            CuEarlyTerminateRule::Fastest => true,
+            CuEarlyTerminateRule::Fast => {
+                // Zero-residual leaf → always accept.
+                if !leaf_has_residual {
+                    true
+                } else if cu_policy.split_search == SplitSearch::PreferLeaf {
+                    // PreferLeaf + some residual → accept if source is smooth.
+                    let activity = self.source_activity(state, x0, y0, log2_cb_size);
+                    activity < 8.0
+                } else {
+                    false
+                }
+            }
+            CuEarlyTerminateRule::Balanced => {
+                if !leaf_has_residual {
+                    true
+                } else if cu_policy.split_search == SplitSearch::PreferLeaf {
+                    let activity = self.source_activity(state, x0, y0, log2_cb_size);
+                    activity < 4.0
+                } else {
+                    false
+                }
+            }
+        };
+
+        if should_skip_split {
+            self.overlay.reattach(leaf_saved);
+            if let CuPlan::Leaf(ref leaf) = leaf_plan {
+                state.store_mode(x0, y0, log2_cb_size, leaf.luma_mode);
+                state.set_ct_depth(x0, y0, log2_cb_size, ct_depth);
+            }
+            return (leaf_plan, leaf_cost);
+        }
+
         let (split_plan, split_cost) = self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
 
         let lambda = rd_lambda(state.cur_qp_y);
@@ -70,8 +117,50 @@ where
         }
     }
 
+    /// Rough source activity: sum of absolute differences from the mean
+    /// for the luma block, normalized per pixel.  Low values indicate
+    /// smooth regions where leaf-only search is likely sufficient.
+    fn source_activity(&self, state: &Encoder<'_>, x0: u32, y0: u32, log2_cb_size: u8) -> f64 {
+        let size = 1usize << log2_cb_size;
+        let n = size * size;
+        if state.bit_depth == 8 {
+            let mut buf = vec![0u8; n];
+            self.source.sample_block_u8(0, x0, y0, size, &mut buf);
+            let mean = buf.iter().map(|&s| s as u64).sum::<u64>() / n as u64;
+            let sad = buf
+                .iter()
+                .map(|&s| (s as i64 - mean as i64).unsigned_abs())
+                .sum::<u64>();
+            sad as f64 / n as f64
+        } else {
+            let mut sad: u64 = 0;
+            let mut sum: u64 = 0;
+            for y in 0..size {
+                for x in 0..size {
+                    let v = self.source.sample(0, x0 + x as u32, y0 + y as u32) as u64;
+                    sum += v;
+                }
+            }
+            let mean = sum / n as u64;
+            for y in 0..size {
+                for x in 0..size {
+                    let v = self.source.sample(0, x0 + x as u32, y0 + y as u32) as u64;
+                    sad += (v as i64 - mean as i64).unsigned_abs();
+                }
+            }
+            sad as f64 / n as f64
+        }
+    }
+
     fn part_nxn_legal(&self, state: &Encoder<'_>, log2_cb_size: u8) -> bool {
-        state.part_nxn_enabled && log2_cb_size == 3 && matches!(state.cat, 0 | 1 | 2 | 3)
+        let nxn_policy = &state.effort_template.nxn;
+        if !nxn_policy.enabled {
+            return false;
+        }
+        if !state.part_nxn_enabled || log2_cb_size != 3 || !matches!(state.cat, 0 | 1 | 2 | 3) {
+            return false;
+        }
+        true
     }
 
     fn save_8x8_modes(&self, state: &Encoder<'_>, x0: u32, y0: u32) -> [u8; 4] {
@@ -111,8 +200,12 @@ where
 
         // Rough SATD below the env threshold means the block is too smooth for
         // PartNxN to improve over the 2Nx2N leaf — skip it.
-        let nxn_threshold = super::env::nxn_skip_satd_threshold();
-        if nxn_threshold > 0.0 && self.workspace.last_8x8_rough_satd < nxn_threshold {
+        let nxn_policy = &state.effort_template.nxn;
+        let nxn_threshold = super::env::nxn_skip_satd_threshold(nxn_policy.rough_satd_threshold);
+        if nxn_policy.rough_gate_enabled
+            && nxn_threshold > 0.0
+            && self.workspace.last_8x8_rough_satd < nxn_threshold
+        {
             state.stats.partnxn_skips += 1;
             state.stats.partnxn_losses += 1;
             self.overlay.truncate(mark0);
@@ -123,7 +216,10 @@ where
             }
             let part_leaf = part_mode_bits(&self.workspace.price_base, false);
             let chroma_bits = chroma_dm_bits(&self.workspace.price_base, state.cat);
-            return (leaf_plan, leaf_cost + lambda * (part_leaf + chroma_bits) as f64 / scale);
+            return (
+                leaf_plan,
+                leaf_cost + lambda * (part_leaf + chroma_bits) as f64 / scale,
+            );
         }
 
         self.restore_8x8_modes(state, x0, y0, incoming_modes);

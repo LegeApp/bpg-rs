@@ -180,6 +180,14 @@ pub struct EncodeStats {
     pub policy_angular_forced: u64,
     pub policy_angular_guarded: u64,
     pub policy_early_term_suppressed: u64,
+    /// Exact-pass `tt_cost` sum × 1000 (fixed-point) and candidate count,
+    /// tracked per mode category.  Reset each frame.  Printed via `--debug-stats`.
+    pub luma_exact_planar_tt_cost_x1000: u64,
+    pub luma_exact_planar_count: u64,
+    pub luma_exact_dc_tt_cost_x1000: u64,
+    pub luma_exact_dc_count: u64,
+    pub luma_exact_angular_tt_cost_x1000: u64,
+    pub luma_exact_angular_count: u64,
     pub region_class_counts: [u64; crate::preanalysis::NUM_CLASSES],
     pub luma_winner_rank_counts: [u64; 5],
     pub chroma_winner_rank_counts: [u64; 6],
@@ -192,11 +200,19 @@ pub struct EncodeStats {
     /// Bucket order is internal to StillSearch for now; legacy counters above
     /// remain compatibility-only and new search work should not write rdo2-era
     /// fields.
-    pub stillsearch_ledger: [u64; 15],
+    pub stillsearch_ledger: [u64; 16],
     /// Optional StillSearch per-bucket wall-clock nanoseconds. Populated only
     /// when `BPG_STILLSEARCH_PROFILE=1`; otherwise all buckets remain zero.
     /// Bucket order matches [`Self::stillsearch_ledger`].
-    pub stillsearch_ledger_ns: [u64; 15],
+    pub stillsearch_ledger_ns: [u64; 16],
+    /// Per-CTU-substage accumulators for `eval_component_8` breakdown.
+    /// Populated only when `BPG_STILLSEARCH_PROFILE=1`.
+    pub substage_predict_ns: u64,
+    pub substage_forward_xform_ns: u64,
+    pub substage_quant_ns: u64,
+    pub substage_recon_dist_ns: u64,
+    pub substage_residual_price_ns: u64,
+    pub substage_calls: u64,
 }
 
 impl EncodeStats {
@@ -222,6 +238,28 @@ impl EncodeStats {
         {
             *dst = dst.saturating_add(*src);
         }
+        self.luma_exact_planar_tt_cost_x1000 += other.luma_exact_planar_tt_cost_x1000;
+        self.luma_exact_planar_count += other.luma_exact_planar_count;
+        self.luma_exact_dc_tt_cost_x1000 += other.luma_exact_dc_tt_cost_x1000;
+        self.luma_exact_dc_count += other.luma_exact_dc_count;
+        self.luma_exact_angular_tt_cost_x1000 += other.luma_exact_angular_tt_cost_x1000;
+        self.luma_exact_angular_count += other.luma_exact_angular_count;
+        self.substage_predict_ns = self
+            .substage_predict_ns
+            .saturating_add(other.substage_predict_ns);
+        self.substage_forward_xform_ns = self
+            .substage_forward_xform_ns
+            .saturating_add(other.substage_forward_xform_ns);
+        self.substage_quant_ns = self
+            .substage_quant_ns
+            .saturating_add(other.substage_quant_ns);
+        self.substage_recon_dist_ns = self
+            .substage_recon_dist_ns
+            .saturating_add(other.substage_recon_dist_ns);
+        self.substage_residual_price_ns = self
+            .substage_residual_price_ns
+            .saturating_add(other.substage_residual_price_ns);
+        self.substage_calls += other.substage_calls;
     }
 }
 
@@ -235,6 +273,110 @@ impl fmt::Display for EncodeStats {
         writeln!(f, "  phase_write_us: {}", self.phase_write_us)?;
         writeln!(f, "  phase_deblock_us: {}", self.phase_deblock_us)?;
         writeln!(f, "  phase_sao_decide_us: {}", self.phase_sao_decide_us)?;
-        writeln!(f, "  phase_sao_apply_us: {}", self.phase_sao_apply_us)
+        writeln!(f, "  phase_sao_apply_us: {}", self.phase_sao_apply_us)?;
+        fn avg(n: u64, sum: u64) -> String {
+            if n == 0 {
+                "N/A".into()
+            } else {
+                format!("{:.3}", sum as f64 / n as f64 / 1000.0)
+            }
+        }
+        writeln!(
+            f,
+            "  luma_exact_planar: count={} avg_tt_cost={}",
+            self.luma_exact_planar_count,
+            avg(
+                self.luma_exact_planar_count,
+                self.luma_exact_planar_tt_cost_x1000
+            )
+        )?;
+        writeln!(
+            f,
+            "  luma_exact_dc:     count={} avg_tt_cost={}",
+            self.luma_exact_dc_count,
+            avg(self.luma_exact_dc_count, self.luma_exact_dc_tt_cost_x1000)
+        )?;
+        writeln!(
+            f,
+            "  luma_exact_angular:count={} avg_tt_cost={}",
+            self.luma_exact_angular_count,
+            avg(
+                self.luma_exact_angular_count,
+                self.luma_exact_angular_tt_cost_x1000
+            )
+        )?;
+        // Per-bucket wall times (only populated when BPG_STILLSEARCH_PROFILE=1).
+        let total_ns: u64 = self.stillsearch_ledger_ns.iter().sum();
+        if total_ns > 0 {
+            const BUCKETS: [&str; 16] = [
+                "RoughLuma",
+                "LumaCheap",
+                "LumaExact",
+                "TuLeaf",
+                "TuSplit",
+                "NxnRough",
+                "NxnBatch",
+                "ChromaRough",
+                "ChromaTrial",
+                "Rdoq",
+                "RdoqTrial",
+                "ResidualPrice",
+                "FinalCommit",
+                "Writer",
+                "Deblock",
+                "Sao",
+            ];
+            writeln!(
+                f,
+                "  stillsearch_profile (total_wall={:.3}s):",
+                total_ns as f64 / 1e9
+            )?;
+            for (name, (&calls, &ns)) in BUCKETS.iter().zip(
+                self.stillsearch_ledger
+                    .iter()
+                    .zip(self.stillsearch_ledger_ns.iter()),
+            ) {
+                if ns > 0 || calls > 0 {
+                    writeln!(
+                        f,
+                        "    {:14} calls={:8}  wall={:7.3}s  ({:5.1}%)",
+                        name,
+                        calls,
+                        ns as f64 / 1e9,
+                        ns as f64 / total_ns as f64 * 100.0,
+                    )?;
+                }
+            }
+            // Substage breakdown (eval_component_8 internals).
+            let sub_ns = self.substage_predict_ns
+                + self.substage_forward_xform_ns
+                + self.substage_quant_ns
+                + self.substage_recon_dist_ns
+                + self.substage_residual_price_ns;
+            if self.substage_calls > 0 && sub_ns > 0 {
+                writeln!(f, "  substage_profile ({} calls):", self.substage_calls)?;
+                for (name, ns) in [
+                    ("Predict", self.substage_predict_ns),
+                    ("ForwardXform", self.substage_forward_xform_ns),
+                    ("Quant+SDH", self.substage_quant_ns),
+                    ("Recon+Dist", self.substage_recon_dist_ns),
+                    ("ResidualPrice", self.substage_residual_price_ns),
+                ] {
+                    writeln!(
+                        f,
+                        "    {:14}  wall={:7.3}s  ({:5.1}%)",
+                        name,
+                        ns as f64 / 1e9,
+                        ns as f64 / sub_ns as f64 * 100.0,
+                    )?;
+                }
+            }
+        }
+        writeln!(
+            f,
+            "  tu_split_early_terminations: {}",
+            self.tu_split_early_terminations
+        )?;
+        Ok(())
     }
 }

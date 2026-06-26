@@ -1,26 +1,50 @@
-//! Rust-local primitive kernels used by the still encoder.
+//! Primitive kernel dispatch table for the still265 encoder.
 //!
-//! The scalar implementations in this module are the **canonical reference**:
-//! every optimized (SIMD/ASM) kernel must produce byte-identical output to
-//! them. Hot kernels are dispatched through [`PRIMITIVES`], a function-pointer
-//! table selected once at startup from the runtime CPU features and the
-//! `BPG_PRIMITIVES` environment variable (`scalar`/`simd`/`asm`/`auto`).
+//! The encoder calls thin public wrappers (`satd_u8`, `ssd_u16`, …) which
+//! dispatch through [`PRIMITIVES`], a function-pointer table selected once at
+//! startup from the runtime CPU features and the `BPG_PRIMITIVES` environment
+//! variable (`scalar`/`simd`/`asm`/`auto`).
 //!
-//! Dispatched kernels: 8-bit SATD (SSE2 on `x86_64`), plus 10/12-bit SATD, SSD,
-//! residual subtraction, and the forward 1-D DCT (portable `wide`-SIMD, behind
-//! the optional `wide-simd` feature). See `docs/remaining-gaps.md` for the
-//! not-yet-vectorized kernels.
+//! ## Backend stack (best first, each overwrites table entries from the one before)
+//!
+//! 1. `scalar` — portable canonical Rust (always available; `BPG_PRIMITIVES=scalar` stops here)
+//! 2. `wide`   — portable SIMD via the `wide` crate (no ISA-specific intrinsics)
+//! 3. `x86::sse2`  — x86_64 SSE2 intrinsics (unconditional on `x86_64`)
+//! 4. `x86::avx2`  — x86_64 AVX2 intrinsics (runtime-detected)
+//!
+//! All optimised backends are **bit-identical** to their scalar references,
+//! enforced by tests in each sub-module.
 
 use bpg_hevc_decode::hevc::transform as dec_transform;
 use std::sync::LazyLock;
 
-pub mod intra_angs;
+pub mod intra;
+pub mod scalar;
+pub mod wide;
 
 #[cfg(target_arch = "x86_64")]
-mod simd_x86;
+mod x86;
 
-#[cfg(feature = "wide-simd")]
-mod wide_simd;
+// ─── Backward-compatibility re-exports ────────────────────────────────────
+
+/// Keep the old module path `crate::primitives::intra_angs` working.
+pub use intra::angs as intra_angs;
+
+// Re-export scalar functions so sub-module tests can reach them via
+// `super::super::*` (e.g. `wide.rs` tests). Also re-exported for use by
+// the public caller of `ssd_u8`.
+#[allow(unused_imports)]
+pub use scalar::{
+    abs_sum_i16_scalar, add_clip_u8_scalar, add_clip_u16_scalar, count_nonzero_scalar,
+    dequantize_scalar, forward_dct_1d, fwd_dct4_scalar, fwd_dct8_scalar, fwd_dct16_scalar,
+    fwd_dct32_scalar, fwd_dst4_scalar, last_nonzero_scalar, narrow_u16_to_u8_scalar,
+    quantize_scalar, sao_stats_bo_scalar, sao_stats_e0_scalar, sao_stats_e1_scalar,
+    sao_stats_e2_scalar, sao_stats_e3_scalar, satd_u8_scalar, satd_u16_scalar, ssd_u8_scalar,
+    ssd_u16_scalar, sub_residual_scalar, sub_residual_u8_scalar,
+};
+
+// ─── DCT matrix infrastructure ────────────────────────────────────────────
+// Shared by scalar.rs and the dispatch functions below.
 
 static DCT4: LazyLock<Vec<i32>> = LazyLock::new(|| build_dct_matrix(4));
 static DCT8: LazyLock<Vec<i32>> = LazyLock::new(|| build_dct_matrix(8));
@@ -28,7 +52,7 @@ static DCT16: LazyLock<Vec<i32>> = LazyLock::new(|| build_dct_matrix(16));
 static DCT32: LazyLock<Vec<i32>> = LazyLock::new(|| build_dct_matrix(32));
 
 #[inline]
-fn round_shift(value: i32, shift: i32) -> i16 {
+pub(crate) fn round_shift(value: i32, shift: i32) -> i16 {
     let add = 1i32 << (shift - 1);
     ((value + add) >> shift).clamp(-32768, 32767) as i16
 }
@@ -60,12 +84,6 @@ fn hevc_cos(i: usize) -> i32 {
     }
 }
 
-/// The exact HEVC `n`×`n` DCT-II matrix (`matrix[k*n + col]` = basis `k` at sample
-/// `col`), sub-sampled from the 32-point master table by the standard cosine index
-/// `((2·col+1)·k·(32/n)) mod 128`. Reproduces the spec matrices the decoder's
-/// inverse uses (e.g. 4×4 row 1 = `[83, 36, -36, -83]`); replaces an earlier
-/// analytic `round(64·√2·cos)` build that did not match the spec — see
-/// [`HEVC_DCT_BASE`].
 fn build_dct_matrix(n: usize) -> Vec<i32> {
     let step = 32 / n;
     let mut matrix = vec![0i32; n * n];
@@ -77,7 +95,7 @@ fn build_dct_matrix(n: usize) -> Vec<i32> {
     matrix
 }
 
-fn dct_matrix(n: usize) -> &'static [i32] {
+pub(crate) fn dct_matrix(n: usize) -> &'static [i32] {
     match n {
         4 => &DCT4,
         8 => &DCT8,
@@ -87,99 +105,7 @@ fn dct_matrix(n: usize) -> &'static [i32] {
     }
 }
 
-fn forward_dct_1d(src: &[i16], dst: &mut [i16], matrix: &[i32], n: usize, shift: i32) {
-    for (k, out) in dst.iter_mut().enumerate().take(n) {
-        let mut sum = 0i32;
-        for (i, &sample) in src.iter().enumerate().take(n) {
-            sum += matrix[k * n + i] * sample as i32;
-        }
-        *out = round_shift(sum, shift);
-    }
-}
-
-fn forward_dct_into(
-    residual: &[i16],
-    log2_size: u8,
-    bit_depth: u8,
-    out: &mut Vec<i16>,
-    tmp: &mut Vec<i16>,
-) {
-    let n = 1usize << log2_size;
-    assert_eq!(residual.len(), n * n);
-
-    let shift1 = log2_size as i32 - 1 + bit_depth as i32 - 8;
-    let shift2 = log2_size as i32 + 6;
-    tmp.resize(n * n, 0);
-    out.resize(n * n, 0);
-    let matrix = dct_matrix(n);
-
-    // Dispatched 1-D transform kernel (scalar or `wide`-SIMD); see [`PRIMITIVES`].
-    let dct1d = PRIMITIVES.forward_dct_1d;
-
-    let mut line = [0i16; 32];
-    let mut transformed = [0i16; 32];
-
-    for row in 0..n {
-        line[..n].copy_from_slice(&residual[row * n..row * n + n]);
-        dct1d(&line[..n], &mut transformed[..n], matrix, n, shift1);
-        for k in 0..n {
-            tmp[k * n + row] = transformed[k];
-        }
-    }
-
-    for row in 0..n {
-        line[..n].copy_from_slice(&tmp[row * n..row * n + n]);
-        dct1d(&line[..n], &mut transformed[..n], matrix, n, shift2);
-        for k in 0..n {
-            out[k * n + row] = transformed[k];
-        }
-    }
-}
-
-fn forward_dct(residual: &[i16], log2_size: u8, bit_depth: u8) -> Vec<i16> {
-    let mut out = Vec::new();
-    let mut tmp = Vec::new();
-    forward_dct_into(residual, log2_size, bit_depth, &mut out, &mut tmp);
-    out
-}
-
-fn forward_dst4_into(residual: &[i16], bit_depth: u8, out: &mut Vec<i16>) {
-    assert_eq!(residual.len(), 16);
-
-    let shift1 = 1 + bit_depth as i32 - 8;
-    let shift2 = 8;
-    let mut tmp = [0i16; 16];
-    let mut local = [0i16; 16];
-
-    for row in 0..4 {
-        forward_dst4_1d(&residual[row * 4..row * 4 + 4], &mut tmp[row..], 4, shift1);
-    }
-
-    for row in 0..4 {
-        forward_dst4_1d(&tmp[row * 4..row * 4 + 4], &mut local[row..], 4, shift2);
-    }
-
-    out.clear();
-    out.extend_from_slice(&local);
-}
-
-fn forward_dst4(residual: &[i16], bit_depth: u8) -> Vec<i16> {
-    let mut out = Vec::with_capacity(16);
-    forward_dst4_into(residual, bit_depth, &mut out);
-    out
-}
-
-fn forward_dst4_1d(src: &[i16], dst: &mut [i16], line: usize, shift: i32) {
-    let c0 = src[0] as i32 + src[3] as i32;
-    let c1 = src[1] as i32 + src[3] as i32;
-    let c2 = src[0] as i32 - src[1] as i32;
-    let c3 = 74 * src[2] as i32;
-
-    dst[0] = round_shift(29 * c0 + 55 * c1 + c3, shift);
-    dst[line] = round_shift(74 * (src[0] as i32 + src[1] as i32 - src[3] as i32), shift);
-    dst[2 * line] = round_shift(29 * c2 + 55 * c0 - c3, shift);
-    dst[3 * line] = round_shift(55 * c2 - 29 * c1 + c3, shift);
-}
+// ─── High-level transform functions ───────────────────────────────────────
 
 pub fn forward_transform(
     residual: &[i16],
@@ -187,11 +113,18 @@ pub fn forward_transform(
     is_intra_4x4_luma: bool,
     bit_depth: u8,
 ) -> Vec<i16> {
+    let n = 1usize << log2_size;
+    let mut out = vec![0i16; n * n];
+    let p = &*PRIMITIVES;
     match (log2_size, is_intra_4x4_luma) {
-        (2, true) => forward_dst4(residual, bit_depth),
-        (2..=5, _) => forward_dct(residual, log2_size, bit_depth),
+        (2, true) => (p.transform.fwd_dst4)(residual, &mut out, bit_depth),
+        (2, false) => (p.transform.fwd_dct4)(residual, &mut out, bit_depth),
+        (3, _) => (p.transform.fwd_dct8)(residual, &mut out, bit_depth),
+        (4, _) => (p.transform.fwd_dct16)(residual, &mut out, bit_depth),
+        (5, _) => (p.transform.fwd_dct32)(residual, &mut out, bit_depth),
         _ => panic!("unsupported transform size log2={log2_size}"),
     }
+    out
 }
 
 pub fn forward_transform_into(
@@ -200,11 +133,17 @@ pub fn forward_transform_into(
     is_intra_4x4_luma: bool,
     bit_depth: u8,
     out: &mut Vec<i16>,
-    tmp: &mut Vec<i16>,
+    _tmp: &mut Vec<i16>,
 ) {
+    let n = 1usize << log2_size;
+    out.resize(n * n, 0);
+    let p = &*PRIMITIVES;
     match (log2_size, is_intra_4x4_luma) {
-        (2, true) => forward_dst4_into(residual, bit_depth, out),
-        (2..=5, _) => forward_dct_into(residual, log2_size, bit_depth, out, tmp),
+        (2, true) => (p.transform.fwd_dst4)(residual, out, bit_depth),
+        (2, false) => (p.transform.fwd_dct4)(residual, out, bit_depth),
+        (3, _) => (p.transform.fwd_dct8)(residual, out, bit_depth),
+        (4, _) => (p.transform.fwd_dct16)(residual, out, bit_depth),
+        (5, _) => (p.transform.fwd_dct32)(residual, out, bit_depth),
         _ => panic!("unsupported transform size log2={log2_size}"),
     }
 }
@@ -234,103 +173,58 @@ pub fn inverse_transform_into(
     dec_transform::inverse_transform(coeffs, out, n, bit_depth, is_intra_4x4_luma);
 }
 
-fn hadamard4_satd(diff: &[i32; 16]) -> u32 {
-    let mut tmp = [0i32; 16];
-    for y in 0..4 {
-        let a0 = diff[y * 4] + diff[y * 4 + 3];
-        let a1 = diff[y * 4 + 1] + diff[y * 4 + 2];
-        let a2 = diff[y * 4 + 1] - diff[y * 4 + 2];
-        let a3 = diff[y * 4] - diff[y * 4 + 3];
-        tmp[y * 4] = a0 + a1;
-        tmp[y * 4 + 1] = a3 + a2;
-        tmp[y * 4 + 2] = a0 - a1;
-        tmp[y * 4 + 3] = a3 - a2;
-    }
+// ─── Public kernel wrappers ────────────────────────────────────────────────
 
-    let mut sum = 0u32;
-    for x in 0..4 {
-        let a0 = tmp[x] + tmp[12 + x];
-        let a1 = tmp[4 + x] + tmp[8 + x];
-        let a2 = tmp[4 + x] - tmp[8 + x];
-        let a3 = tmp[x] - tmp[12 + x];
-        sum += (a0 + a1).unsigned_abs();
-        sum += (a3 + a2).unsigned_abs();
-        sum += (a0 - a1).unsigned_abs();
-        sum += (a3 - a2).unsigned_abs();
-    }
-
-    (sum + 1) >> 1
-}
-
-/// Sum of absolute Hadamard-transformed differences for an 8-bit block.
-///
-/// Dispatched through [`PRIMITIVES`] (SSE2 on `x86_64`, scalar elsewhere or
-/// when `BPG_PRIMITIVES=scalar`). All backends are byte-identical to
-/// [`satd_u8_scalar`].
+/// 8-bit SATD (Sum of Absolute Hadamard-Transformed Differences).
+/// Dispatched through [`PRIMITIVES`]; byte-identical to [`satd_u8_scalar`].
 pub fn satd_u8(a: &[u8], stride_a: usize, b: &[u8], stride_b: usize, size: usize) -> u32 {
-    (PRIMITIVES.satd_u8)(a, stride_a, b, stride_b, size)
+    (PRIMITIVES.pixel.satd_u8)(a, stride_a, b, stride_b, size)
 }
 
-/// Sum of absolute Hadamard-transformed differences for a 10/12-bit block.
-/// Dispatched through [`PRIMITIVES`] (portable `wide` SIMD under the
-/// `wide-simd` feature, else scalar); byte-identical to [`satd_u16_scalar`].
+/// 10/12-bit SATD. Dispatched through [`PRIMITIVES`]; byte-identical to [`satd_u16_scalar`].
 pub fn satd_u16(a: &[u16], stride_a: usize, b: &[u16], stride_b: usize, size: usize) -> u32 {
-    (PRIMITIVES.satd_u16)(a, stride_a, b, stride_b, size)
+    (PRIMITIVES.pixel.satd_u16)(a, stride_a, b, stride_b, size)
 }
 
-/// Canonical scalar 8-bit SATD. Reference for all optimized backends.
-pub fn satd_u8_scalar(a: &[u8], stride_a: usize, b: &[u8], stride_b: usize, size: usize) -> u32 {
-    satd_by(a, stride_a, b, stride_b, size, |v| v as i32)
-}
-
-/// Canonical scalar 10/12-bit SATD. Reference for all optimized backends.
-pub fn satd_u16_scalar(a: &[u16], stride_a: usize, b: &[u16], stride_b: usize, size: usize) -> u32 {
-    satd_by(a, stride_a, b, stride_b, size, |v| v as i32)
-}
-
-/// Sum of squared differences over an 8-bit `size`x`size` block. This is the
-/// scalar 8-bit hot-path counterpart to [`ssd_u16`]; SIMD dispatch can be added
-/// behind the same primitive table once the 8-bit path is fully settled.
+/// Sum of squared differences (8-bit). Dispatched; byte-identical to [`ssd_u8_scalar`].
 pub fn ssd_u8(a: &[u8], stride_a: usize, b: &[u8], stride_b: usize, size: usize) -> u64 {
-    debug_assert!(stride_a >= size && stride_b >= size);
-    let mut sse = 0u64;
-    for j in 0..size {
-        let ra = &a[j * stride_a..j * stride_a + size];
-        let rb = &b[j * stride_b..j * stride_b + size];
-        for (&x, &y) in ra.iter().zip(rb.iter()) {
-            let d = x as i32 - y as i32;
-            sse += (d * d) as u64;
-        }
-    }
-    sse
+    (PRIMITIVES.pixel.ssd_u8)(a, stride_a, b, stride_b, size)
 }
 
-/// Sum of squared differences over a `size`x`size` block (HEVC distortion).
-/// Dispatched through [`PRIMITIVES`]; byte-identical to [`ssd_u16_scalar`].
-/// Maps to x265's `pixel_ssd` (`ssd-a.asm`).
+/// Sum of squared differences (u16 path). Dispatched; byte-identical to [`ssd_u16_scalar`].
 pub fn ssd_u16(a: &[u16], stride_a: usize, b: &[u16], stride_b: usize, size: usize) -> u64 {
-    (PRIMITIVES.ssd_u16)(a, stride_a, b, stride_b, size)
+    (PRIMITIVES.pixel.ssd_u16)(a, stride_a, b, stride_b, size)
 }
 
-/// Canonical scalar SSD. Reference for all optimized backends.
-pub fn ssd_u16_scalar(a: &[u16], stride_a: usize, b: &[u16], stride_b: usize, size: usize) -> u64 {
-    debug_assert!(stride_a >= size && stride_b >= size);
-    let mut sse = 0u64;
-    for j in 0..size {
-        let ra = &a[j * stride_a..j * stride_a + size];
-        let rb = &b[j * stride_b..j * stride_b + size];
-        for (&x, &y) in ra.iter().zip(rb.iter()) {
-            let d = x as i64 - y as i64;
-            sse += (d * d) as u64;
-        }
-    }
-    sse
+/// 8-bit residual subtraction. Dispatched; byte-identical to [`sub_residual_u8_scalar`].
+pub fn sub_residual_u8(
+    src: &[u8],
+    src_stride: usize,
+    pred: &[u8],
+    pred_stride: usize,
+    out: &mut [i16],
+    size: usize,
+) {
+    (PRIMITIVES.pixel.sub_residual_u8)(src, src_stride, pred, pred_stride, out, size)
 }
 
-/// Residual generation: `out[j*size+i] = src[..] - pred[..]` for a `size`x`size`
-/// block, where `out` is contiguous (stride `size`). Dispatched through
-/// [`PRIMITIVES`]; byte-identical to [`sub_residual_scalar`]. Maps to x265's
-/// `pixel_sub_ps` / `getResidual*` (`pixel-util8.asm`).
+/// Add residual to 8-bit prediction and clip. Dispatched; byte-identical to [`add_clip_u8_scalar`].
+pub fn add_clip_u8(pred: &[u8], residual: &[i16], out: &mut [u8], n: usize) {
+    (PRIMITIVES.pixel.add_clip_u8)(pred, residual, out, n)
+}
+
+/// Add residual to u16 prediction and clip. Dispatched; byte-identical to [`add_clip_u16_scalar`].
+pub fn add_clip_u16(pred: &[u16], residual: &[i16], out: &mut [u16], n: usize, max: u16) {
+    (PRIMITIVES.pixel.add_clip_u16)(pred, residual, out, n, max)
+}
+
+/// Narrow u16 prediction to u8 (clip to [0,255]). Dispatched; byte-identical to [`narrow_u16_to_u8_scalar`].
+pub fn narrow_u16_to_u8(src: &[u16], dst: &mut [u8], n: usize) {
+    (PRIMITIVES.pixel.narrow_u16_to_u8)(src, dst, n)
+}
+
+/// Residual generation (u16 path). Dispatched; byte-identical to [`sub_residual_scalar`].
+#[allow(dead_code)]
 pub fn sub_residual(
     src: &[u16],
     src_stride: usize,
@@ -339,93 +233,91 @@ pub fn sub_residual(
     out: &mut [i16],
     size: usize,
 ) {
-    (PRIMITIVES.sub_residual)(src, src_stride, pred, pred_stride, out, size)
+    (PRIMITIVES.residual.sub_residual)(src, src_stride, pred, pred_stride, out, size)
 }
 
-/// Canonical scalar residual subtraction. Reference for all optimized backends.
-pub fn sub_residual_scalar(
+/// Inverse quantization in place. Dispatched; byte-identical to [`dequantize_scalar`].
+pub fn dequantize(levels: &mut [i16], combined: i32, shift: i32) {
+    (PRIMITIVES.quant.dequantize)(levels, combined, shift)
+}
+
+/// Forward quantization. Dispatched; byte-identical to [`quantize_scalar`].
+pub fn quantize(coeffs: &[i16], levels: &mut [i16], scale: i32, add: i32, qbits: i32) -> u32 {
+    (PRIMITIVES.quant.quantize)(coeffs, levels, scale, add, qbits)
+}
+
+/// SAO vertical EO stats (EO1). Dispatched.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub fn sao_stats_e1(
+    rec: &[u16],
+    rec_stride: usize,
     src: &[u16],
     src_stride: usize,
-    pred: &[u16],
-    pred_stride: usize,
-    out: &mut [i16],
-    size: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    sum: &mut [i64; 5],
+    count: &mut [u32; 5],
 ) {
-    debug_assert!(src_stride >= size && pred_stride >= size && out.len() >= size * size);
-    for j in 0..size {
-        let s = &src[j * src_stride..j * src_stride + size];
-        let p = &pred[j * pred_stride..j * pred_stride + size];
-        let o = &mut out[j * size..j * size + size];
-        for i in 0..size {
-            o[i] = s[i] as i16 - p[i] as i16;
-        }
-    }
+    (PRIMITIVES.sao.stats_e1)(rec, rec_stride, src, src_stride, x0, y0, w, h, sum, count)
 }
 
-/// Inverse quantization (H.265 8.6.3, flat scaling list) of a coefficient
-/// block in place: `level = clip((level * combined + add) >> shift)`, where
-/// `add = 1 << (shift-1)` for `shift > 0`. Dispatched through [`PRIMITIVES`];
-/// byte-identical to [`dequantize_scalar`]. Maps to x265's `dequant_normal`
-/// (`quant-a.asm`) — an RDO/reconstruction hot path (every TU trial + final).
-pub fn dequantize(levels: &mut [i16], combined: i32, shift: i32) {
-    (PRIMITIVES.dequantize)(levels, combined, shift)
+/// SAO 135° EO stats (EO2). Dispatched.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub fn sao_stats_e2(
+    rec: &[u16],
+    rec_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    sum: &mut [i64; 5],
+    count: &mut [u32; 5],
+) {
+    (PRIMITIVES.sao.stats_e2)(rec, rec_stride, src, src_stride, x0, y0, w, h, sum, count)
 }
 
-/// Forward quantization (H.265 8.6.2, flat scaling list) of a transformed
-/// coefficient block: `level = min(32767, (|coeff| * scale + add) >> qbits)`,
-/// re-signed to match `coeff`, written into `levels` (which the caller has
-/// already sized to `coeffs.len()` and zeroed). Returns the non-zero count.
-/// Dispatched through [`PRIMITIVES`]; byte-identical to [`quantize_scalar`].
-/// Hot path: every plain-quant trial in the staged rdo2 search.
-pub fn quantize(coeffs: &[i16], levels: &mut [i16], scale: i32, add: i32, qbits: i32) -> u32 {
-    (PRIMITIVES.quantize)(coeffs, levels, scale, add, qbits)
+/// SAO 45° EO stats (EO3). Dispatched.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub fn sao_stats_e3(
+    rec: &[u16],
+    rec_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    sum: &mut [i64; 5],
+    count: &mut [u32; 5],
+) {
+    (PRIMITIVES.sao.stats_e3)(rec, rec_stride, src, src_stride, x0, y0, w, h, sum, count)
 }
 
-/// Canonical scalar forward quantization. Reference for the SIMD backend; the
-/// `i64` intermediate matches the original `transform::quantize_into` exactly.
-pub fn quantize_scalar(
-    coeffs: &[i16],
-    levels: &mut [i16],
-    scale: i32,
-    add: i32,
-    qbits: i32,
-) -> u32 {
-    let mut nnz = 0u32;
-    for (i, &c) in coeffs.iter().enumerate() {
-        let level = ((c.unsigned_abs() as i64 * scale as i64 + add as i64) >> qbits) as i32;
-        let level = level.min(32767);
-        if level != 0 {
-            levels[i] = if c < 0 { -level } else { level } as i16;
-            nnz += 1;
-        }
-    }
-    nnz
+/// SAO Band Offset stats. Dispatched.
+#[allow(clippy::too_many_arguments, dead_code)]
+pub fn sao_stats_bo(
+    rec: &[u16],
+    rec_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    band_shift: u8,
+    sum: &mut [i64; 32],
+    count: &mut [u32; 32],
+) {
+    (PRIMITIVES.sao.stats_bo)(
+        rec, rec_stride, src, src_stride, x0, y0, w, h, band_shift, sum, count,
+    )
 }
 
-/// Canonical scalar inverse quantization. Reference for all optimized backends;
-/// kept bit-identical to `bpg-hevc-decode`'s decoder dequant.
-pub fn dequantize_scalar(levels: &mut [i16], combined: i32, shift: i32) {
-    if shift >= 0 {
-        let add = if shift > 0 { 1 << (shift - 1) } else { 0 };
-        for v in levels.iter_mut() {
-            let value = (*v as i32 * combined + add) >> shift;
-            *v = value.clamp(-32768, 32767) as i16;
-        }
-    } else {
-        let neg = -shift;
-        for v in levels.iter_mut() {
-            *v = ((*v as i32 * combined) << neg).clamp(-32768, 32767) as i16;
-        }
-    }
-}
-
-/// Sample-Adaptive-Offset horizontal edge-offset (`eo_class == 0`) statistics
-/// over an interior region whose every pixel has valid left/right neighbours
-/// and an unclamped co-located source sample. Accumulates `sum[edgeIdx] +=
-/// src - rec` and `count[edgeIdx] += 1` for `edgeIdx` in `0,1,3,4` (the "no
-/// edge" category 2 is skipped). Dispatched through [`PRIMITIVES`];
-/// byte-identical to [`sao_stats_e0_scalar`]. Maps to x265's `saoCuStatsE0`
-/// (`loopfilter.asm`).
+/// SAO horizontal edge-offset stats. Dispatched; byte-identical to [`sao_stats_e0_scalar`].
 #[allow(clippy::too_many_arguments)]
 pub fn sao_stats_e0(
     rec: &[u16],
@@ -439,66 +331,44 @@ pub fn sao_stats_e0(
     sum: &mut [i64; 5],
     count: &mut [u32; 5],
 ) {
-    (PRIMITIVES.sao_stats_e0)(rec, rec_stride, src, src_stride, x0, y0, w, h, sum, count)
+    (PRIMITIVES.sao.stats_e0)(rec, rec_stride, src, src_stride, x0, y0, w, h, sum, count)
 }
 
-/// Canonical scalar SAO horizontal-EO stats. Reference for the SIMD backend;
-/// matches the per-pixel logic in the encoder's `sao_eo_stats` for `eo_class 0`
-/// over a region with valid neighbours (no plane-edge / source clamping).
-#[allow(clippy::too_many_arguments)]
-pub fn sao_stats_e0_scalar(
-    rec: &[u16],
-    rec_stride: usize,
-    src: &[u16],
-    src_stride: usize,
-    x0: u32,
-    y0: u32,
-    w: u32,
-    h: u32,
-    sum: &mut [i64; 5],
-    count: &mut [u32; 5],
+/// Count nonzero i16 elements in a flat slice. Dispatched; byte-identical to scalar.
+#[allow(dead_code)]
+pub fn count_nonzero(levels: &[i16]) -> u32 {
+    (PRIMITIVES.residual.count_nonzero)(levels)
+}
+
+/// Absolute sum of i16 values in a flat slice. Dispatched; byte-identical to scalar.
+#[allow(dead_code)]
+pub fn abs_sum_i16(levels: &[i16]) -> u64 {
+    (PRIMITIVES.residual.abs_sum_i16)(levels)
+}
+
+/// Index of the last nonzero element in linear order. Dispatched; byte-identical to scalar.
+#[allow(dead_code)]
+pub fn last_nonzero(levels: &[i16]) -> Option<usize> {
+    (PRIMITIVES.residual.last_nonzero)(levels)
+}
+
+/// Batched all-angular intra prediction to u8 (8-bit content only). Dispatched.
+pub fn pred_allangs_u8(
+    dst: &mut [u8],
+    unfiltered: &[i32],
+    filtered: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
 ) {
-    for y in y0..y0 + h {
-        let rrow = y as usize * rec_stride;
-        let srow = y as usize * src_stride;
-        for x in x0..x0 + w {
-            let xi = x as usize;
-            let r = rec[rrow + xi] as i32;
-            let left = rec[rrow + xi - 1] as i32;
-            let right = rec[rrow + xi + 1] as i32;
-            let edge = (2 + (r - left).signum() + (r - right).signum()) as usize;
-            if edge == 2 {
-                continue;
-            }
-            sum[edge] += src[srow + xi] as i64 - r as i64;
-            count[edge] += 1;
-        }
-    }
+    (PRIMITIVES.intra.pred_allangs_u8)(
+        dst, unfiltered, filtered, center, log2_size, c_idx, bit_depth,
+    )
 }
 
-/// Function-pointer table of the dispatchable hot kernels. Selected once,
-/// lazily, by [`select_primitives`] from the CPU features and the
-/// `BPG_PRIMITIVES` environment variable.
-pub struct Primitives {
-    pub satd_u8: fn(&[u8], usize, &[u8], usize, usize) -> u32,
-    pub satd_u16: fn(&[u16], usize, &[u16], usize, usize) -> u32,
-    pub ssd_u16: fn(&[u16], usize, &[u16], usize, usize) -> u64,
-    pub sub_residual: fn(&[u16], usize, &[u16], usize, &mut [i16], usize),
-    pub dequantize: fn(&mut [i16], i32, i32),
-    pub quantize: fn(&[i16], &mut [i16], i32, i32, i32) -> u32,
-    #[allow(clippy::type_complexity)]
-    pub sao_stats_e0:
-        fn(&[u16], usize, &[u16], usize, u32, u32, u32, u32, &mut [i64; 5], &mut [u32; 5]),
-    pub forward_dct_1d: fn(&[i16], &mut [i16], &[i32], usize, i32),
-    /// Batched angular intra prediction (modes 2..=34) for the luma rough search.
-    /// `(dst, unfiltered_border, filtered_border, center, log2_size, c_idx, bit_depth)`.
-    pub intra_pred_allangs: fn(&mut [u16], &[i32], &[i32], usize, u8, u8, u8),
-    /// Human-readable name of the selected backend, for `--debug-stats`.
-    pub backend: &'static str,
-}
-
-/// Batched angular intra prediction, dispatched through [`PRIMITIVES`].
-/// Byte-identical to per-mode `predict_intra_into` for modes 2..=34.
+/// Batched all-angular intra prediction (modes 2..=34). Dispatched;
+/// byte-identical to [`intra::angs::intra_pred_allangs_scalar`].
 pub fn intra_pred_allangs(
     dst: &mut [u16],
     unfiltered: &[i32],
@@ -508,27 +378,84 @@ pub fn intra_pred_allangs(
     c_idx: u8,
     bit_depth: u8,
 ) {
-    (PRIMITIVES.intra_pred_allangs)(
+    (PRIMITIVES.intra.pred_allangs)(
         dst, unfiltered, filtered, center, log2_size, c_idx, bit_depth,
     )
 }
 
+// ─── Sub-struct definitions ────────────────────────────────────────────────
+
+pub struct PixelPrimitives {
+    pub satd_u8: fn(&[u8], usize, &[u8], usize, usize) -> u32,
+    pub satd_u16: fn(&[u16], usize, &[u16], usize, usize) -> u32,
+    pub ssd_u8: fn(&[u8], usize, &[u8], usize, usize) -> u64,
+    pub ssd_u16: fn(&[u16], usize, &[u16], usize, usize) -> u64,
+    pub sub_residual_u8: fn(&[u8], usize, &[u8], usize, &mut [i16], usize),
+    pub add_clip_u8: fn(&[u8], &[i16], &mut [u8], usize),
+    pub add_clip_u16: fn(&[u16], &[i16], &mut [u16], usize, u16),
+    pub narrow_u16_to_u8: fn(&[u16], &mut [u8], usize),
+}
+
+pub struct TransformPrimitives {
+    pub fwd_dst4: fn(&[i16], &mut [i16], u8),
+    pub fwd_dct4: fn(&[i16], &mut [i16], u8),
+    pub fwd_dct8: fn(&[i16], &mut [i16], u8),
+    pub fwd_dct16: fn(&[i16], &mut [i16], u8),
+    pub fwd_dct32: fn(&[i16], &mut [i16], u8),
+}
+
+pub struct QuantPrimitives {
+    pub dequantize: fn(&mut [i16], i32, i32),
+    pub quantize: fn(&[i16], &mut [i16], i32, i32, i32) -> u32,
+}
+
+pub struct ResidualPrimitives {
+    pub sub_residual: fn(&[u16], usize, &[u16], usize, &mut [i16], usize),
+    pub count_nonzero: fn(&[i16]) -> u32,
+    pub abs_sum_i16: fn(&[i16]) -> u64,
+    pub last_nonzero: fn(&[i16]) -> Option<usize>,
+}
+
+type SaoEoFn = fn(&[u16], usize, &[u16], usize, u32, u32, u32, u32, &mut [i64; 5], &mut [u32; 5]);
+type SaoBoFn =
+    fn(&[u16], usize, &[u16], usize, u32, u32, u32, u32, u8, &mut [i64; 32], &mut [u32; 32]);
+
+pub struct SaoPrimitives {
+    pub stats_e0: SaoEoFn,
+    pub stats_e1: SaoEoFn,
+    pub stats_e2: SaoEoFn,
+    pub stats_e3: SaoEoFn,
+    pub stats_bo: SaoBoFn,
+}
+
+/// Function-pointer table of the dispatchable hot kernels. Selected once,
+/// lazily, by [`select_primitives`] from the CPU features and the
+/// `BPG_PRIMITIVES` environment variable.
+pub struct Primitives {
+    pub pixel: PixelPrimitives,
+    pub transform: TransformPrimitives,
+    pub quant: QuantPrimitives,
+    pub residual: ResidualPrimitives,
+    pub intra: intra::IntraPrimitives,
+    pub sao: SaoPrimitives,
+    /// Human-readable name of the selected backend, for `--debug-stats`.
+    pub backend: &'static str,
+}
+
+// ─── Dispatch selection ────────────────────────────────────────────────────
+
 /// The active primitive backend, chosen once on first use.
 pub static PRIMITIVES: LazyLock<Primitives> = LazyLock::new(select_primitives);
 
-/// Which optimized tier the build requested, after resolving the
-/// `BPG_PRIMITIVES` override against what is actually available.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BackendChoice {
     Scalar,
-    /// Best available SIMD (and, in future, ASM) kernels.
     Simd,
 }
 
 fn select_primitives() -> Primitives {
     let choice = match std::env::var("BPG_PRIMITIVES").ok().as_deref() {
         Some("scalar") => BackendChoice::Scalar,
-        // `asm` has no kernels yet, so it resolves to the best SIMD path.
         Some("simd") | Some("asm") | Some("auto") | None => BackendChoice::Simd,
         Some(other) => {
             eprintln!("warning: unknown BPG_PRIMITIVES={other:?}, using scalar");
@@ -538,75 +465,86 @@ fn select_primitives() -> Primitives {
 
     // Scalar reference table.
     let mut p = Primitives {
-        satd_u8: satd_u8_scalar,
-        satd_u16: satd_u16_scalar,
-        ssd_u16: ssd_u16_scalar,
-        sub_residual: sub_residual_scalar,
-        dequantize: dequantize_scalar,
-        quantize: quantize_scalar,
-        sao_stats_e0: sao_stats_e0_scalar,
-        forward_dct_1d,
-        intra_pred_allangs: intra_angs::intra_pred_allangs_scalar,
+        pixel: PixelPrimitives {
+            satd_u8: scalar::satd_u8_scalar,
+            satd_u16: scalar::satd_u16_scalar,
+            ssd_u8: scalar::ssd_u8_scalar,
+            ssd_u16: scalar::ssd_u16_scalar,
+            sub_residual_u8: scalar::sub_residual_u8_scalar,
+            add_clip_u8: scalar::add_clip_u8_scalar,
+            add_clip_u16: scalar::add_clip_u16_scalar,
+            narrow_u16_to_u8: scalar::narrow_u16_to_u8_scalar,
+        },
+        transform: TransformPrimitives {
+            fwd_dst4: scalar::fwd_dst4_scalar,
+            fwd_dct4: scalar::fwd_dct4_scalar,
+            fwd_dct8: scalar::fwd_dct8_scalar,
+            fwd_dct16: scalar::fwd_dct16_scalar,
+            fwd_dct32: scalar::fwd_dct32_scalar,
+        },
+        quant: QuantPrimitives {
+            dequantize: scalar::dequantize_scalar,
+            quantize: scalar::quantize_scalar,
+        },
+        residual: ResidualPrimitives {
+            sub_residual: scalar::sub_residual_scalar,
+            count_nonzero: scalar::count_nonzero_scalar,
+            abs_sum_i16: scalar::abs_sum_i16_scalar,
+            last_nonzero: scalar::last_nonzero_scalar,
+        },
+        intra: intra::IntraPrimitives {
+            pred_allangs: intra::angs::intra_pred_allangs_scalar,
+            pred_allangs_u8: intra::angs::intra_pred_allangs_u8_scalar,
+        },
+        sao: SaoPrimitives {
+            stats_e0: scalar::sao_stats_e0_scalar,
+            stats_e1: scalar::sao_stats_e1_scalar,
+            stats_e2: scalar::sao_stats_e2_scalar,
+            stats_e3: scalar::sao_stats_e3_scalar,
+            stats_bo: scalar::sao_stats_bo_scalar,
+        },
         backend: "scalar",
     };
 
-    #[cfg(target_arch = "x86_64")]
-    if choice == BackendChoice::Simd && std::arch::is_x86_feature_detected!("sse2") {
-        p.satd_u8 = simd_x86::satd_u8_sse2;
-        p.backend = "sse2";
-    }
-
-    // Portable-SIMD (`wide`) kernels: SSD, residual subtraction, forward DCT.
-    // Bit-identical to the scalar references (enforced by `wide_simd::tests`).
-    #[cfg(feature = "wide-simd")]
     if choice == BackendChoice::Simd {
-        p.satd_u16 = wide_simd::satd_u16;
-        p.ssd_u16 = wide_simd::ssd_u16;
-        p.sub_residual = wide_simd::sub_residual;
-        p.dequantize = wide_simd::dequantize;
-        p.quantize = wide_simd::quantize;
-        p.sao_stats_e0 = wide_simd::sao_stats_e0;
-        p.forward_dct_1d = wide_simd::forward_dct_1d;
-        p.intra_pred_allangs = wide_simd::intra_pred_allangs;
-        p.backend = if p.backend == "sse2" {
-            "sse2+wide"
-        } else {
-            "wide"
-        };
+        // Portable wide-SIMD layer: bit-identical to scalar, no ISA-specific
+        // intrinsics. Overwrites every kernel it covers.
+        p.pixel.satd_u16 = wide::satd_u16;
+        p.pixel.ssd_u8 = wide::ssd_u8;
+        p.pixel.ssd_u16 = wide::ssd_u16;
+        p.pixel.sub_residual_u8 = wide::sub_residual_u8;
+        p.pixel.add_clip_u8 = wide::add_clip_u8;
+        p.pixel.add_clip_u16 = wide::add_clip_u16;
+        p.pixel.narrow_u16_to_u8 = wide::narrow_u16_to_u8;
+        p.residual.sub_residual = wide::sub_residual;
+        p.residual.count_nonzero = wide::count_nonzero;
+        p.residual.abs_sum_i16 = wide::abs_sum_i16;
+        p.residual.last_nonzero = wide::last_nonzero;
+        p.quant.dequantize = wide::dequantize;
+        p.quant.quantize = wide::quantize;
+        p.sao.stats_e0 = wide::sao_stats_e0;
+        p.sao.stats_e1 = wide::sao_stats_e1;
+        p.sao.stats_e2 = wide::sao_stats_e2;
+        p.sao.stats_e3 = wide::sao_stats_e3;
+        p.sao.stats_bo = wide::sao_stats_bo;
+        p.transform.fwd_dst4 = wide::fwd_dst4;
+        p.transform.fwd_dct4 = wide::fwd_dct4;
+        p.transform.fwd_dct8 = wide::fwd_dct8;
+        p.transform.fwd_dct16 = wide::fwd_dct16;
+        p.transform.fwd_dct32 = wide::fwd_dct32;
+        p.intra.pred_allangs = wide::intra_pred_allangs;
+        p.intra.pred_allangs_u8 = wide::pred_allangs_u8;
+        p.backend = "wide";
+
+        // ISA-specific layers overwrite individual entries as detected.
+        #[cfg(target_arch = "x86_64")]
+        x86::setup(&mut p);
     }
 
-    let _ = choice; // used on non-x86_64 only to silence unused warnings
     p
 }
 
-fn satd_by<T: Copy>(
-    a: &[T],
-    stride_a: usize,
-    b: &[T],
-    stride_b: usize,
-    size: usize,
-    to_i32: impl Fn(T) -> i32,
-) -> u32 {
-    assert!(matches!(size, 4 | 8 | 16 | 32));
-    assert!(stride_a >= size && stride_b >= size);
-    assert!(a.len() >= stride_a * (size - 1) + size);
-    assert!(b.len() >= stride_b * (size - 1) + size);
-
-    let mut sum = 0u32;
-    let mut diff = [0i32; 16];
-    for by in (0..size).step_by(4) {
-        for bx in (0..size).step_by(4) {
-            for y in 0..4 {
-                for x in 0..4 {
-                    diff[y * 4 + x] = to_i32(a[(by + y) * stride_a + bx + x])
-                        - to_i32(b[(by + y) * stride_b + bx + x]);
-                }
-            }
-            sum += hadamard4_satd(&diff);
-        }
-    }
-    sum
-}
+// ─── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -630,22 +568,32 @@ mod tests {
         }
     }
 
-    /// Deterministic xorshift so patterns are reproducible without a dep.
+    fn fill_pattern_i16(buf: &mut [i16], seed: &mut u32) {
+        for p in buf.iter_mut() {
+            let mut x = *seed;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *seed = x;
+            // Map to range [-256, 255] (typical residual range).
+            *p = ((x >> 16) as i16).wrapping_mul(2);
+        }
+    }
+
     fn fill_pattern(buf: &mut [u8], kind: u32, seed: &mut u32) {
         for (i, p) in buf.iter_mut().enumerate() {
             *p = match kind {
-                0 => 0,                          // flat
-                1 => 255,                        // saturated
-                2 => (i as u8).wrapping_mul(17), // gradient
+                0 => 0,
+                1 => 255,
+                2 => (i as u8).wrapping_mul(17),
                 3 => {
                     if i % 2 == 0 {
                         0
                     } else {
                         255
                     }
-                } // alternating
+                }
                 _ => {
-                    // xorshift32 pseudo-random
                     let mut x = *seed;
                     x ^= x << 13;
                     x ^= x >> 17;
@@ -669,7 +617,7 @@ mod tests {
             let aw: Vec<u16> = a.iter().map(|&v| u16::from(v)).collect();
             let bw: Vec<u16> = b.iter().map(|&v| u16::from(v)).collect();
             assert_eq!(
-                ssd_u8(&a, stride, &b, stride, size),
+                ssd_u8_scalar(&a, stride, &b, stride, size),
                 ssd_u16_scalar(&aw, stride, &bw, stride, size),
                 "size={size}"
             );
@@ -677,9 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn sse2_satd_u8_matches_scalar() {
-        // Exercise the active dispatched kernel (SSE2 on this host) against the
-        // canonical scalar reference, with a non-trivial stride.
+    fn dispatched_satd_u8_matches_scalar() {
         let mut seed = 0x1234_5678u32;
         for &size in &[4usize, 8, 16, 32] {
             let stride = size + 3;
@@ -690,7 +636,7 @@ mod tests {
                     fill_pattern(&mut a, ka, &mut seed);
                     fill_pattern(&mut b, kb, &mut seed);
                     let want = satd_u8_scalar(&a, stride, &b, stride, size);
-                    let got = (PRIMITIVES.satd_u8)(&a, stride, &b, stride, size);
+                    let got = (PRIMITIVES.pixel.satd_u8)(&a, stride, &b, stride, size);
                     assert_eq!(got, want, "size={size} pattern a={ka} b={kb}");
                 }
             }
@@ -709,7 +655,85 @@ mod tests {
                 fill_pattern(&mut a, 99, &mut seed);
                 fill_pattern(&mut b, 99, &mut seed);
                 let want = satd_u8_scalar(&a, stride, &b, stride, size);
-                let got = super::simd_x86::satd_u8_sse2(&a, stride, &b, stride, size);
+                let got = x86::sse2::satd_u8_sse2(&a, stride, &b, stride, size);
+                assert_eq!(got, want, "size={size} stride={stride}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_satd_u8_stub_matches_sse2() {
+        let mut seed = 0xdeadbeef_u32;
+        for &size in &[4usize, 8, 16, 32] {
+            let stride = size + 2;
+            let mut a = vec![0u8; stride * size];
+            let mut b = vec![0u8; stride * size];
+            fill_pattern(&mut a, 99, &mut seed);
+            fill_pattern(&mut b, 99, &mut seed);
+            let want = x86::sse2::satd_u8_sse2(&a, stride, &b, stride, size);
+            let got = x86::avx2::satd_u8_avx2_dispatch(&a, stride, &b, stride, size);
+            assert_eq!(got, want, "size={size}");
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_quantize_matches_scalar() {
+        let mut seed = 0xabcd1234_u32;
+        for _ in 0..100 {
+            for n in [16, 32, 64, 128, 1024, 1025] {
+                let mut coeffs = vec![0i16; n];
+                fill_pattern_i16(&mut coeffs, &mut seed);
+                let mut want_out = vec![0i16; n];
+                let mut got_out = vec![0i16; n];
+                let scale = 13762;
+                let add = 1 << 14;
+                let qbits = 15;
+                let want_nnz = quantize_scalar(&coeffs, &mut want_out, scale, add, qbits);
+                let got_nnz =
+                    x86::avx2::quantize_avx2_dispatch(&coeffs, &mut got_out, scale, add, qbits);
+                assert_eq!(got_out, want_out, "n={n}");
+                assert_eq!(got_nnz, want_nnz, "nnz n={n}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_ssd_u8_matches_scalar() {
+        let mut seed = 0x5555aaaa_u32;
+        for _ in 0..100 {
+            for &size in &[4usize, 8, 16, 32] {
+                let stride = size + (seed as usize & 3);
+                let mut a = vec![0u8; stride * size];
+                let mut b = vec![0u8; stride * size];
+                fill_pattern(&mut a, 99, &mut seed);
+                fill_pattern(&mut b, 99, &mut seed);
+                let want = ssd_u8_scalar(&a, stride, &b, stride, size);
+                let got = x86::avx2::ssd_u8_avx2_dispatch(&a, stride, &b, stride, size);
+                assert_eq!(got, want, "size={size} stride={stride}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_sub_residual_u8_matches_scalar() {
+        let mut seed = 0x13571357_u32;
+        for _ in 0..100 {
+            for &size in &[4usize, 8, 16, 32] {
+                let stride = size + (seed as usize & 3);
+                let mut src = vec![0u8; stride * size];
+                let mut pred = vec![0u8; stride * size];
+                fill_pattern(&mut src, 99, &mut seed);
+                fill_pattern(&mut pred, 99, &mut seed);
+                let mut want = vec![0i16; size * size];
+                let mut got = vec![0i16; size * size];
+                sub_residual_u8_scalar(&src, stride, &pred, stride, &mut want, size);
+                x86::avx2::sub_residual_u8_avx2_dispatch(
+                    &src, stride, &pred, stride, &mut got, size,
+                );
                 assert_eq!(got, want, "size={size} stride={stride}");
             }
         }

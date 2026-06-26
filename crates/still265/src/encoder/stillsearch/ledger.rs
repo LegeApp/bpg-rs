@@ -9,8 +9,11 @@
 //!   timed by `EncodeStats::phase_deblock_us` / `phase_sao_*_us`, not counted
 //!   here.
 //!
-//! `Rdoq` counts winner-only final RDOQ blocks. Broad search/trial screening
-//! remains on hard quantization and must not bump this bucket.
+//! `Rdoq` counts winner-only final RDOQ blocks. `RdoqTrial` counts analysis-stage
+//! RDOQ trials (close candidate re-evaluation in Slow/Placebo).
+//!
+//! Broad search/trial screening remains on hard quantization and must not bump
+//! these buckets.
 
 use std::time::Instant;
 
@@ -32,6 +35,8 @@ pub(super) enum WorkBucket {
     /// Reserved: chroma is DM-only (no chroma trial candidates) currently.
     ChromaTrial,
     Rdoq,
+    /// Analysis-stage RDOQ trials (separate from winner-only final RDOQ).
+    RdoqTrial,
     ResidualPrice,
     FinalCommit,
     Writer,
@@ -42,7 +47,7 @@ pub(super) enum WorkBucket {
 }
 
 impl WorkBucket {
-    pub(super) const COUNT: usize = 15;
+    pub(super) const COUNT: usize = 16;
 
     fn idx(self) -> usize {
         self as usize

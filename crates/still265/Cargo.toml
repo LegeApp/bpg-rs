@@ -18,16 +18,17 @@ bpg-hevc-decode = { path = "../bpg-hevc-decode" }
 # subtraction, forward DCT). `wide` is pure Rust (no C/asm), so the default
 # build stays portable; enabling `wide-simd` only swaps in vectorized kernels
 # that are bit-identical to the scalar reference. See `src/primitives/`.
-wide = { version = "1.3", optional = true }
+wide = { version = "1.3" }
 
 [features]
-default = []
+default = ["wide-simd"]
 # Marker feature for profiling builds. Keep profiling-only instrumentation
 # behind this feature if it would perturb normal release measurements.
 flamegraph = []
-# Route the dispatchable hot kernels through `wide`-based portable-SIMD
-# implementations (still selectable at runtime via `BPG_PRIMITIVES`).
-wide-simd = ["dep:wide"]
+# Enable the wide-SIMD portable kernel layer (default). Disable with
+# `--no-default-features` to build a fully scalar binary (useful for testing
+# the scalar reference path without the BPG_PRIMITIVES env override).
+wide-simd = []
 
 [dev-dependencies]
 bpg-hevc = { path = "../bpg-hevc" }

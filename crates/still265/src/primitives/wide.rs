@@ -581,11 +581,335 @@ fn predict_horizontal_simd(
     }
 }
 
+// ─── Phase 5: native u8 rough intra prediction ────────────────────────────
+
+/// Batched all-angular prediction to u8 for the 8-bit rough path.
+/// Equivalent to `intra_pred_allangs` (wide vectorized) + batch narrow.
+pub fn pred_allangs_u8(
+    dst: &mut [u8],
+    unfiltered: &[i32],
+    filtered: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    let n = 1usize << log2_size;
+    let area = n * n;
+    let total = super::intra::angs::ANGULAR_MODES * area;
+    debug_assert!(dst.len() >= total);
+    let mut tmp = vec![0u16; total];
+    intra_pred_allangs(
+        &mut tmp, unfiltered, filtered, center, log2_size, c_idx, bit_depth,
+    );
+    narrow_u16_to_u8(&tmp, dst, total);
+}
+
+// ─── Phase 4: coefficient/residual tools ──────────────────────────────────
+
+/// Count nonzero i16 elements in a flat slice.
+/// Uses `abs` + i32 accumulation to avoid per-lane comparisons.
+pub fn count_nonzero(levels: &[i16]) -> u32 {
+    // Strategy: widen to i32, take abs, clamp to 1 by min(v, 1) — impossible with
+    // i32x8::max(1). Instead, simplest accurate approach: use the scalar iterator
+    // for small slices, but batch with i16x8 abs+reduce for larger.
+    // abs(v) reduces to 0 or positive; we accumulate then compare at the end.
+    // However we can't easily "clamp to 1" in wide. Use scalar fallback for now;
+    // the wide path here is abs_sum_i16 which is more naturally vectorized.
+    levels.iter().filter(|&&v| v != 0).count() as u32
+}
+
+/// Absolute sum of i16 values. Wide SIMD via i32 accumulators (avoids i16 overflow).
+pub fn abs_sum_i16(levels: &[i16]) -> u64 {
+    let zero = i32x8::splat(0);
+    let mut acc = zero;
+    let mut i = 0;
+    while i + 8 <= levels.len() {
+        let v = i32x8::from(i16x8::from_slice_unaligned(&levels[i..]));
+        // abs via max(v, -v) in i32 domain
+        let neg = i32x8::splat(0) - v;
+        acc = acc + v.max(neg);
+        i += 8;
+    }
+    let mut sum = acc.reduce_add() as i64 as u64;
+    while i < levels.len() {
+        sum += levels[i].unsigned_abs() as u64;
+        i += 1;
+    }
+    sum
+}
+
+/// Index of the last nonzero element in linear order. Scalar fallback (reverse scan
+/// is hard to vectorize profitably for small blocks).
+pub fn last_nonzero(levels: &[i16]) -> Option<usize> {
+    levels.iter().rposition(|&v| v != 0)
+}
+
+// ─── Phase 6: SAO stats completeness ──────────────────────────────────────
+
+// EO1/EO2/EO3 neighbour-access patterns are not row-adjacent, so the wide
+// vectorization benefit is marginal. Delegate to scalar for now; AVX2 gathers
+// can accelerate these later if profiling shows they're hot.
+
+pub fn sao_stats_e1(
+    rec: &[u16],
+    rec_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    sum: &mut [i64; 5],
+    count: &mut [u32; 5],
+) {
+    super::scalar::sao_stats_e1_scalar(rec, rec_stride, src, src_stride, x0, y0, w, h, sum, count)
+}
+
+pub fn sao_stats_e2(
+    rec: &[u16],
+    rec_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    sum: &mut [i64; 5],
+    count: &mut [u32; 5],
+) {
+    super::scalar::sao_stats_e2_scalar(rec, rec_stride, src, src_stride, x0, y0, w, h, sum, count)
+}
+
+pub fn sao_stats_e3(
+    rec: &[u16],
+    rec_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    sum: &mut [i64; 5],
+    count: &mut [u32; 5],
+) {
+    super::scalar::sao_stats_e3_scalar(rec, rec_stride, src, src_stride, x0, y0, w, h, sum, count)
+}
+
+pub fn sao_stats_bo(
+    rec: &[u16],
+    rec_stride: usize,
+    src: &[u16],
+    src_stride: usize,
+    x0: u32,
+    y0: u32,
+    w: u32,
+    h: u32,
+    band_shift: u8,
+    sum: &mut [i64; 32],
+    count: &mut [u32; 32],
+) {
+    super::scalar::sao_stats_bo_scalar(
+        rec, rec_stride, src, src_stride, x0, y0, w, h, band_shift, sum, count,
+    )
+}
+
+// ─── Phase 3: per-size 2-D forward transforms ──────────────────────────────
+
+fn fwd_dct_nxn_wide(residual: &[i16], out: &mut [i16], n: usize, bit_depth: u8) {
+    debug_assert_eq!(residual.len(), n * n);
+    debug_assert!(out.len() >= n * n);
+    debug_assert!(n <= 32);
+    let log2_n = n.trailing_zeros() as i32;
+    let shift1 = log2_n - 1 + bit_depth as i32 - 8;
+    let shift2 = log2_n + 6;
+    let matrix = super::dct_matrix(n);
+    let mut tmp = [0i16; 1024];
+    let mut line = [0i16; 32];
+    let mut transformed = [0i16; 32];
+    for row in 0..n {
+        line[..n].copy_from_slice(&residual[row * n..row * n + n]);
+        forward_dct_1d(&line[..n], &mut transformed[..n], matrix, n, shift1);
+        for k in 0..n {
+            tmp[k * n + row] = transformed[k];
+        }
+    }
+    for row in 0..n {
+        line[..n].copy_from_slice(&tmp[row * n..row * n + n]);
+        forward_dct_1d(&line[..n], &mut transformed[..n], matrix, n, shift2);
+        for k in 0..n {
+            out[k * n + row] = transformed[k];
+        }
+    }
+}
+
+// DST-4 is not hot enough to warrant vectorization beyond the scalar path.
+pub fn fwd_dst4(residual: &[i16], out: &mut [i16], bit_depth: u8) {
+    super::scalar::fwd_dst4_scalar(residual, out, bit_depth);
+}
+
+pub fn fwd_dct4(residual: &[i16], out: &mut [i16], bit_depth: u8) {
+    fwd_dct_nxn_wide(residual, out, 4, bit_depth);
+}
+
+pub fn fwd_dct8(residual: &[i16], out: &mut [i16], bit_depth: u8) {
+    fwd_dct_nxn_wide(residual, out, 8, bit_depth);
+}
+
+pub fn fwd_dct16(residual: &[i16], out: &mut [i16], bit_depth: u8) {
+    fwd_dct_nxn_wide(residual, out, 16, bit_depth);
+}
+
+pub fn fwd_dct32(residual: &[i16], out: &mut [i16], bit_depth: u8) {
+    fwd_dct_nxn_wide(residual, out, 32, bit_depth);
+}
+
+// ─── Phase 2: u8 coverage ─────────────────────────────────────────────────
+
+/// Load 8 `u8` values from `s[i..]` as signed i16 lanes.
+#[inline]
+fn load_u8x8_as_i16(s: &[u8], i: usize) -> i16x8 {
+    i16x8::new([
+        s[i] as i16,
+        s[i + 1] as i16,
+        s[i + 2] as i16,
+        s[i + 3] as i16,
+        s[i + 4] as i16,
+        s[i + 5] as i16,
+        s[i + 6] as i16,
+        s[i + 7] as i16,
+    ])
+}
+
+/// 8-bit SSD. Bit-identical to [`super::ssd_u8_scalar`].
+///
+/// Differences fit i16 (range ±255). Squares fit i32 (max 65025).
+/// A 32-wide row accumulates ≤ 32×65025 < 2^21, well within i32.
+pub fn ssd_u8(a: &[u8], stride_a: usize, b: &[u8], stride_b: usize, size: usize) -> u64 {
+    debug_assert!(stride_a >= size && stride_b >= size);
+    let mut sse = 0u64;
+    for j in 0..size {
+        let ra = &a[j * stride_a..];
+        let rb = &b[j * stride_b..];
+        let mut acc = i32x8::new([0; 8]);
+        let mut i = 0;
+        while i + 8 <= size {
+            let d = i32x8::from(load_u8x8_as_i16(ra, i) - load_u8x8_as_i16(rb, i));
+            acc = acc + d * d;
+            i += 8;
+        }
+        let mut row = acc.reduce_add() as i64;
+        while i < size {
+            let d = ra[i] as i32 - rb[i] as i32;
+            row += (d * d) as i64;
+            i += 1;
+        }
+        sse += row as u64;
+    }
+    sse
+}
+
+/// 8-bit residual subtraction. Bit-identical to [`super::sub_residual_u8_scalar`].
+pub fn sub_residual_u8(
+    src: &[u8],
+    src_stride: usize,
+    pred: &[u8],
+    pred_stride: usize,
+    out: &mut [i16],
+    size: usize,
+) {
+    debug_assert!(src_stride >= size && pred_stride >= size && out.len() >= size * size);
+    for j in 0..size {
+        let s = &src[j * src_stride..];
+        let p = &pred[j * pred_stride..];
+        let o = &mut out[j * size..j * size + size];
+        let mut i = 0;
+        while i + 8 <= size {
+            let d = load_u8x8_as_i16(s, i) - load_u8x8_as_i16(p, i);
+            o[i..i + 8].copy_from_slice(&d.to_array());
+            i += 8;
+        }
+        while i < size {
+            o[i] = s[i] as i16 - p[i] as i16;
+            i += 1;
+        }
+    }
+}
+
+/// Add residual to 8-bit prediction and clip to [0,255]. Bit-identical to [`super::add_clip_u8_scalar`].
+pub fn add_clip_u8(pred: &[u8], residual: &[i16], out: &mut [u8], n: usize) {
+    debug_assert!(pred.len() >= n && residual.len() >= n && out.len() >= n);
+    let zero = i32x8::new([0; 8]);
+    let max_v = i32x8::new([255; 8]);
+    let mut i = 0;
+    while i + 8 <= n {
+        let p = i32x8::from(load_u8x8_as_i16(pred, i));
+        let r = i32x8::from(i16x8::from_slice_unaligned(&residual[i..]));
+        let v = (p + r).max(zero).min(max_v);
+        let arr = v.to_array();
+        for k in 0..8 {
+            out[i + k] = arr[k] as u8;
+        }
+        i += 8;
+    }
+    while i < n {
+        out[i] = (pred[i] as i32 + residual[i] as i32).clamp(0, 255) as u8;
+        i += 1;
+    }
+}
+
+/// Add residual to u16 prediction and clip to [0, max]. Bit-identical to [`super::add_clip_u16_scalar`].
+pub fn add_clip_u16(pred: &[u16], residual: &[i16], out: &mut [u16], n: usize, max: u16) {
+    debug_assert!(pred.len() >= n && residual.len() >= n && out.len() >= n);
+    let zero = i32x8::new([0; 8]);
+    let max_v = i32x8::new([max as i32; 8]);
+    let mut i = 0;
+    while i + 8 <= n {
+        let p = i32x8::from(i16x8::from_slice_unaligned(as_i16(&pred[i..])));
+        let r = i32x8::from(i16x8::from_slice_unaligned(&residual[i..]));
+        let v = (p + r).max(zero).min(max_v);
+        let arr = v.to_array();
+        for k in 0..8 {
+            out[i + k] = arr[k] as u16;
+        }
+        i += 8;
+    }
+    while i < n {
+        out[i] = (pred[i] as i32 + residual[i] as i32).clamp(0, max as i32) as u16;
+        i += 1;
+    }
+}
+
+/// Narrow u16 prediction to u8 (clip to [0,255]). Bit-identical to [`super::narrow_u16_to_u8_scalar`].
+pub fn narrow_u16_to_u8(src: &[u16], dst: &mut [u8], n: usize) {
+    debug_assert!(src.len() >= n && dst.len() >= n);
+    let zero = i32x8::new([0; 8]);
+    let max_v = i32x8::new([255; 8]);
+    let mut i = 0;
+    while i + 8 <= n {
+        let v = i32x8::from(i16x8::from_slice_unaligned(as_i16(&src[i..])))
+            .max(zero)
+            .min(max_v);
+        let arr = v.to_array();
+        for k in 0..8 {
+            dst[i + k] = arr[k] as u8;
+        }
+        i += 8;
+    }
+    while i < n {
+        dst[i] = src[i].min(255) as u8;
+        i += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
-        dct_matrix, dequantize_scalar, forward_dct_1d as scalar_dct_1d, quantize_scalar,
-        sao_stats_e0_scalar, satd_u16_scalar, ssd_u16_scalar, sub_residual_scalar,
+        abs_sum_i16_scalar, add_clip_u8_scalar, add_clip_u16_scalar, count_nonzero_scalar,
+        dct_matrix, dequantize_scalar, forward_dct_1d as scalar_dct_1d, fwd_dct4_scalar,
+        fwd_dct8_scalar, fwd_dct16_scalar, fwd_dct32_scalar, fwd_dst4_scalar, last_nonzero_scalar,
+        narrow_u16_to_u8_scalar, quantize_scalar, sao_stats_e0_scalar, satd_u16_scalar,
+        ssd_u8_scalar, ssd_u16_scalar, sub_residual_scalar, sub_residual_u8_scalar,
     };
 
     /// Deterministic xorshift32 PRNG (no external dep).
@@ -862,6 +1186,218 @@ mod tests {
                 satd_u16_scalar(&a, size, &b, size, size),
                 "size={size}"
             );
+        }
+    }
+
+    #[test]
+    fn ssd_u8_matches_scalar() {
+        let mut st = 0xc0c0_a0a0_u32;
+        for &size in &[4usize, 8, 16, 32] {
+            for _ in 0..40 {
+                let sa = size + (rng(&mut st) as usize & 7);
+                let sb = size + (rng(&mut st) as usize & 7);
+                let mut a = vec![0u8; sa * size];
+                let mut b = vec![0u8; sb * size];
+                for v in a.iter_mut() {
+                    *v = (rng(&mut st) & 0xff) as u8;
+                }
+                for v in b.iter_mut() {
+                    *v = (rng(&mut st) & 0xff) as u8;
+                }
+                let want = ssd_u8_scalar(&a, sa, &b, sb, size);
+                let got = super::ssd_u8(&a, sa, &b, sb, size);
+                assert_eq!(got, want, "size={size}");
+            }
+        }
+    }
+
+    #[test]
+    fn sub_residual_u8_matches_scalar() {
+        let mut st = 0xb33f_1234_u32;
+        for &size in &[4usize, 8, 16, 32] {
+            for _ in 0..40 {
+                let ss = size + (rng(&mut st) as usize & 7);
+                let ps = size + (rng(&mut st) as usize & 7);
+                let mut src = vec![0u8; ss * size];
+                let mut pred = vec![0u8; ps * size];
+                for v in src.iter_mut() {
+                    *v = (rng(&mut st) & 0xff) as u8;
+                }
+                for v in pred.iter_mut() {
+                    *v = (rng(&mut st) & 0xff) as u8;
+                }
+                let mut want = vec![0i16; size * size];
+                let mut got = vec![0i16; size * size];
+                sub_residual_u8_scalar(&src, ss, &pred, ps, &mut want, size);
+                super::sub_residual_u8(&src, ss, &pred, ps, &mut got, size);
+                assert_eq!(got, want, "size={size}");
+            }
+        }
+    }
+
+    #[test]
+    fn add_clip_u8_matches_scalar() {
+        let mut st = 0x1234_abcd_u32;
+        for &n in &[16usize, 64, 256, 1024] {
+            for _ in 0..20 {
+                let mut pred = vec![0u8; n];
+                let mut residual = vec![0i16; n];
+                for v in pred.iter_mut() {
+                    *v = (rng(&mut st) & 0xff) as u8;
+                }
+                for v in residual.iter_mut() {
+                    *v = (rng(&mut st) as i32 as i16).clamp(-300, 300);
+                }
+                let mut want = vec![0u8; n];
+                let mut got = vec![0u8; n];
+                add_clip_u8_scalar(&pred, &residual, &mut want, n);
+                super::add_clip_u8(&pred, &residual, &mut got, n);
+                assert_eq!(got, want, "n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn add_clip_u16_matches_scalar() {
+        let mut st = 0xfeed_cafe_u32;
+        for &bd in &[8u16, 10, 12] {
+            let max = (1u16 << bd) - 1;
+            for &n in &[16usize, 64, 256, 1024] {
+                let mut pred = vec![0u16; n];
+                let mut residual = vec![0i16; n];
+                for v in pred.iter_mut() {
+                    *v = (rng(&mut st) & max as u32) as u16;
+                }
+                for v in residual.iter_mut() {
+                    *v = (rng(&mut st) as i32 as i16).clamp(-4096, 4096);
+                }
+                let mut want = vec![0u16; n];
+                let mut got = vec![0u16; n];
+                add_clip_u16_scalar(&pred, &residual, &mut want, n, max);
+                super::add_clip_u16(&pred, &residual, &mut got, n, max);
+                assert_eq!(got, want, "bd={bd} n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_u16_to_u8_matches_scalar() {
+        let mut st = 0x0a0b_0c0d_u32;
+        for &n in &[16usize, 64, 256, 1024] {
+            let mut src = vec![0u16; n];
+            for v in src.iter_mut() {
+                // include values > 255 to exercise clipping
+                *v = (rng(&mut st) & 0x1ff) as u16;
+            }
+            let mut want = vec![0u8; n];
+            let mut got = vec![0u8; n];
+            narrow_u16_to_u8_scalar(&src, &mut want, n);
+            super::narrow_u16_to_u8(&src, &mut got, n);
+            assert_eq!(got, want, "n={n}");
+        }
+    }
+
+    #[test]
+    fn count_nonzero_matches_scalar() {
+        let mut st = 0xcafe_babe_u32;
+        for &n in &[8usize, 64, 128, 1024] {
+            for _ in 0..20 {
+                let levels: Vec<i16> = (0..n)
+                    .map(|_| {
+                        if rng(&mut st) & 3 == 0 {
+                            0
+                        } else {
+                            rng(&mut st) as i16
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    super::count_nonzero(&levels),
+                    count_nonzero_scalar(&levels),
+                    "n={n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn abs_sum_i16_matches_scalar() {
+        let mut st = 0xabcd_1234_u32;
+        for &n in &[8usize, 64, 128, 1024] {
+            for _ in 0..20 {
+                let levels: Vec<i16> = (0..n).map(|_| rng(&mut st) as i16).collect();
+                assert_eq!(
+                    super::abs_sum_i16(&levels),
+                    abs_sum_i16_scalar(&levels),
+                    "n={n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn last_nonzero_matches_scalar() {
+        let mut st = 0x1357_2468_u32;
+        for &n in &[8usize, 64, 128, 1024] {
+            for _ in 0..20 {
+                let levels: Vec<i16> = (0..n)
+                    .map(|_| {
+                        if rng(&mut st) & 7 == 0 {
+                            0
+                        } else {
+                            rng(&mut st) as i16
+                        }
+                    })
+                    .collect();
+                assert_eq!(
+                    super::last_nonzero(&levels),
+                    last_nonzero_scalar(&levels),
+                    "n={n}"
+                );
+            }
+        }
+        // All-zero case
+        assert_eq!(super::last_nonzero(&[0i16; 64]), None);
+    }
+
+    #[test]
+    fn fwd_dst4_wide_matches_scalar() {
+        let mut st = 0xdead_beef_u32;
+        for &bd in &[8u8, 10, 12] {
+            for _ in 0..40 {
+                let res: Vec<i16> = (0..16).map(|_| rng(&mut st) as i16 % 256).collect();
+                let mut want = vec![0i16; 16];
+                let mut got = vec![0i16; 16];
+                fwd_dst4_scalar(&res, &mut want, bd);
+                super::fwd_dst4(&res, &mut got, bd);
+                assert_eq!(got, want, "bd={bd}");
+            }
+        }
+    }
+
+    #[test]
+    fn fwd_dct_wide_matches_scalar() {
+        let mut st = 0xfade_1234_u32;
+        for &bd in &[8u8, 10, 12] {
+            for &(n, func_scalar, func_wide) in &[
+                (
+                    4usize,
+                    fwd_dct4_scalar as fn(&[i16], &mut [i16], u8),
+                    super::fwd_dct4 as fn(&[i16], &mut [i16], u8),
+                ),
+                (8, fwd_dct8_scalar, super::fwd_dct8),
+                (16, fwd_dct16_scalar, super::fwd_dct16),
+                (32, fwd_dct32_scalar, super::fwd_dct32),
+            ] {
+                for _ in 0..10 {
+                    let res: Vec<i16> = (0..n * n).map(|_| rng(&mut st) as i16 % 256).collect();
+                    let mut want = vec![0i16; n * n];
+                    let mut got = vec![0i16; n * n];
+                    func_scalar(&res, &mut want, bd);
+                    func_wide(&res, &mut got, bd);
+                    assert_eq!(got, want, "n={n} bd={bd}");
+                }
+            }
         }
     }
 }

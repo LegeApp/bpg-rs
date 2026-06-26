@@ -25,26 +25,27 @@ pub use self::types::{EncodeStats, Source};
 use self::write::{build_slice_trees_serial, encode_slice_data, write_slice_from_trees};
 
 pub(super) struct Encoder<'a> {
-    display_width: u32,
-    display_height: u32,
-    cat: u8,
-    bit_depth: u8,
-    tile_grid: bpg_hevc_decode::hevc::tile::TileGrid,
-    src: Source<'a>,
-    frame: DecodedFrame,
-    mode_map: Vec<u8>,
-    mode_stride: usize,
-    ct_depth_map: Vec<u8>,
-    ct_depth_stride: usize,
-    deblock: bool,
-    sign_data_hiding: bool,
-    aq: AqState,
-    cur_qp_y: i32,
-    cur_qp_c: i32,
-    best_aq: Option<(bool, f32)>,
-    part_nxn_enabled: bool,
-    analysis: Arc<crate::preanalysis::AnalysisMaps>,
-    stats: EncodeStats,
+    pub(super) display_width: u32,
+    pub(super) display_height: u32,
+    pub(super) cat: u8,
+    pub(super) bit_depth: u8,
+    pub(super) tile_grid: bpg_hevc_decode::hevc::tile::TileGrid,
+    pub(super) src: Source<'a>,
+    pub(super) frame: DecodedFrame,
+    pub(super) mode_map: Vec<u8>,
+    pub(super) mode_stride: usize,
+    pub(super) ct_depth_map: Vec<u8>,
+    pub(super) ct_depth_stride: usize,
+    pub(super) deblock: bool,
+    pub(super) sign_data_hiding: bool,
+    pub(super) aq: AqState,
+    pub(super) cur_qp_y: i32,
+    pub(super) cur_qp_c: i32,
+    pub(super) best_aq: Option<(bool, f32)>,
+    pub(super) part_nxn_enabled: bool,
+    pub(super) analysis: Arc<crate::preanalysis::AnalysisMaps>,
+    pub(super) stats: EncodeStats,
+    pub(super) effort_template: &'static crate::effort::EffortTemplate,
 }
 
 impl<'a> Encoder<'a> {
@@ -131,32 +132,88 @@ impl<'a> Encoder<'a> {
         let (plane, stride) = self.frame.plane(c_idx);
         let (plane_w, plane_h) = self.frame.component_dims(c_idx);
 
-        // Horizontal EO over an interior region (left/right neighbours valid and
-        // the source unclamped) uses the dispatched SIMD kernel. Plane-edge /
-        // source-padding CTBs fall through to the generic scalar loop below.
-        if eo_class == 0 {
-            let (src_plane, src_stride, sw, sh) = self.src_plane(c_idx);
-            if x_start >= 1
-                && x_end > x_start
-                && x_end + 1 <= plane_w
-                && x_end <= sw
-                && y_end <= plane_h
-                && y_end <= sh
-            {
-                let mut stats = sao::EoStats::default();
-                crate::primitives::sao_stats_e0(
-                    plane,
-                    stride,
-                    src_plane,
-                    src_stride,
-                    x_start,
-                    y_start,
-                    x_end - x_start,
-                    y_end - y_start,
-                    &mut stats.sum,
-                    &mut stats.count,
-                );
-                return stats;
+        let (src_plane, src_stride, sw, sh) = self.src_plane(c_idx);
+
+        // Use dispatched SIMD kernels for interior regions where all neighbours
+        // are within the plane and source bounds. Plane-edge / source-padding
+        // CTBs fall through to the generic scalar loop.
+        let interior = x_end > x_start && y_end > y_start && x_end <= sw && y_end <= sh;
+
+        if interior {
+            match eo_class {
+                0 if x_start >= 1 && x_end + 1 <= plane_w => {
+                    let mut stats = sao::EoStats::default();
+                    crate::primitives::sao_stats_e0(
+                        plane,
+                        stride,
+                        src_plane,
+                        src_stride,
+                        x_start,
+                        y_start,
+                        x_end - x_start,
+                        y_end - y_start,
+                        &mut stats.sum,
+                        &mut stats.count,
+                    );
+                    return stats;
+                }
+                1 if y_start >= 1 && y_end + 1 <= plane_h && x_end <= plane_w => {
+                    let mut stats = sao::EoStats::default();
+                    crate::primitives::sao_stats_e1(
+                        plane,
+                        stride,
+                        src_plane,
+                        src_stride,
+                        x_start,
+                        y_start,
+                        x_end - x_start,
+                        y_end - y_start,
+                        &mut stats.sum,
+                        &mut stats.count,
+                    );
+                    return stats;
+                }
+                2 if x_start >= 1
+                    && y_start >= 1
+                    && x_end + 1 <= plane_w
+                    && y_end + 1 <= plane_h =>
+                {
+                    let mut stats = sao::EoStats::default();
+                    crate::primitives::sao_stats_e2(
+                        plane,
+                        stride,
+                        src_plane,
+                        src_stride,
+                        x_start,
+                        y_start,
+                        x_end - x_start,
+                        y_end - y_start,
+                        &mut stats.sum,
+                        &mut stats.count,
+                    );
+                    return stats;
+                }
+                3 if x_end + 1 <= plane_w
+                    && y_start >= 1
+                    && x_start >= 1
+                    && y_end + 1 <= plane_h =>
+                {
+                    let mut stats = sao::EoStats::default();
+                    crate::primitives::sao_stats_e3(
+                        plane,
+                        stride,
+                        src_plane,
+                        src_stride,
+                        x_start,
+                        y_start,
+                        x_end - x_start,
+                        y_end - y_start,
+                        &mut stats.sum,
+                        &mut stats.count,
+                    );
+                    return stats;
+                }
+                _ => {}
             }
         }
 
@@ -211,8 +268,29 @@ impl<'a> Encoder<'a> {
         y_end: u32,
     ) -> sao::BoStats {
         let (plane, stride) = self.frame.plane(c_idx);
-        let band_shift = self.bit_depth.saturating_sub(5);
+        let (plane_w, plane_h) = self.frame.component_dims(c_idx);
+        let band_shift = self.bit_depth.saturating_sub(5) as u8;
         let mut stats = sao::BoStats::default();
+
+        let (src_plane, src_stride, sw, sh) = self.src_plane(c_idx);
+        if x_end <= plane_w && y_end <= plane_h && x_end <= sw && y_end <= sh {
+            crate::primitives::sao_stats_bo(
+                plane,
+                stride,
+                src_plane,
+                src_stride,
+                x_start,
+                y_start,
+                x_end - x_start,
+                y_end - y_start,
+                band_shift,
+                &mut stats.sum,
+                &mut stats.count,
+            );
+            return stats;
+        }
+
+        let band_shift = band_shift as u32;
         for y in y_start..y_end {
             for x in x_start..x_end {
                 let idx = y as usize * stride + x as usize;
@@ -528,7 +606,8 @@ pub fn encode_with_stats(
         }
     };
 
-    let analysis = if aq_active || config.effort != crate::Effort::Best {
+    let eff_t = crate::effort::template(config.effort);
+    let analysis = if aq_active || !eff_t.oracle {
         Arc::new(crate::preanalysis::analyze(width, height, bd, cat, src))
     } else {
         Arc::new(crate::preanalysis::AnalysisMaps::empty())
@@ -570,15 +649,10 @@ pub fn encode_with_stats(
         } else {
             None
         },
-        part_nxn_enabled: matches!(
-            config.effort,
-            crate::Effort::SlowPlus
-                | crate::Effort::Best
-                | crate::Effort::Placebo
-                | crate::Effort::Reference
-        ),
+        part_nxn_enabled: eff_t.nxn.enabled,
         analysis,
         stats: EncodeStats::default(),
+        effort_template: crate::effort::template(config.effort),
     };
 
     let ctb = 1u32 << CTB_LOG2;

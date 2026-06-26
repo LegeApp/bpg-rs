@@ -1,11 +1,13 @@
 //! Component evaluation kernels.
 
+use std::time::Instant;
+
 use bpg_hevc_decode::hevc::slice::IntraPredMode;
 
 use crate::cabac::CabacEstimator;
 use crate::contexts::ctx;
 use crate::encoder::Encoder;
-use crate::primitives::{ssd_u8, ssd_u16};
+use crate::primitives::{add_clip_u8, add_clip_u16, ssd_u8, ssd_u16, sub_residual_u8};
 use crate::residual::{apply_sign_data_hiding, estimate_residual_bits_into, get_scan_order};
 use crate::transform;
 
@@ -19,17 +21,19 @@ use super::source::CtuSourceCache;
 use super::workspace::BlockScratch;
 
 /// Quantization mode for the shared component evaluator. Search/screening uses
-/// [`QuantMode::HardQuantSearch`] (the green baseline); only the winner-only
-/// RDOQ finalizer uses [`QuantMode::RdoqFinal`]. The two modes share the same
-/// prediction, transform, sign-data-hiding, recon, and residual-pricing path —
-/// only the quantization step differs.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// [`QuantMode::HardQuantSearch`] (the green baseline); the winner-only
+/// RDOQ finalizer uses [`QuantMode::RdoqFinal`]; and analysis-stage RDOQ
+/// trials (for close candidates in Slow/Placebo) use [`QuantMode::RdoqTrial`].
+/// All three modes share the same prediction, transform, sign-data-hiding, recon,
+/// and residual-pricing path — only the quantization step differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum QuantMode {
     HardQuantSearch,
     RdoqFinal,
+    RdoqTrial { level: u8 },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ResidualPricingMode {
     Exact,
     Skip,
@@ -134,6 +138,28 @@ where
         let mut nnz;
         let mut recon_coded: Option<Vec<u16>> = None;
         let dist_zero = ssd_u16(&src, size, &pred, size, size);
+        let cbf_ci = if c_idx == 0 {
+            ctx::CBF_LUMA + if trafo_depth == 0 { 1 } else { 0 }
+        } else {
+            ctx::CBF_CBCR + trafo_depth as usize
+        };
+        let cbf0_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 0);
+        let scale = CabacEstimator::SCALE as f64;
+        let cost_zero = dist_zero as f64 + lambda * cbf0_bits as f64 / scale;
+        if dist_zero == 0 {
+            self.overlay
+                .push_block(c_idx, x0, y0, size as u32, size as u32, &pred);
+            self.workspace
+                .ledger
+                .finish_timer(WorkBucket::ChromaTrial, chroma_timer);
+            return BlockTrial {
+                coeff: None,
+                cbf: false,
+                frac_bits: 0,
+                cost: cost_zero,
+            };
+        }
+
         let mut dist_coded = dist_zero;
         let scan = get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
         {
@@ -143,10 +169,7 @@ where
 
             residual.clear();
             residual.resize(n, 0);
-            for i in 0..n {
-                residual[i] =
-                    (src[i] as i32 - pred[i] as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-            }
+            crate::primitives::sub_residual(&src, size, &pred, size, residual, size);
 
             transform::forward_transform_into(residual, log2_size, is_dst4, bit_depth, coeff, tmp);
             nnz = match quant_mode {
@@ -173,6 +196,28 @@ where
                     self.workspace.ledger.finish_timer(WorkBucket::Rdoq, timer);
                     rdoq.nnz
                 }
+                QuantMode::RdoqTrial { level: _ } => {
+                    let timer = StillSearchLedger::start_timer();
+                    let rdoq = crate::rdoq::rdoq_single_scan_into(
+                        &self.workspace.price_base,
+                        coeff,
+                        log2_size,
+                        c_idx,
+                        qp,
+                        bit_depth,
+                        scan,
+                        lambda,
+                        true,
+                        &mut self.workspace.rdoq_scratch,
+                    );
+                    levels.clear();
+                    levels.extend_from_slice(rdoq.levels);
+                    self.workspace.ledger.bump(WorkBucket::RdoqTrial);
+                    self.workspace
+                        .ledger
+                        .finish_timer(WorkBucket::RdoqTrial, timer);
+                    rdoq.nnz
+                }
             };
             if sdh_enabled && nnz > 0 {
                 let (scale, qbits) = transform::quant_params(log2_size, qp, bit_depth);
@@ -189,28 +234,16 @@ where
                     dequant,
                     recon_residual,
                 );
-                let max_sample = (1i32 << bit_depth) - 1;
+                let max_sample = ((1i32 << bit_depth) - 1) as u16;
                 let mut recon = vec![0u16; n];
-                for i in 0..n {
-                    recon[i] =
-                        (pred[i] as i32 + recon_residual[i] as i32).clamp(0, max_sample) as u16;
-                }
+                add_clip_u16(&pred, recon_residual, &mut recon, n, max_sample);
                 dist_coded = ssd_u16(&src, size, &recon, size, size);
                 levels_vec = levels.clone();
                 recon_coded = Some(recon);
             }
         }
 
-        let cbf_ci = if c_idx == 0 {
-            ctx::CBF_LUMA + if trafo_depth == 0 { 1 } else { 0 }
-        } else {
-            ctx::CBF_CBCR + trafo_depth as usize
-        };
-        let cbf0_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 0);
         let cbf1_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 1);
-
-        let scale = CabacEstimator::SCALE as f64;
-        let cost_zero = dist_zero as f64 + lambda * cbf0_bits as f64 / scale;
 
         let coded_min_cost = dist_coded as f64 + lambda * cbf1_bits as f64 / scale;
         let coded = if nnz > 0 && residual_pricing == ResidualPricingMode::Skip {
@@ -282,6 +315,9 @@ where
         residual_pricing: ResidualPricingMode,
         retain_coeff: bool,
     ) -> BlockTrial {
+        let profile = super::env::profile_enabled();
+        self.workspace.substage.calls += u64::from(profile);
+
         let size = 1usize << log2_size;
         let n = size * size;
         let cat = state.cat;
@@ -295,6 +331,8 @@ where
         let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
         pred.resize(n, 0);
         let mut pred_u16 = std::mem::take(&mut self.workspace.block_scratch.component_pred_tmp_u16);
+
+        let t_predict = profile.then(Instant::now);
         self.predict_into_u8(
             state,
             x0,
@@ -305,12 +343,40 @@ where
             &mut pred,
             &mut pred_u16,
         );
+        if let Some(t) = t_predict {
+            let ns = t.elapsed().as_nanos() as u64;
+            self.workspace.substage.predict_ns =
+                self.workspace.substage.predict_ns.saturating_add(ns);
+        }
 
         let mut levels_vec = Vec::new();
         let mut nnz;
         let mut recon_coded = false;
         let mut recon = std::mem::take(&mut self.workspace.block_scratch.component_recon_u8);
         let dist_zero = ssd_u8(&src, size, &pred, size, size);
+        let cbf_ci = if c_idx == 0 {
+            ctx::CBF_LUMA + if trafo_depth == 0 { 1 } else { 0 }
+        } else {
+            ctx::CBF_CBCR + trafo_depth as usize
+        };
+        let cbf0_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 0);
+        let scale = CabacEstimator::SCALE as f64;
+        let cost_zero = dist_zero as f64 + lambda * cbf0_bits as f64 / scale;
+        if dist_zero == 0 {
+            self.overlay
+                .push_block_u8(c_idx, x0, y0, size as u32, size as u32, &pred);
+            self.workspace.block_scratch.component_src_u8 = src;
+            self.workspace.block_scratch.component_pred_u8 = pred;
+            self.workspace.block_scratch.component_recon_u8 = recon;
+            self.workspace.block_scratch.component_pred_tmp_u16 = pred_u16;
+            return BlockTrial {
+                coeff: None,
+                cbf: false,
+                frac_bits: 0,
+                cost: cost_zero,
+            };
+        }
+
         let mut dist_coded = dist_zero;
         let scan = get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
         {
@@ -320,11 +386,17 @@ where
 
             residual.clear();
             residual.resize(n, 0);
-            for i in 0..n {
-                residual[i] = src[i] as i16 - pred[i] as i16;
+
+            let t_xform = profile.then(Instant::now);
+            sub_residual_u8(&src, size, &pred, size, residual, size);
+            transform::forward_transform_into(residual, log2_size, is_dst4, 8, coeff, tmp);
+            if let Some(t) = t_xform {
+                let ns = t.elapsed().as_nanos() as u64;
+                self.workspace.substage.forward_xform_ns =
+                    self.workspace.substage.forward_xform_ns.saturating_add(ns);
             }
 
-            transform::forward_transform_into(residual, log2_size, is_dst4, 8, coeff, tmp);
+            let t_quant = profile.then(Instant::now);
             nnz = match quant_mode {
                 QuantMode::HardQuantSearch => {
                     transform::quantize_into(coeff, log2_size, qp, 8, levels)
@@ -349,13 +421,41 @@ where
                     self.workspace.ledger.finish_timer(WorkBucket::Rdoq, timer);
                     rdoq.nnz
                 }
+                QuantMode::RdoqTrial { level: _ } => {
+                    let timer = StillSearchLedger::start_timer();
+                    let rdoq = crate::rdoq::rdoq_single_scan_into(
+                        &self.workspace.price_base,
+                        coeff,
+                        log2_size,
+                        c_idx,
+                        qp,
+                        8,
+                        scan,
+                        lambda,
+                        true,
+                        &mut self.workspace.rdoq_scratch,
+                    );
+                    levels.clear();
+                    levels.extend_from_slice(rdoq.levels);
+                    self.workspace.ledger.bump(WorkBucket::RdoqTrial);
+                    self.workspace
+                        .ledger
+                        .finish_timer(WorkBucket::RdoqTrial, timer);
+                    rdoq.nnz
+                }
             };
             if sdh_enabled && nnz > 0 {
                 let (scale, qbits) = transform::quant_params(log2_size, qp, 8);
                 nnz = apply_sign_data_hiding(levels, coeff, log2_size, scan, scale, qbits, nnz);
             }
+            if let Some(t) = t_quant {
+                let ns = t.elapsed().as_nanos() as u64;
+                self.workspace.substage.quant_ns =
+                    self.workspace.substage.quant_ns.saturating_add(ns);
+            }
 
             if nnz > 0 {
+                let t_recon = profile.then(Instant::now);
                 transform::reconstruct_residual_into(
                     levels,
                     log2_size,
@@ -367,10 +467,13 @@ where
                 );
                 recon.clear();
                 recon.resize(n, 0);
-                for i in 0..n {
-                    recon[i] = (pred[i] as i32 + recon_residual[i] as i32).clamp(0, 255) as u8;
-                }
+                add_clip_u8(&pred, recon_residual, &mut recon, n);
                 dist_coded = ssd_u8(&src, size, &recon, size, size);
+                if let Some(t) = t_recon {
+                    let ns = t.elapsed().as_nanos() as u64;
+                    self.workspace.substage.recon_dist_ns =
+                        self.workspace.substage.recon_dist_ns.saturating_add(ns);
+                }
                 // Clone levels only when we will actually use them (residual
                 // pricing or coeff retention). Skip-pricing + discard covers
                 // most cheap-pass evaluations.
@@ -381,22 +484,13 @@ where
             }
         }
 
-        let cbf_ci = if c_idx == 0 {
-            ctx::CBF_LUMA + if trafo_depth == 0 { 1 } else { 0 }
-        } else {
-            ctx::CBF_CBCR + trafo_depth as usize
-        };
-        let cbf0_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 0);
         let cbf1_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 1);
-
-        let scale = CabacEstimator::SCALE as f64;
-        let cost_zero = dist_zero as f64 + lambda * cbf0_bits as f64 / scale;
 
         let coded_min_cost = dist_coded as f64 + lambda * cbf1_bits as f64 / scale;
         let coded = if nnz > 0 && residual_pricing == ResidualPricingMode::Skip {
             Some((0, coded_min_cost))
         } else if nnz > 0 && coded_min_cost < cost_zero {
-            let timer = StillSearchLedger::start_timer();
+            let t_price = profile.then(Instant::now);
             let residual_bits = estimate_residual_bits_into(
                 &self.workspace.price_base,
                 &levels_vec,
@@ -406,10 +500,12 @@ where
                 sdh_enabled,
                 &mut self.workspace.price_scratch,
             );
+            if let Some(t) = t_price {
+                let ns = t.elapsed().as_nanos() as u64;
+                self.workspace.substage.residual_price_ns =
+                    self.workspace.substage.residual_price_ns.saturating_add(ns);
+            }
             self.workspace.ledger.bump(WorkBucket::ResidualPrice);
-            self.workspace
-                .ledger
-                .finish_timer(WorkBucket::ResidualPrice, timer);
             let cost = dist_coded as f64 + lambda * (residual_bits + cbf1_bits) as f64 / scale;
             Some((residual_bits, cost))
         } else {

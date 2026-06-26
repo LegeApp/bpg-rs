@@ -13,22 +13,25 @@ use super::eval::{BlockTrial, QuantMode, ResidualPricingMode};
 use super::ledger::{StillSearchLedger, WorkBucket};
 use super::overlay::OverlayCache;
 use super::plan::{CuPlan, NxnInfoPlan, ParentChromaPlan, TtPlan};
-use super::price::{ROUGH_RD_CANDS, luma_mode_bits};
+use super::price::luma_mode_bits;
+use super::rough::build_luma_shortlist;
 use super::source::CtuSourceCache;
+use crate::effort::{AngularFamily, ModeClass, ModeCost};
 use crate::encoder::types::{CHROMA_DM_IDX, chroma_pred_mode};
 
-/// Rough-mode cache for the four PartNxN PUs. This is intentionally small and
-/// stack-friendly; the later optimized batch path can fill it without changing
-/// the CU-level NxN API.
+/// Rough-mode cache for the four PartNxN PUs. Uses a fixed-size array
+/// large enough for any shortlist policy max_modes + MPMs.
+const NXN_MAX_SHORTLIST: usize = 16;
+
 pub(super) struct NxnRoughSet {
-    shortlist: [[u8; ROUGH_RD_CANDS + 3]; 4],
+    shortlist: [[u8; NXN_MAX_SHORTLIST]; 4],
     len: [usize; 4],
 }
 
 impl NxnRoughSet {
     fn new() -> Self {
         Self {
-            shortlist: [[0; ROUGH_RD_CANDS + 3]; 4],
+            shortlist: [[0; NXN_MAX_SHORTLIST]; 4],
             len: [0; 4],
         }
     }
@@ -304,15 +307,16 @@ where
         // overlay-aware reference border, mirroring the CU-level rough batch.
         // Planar/DC (0/1) stay on the per-mode predictor.
         let n = size * size;
-        let mut batch = [0u16; intra_angs::ANGULAR_MODES * 16];
-        self.predict_all_angular_into_u16(
-            state,
-            x0,
-            y0,
-            2,
-            &mut batch[..intra_angs::ANGULAR_MODES * n],
-        );
         if state.bit_depth == 8 {
+            // Predict directly to u8 — one batch narrow, no per-mode narrow loop.
+            let mut batch_u8 = [0u8; intra_angs::ANGULAR_MODES * 16];
+            self.predict_all_angular_into_u8(
+                state,
+                x0,
+                y0,
+                2,
+                &mut batch_u8[..intra_angs::ANGULAR_MODES * n],
+            );
             let mut src = [0u8; 16];
             self.source.sample_block_u8(0, x0, y0, size, &mut src);
             let mut pred = [0u8; 16];
@@ -326,15 +330,19 @@ where
             }
             for m in 2u8..=34 {
                 let off = intra_angs::slot_offset(m, 2);
-                let slot = &batch[off..off + n];
-                for (d, &s) in pred.iter_mut().zip(slot.iter()) {
-                    *d = s.min(u8::MAX as u16) as u8;
-                }
-                let satd = satd_u8(&src, size, &pred, size, size);
+                let satd = satd_u8(&src, size, &batch_u8[off..off + n], size, size);
                 let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
                 rough[m as usize] = (satd as f64 + lambda_sad * mbits as f64 / scale, m);
             }
         } else {
+            let mut batch = [0u16; intra_angs::ANGULAR_MODES * 16];
+            self.predict_all_angular_into_u16(
+                state,
+                x0,
+                y0,
+                2,
+                &mut batch[..intra_angs::ANGULAR_MODES * n],
+            );
             let mut src = [0u16; 16];
             for y in 0..size {
                 for x in 0..size {
@@ -367,24 +375,31 @@ where
             .ledger
             .finish_timer(WorkBucket::NxnRough, timer);
 
-        let best_rough = rough[0].0;
-        let rough_rd_cands = super::env::rough_rd_cands();
-        let mut modes = [0u8; ROUGH_RD_CANDS + 3];
-        let mut len = 0usize;
-        for &(cost, m) in rough.iter() {
-            if len >= rough_rd_cands || cost > best_rough * 1.25 {
-                break;
-            }
-            modes[len] = m;
-            len += 1;
-        }
-        for &mm in mpm_u8.iter() {
-            if !modes[..len].contains(&mm) {
-                modes[len] = mm;
-                len += 1;
+        let sl_policy = &state.effort_template.luma.shortlist;
+        fn classify_nxn(m: u8) -> (ModeClass, Option<AngularFamily>) {
+            if m == 0 {
+                (ModeClass::Planar, None)
+            } else if m == 1 {
+                (ModeClass::Dc, None)
+            } else {
+                (ModeClass::Angular, AngularFamily::classify(m))
             }
         }
-        set.set(pu, &modes[..len]);
+        let rough_costs: Vec<ModeCost> = rough
+            .iter()
+            .map(|&(cost, m)| {
+                let (class, family) = classify_nxn(m);
+                ModeCost {
+                    mode: m,
+                    cost,
+                    satd: 0,
+                    class,
+                    family,
+                }
+            })
+            .collect();
+        let modes = build_luma_shortlist(&rough_costs, mpm_u8, sl_policy);
+        set.set(pu, &modes);
     }
 
     /// Exact-evaluate the selected PU's rough set. The name is intentionally the

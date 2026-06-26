@@ -350,8 +350,8 @@ struct Row {
     angular_modes_before: u64,
     angular_modes_after: u64,
     angular_modes_removed: u64,
-    stillsearch_ledger: [u64; 15],
-    stillsearch_ledger_ns: [u64; 15],
+    stillsearch_ledger: [u64; 16],
+    stillsearch_ledger_ns: [u64; 16],
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -877,11 +877,11 @@ struct RustResult {
     /// StillSearch per-CTU work-ledger bucket call counts (summed over the
     /// frame). Indexed by `WorkBucket` order: RoughLuma, LumaCheap, LumaExact,
     /// TuLeaf, TuSplit, NxnRough, NxnBatch, ChromaRough, ChromaTrial, Rdoq,
-    /// ResidualPrice, FinalCommit, Writer, Deblock, Sao.
-    stillsearch_ledger: [u64; 15],
+    /// RdoqTrial, ResidualPrice, FinalCommit, Writer, Deblock, Sao.
+    stillsearch_ledger: [u64; 16],
     /// Optional StillSearch per-bucket wall-clock nanoseconds; nonzero only when
     /// BPG_STILLSEARCH_PROFILE=1 is set. Same bucket order as `stillsearch_ledger`.
-    stillsearch_ledger_ns: [u64; 15],
+    stillsearch_ledger_ns: [u64; 16],
     /// True end-to-end RGB PSNR (decode `.bpg` → RGB vs source), comparable to the
     /// C number from [`decoded_rgb_psnr`].
     rgb_psnr: Option<f64>,
@@ -1327,7 +1327,7 @@ fn write_combined_summary(
     )?;
     writeln!(out)?;
 
-    const BUCKETS: [&str; 15] = [
+    const BUCKETS: [&str; 16] = [
         "RoughLuma",
         "LumaCheap",
         "LumaExact",
@@ -1338,6 +1338,7 @@ fn write_combined_summary(
         "ChromaRough",
         "ChromaTrial",
         "Rdoq",
+        "RdoqTrial",
         "ResidualPrice",
         "FinalCommit",
         "Writer",

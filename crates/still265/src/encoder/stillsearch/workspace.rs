@@ -1,10 +1,24 @@
 //! CTU-local workspace and scratch buffers.
 
+use std::time::Instant;
+
 use super::arena::CoeffArena;
 use super::ledger::StillSearchLedger;
 use crate::contexts::Contexts;
 use crate::rdoq::RdoqScratch;
 use crate::residual::ResidualPricingScratch;
+
+/// Per-CTU substage profile accumulators for `eval_component_8`.
+/// Populated only when `BPG_STILLSEARCH_PROFILE=1`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SubstageProfile {
+    pub predict_ns: u64,
+    pub forward_xform_ns: u64,
+    pub quant_ns: u64,
+    pub recon_dist_ns: u64,
+    pub residual_price_ns: u64,
+    pub calls: u64,
+}
 
 pub(super) struct CtuWorkspace {
     pub(super) coeffs: CoeffArena,
@@ -20,6 +34,12 @@ pub(super) struct CtuWorkspace {
     /// Best rough SATD score for the current 8×8 CU (set by decide_cu_luma_mode
     /// when log2_cb_size==3, consumed by decide_cu_min_leaf_or_nxn).
     pub(super) last_8x8_rough_satd: f64,
+    /// Per-CTU substage profile (eval_component_8 breakdown). Zero when
+    /// profiling is disabled.
+    pub(super) substage: SubstageProfile,
+    /// Number of TU split evaluations skipped due to zero-residual early
+    /// termination in this CTU.
+    pub(super) tu_split_early_terminations: u64,
 }
 
 impl Default for CtuWorkspace {
@@ -32,6 +52,8 @@ impl Default for CtuWorkspace {
             price_scratch: ResidualPricingScratch::default(),
             rdoq_scratch: RdoqScratch::default(),
             last_8x8_rough_satd: f64::INFINITY,
+            substage: SubstageProfile::default(),
+            tu_split_early_terminations: 0,
         }
     }
 }
@@ -41,6 +63,8 @@ impl CtuWorkspace {
         self.coeffs.clear();
         self.ledger.clear_ctu();
         self.block_scratch.clear_ctu();
+        self.substage = SubstageProfile::default();
+        self.tu_split_early_terminations = 0;
     }
 
     /// Seed the trial-pricing entry context with the live CTU-entry context.

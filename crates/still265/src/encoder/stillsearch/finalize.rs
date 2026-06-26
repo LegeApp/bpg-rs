@@ -122,6 +122,7 @@ where
                     QuantMode::RdoqFinal,
                     ResidualPricingMode::Exact,
                     true,
+                    super::tu::TtEvalScope::FullComponents,
                 );
                 new_tt
             }

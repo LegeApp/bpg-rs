@@ -67,6 +67,31 @@ pub fn intra_pred_allangs_scalar(
     }
 }
 
+/// Predict all angular modes (2..=34) directly into a u8 batch (8-bit content only).
+/// Semantically equivalent to `intra_pred_allangs_scalar` + narrow; avoids the
+/// per-mode narrow loop in the rough path by doing one batch narrow.
+pub fn intra_pred_allangs_u8_scalar(
+    dst: &mut [u8],
+    unfiltered: &[i32],
+    filtered: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    debug_assert_eq!(bit_depth, 8, "pred_allangs_u8 is only for 8-bit content");
+    let size = 1usize << log2_size;
+    let n = size * size;
+    debug_assert!(dst.len() >= ANGULAR_MODES * n);
+    let mut tmp = vec![0u16; ANGULAR_MODES * n];
+    intra_pred_allangs_scalar(
+        &mut tmp, unfiltered, filtered, center, log2_size, c_idx, bit_depth,
+    );
+    for (d, &s) in dst.iter_mut().zip(tmp.iter()) {
+        *d = s.min(255) as u8;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
