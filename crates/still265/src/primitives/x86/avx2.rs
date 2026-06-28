@@ -400,6 +400,181 @@ pub fn satd_u8_avx2_dispatch(
     unsafe { satd_u8_avx2(a, stride_a, b, stride_b, size) }
 }
 
+// ─── sa8d_u8 (8x8 Hadamard) ──────────────────────────────────────────────────
+
+/// 8-bit SA8D — AVX2. Bit-identical to `scalar::sa8d_u8_scalar`: size 4 is a
+/// single 4x4 SATD, larger sizes tile into 8x8 Hadamard blocks each scaled by
+/// `(sum + 2) >> 2`, summed over tiles.
+///
+/// The 8x8 block uses an i16 separable Walsh-Hadamard (row pass, transpose, row
+/// pass). The scalar `hadamard8_1d` emits its outputs in a different lane order
+/// than this kernel's `hadamard8_rows_i16`, but the final sum-of-absolutes is
+/// invariant to that permutation as long as both passes share one butterfly
+/// (the permutation P turns the 2D result T into P·T·Pᵀ, leaving Σ|·| unchanged).
+///
+/// For 8-bit input the butterflies stay within i16 (worst-case coefficient
+/// 255·64 = 16320 < 32767), but the per-lane absolute-value accumulation across
+/// 8 rows would overflow i16, so it widens to i32 before summing.
+#[target_feature(enable = "avx2")]
+pub unsafe fn sa8d_u8_avx2(
+    a: &[u8],
+    stride_a: usize,
+    b: &[u8],
+    stride_b: usize,
+    size: usize,
+) -> u32 {
+    assert!(matches!(size, 4 | 8 | 16 | 32));
+    assert!(stride_a >= size && stride_b >= size);
+
+    if size == 4 {
+        return unsafe { satd_u8_avx2(a, stride_a, b, stride_b, 4) };
+    }
+
+    let mut sum = 0u32;
+    let mut by = 0;
+    while by < size {
+        let mut bx = 0;
+        while bx < size {
+            sum += unsafe {
+                sa8d_8x8_u8_avx2(
+                    &a[by * stride_a + bx..],
+                    stride_a,
+                    &b[by * stride_b + bx..],
+                    stride_b,
+                )
+            };
+            bx += 8;
+        }
+        by += 8;
+    }
+    sum
+}
+
+/// One 8x8 SA8D tile. Returns `(Σ|coeff| + 2) >> 2`, matching `sa8d_8x8_by`.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn sa8d_8x8_u8_avx2(a: &[u8], sa: usize, b: &[u8], sb: usize) -> u32 {
+    unsafe {
+        let zero = _mm_setzero_si128();
+
+        // Load row `row` as eight i16 differences (a - b).
+        let load_diff8 = |row: usize| -> __m128i {
+            let va = _mm_loadl_epi64(a.as_ptr().add(row * sa) as *const __m128i);
+            let vb = _mm_loadl_epi64(b.as_ptr().add(row * sb) as *const __m128i);
+            _mm_sub_epi16(_mm_unpacklo_epi8(va, zero), _mm_unpacklo_epi8(vb, zero))
+        };
+
+        let mut r = [
+            load_diff8(0),
+            load_diff8(1),
+            load_diff8(2),
+            load_diff8(3),
+            load_diff8(4),
+            load_diff8(5),
+            load_diff8(6),
+            load_diff8(7),
+        ];
+
+        hadamard8_rows_i16(&mut r);
+        transpose8x8_i16(&mut r);
+        hadamard8_rows_i16(&mut r);
+
+        // Σ|coeff|, widened to i32 per lane to avoid i16 overflow across 8 rows.
+        let mut acc = _mm_setzero_si128(); // 4 × i32
+        for v in r {
+            let abs = _mm_max_epi16(v, _mm_sub_epi16(zero, v));
+            let lo = _mm_unpacklo_epi16(abs, zero); // 4 × i32 (abs ≥ 0)
+            let hi = _mm_unpackhi_epi16(abs, zero); // 4 × i32
+            acc = _mm_add_epi32(acc, _mm_add_epi32(lo, hi));
+        }
+
+        // Horizontal sum of the four i32 lanes.
+        let s = _mm_add_epi32(acc, _mm_shuffle_epi32(acc, 0b01_00_11_10));
+        let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b00_00_00_01));
+        let sum = _mm_cvtsi128_si32(s) as u32;
+        (sum + 2) >> 2
+    }
+}
+
+/// In-place 8-point Hadamard butterfly applied to each of the 8 lanes across the
+/// eight `__m128i` rows (one i16 per lane per row).
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn hadamard8_rows_i16(r: &mut [__m128i; 8]) {
+    unsafe {
+        let a0 = _mm_add_epi16(r[0], r[4]);
+        let a1 = _mm_add_epi16(r[1], r[5]);
+        let a2 = _mm_add_epi16(r[2], r[6]);
+        let a3 = _mm_add_epi16(r[3], r[7]);
+        let a4 = _mm_sub_epi16(r[0], r[4]);
+        let a5 = _mm_sub_epi16(r[1], r[5]);
+        let a6 = _mm_sub_epi16(r[2], r[6]);
+        let a7 = _mm_sub_epi16(r[3], r[7]);
+
+        let b0 = _mm_add_epi16(a0, a2);
+        let b1 = _mm_add_epi16(a1, a3);
+        let b2 = _mm_sub_epi16(a0, a2);
+        let b3 = _mm_sub_epi16(a1, a3);
+        let b4 = _mm_add_epi16(a4, a6);
+        let b5 = _mm_add_epi16(a5, a7);
+        let b6 = _mm_sub_epi16(a4, a6);
+        let b7 = _mm_sub_epi16(a5, a7);
+
+        r[0] = _mm_add_epi16(b0, b1);
+        r[1] = _mm_sub_epi16(b0, b1);
+        r[2] = _mm_add_epi16(b2, b3);
+        r[3] = _mm_sub_epi16(b2, b3);
+        r[4] = _mm_add_epi16(b4, b5);
+        r[5] = _mm_sub_epi16(b4, b5);
+        r[6] = _mm_add_epi16(b6, b7);
+        r[7] = _mm_sub_epi16(b6, b7);
+    }
+}
+
+/// Transpose eight `__m128i` rows of eight i16 each.
+#[inline]
+#[target_feature(enable = "avx2")]
+unsafe fn transpose8x8_i16(r: &mut [__m128i; 8]) {
+    unsafe {
+        let t0 = _mm_unpacklo_epi16(r[0], r[1]);
+        let t1 = _mm_unpackhi_epi16(r[0], r[1]);
+        let t2 = _mm_unpacklo_epi16(r[2], r[3]);
+        let t3 = _mm_unpackhi_epi16(r[2], r[3]);
+        let t4 = _mm_unpacklo_epi16(r[4], r[5]);
+        let t5 = _mm_unpackhi_epi16(r[4], r[5]);
+        let t6 = _mm_unpacklo_epi16(r[6], r[7]);
+        let t7 = _mm_unpackhi_epi16(r[6], r[7]);
+
+        let u0 = _mm_unpacklo_epi32(t0, t2);
+        let u1 = _mm_unpackhi_epi32(t0, t2);
+        let u2 = _mm_unpacklo_epi32(t1, t3);
+        let u3 = _mm_unpackhi_epi32(t1, t3);
+        let u4 = _mm_unpacklo_epi32(t4, t6);
+        let u5 = _mm_unpackhi_epi32(t4, t6);
+        let u6 = _mm_unpacklo_epi32(t5, t7);
+        let u7 = _mm_unpackhi_epi32(t5, t7);
+
+        r[0] = _mm_unpacklo_epi64(u0, u4);
+        r[1] = _mm_unpackhi_epi64(u0, u4);
+        r[2] = _mm_unpacklo_epi64(u1, u5);
+        r[3] = _mm_unpackhi_epi64(u1, u5);
+        r[4] = _mm_unpacklo_epi64(u2, u6);
+        r[5] = _mm_unpackhi_epi64(u2, u6);
+        r[6] = _mm_unpacklo_epi64(u3, u7);
+        r[7] = _mm_unpackhi_epi64(u3, u7);
+    }
+}
+
+pub fn sa8d_u8_avx2_dispatch(
+    a: &[u8],
+    stride_a: usize,
+    b: &[u8],
+    stride_b: usize,
+    size: usize,
+) -> u32 {
+    unsafe { sa8d_u8_avx2(a, stride_a, b, stride_b, size) }
+}
+
 // ─── Intra prediction (8-bit) ────────────────────────────────────────────────
 //
 // All prediction functions implement the HEVC spec formulas exactly.
@@ -1291,6 +1466,7 @@ pub fn fwd_dct32_avx2_dispatch(residual: &[i16], out: &mut [i16], bit_depth: u8)
 /// Install AVX2 kernels into the primitive table.
 pub(super) fn setup(p: &mut crate::primitives::Primitives) {
     p.pixel.satd_u8 = satd_u8_avx2_dispatch;
+    p.pixel.sa8d_u8 = sa8d_u8_avx2_dispatch;
     p.pixel.ssd_u8 = ssd_u8_avx2_dispatch;
     p.pixel.sub_residual_u8 = sub_residual_u8_avx2_dispatch;
     p.pixel.add_clip_u8 = add_clip_u8_avx2_dispatch;

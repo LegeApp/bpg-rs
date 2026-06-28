@@ -845,6 +845,36 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
+    fn avx2_sa8d_u8_matches_scalar() {
+        let mut seed = 0x51a8_d000u32;
+        for _ in 0..50 {
+            for &size in &[4usize, 8, 16, 32] {
+                let stride = size + (seed as usize & 7);
+                let mut a = vec![0u8; stride * size];
+                let mut b = vec![0u8; stride * size];
+                fill_pattern(&mut a, 99, &mut seed);
+                fill_pattern(&mut b, 99, &mut seed);
+                let want = sa8d_u8_scalar(&a, stride, &b, stride, size);
+                let got = x86::avx2::sa8d_u8_avx2_dispatch(&a, stride, &b, stride, size);
+                assert_eq!(got, want, "size={size} stride={stride}");
+            }
+        }
+        // Extreme contrast (all-255 vs all-0) maximizes Hadamard coefficient
+        // magnitude — guards the i32 accumulation against i16 overflow.
+        for &size in &[8usize, 16, 32] {
+            let stride = size;
+            let zero = vec![0u8; stride * size];
+            let full = vec![255u8; stride * size];
+            assert_eq!(
+                x86::avx2::sa8d_u8_avx2_dispatch(&zero, stride, &full, stride, size),
+                sa8d_u8_scalar(&zero, stride, &full, stride, size),
+                "extreme size={size}",
+            );
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn sse2_satd_u8_randomized_matches_scalar() {
         let mut seed = 0x9e37_79b9u32;
         for _ in 0..200 {
