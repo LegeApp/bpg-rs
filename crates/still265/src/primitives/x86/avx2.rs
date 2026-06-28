@@ -206,6 +206,47 @@ pub fn sub_residual_u8_avx2_dispatch(
     unsafe { sub_residual_u8_avx2(src, src_stride, pred, pred_stride, out, size) }
 }
 
+// ─── add_clip_u8 (pack-store) ────────────────────────────────────────────────
+
+/// Reconstruct 8-bit samples: `out = clip(pred + residual, 0, 255)`, 16/iter.
+///
+/// Bit-identical to `scalar::add_clip_u8_scalar`. Unlike the `wide` path, which
+/// widens to `i32x8` and stores the 8 lanes element-by-element, this stays in
+/// i16 and uses saturating add + `packus` — the x265-style narrow-type pipeline
+/// that `wide` cannot express. `_mm256_adds_epi16` saturates the signed sum (a
+/// `u8` pred plus an i16 residual can exceed i16 range), then `_mm_packus_epi16`
+/// clamps to `[0, 255]`; the two together reproduce the scalar `clamp(0, 255)`
+/// exactly.
+#[target_feature(enable = "avx2")]
+pub unsafe fn add_clip_u8_avx2(pred: &[u8], residual: &[i16], out: &mut [u8], n: usize) {
+    debug_assert!(pred.len() >= n && residual.len() >= n && out.len() >= n);
+    let mut i = 0;
+    while i + 16 <= n {
+        // 16 u8 pred → 16 i16, 16 i16 residual, saturating add.
+        let p = _mm256_cvtepu8_epi16(_mm_loadu_si128(pred.as_ptr().add(i) as *const __m128i));
+        let r = _mm256_loadu_si256(residual.as_ptr().add(i) as *const __m256i);
+        let s = _mm256_adds_epi16(p, r);
+        // Pack 16 i16 → 16 u8 (clamps to [0,255]); packus interleaves the two
+        // 128-bit lanes, so permute the qwords back into source order before the
+        // 16-byte store: result low 128 = [lane0.lo, lane1.lo].
+        let packed = _mm256_packus_epi16(s, s);
+        let perm = _mm256_permute4x64_epi64(packed, 0b0000_1000);
+        _mm_storeu_si128(
+            out.as_mut_ptr().add(i) as *mut __m128i,
+            _mm256_castsi256_si128(perm),
+        );
+        i += 16;
+    }
+    while i < n {
+        out[i] = (pred[i] as i32 + residual[i] as i32).clamp(0, 255) as u8;
+        i += 1;
+    }
+}
+
+pub fn add_clip_u8_avx2_dispatch(pred: &[u8], residual: &[i16], out: &mut [u8], n: usize) {
+    unsafe { add_clip_u8_avx2(pred, residual, out, n) }
+}
+
 // ─── satd_u8 ───────────────────────────────────────────────────────────────
 
 /// 8-bit SATD — AVX2. Processes two 4×4 blocks simultaneously in the two
@@ -1252,6 +1293,7 @@ pub(super) fn setup(p: &mut crate::primitives::Primitives) {
     p.pixel.satd_u8 = satd_u8_avx2_dispatch;
     p.pixel.ssd_u8 = ssd_u8_avx2_dispatch;
     p.pixel.sub_residual_u8 = sub_residual_u8_avx2_dispatch;
+    p.pixel.add_clip_u8 = add_clip_u8_avx2_dispatch;
     p.quant.quantize = quantize_avx2_dispatch;
     p.intra.pred_planar_u8 = pred_planar_u8_avx2_dispatch;
     p.intra.pred_dc_u8 = pred_dc_u8_avx2_dispatch;

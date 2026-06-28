@@ -36,11 +36,12 @@ pub use intra::angs as intra_angs;
 #[allow(unused_imports)]
 pub use scalar::{
     abs_sum_i16_scalar, add_clip_u8_scalar, add_clip_u16_scalar, count_nonzero_scalar,
-    dequantize_scalar, forward_dct_1d, fwd_dct4_scalar, fwd_dct8_scalar, fwd_dct16_scalar,
+    dequantize_scalar, forward_dct_1d, fwd_dct4_butterfly, fwd_dct4_scalar, fwd_dct8_butterfly,
+    fwd_dct8_scalar, fwd_dct16_butterfly, fwd_dct16_scalar, fwd_dct32_butterfly,
     fwd_dct32_scalar, fwd_dst4_scalar, last_nonzero_scalar, narrow_u16_to_u8_scalar,
-    quantize_scalar, sao_stats_bo_scalar, sao_stats_e0_scalar, sao_stats_e1_scalar,
-    sao_stats_e2_scalar, sao_stats_e3_scalar, satd_u8_scalar, satd_u16_scalar, ssd_u8_scalar,
-    ssd_u16_scalar, sub_residual_scalar, sub_residual_u8_scalar,
+    quantize_scalar, sa8d_u8_scalar, sa8d_u16_scalar, sao_stats_bo_scalar, sao_stats_e0_scalar,
+    sao_stats_e1_scalar, sao_stats_e2_scalar, sao_stats_e3_scalar, satd_u8_scalar, satd_u16_scalar,
+    ssd_u8_scalar, ssd_u16_scalar, sub_residual_scalar, sub_residual_u8_scalar,
 };
 
 // ─── DCT matrix infrastructure ────────────────────────────────────────────
@@ -184,6 +185,16 @@ pub fn satd_u8(a: &[u8], stride_a: usize, b: &[u8], stride_b: usize, size: usize
 /// 10/12-bit SATD. Dispatched through [`PRIMITIVES`]; byte-identical to [`satd_u16_scalar`].
 pub fn satd_u16(a: &[u16], stride_a: usize, b: &[u16], stride_b: usize, size: usize) -> u32 {
     (PRIMITIVES.pixel.satd_u16)(a, stride_a, b, stride_b, size)
+}
+
+/// 8-bit x265-style CU SA8D.
+pub fn sa8d_u8(a: &[u8], stride_a: usize, b: &[u8], stride_b: usize, size: usize) -> u32 {
+    (PRIMITIVES.pixel.sa8d_u8)(a, stride_a, b, stride_b, size)
+}
+
+/// 10/12-bit x265-style CU SA8D.
+pub fn sa8d_u16(a: &[u16], stride_a: usize, b: &[u16], stride_b: usize, size: usize) -> u32 {
+    (PRIMITIVES.pixel.sa8d_u16)(a, stride_a, b, stride_b, size)
 }
 
 /// Sum of squared differences (8-bit). Dispatched; byte-identical to [`ssd_u8_scalar`].
@@ -383,11 +394,130 @@ pub fn intra_pred_allangs(
     )
 }
 
+/// Exact planar intra prediction to u16 from a prepared border. Dispatched.
+#[allow(dead_code)]
+pub fn pred_planar_u16(
+    dst: &mut [u16],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    (PRIMITIVES.intra.pred_planar_u16)(dst, border, center, log2_size, c_idx, bit_depth)
+}
+
+/// Exact DC intra prediction to u16 from a prepared border. Dispatched.
+#[allow(dead_code)]
+pub fn pred_dc_u16(
+    dst: &mut [u16],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    (PRIMITIVES.intra.pred_dc_u16)(dst, border, center, log2_size, c_idx, bit_depth)
+}
+
+/// Exact angular intra prediction to u16 from a prepared border. Dispatched.
+#[allow(dead_code)]
+pub fn pred_angular_u16(
+    dst: &mut [u16],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    mode: u8,
+    bit_depth: u8,
+) {
+    (PRIMITIVES.intra.pred_angular_u16)(dst, border, center, log2_size, c_idx, mode, bit_depth)
+}
+
+/// Backward-compatible alias for the exact u16 planar primitive.
+#[allow(dead_code)]
+pub fn pred_planar(
+    dst: &mut [u16],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    pred_planar_u16(dst, border, center, log2_size, c_idx, bit_depth)
+}
+
+/// Backward-compatible alias for the exact u16 DC primitive.
+#[allow(dead_code)]
+pub fn pred_dc(
+    dst: &mut [u16],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    pred_dc_u16(dst, border, center, log2_size, c_idx, bit_depth)
+}
+
+/// Backward-compatible alias for the exact u16 angular primitive.
+#[allow(dead_code)]
+pub fn pred_angular(
+    dst: &mut [u16],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    mode: u8,
+    bit_depth: u8,
+) {
+    pred_angular_u16(dst, border, center, log2_size, c_idx, mode, bit_depth)
+}
+
+/// Exact planar intra prediction to u8 from a prepared border. Dispatched.
+pub fn pred_planar_u8(
+    dst: &mut [u8],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    (PRIMITIVES.intra.pred_planar_u8)(dst, border, center, log2_size, c_idx, bit_depth)
+}
+
+/// Exact DC intra prediction to u8 from a prepared border. Dispatched.
+pub fn pred_dc_u8(
+    dst: &mut [u8],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    (PRIMITIVES.intra.pred_dc_u8)(dst, border, center, log2_size, c_idx, bit_depth)
+}
+
+/// Exact angular intra prediction to u8 from a prepared border. Dispatched.
+pub fn pred_angular_u8(
+    dst: &mut [u8],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    mode: u8,
+    bit_depth: u8,
+) {
+    (PRIMITIVES.intra.pred_angular_u8)(dst, border, center, log2_size, c_idx, mode, bit_depth)
+}
+
 // ─── Sub-struct definitions ────────────────────────────────────────────────
 
 pub struct PixelPrimitives {
     pub satd_u8: fn(&[u8], usize, &[u8], usize, usize) -> u32,
     pub satd_u16: fn(&[u16], usize, &[u16], usize, usize) -> u32,
+    pub sa8d_u8: fn(&[u8], usize, &[u8], usize, usize) -> u32,
+    pub sa8d_u16: fn(&[u16], usize, &[u16], usize, usize) -> u32,
     pub ssd_u8: fn(&[u8], usize, &[u8], usize, usize) -> u64,
     pub ssd_u16: fn(&[u16], usize, &[u16], usize, usize) -> u64,
     pub sub_residual_u8: fn(&[u8], usize, &[u8], usize, &mut [i16], usize),
@@ -468,6 +598,8 @@ fn select_primitives() -> Primitives {
         pixel: PixelPrimitives {
             satd_u8: scalar::satd_u8_scalar,
             satd_u16: scalar::satd_u16_scalar,
+            sa8d_u8: scalar::sa8d_u8_scalar,
+            sa8d_u16: scalar::sa8d_u16_scalar,
             ssd_u8: scalar::ssd_u8_scalar,
             ssd_u16: scalar::ssd_u16_scalar,
             sub_residual_u8: scalar::sub_residual_u8_scalar,
@@ -495,6 +627,12 @@ fn select_primitives() -> Primitives {
         intra: intra::IntraPrimitives {
             pred_allangs: intra::angs::intra_pred_allangs_scalar,
             pred_allangs_u8: intra::angs::intra_pred_allangs_u8_scalar,
+            pred_planar_u16: intra::exact::pred_planar_scalar,
+            pred_dc_u16: intra::exact::pred_dc_scalar,
+            pred_angular_u16: intra::exact::pred_angular_scalar,
+            pred_planar_u8: intra::exact::pred_planar_u8_scalar,
+            pred_dc_u8: intra::exact::pred_dc_u8_scalar,
+            pred_angular_u8: intra::exact::pred_angular_u8_scalar,
         },
         sao: SaoPrimitives {
             stats_e0: scalar::sao_stats_e0_scalar,
@@ -643,6 +781,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sa8d_u8_matches_x265_shape_sanity() {
+        let zero = vec![0u8; 32 * 32];
+        let full = vec![7u8; 32 * 32];
+        assert_eq!(sa8d_u8_scalar(&zero, 4, &full, 4, 4), 56);
+        assert_eq!(sa8d_u8_scalar(&zero, 8, &full, 8, 8), 112);
+        assert_eq!(sa8d_u8_scalar(&zero, 16, &full, 16, 16), 448);
+        assert_eq!(sa8d_u8_scalar(&zero, 32, &full, 32, 32), 1792);
+    }
+
+    fn transpose_square_u8(src: &[u8], stride: usize, size: usize) -> Vec<u8> {
+        let mut dst = vec![0u8; size * size];
+        for y in 0..size {
+            for x in 0..size {
+                dst[x * size + y] = src[y * stride + x];
+            }
+        }
+        dst
+    }
+
+    #[test]
+    fn sa8d_u8_is_transpose_invariant_for_x265_allangs_layout() {
+        let mut seed = 0x3141_5926u32;
+        for &size in &[4usize, 8, 16, 32] {
+            let stride = size + 7;
+            let mut a = vec![0u8; stride * size];
+            let mut b = vec![0u8; stride * size];
+            for ka in 0..5 {
+                for kb in 0..5 {
+                    fill_pattern(&mut a, ka, &mut seed);
+                    fill_pattern(&mut b, kb, &mut seed);
+                    let at = transpose_square_u8(&a, stride, size);
+                    let bt = transpose_square_u8(&b, stride, size);
+                    assert_eq!(
+                        sa8d_u8_scalar(&a, stride, &b, stride, size),
+                        sa8d_u8_scalar(&at, size, &bt, size, size),
+                        "size={size} pattern a={ka} b={kb}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatched_sa8d_u8_matches_scalar() {
+        let mut seed = 0x2468_ace0u32;
+        for &size in &[4usize, 8, 16, 32] {
+            let stride = size + 5;
+            let mut a = vec![0u8; stride * size];
+            let mut b = vec![0u8; stride * size];
+            for ka in 0..5 {
+                for kb in 0..5 {
+                    fill_pattern(&mut a, ka, &mut seed);
+                    fill_pattern(&mut b, kb, &mut seed);
+                    let want = sa8d_u8_scalar(&a, stride, &b, stride, size);
+                    let got = (PRIMITIVES.pixel.sa8d_u8)(&a, stride, &b, stride, size);
+                    assert_eq!(got, want, "size={size} pattern a={ka} b={kb}");
+                }
+            }
+        }
+    }
+
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn sse2_satd_u8_randomized_matches_scalar() {
@@ -735,6 +935,30 @@ mod tests {
                     &src, stride, &pred, stride, &mut got, size,
                 );
                 assert_eq!(got, want, "size={size} stride={stride}");
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_add_clip_u8_matches_scalar() {
+        use super::scalar::add_clip_u8_scalar;
+        let mut seed = 0x0badf00d_u32;
+        for _ in 0..100 {
+            // Lengths cross the 16-wide boundary so both the vector body and the
+            // scalar tail are exercised.
+            for n in [1usize, 7, 16, 17, 31, 64, 256, 1024, 1025] {
+                let mut pred = vec![0u8; n];
+                fill_pattern(&mut pred, 255, &mut seed);
+                // Full-range i16 residual so the saturating add + packus clamp is
+                // covered on both the +overflow and -overflow sides.
+                let mut residual = vec![0i16; n];
+                fill_pattern_i16(&mut residual, &mut seed);
+                let mut want = vec![0u8; n];
+                let mut got = vec![0u8; n];
+                add_clip_u8_scalar(&pred, &residual, &mut want, n);
+                x86::avx2::add_clip_u8_avx2_dispatch(&pred, &residual, &mut got, n);
+                assert_eq!(got, want, "n={n}");
             }
         }
     }
