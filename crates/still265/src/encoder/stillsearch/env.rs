@@ -59,6 +59,31 @@ pub(super) const SCALAR_ANGULAR_ROUGH: &str = "BPG_STILLSEARCH_SCALAR_ANGULAR_RO
 /// is suppressing angular candidates too early.
 pub(super) const ROUGH_MODE_BIT_WEIGHT: &str = "BPG_STILLSEARCH_ROUGH_MODE_BIT_WEIGHT";
 
+/// Diagnostic x265shape RMD admission window. x265 uses 1.25. Larger values
+/// are not canonical; they test whether Still265's current rough cost model is
+/// losing oracle winners before simple RDO can rank them.
+pub(super) const X265_RMD_WINDOW: &str = "BPG_STILLSEARCH_X265_RMD_WINDOW";
+
+/// Diagnostic x265shape RMD candidate cap. x265 placebo uses
+/// `2 + rdLevel + (depth >> 1)`. Larger values are not canonical; they test
+/// whether Still265 rough ranking is pushing oracle winners below x265's cap.
+pub(super) const X265_RMD_CAP: &str = "BPG_STILLSEARCH_X265_RMD_CAP";
+
+/// Diagnostic only: when set alongside the luma oracle, print one `RMD_AUDIT:`
+/// line per oracle sample comparing Still265's fractional mode-bit RMD rank
+/// with x265-like integer `bitsCodeBin()` RMD ranks, including carry brackets.
+pub(super) const X265_RMD_AUDIT: &str = "BPG_STILLSEARCH_X265_RMD_AUDIT";
+
+/// Diagnostic only: use the no-carry integer x265 `calcRdSADCost` approximation
+/// for x265shape RMD candidate admission. This is not the default because
+/// x265's real `bitsCodeBin()` depends on the current fractional CABAC carry.
+pub(super) const X265_RMD_INTEGER_COST: &str = "BPG_STILLSEARCH_X265_RMD_INTEGER_COST";
+
+/// Diagnostic only: when set alongside the luma oracle, print one
+/// `MISS_AUDIT:` line per sampled oracle miss with RMD admission and
+/// simple-RDO ranking context.
+pub(super) const LUMA_MISS_AUDIT: &str = "BPG_STILLSEARCH_LUMA_MISS_AUDIT";
+
 /// Oracle diagnostic: when set, sampled CUs get full `decide_tt()` run on the
 /// entire shortlist AND on all 35 modes, reporting the true-best winner.
 /// Output is CSV-compatible lines on stderr bearing the `ORACLE:` prefix.
@@ -72,6 +97,24 @@ pub(super) const LUMA_ORACLE_MOD: &str = "BPG_STILLSEARCH_LUMA_ORACLE_MOD";
 pub(super) fn profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os(PROFILE).is_some())
+}
+
+#[inline]
+pub(super) fn x265_rmd_audit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os(X265_RMD_AUDIT).is_some())
+}
+
+#[inline]
+pub(super) fn x265_rmd_integer_cost_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os(X265_RMD_INTEGER_COST).is_some())
+}
+
+#[inline]
+pub(super) fn luma_miss_audit_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os(LUMA_MISS_AUDIT).is_some())
 }
 
 /// Returns `true` if luma cheap pass is enabled.
@@ -192,6 +235,24 @@ pub(super) fn luma_oracle_mod() -> u64 {
             .unwrap_or(64)
             .max(1)
     })
+}
+
+#[inline]
+pub(super) fn x265_rmd_window() -> f64 {
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| parse_env_or(X265_RMD_WINDOW, 1.25_f64).max(1.0))
+}
+
+#[inline]
+pub(super) fn x265_rmd_cap(default_cap: usize) -> usize {
+    static V: OnceLock<Option<usize>> = OnceLock::new();
+    V.get_or_init(|| {
+        std::env::var(X265_RMD_CAP)
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 35))
+    })
+    .unwrap_or(default_cap)
 }
 
 fn parse_env_or<T>(key: &str, default: T) -> T

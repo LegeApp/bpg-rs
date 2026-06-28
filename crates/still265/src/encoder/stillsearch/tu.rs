@@ -18,6 +18,34 @@ use crate::encoder::types::{
     MAX_INTRA_TT_DEPTH, MAX_TB_LOG2, chroma_pred_mode, chroma_tb_geom, has_chroma_tb,
 };
 
+/// Per-mode accumulator for the batched, leaf-major simple-RDO ranker
+/// ([`StillSearchDepth::eval_simple_rdo_luma_modes`]). One per candidate mode;
+/// each TU leaf adds its luma RD cost (plus the `split=false` flag bits) and ORs
+/// in its coded-block flag.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SimpleRdoAccum {
+    pub(super) mode: u8,
+    pub(super) cost: f64,
+    pub(super) cbf: bool,
+}
+
+impl SimpleRdoAccum {
+    #[inline]
+    fn new(mode: u8) -> Self {
+        Self {
+            mode,
+            cost: 0.0,
+            cbf: false,
+        }
+    }
+
+    #[inline]
+    fn add_leaf(&mut self, cost: f64, cbf: bool) {
+        self.cost += cost;
+        self.cbf |= cbf;
+    }
+}
+
 /// Scope of transform-tree evaluation: luma-only (for fast mode/TU search)
 /// or full luma+chroma (for winner re-evaluation and finalize).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,6 +563,198 @@ where
                 lambda,
             )
         }
+    }
+
+    /// Batched, leaf-major x265-shape simple RDO. Equivalent to calling
+    /// [`eval_simple_rdo_luma`] once per mode, but each concrete TU leaf samples
+    /// its source and builds its intra reference border **once**, then evaluates
+    /// every candidate mode against them — eliminating the per-mode source
+    /// resample and border rebuild that dominated `LumaCheap`. Byte-identical to
+    /// the per-mode path (same leaf cost, same `split_false` bits, same child sum
+    /// order).
+    pub(super) fn eval_simple_rdo_luma_modes(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        modes: &[u8],
+        lambda: f64,
+        out: &mut Vec<SimpleRdoAccum>,
+    ) {
+        out.clear();
+        out.extend(modes.iter().copied().map(SimpleRdoAccum::new));
+        self.eval_simple_rdo_luma_modes_accum(state, x0, y0, log2_size, trafo_depth, lambda, out);
+    }
+
+    fn eval_simple_rdo_luma_modes_accum(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        lambda: f64,
+        accum: &mut [SimpleRdoAccum],
+    ) {
+        if log2_size > MAX_TB_LOG2 {
+            // Forced split: recurse children in decoder/z-order, accumulating
+            // each child leaf's per-mode cost into the same accumulators.
+            let half = 1u32 << (log2_size - 1);
+            let kid_log2 = log2_size - 1;
+            let kid_depth = trafo_depth + 1;
+            self.eval_simple_rdo_luma_modes_accum(state, x0, y0, kid_log2, kid_depth, lambda, accum);
+            self.eval_simple_rdo_luma_modes_accum(
+                state,
+                x0 + half,
+                y0,
+                kid_log2,
+                kid_depth,
+                lambda,
+                accum,
+            );
+            self.eval_simple_rdo_luma_modes_accum(
+                state,
+                x0,
+                y0 + half,
+                kid_log2,
+                kid_depth,
+                lambda,
+                accum,
+            );
+            self.eval_simple_rdo_luma_modes_accum(
+                state,
+                x0 + half,
+                y0 + half,
+                kid_log2,
+                kid_depth,
+                lambda,
+                accum,
+            );
+            return;
+        }
+
+        let split_flag_coded = state.cat != 2
+            && log2_size > state.effort_template.tu.min_split_log2
+            && trafo_depth < MAX_INTRA_TT_DEPTH;
+        let split_false_cost = if split_flag_coded {
+            let bits = split_flag_bits(&self.workspace.price_base, log2_size, false);
+            lambda * bits as f64 / CabacEstimator::SCALE as f64
+        } else {
+            0.0
+        };
+
+        self.eval_tt_luma_leaf_cheap_modes(
+            state,
+            x0,
+            y0,
+            log2_size,
+            trafo_depth,
+            lambda,
+            split_false_cost,
+            accum,
+        );
+    }
+
+    /// Leaf-major batched cheap leaf evaluator. Mirrors the per-mode
+    /// `eval_tt_luma_leaf_cheap`, which does not bump `TuLeaf` (cheap-path work is
+    /// accounted under `LumaCheap`), so this doesn't either.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_tt_luma_leaf_cheap_modes(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        lambda: f64,
+        split_false_cost: f64,
+        accum: &mut [SimpleRdoAccum],
+    ) {
+        if state.bit_depth == 8 {
+            self.eval_tt_luma_leaf_cheap_modes_8(
+                state,
+                x0,
+                y0,
+                log2_size,
+                trafo_depth,
+                lambda,
+                split_false_cost,
+                accum,
+            );
+            return;
+        }
+        // High-bit-depth keeps the per-mode path (less hot).
+        for a in accum.iter_mut() {
+            let (cost, cbf) = self.eval_tt_luma_leaf_cheap(
+                state, x0, y0, log2_size, trafo_depth, a.mode, false, lambda,
+            );
+            a.add_leaf(cost + split_false_cost, cbf);
+        }
+    }
+
+    /// 8-bit leaf-major inner loop: sample source + build refs once, then predict
+    /// and evaluate each mode against the shared source/refs.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_tt_luma_leaf_cheap_modes_8(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        lambda: f64,
+        split_false_cost: f64,
+        accum: &mut [SimpleRdoAccum],
+    ) {
+        let size = 1usize << log2_size;
+        let n = size * size;
+
+        // Source and reference borders are identical for every candidate mode at
+        // this leaf (simple RDO never pushes candidate recon to the overlay).
+        let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
+        src.resize(n, 0);
+        self.source.sample_block_u8(0, x0, y0, size, &mut src);
+        let refs = self.build_intra_refs_for_block(state, x0, y0, log2_size, 0);
+
+        let residual_pricing = if super::env::luma_cheap_residual_price_exact(
+            state.effort_template.luma.cheap.residual_price
+                == crate::effort::ResidualPriceLevel::Exact,
+        ) {
+            ResidualPricingMode::Exact
+        } else {
+            ResidualPricingMode::Skip
+        };
+
+        let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
+        pred.resize(n, 0);
+
+        for a in accum.iter_mut() {
+            let mode = IntraPredMode::from_u8(a.mode).unwrap_or(IntraPredMode::Dc);
+            self.predict_exact_from_refs_u8(&refs, log2_size, 0, mode, &mut pred);
+            let trial = self.eval_component_8_from_src_pred(
+                state,
+                x0,
+                y0,
+                log2_size,
+                0,
+                mode,
+                state.cur_qp_y,
+                trafo_depth,
+                lambda,
+                QuantMode::HardQuantSearch,
+                residual_pricing,
+                false,
+                false,
+                &src,
+                &pred,
+            );
+            a.add_leaf(trial.cost + split_false_cost, trial.cbf);
+        }
+
+        self.workspace.block_scratch.component_src_u8 = src;
+        self.workspace.block_scratch.component_pred_u8 = pred;
     }
 
     fn eval_tt_forced_split_no_optional(

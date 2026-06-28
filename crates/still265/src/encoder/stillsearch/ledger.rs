@@ -1,10 +1,10 @@
 //! StillSearch work ledger buckets.
 //!
 //! Buckets read 0 in the current core for one of two reasons:
-//! - **Stage not yet implemented.** `LumaCheap` (no separate cheap luma screen;
-//!   `decide_cu_luma_mode` goes rough -> exact directly) and `ChromaRough` /
-//!   `ChromaTrial` (chroma is DM-only, no chroma mode search) are reserved for
-//!   when those stages land.
+//! - **Search stage not active for this preset/path.** `ChromaRough` remains
+//!   reserved because chroma is DM-only, but `LumaCheap` and `ChromaTrial` are
+//!   live buckets: cheap luma ranking and chroma component trials bump them
+//!   whenever those paths execute.
 //! - **Measured elsewhere.** `Deblock` and `Sao` are frame-level post-passes
 //!   timed by `EncodeStats::phase_deblock_us` / `phase_sao_*_us`, not counted
 //!   here.
@@ -17,13 +17,11 @@
 
 use std::time::Instant;
 
-// Several variants are reserved for not-yet-implemented stages (see module doc);
-// they are kept for index stability and future wiring.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum WorkBucket {
     RoughLuma,
-    /// Reserved: no separate cheap luma screen in the current core.
+    /// Cheap luma ranking evaluations.
     LumaCheap,
     LumaExact,
     TuLeaf,
@@ -32,7 +30,7 @@ pub(super) enum WorkBucket {
     NxnBatch,
     /// Reserved: chroma is DM-only (no chroma mode search) in the current core.
     ChromaRough,
-    /// Reserved: chroma is DM-only (no chroma trial candidates) currently.
+    /// Chroma component evaluations for luma-mode/TU candidates.
     ChromaTrial,
     Rdoq,
     /// Analysis-stage RDOQ trials (separate from winner-only final RDOQ).

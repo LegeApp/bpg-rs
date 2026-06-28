@@ -10,6 +10,13 @@ mod syntax;
 mod types;
 mod write;
 
+/// Temporary overlay-probe accessor (feature `overlay-probe`): returns
+/// (sample_calls, patch_iters) from the CTU recon overlay scans.
+#[cfg(feature = "overlay-probe")]
+pub(crate) fn overlay_probe_counts() -> (u64, u64) {
+    stillsearch::overlay_probe_counts()
+}
+
 use std::sync::Arc;
 
 use bpg_hevc_decode::DecodedFrame;
@@ -45,7 +52,7 @@ pub(super) struct Encoder<'a> {
     pub(super) part_nxn_enabled: bool,
     pub(super) analysis: Arc<crate::preanalysis::AnalysisMaps>,
     pub(super) stats: EncodeStats,
-    pub(super) effort_template: &'static crate::effort::EffortTemplate,
+    pub(super) effort_template: crate::effort::EffortTemplate,
 }
 
 impl<'a> Encoder<'a> {
@@ -606,7 +613,7 @@ pub fn encode_with_stats(
         }
     };
 
-    let eff_t = crate::effort::template(config.effort);
+    let eff_t = crate::effort::template_for_encode(config.effort);
     let analysis = if aq_active || !eff_t.oracle {
         Arc::new(crate::preanalysis::analyze(width, height, bd, cat, src))
     } else {
@@ -652,7 +659,7 @@ pub fn encode_with_stats(
         part_nxn_enabled: eff_t.nxn.enabled,
         analysis,
         stats: EncodeStats::default(),
-        effort_template: crate::effort::template(config.effort),
+        effort_template: eff_t,
     };
 
     let ctb = 1u32 << CTB_LOG2;

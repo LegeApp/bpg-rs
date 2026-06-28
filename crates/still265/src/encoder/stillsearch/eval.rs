@@ -84,20 +84,90 @@ where
         residual_pricing: ResidualPricingMode,
         retain_coeff: bool,
     ) -> BlockTrial {
-        // Chroma block evaluations (Cb/Cr) are otherwise invisible in the
-        // ledger: luma evals are attributed to RoughLuma/LumaExact/Tu*/Nxn*,
-        // but chroma has no rough/exact search of its own (DM-only). Count
-        // every chroma component evaluation here so the profile accounts for
-        // chroma transform/quant/pricing work. Counted once per call: the
-        // 8-bit path below is only reached through this function.
         let chroma_timer = if c_idx != 0 {
             self.workspace.ledger.bump(WorkBucket::ChromaTrial);
             StillSearchLedger::start_timer()
         } else {
             None
         };
+        let out = self.eval_component_impl(
+            state,
+            x0,
+            y0,
+            log2_size,
+            c_idx,
+            mode,
+            qp,
+            trafo_depth,
+            lambda,
+            quant_mode,
+            residual_pricing,
+            retain_coeff,
+            true,
+        );
+        self.workspace
+            .ledger
+            .finish_timer(WorkBucket::ChromaTrial, chroma_timer);
+        out
+    }
+
+    /// Like [`eval_component`] but skips overlay push. Useful for cheap
+    /// ranking passes where only the cost matters.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn eval_component_no_overlay(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+        mode: IntraPredMode,
+        qp: i32,
+        trafo_depth: u8,
+        lambda: f64,
+        quant_mode: QuantMode,
+        residual_pricing: ResidualPricingMode,
+        retain_coeff: bool,
+    ) -> BlockTrial {
+        self.eval_component_impl(
+            state,
+            x0,
+            y0,
+            log2_size,
+            c_idx,
+            mode,
+            qp,
+            trafo_depth,
+            lambda,
+            quant_mode,
+            residual_pricing,
+            retain_coeff,
+            false,
+        )
+    }
+
+    /// Shared implementation for [`eval_component`] and
+    /// [`eval_component_no_overlay`]. When `push_overlay` is false the winning
+    /// reconstruction is not stored in the overlay cache.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_component_impl(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+        mode: IntraPredMode,
+        qp: i32,
+        trafo_depth: u8,
+        lambda: f64,
+        quant_mode: QuantMode,
+        residual_pricing: ResidualPricingMode,
+        retain_coeff: bool,
+        push_overlay: bool,
+    ) -> BlockTrial {
         if bit_depth_is_8(state) {
-            let out = self.eval_component_8(
+            let out = self.eval_component_8_impl(
                 state,
                 x0,
                 y0,
@@ -110,10 +180,8 @@ where
                 quant_mode,
                 residual_pricing,
                 retain_coeff,
+                push_overlay,
             );
-            self.workspace
-                .ledger
-                .finish_timer(WorkBucket::ChromaTrial, chroma_timer);
             return out;
         }
 
@@ -147,11 +215,10 @@ where
         let scale = CabacEstimator::SCALE as f64;
         let cost_zero = dist_zero as f64 + lambda * cbf0_bits as f64 / scale;
         if dist_zero == 0 {
-            self.overlay
-                .push_block(c_idx, x0, y0, size as u32, size as u32, &pred);
-            self.workspace
-                .ledger
-                .finish_timer(WorkBucket::ChromaTrial, chroma_timer);
+            if push_overlay {
+                self.overlay
+                    .push_block(c_idx, x0, y0, size as u32, size as u32, &pred);
+            }
             return BlockTrial {
                 coeff: None,
                 cbf: false,
@@ -272,8 +339,10 @@ where
         let out = match coded {
             Some((residual_bits, cost_coded)) if cost_coded < cost_zero => {
                 let recon = recon_coded.expect("coded candidate has recon");
-                self.overlay
-                    .push_block(c_idx, x0, y0, size as u32, size as u32, &recon);
+                if push_overlay {
+                    self.overlay
+                        .push_block(c_idx, x0, y0, size as u32, size as u32, &recon);
+                }
                 let coeff = retain_coeff.then(|| self.workspace.coeffs.push(&levels_vec));
                 BlockTrial {
                     coeff,
@@ -283,8 +352,10 @@ where
                 }
             }
             _ => {
-                self.overlay
-                    .push_block(c_idx, x0, y0, size as u32, size as u32, &pred);
+                if push_overlay {
+                    self.overlay
+                        .push_block(c_idx, x0, y0, size as u32, size as u32, &pred);
+                }
                 BlockTrial {
                     coeff: None,
                     cbf: false,
@@ -293,14 +364,11 @@ where
                 }
             }
         };
-        self.workspace
-            .ledger
-            .finish_timer(WorkBucket::ChromaTrial, chroma_timer);
         out
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn eval_component_8(
+    fn eval_component_8_impl(
         &mut self,
         state: &Encoder<'_>,
         x0: u32,
@@ -314,6 +382,72 @@ where
         quant_mode: QuantMode,
         residual_pricing: ResidualPricingMode,
         retain_coeff: bool,
+        push_overlay: bool,
+    ) -> BlockTrial {
+        let profile = super::env::profile_enabled();
+        let size = 1usize << log2_size;
+        let n = size * size;
+
+        let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
+        src.resize(n, 0);
+        self.source.sample_block_u8(c_idx, x0, y0, size, &mut src);
+
+        let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
+        pred.resize(n, 0);
+        let t_predict = profile.then(Instant::now);
+        self.predict_exact_into_u8(state, x0, y0, log2_size, c_idx, mode, &mut pred);
+        if let Some(t) = t_predict {
+            let ns = t.elapsed().as_nanos() as u64;
+            self.workspace.substage.predict_ns =
+                self.workspace.substage.predict_ns.saturating_add(ns);
+        }
+
+        let out = self.eval_component_8_from_src_pred(
+            state,
+            x0,
+            y0,
+            log2_size,
+            c_idx,
+            mode,
+            qp,
+            trafo_depth,
+            lambda,
+            quant_mode,
+            residual_pricing,
+            retain_coeff,
+            push_overlay,
+            &src,
+            &pred,
+        );
+
+        self.workspace.block_scratch.component_src_u8 = src;
+        self.workspace.block_scratch.component_pred_u8 = pred;
+        out
+    }
+
+    /// Evaluate one 8-bit component from a precomputed source block and intra
+    /// prediction. This is the shared body of [`eval_component_8_impl`] (which
+    /// samples + predicts then calls this) and the batched cheap-RDO leaf path
+    /// (which builds source + refs once per leaf and calls this once per mode).
+    /// Byte-identical to the previous monolithic `eval_component_8_impl`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn eval_component_8_from_src_pred(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+        mode: IntraPredMode,
+        qp: i32,
+        trafo_depth: u8,
+        lambda: f64,
+        quant_mode: QuantMode,
+        residual_pricing: ResidualPricingMode,
+        retain_coeff: bool,
+        push_overlay: bool,
+        src: &[u8],
+        pred: &[u8],
     ) -> BlockTrial {
         let profile = super::env::profile_enabled();
         self.workspace.substage.calls += u64::from(profile);
@@ -323,52 +457,29 @@ where
         let cat = state.cat;
         let sdh_enabled = state.sign_data_hiding;
         let is_dst4 = c_idx == 0 && log2_size == 2;
-
-        let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
-        src.resize(n, 0);
-        self.source.sample_block_u8(c_idx, x0, y0, size, &mut src);
-
-        let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
-        pred.resize(n, 0);
-        let mut pred_u16 = std::mem::take(&mut self.workspace.block_scratch.component_pred_tmp_u16);
-
-        let t_predict = profile.then(Instant::now);
-        self.predict_into_u8(
-            state,
-            x0,
-            y0,
-            log2_size,
-            c_idx,
-            mode,
-            &mut pred,
-            &mut pred_u16,
-        );
-        if let Some(t) = t_predict {
-            let ns = t.elapsed().as_nanos() as u64;
-            self.workspace.substage.predict_ns =
-                self.workspace.substage.predict_ns.saturating_add(ns);
-        }
+        debug_assert!(src.len() >= n && pred.len() >= n);
 
         let mut levels_vec = Vec::new();
+        let mut priced_residual_bits = None;
         let mut nnz;
         let mut recon_coded = false;
         let mut recon = std::mem::take(&mut self.workspace.block_scratch.component_recon_u8);
-        let dist_zero = ssd_u8(&src, size, &pred, size, size);
+        let dist_zero = ssd_u8(src, size, pred, size, size);
         let cbf_ci = if c_idx == 0 {
             ctx::CBF_LUMA + if trafo_depth == 0 { 1 } else { 0 }
         } else {
             ctx::CBF_CBCR + trafo_depth as usize
         };
         let cbf0_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 0);
+        let cbf1_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 1);
         let scale = CabacEstimator::SCALE as f64;
         let cost_zero = dist_zero as f64 + lambda * cbf0_bits as f64 / scale;
         if dist_zero == 0 {
-            self.overlay
-                .push_block_u8(c_idx, x0, y0, size as u32, size as u32, &pred);
-            self.workspace.block_scratch.component_src_u8 = src;
-            self.workspace.block_scratch.component_pred_u8 = pred;
+            if push_overlay {
+                self.overlay
+                    .push_block_u8(c_idx, x0, y0, size as u32, size as u32, pred);
+            }
             self.workspace.block_scratch.component_recon_u8 = recon;
-            self.workspace.block_scratch.component_pred_tmp_u16 = pred_u16;
             return BlockTrial {
                 coeff: None,
                 cbf: false,
@@ -388,7 +499,7 @@ where
             residual.resize(n, 0);
 
             let t_xform = profile.then(Instant::now);
-            sub_residual_u8(&src, size, &pred, size, residual, size);
+            sub_residual_u8(src, size, pred, size, residual, size);
             transform::forward_transform_into(residual, log2_size, is_dst4, 8, coeff, tmp);
             if let Some(t) = t_xform {
                 let ns = t.elapsed().as_nanos() as u64;
@@ -467,45 +578,45 @@ where
                 );
                 recon.clear();
                 recon.resize(n, 0);
-                add_clip_u8(&pred, recon_residual, &mut recon, n);
-                dist_coded = ssd_u8(&src, size, &recon, size, size);
+                add_clip_u8(pred, recon_residual, &mut recon, n);
+                dist_coded = ssd_u8(src, size, &recon, size, size);
                 if let Some(t) = t_recon {
                     let ns = t.elapsed().as_nanos() as u64;
                     self.workspace.substage.recon_dist_ns =
                         self.workspace.substage.recon_dist_ns.saturating_add(ns);
                 }
-                // Clone levels only when we will actually use them (residual
-                // pricing or coeff retention). Skip-pricing + discard covers
-                // most cheap-pass evaluations.
-                if retain_coeff || residual_pricing == ResidualPricingMode::Exact {
+                let coded_min_cost = dist_coded as f64 + lambda * cbf1_bits as f64 / scale;
+                if residual_pricing == ResidualPricingMode::Exact && coded_min_cost < cost_zero {
+                    let t_price = profile.then(Instant::now);
+                    let residual_bits = estimate_residual_bits_into(
+                        &self.workspace.price_base,
+                        levels,
+                        log2_size,
+                        c_idx,
+                        scan,
+                        sdh_enabled,
+                        &mut self.workspace.price_scratch,
+                    );
+                    if let Some(t) = t_price {
+                        let ns = t.elapsed().as_nanos() as u64;
+                        self.workspace.substage.residual_price_ns =
+                            self.workspace.substage.residual_price_ns.saturating_add(ns);
+                    }
+                    self.workspace.ledger.bump(WorkBucket::ResidualPrice);
+                    priced_residual_bits = Some(residual_bits);
+                }
+                if retain_coeff && coded_min_cost < cost_zero {
                     levels_vec = levels.clone();
                 }
                 recon_coded = true;
             }
         }
 
-        let cbf1_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 1);
-
         let coded_min_cost = dist_coded as f64 + lambda * cbf1_bits as f64 / scale;
         let coded = if nnz > 0 && residual_pricing == ResidualPricingMode::Skip {
             Some((0, coded_min_cost))
         } else if nnz > 0 && coded_min_cost < cost_zero {
-            let t_price = profile.then(Instant::now);
-            let residual_bits = estimate_residual_bits_into(
-                &self.workspace.price_base,
-                &levels_vec,
-                log2_size,
-                c_idx,
-                scan,
-                sdh_enabled,
-                &mut self.workspace.price_scratch,
-            );
-            if let Some(t) = t_price {
-                let ns = t.elapsed().as_nanos() as u64;
-                self.workspace.substage.residual_price_ns =
-                    self.workspace.substage.residual_price_ns.saturating_add(ns);
-            }
-            self.workspace.ledger.bump(WorkBucket::ResidualPrice);
+            let residual_bits = priced_residual_bits.expect("exact residual bits were priced");
             let cost = dist_coded as f64 + lambda * (residual_bits + cbf1_bits) as f64 / scale;
             Some((residual_bits, cost))
         } else {
@@ -515,8 +626,10 @@ where
         let out = match coded {
             Some((residual_bits, cost_coded)) if cost_coded < cost_zero => {
                 debug_assert!(recon_coded, "coded candidate has recon");
-                self.overlay
-                    .push_block_u8(c_idx, x0, y0, size as u32, size as u32, &recon);
+                if push_overlay {
+                    self.overlay
+                        .push_block_u8(c_idx, x0, y0, size as u32, size as u32, &recon);
+                }
                 let coeff = retain_coeff.then(|| self.workspace.coeffs.push(&levels_vec));
                 BlockTrial {
                     coeff,
@@ -526,8 +639,10 @@ where
                 }
             }
             _ => {
-                self.overlay
-                    .push_block_u8(c_idx, x0, y0, size as u32, size as u32, &pred);
+                if push_overlay {
+                    self.overlay
+                        .push_block_u8(c_idx, x0, y0, size as u32, size as u32, pred);
+                }
                 BlockTrial {
                     coeff: None,
                     cbf: false,
@@ -537,10 +652,7 @@ where
             }
         };
 
-        self.workspace.block_scratch.component_src_u8 = src;
-        self.workspace.block_scratch.component_pred_u8 = pred;
         self.workspace.block_scratch.component_recon_u8 = recon;
-        self.workspace.block_scratch.component_pred_tmp_u16 = pred_u16;
         out
     }
 }

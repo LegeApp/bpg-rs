@@ -1,24 +1,32 @@
 //! Rough and exact luma mode search.
 
+use std::fmt::Write as _;
+
 use bpg_hevc_decode::hevc::slice::IntraPredMode;
 
 use crate::cabac::CabacEstimator;
+use crate::contexts::Contexts;
 use crate::encoder::Encoder;
 use crate::primitives;
 use crate::primitives::intra_angs;
-use crate::primitives::{satd_u8, satd_u16};
+use crate::primitives::{sa8d_u8, sa8d_u16, satd_u8, satd_u16};
 
 use super::depth::StillSearchDepth;
 use super::ledger::{StillSearchLedger, WorkBucket};
 use super::overlay::OverlayCache;
 use super::plan::TtPlan;
-use super::price::luma_mode_bits;
+use super::price::{
+    luma_mode_bits, x265_rd_sad_cost, x265_rmd_luma_mode_bits_no_carry,
+    x265_rmd_luma_mode_bits_with_carry, x265_rmd_luma_mode_carry_representatives, x265_sad_lambda,
+};
 use super::source::CtuSourceCache;
-use crate::encoder::types::{MAX_TB_LOG2, chroma_pred_mode, chroma_tb_geom, has_chroma_tb};
+use crate::encoder::types::{
+    CTB_LOG2, MAX_TB_LOG2, chroma_pred_mode, chroma_tb_geom, has_chroma_tb,
+};
 
 use crate::effort::{
     AngularFamily, CheapMode, ExactModeWinner, ExactUsage, ModeClass, ModeCost, RoughBlockEvidence,
-    TrialRdoqMode,
+    SimpleRdoResult, TrialRdoqMode,
 };
 
 impl<S, O> StillSearchDepth<S, O>
@@ -63,10 +71,9 @@ where
         let shortlist = build_luma_shortlist(&evidence.rough_costs, mpm_u8, sl_policy);
 
         let cheap_policy = &state.effort_template.luma.cheap;
-        let exact_policy = &state.effort_template.luma.exact;
         let cheap_enabled = super::env::luma_cheap_enabled(cheap_policy.enabled);
 
-        let winner = match (cheap_enabled, exact_policy.exact_usage) {
+        let winner = match (cheap_enabled, state.effort_template.luma.exact.exact_usage) {
             // Placebo: bypass cheap, run all shortlist through exact.
             (false, _) | (_, ExactUsage::AllShortlist) => self.evaluate_exact_modes(
                 state,
@@ -117,7 +124,11 @@ where
                     &shortlist,
                     &evidence,
                 );
-                let exact_set = build_exact_set(&shortlist, &cheap_ranked, &exact_policy.promote);
+                let exact_set = build_exact_set(
+                    &shortlist,
+                    &cheap_ranked,
+                    &state.effort_template.luma.exact.promote,
+                );
                 let winner = self.evaluate_exact_modes(
                     state,
                     x0,
@@ -143,6 +154,79 @@ where
                         exact_set.len(),
                         winner.mode,
                         winner.cost,
+                    );
+                }
+                winner
+            }
+            (true, ExactUsage::X265Shape) => {
+                let shortlist = build_x265_shape_shortlist(
+                    state,
+                    &self.workspace.price_base,
+                    &evidence.rough_costs,
+                    mpm_u8,
+                    log2_cb_size,
+                );
+                let simple_ranked = self.rank_x265_simple_rdo_modes(
+                    state,
+                    x0,
+                    y0,
+                    log2_cb_size,
+                    mpm_u8,
+                    lambda,
+                    scale,
+                    &shortlist,
+                    &evidence,
+                );
+                let mode = simple_ranked
+                    .first()
+                    .expect("x265shape cheap RDO must rank at least one candidate")
+                    .mode;
+                let winner = self.materialize_x265_shape_winner(
+                    state,
+                    x0,
+                    y0,
+                    log2_cb_size,
+                    mpm_u8,
+                    lambda,
+                    scale,
+                    mode,
+                );
+                if super::env::luma_oracle_enabled() {
+                    let current_luma_cost = self.oracle_luma_exact_cost(
+                        state,
+                        x0,
+                        y0,
+                        log2_cb_size,
+                        mpm_u8,
+                        lambda,
+                        scale,
+                        winner.mode,
+                    );
+                    let cheap_ranked: Vec<CheapMode> = simple_ranked
+                        .iter()
+                        .map(|r| CheapMode {
+                            mode: r.mode,
+                            cost: r.cost,
+                            luma_cbf: r.cbf,
+                            residual_bits: r.bits,
+                            distortion: r.dist,
+                            rough_rank: r.rough_rank,
+                        })
+                        .collect();
+                    self.run_luma_oracle(
+                        state,
+                        x0,
+                        y0,
+                        log2_cb_size,
+                        mpm_u8,
+                        lambda,
+                        scale,
+                        &evidence.rough_costs,
+                        &shortlist,
+                        Some(&cheap_ranked),
+                        1,
+                        winner.mode,
+                        current_luma_cost,
                     );
                 }
                 winner
@@ -195,7 +279,15 @@ where
         let rough_log2 = log2_cb_size.min(MAX_TB_LOG2);
         let size = 1usize << rough_log2;
         let n = size * size;
-        let lambda_sad = lambda.sqrt();
+        let use_x265_sa8d = matches!(
+            state.effort_template.luma.exact.exact_usage,
+            ExactUsage::X265Shape
+        );
+        let lambda_sad = if use_x265_sa8d {
+            x265_sad_lambda(state.cur_qp_y, state.bit_depth)
+        } else {
+            lambda.sqrt()
+        };
         let mbits_weight = super::env::rough_mode_bit_weight_override().unwrap_or(1.0);
         let scalar_angular = super::env::scalar_angular_rough_enabled();
         let mut rough_costs: Vec<ModeCost> = Vec::with_capacity(35);
@@ -210,6 +302,18 @@ where
                 mode_list.push(m);
             }
         }
+        let mut seen_modes = [false; 35];
+        mode_list.retain(|&m| {
+            let Some(seen) = seen_modes.get_mut(m as usize) else {
+                return false;
+            };
+            if *seen {
+                false
+            } else {
+                *seen = true;
+                true
+            }
+        });
 
         if state.bit_depth == 8 {
             let mut src = vec![0u8; n];
@@ -218,10 +322,29 @@ where
             let mut tmp_u16 = Vec::with_capacity(n);
             for &m in mode_list.iter().filter(|&&m| m <= 1) {
                 let mode = IntraPredMode::from_u8(m).expect("0..=1 are valid intra modes");
-                self.predict_into_u8(state, x0, y0, rough_log2, 0, mode, &mut pred, &mut tmp_u16);
-                let satd = satd_u8(&src, size, &pred, size, size);
-                let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
-                let cost = satd as f64 + mbits_weight * lambda_sad * mbits as f64 / scale;
+                if use_x265_sa8d && m == 0 {
+                    self.predict_x265_rmd_planar_into_u8(state, x0, y0, rough_log2, &mut pred);
+                } else {
+                    self.predict_into_u8(
+                        state,
+                        x0,
+                        y0,
+                        rough_log2,
+                        0,
+                        mode,
+                        &mut pred,
+                        &mut tmp_u16,
+                    );
+                }
+                let satd = if use_x265_sa8d {
+                    sa8d_u8(&src, size, &pred, size, size)
+                } else {
+                    satd_u8(&src, size, &pred, size, size)
+                };
+                let bit_cost = lambda_sad
+                    * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                    / scale;
+                let cost = satd as f64 + mbits_weight * bit_cost;
                 let (class, family) = classify_mode(m);
                 rough_costs.push(ModeCost {
                     mode: m,
@@ -240,9 +363,15 @@ where
                 self.predict_all_angular_into_u8(state, x0, y0, rough_log2, &mut batch8);
                 for &m in mode_list.iter().filter(|&&m| (2..=34).contains(&m)) {
                     let off = intra_angs::slot_offset(m, rough_log2);
-                    let satd = satd_u8(&src, size, &batch8[off..off + n], size, size);
-                    let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
-                    let cost = satd as f64 + mbits_weight * lambda_sad * mbits as f64 / scale;
+                    let satd = if use_x265_sa8d {
+                        sa8d_u8(&src, size, &batch8[off..off + n], size, size)
+                    } else {
+                        satd_u8(&src, size, &batch8[off..off + n], size, size)
+                    };
+                    let bit_cost = lambda_sad
+                        * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                        / scale;
+                    let cost = satd as f64 + mbits_weight * bit_cost;
                     let (class, family) = classify_mode(m);
                     rough_costs.push(ModeCost {
                         mode: m,
@@ -266,9 +395,15 @@ where
                         &mut pred,
                         &mut tmp_u16,
                     );
-                    let satd = satd_u8(&src, size, &pred, size, size);
-                    let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
-                    let cost = satd as f64 + mbits_weight * lambda_sad * mbits as f64 / scale;
+                    let satd = if use_x265_sa8d {
+                        sa8d_u8(&src, size, &pred, size, size)
+                    } else {
+                        satd_u8(&src, size, &pred, size, size)
+                    };
+                    let bit_cost = lambda_sad
+                        * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                        / scale;
+                    let cost = satd as f64 + mbits_weight * bit_cost;
                     let (class, family) = classify_mode(m);
                     rough_costs.push(ModeCost {
                         mode: m,
@@ -289,10 +424,20 @@ where
             let mut pred = vec![0u16; n];
             for &m in mode_list.iter().filter(|&&m| m <= 1) {
                 let mode = IntraPredMode::from_u8(m).expect("0..=1 are valid intra modes");
-                self.predict_into(state, x0, y0, rough_log2, 0, mode, &mut pred);
-                let satd = satd_u16(&src, size, &pred, size, size);
-                let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
-                let cost = satd as f64 + mbits_weight * lambda_sad * mbits as f64 / scale;
+                if use_x265_sa8d && m == 0 {
+                    self.predict_x265_rmd_planar_into_u16(state, x0, y0, rough_log2, &mut pred);
+                } else {
+                    self.predict_into(state, x0, y0, rough_log2, 0, mode, &mut pred);
+                }
+                let satd = if use_x265_sa8d {
+                    sa8d_u16(&src, size, &pred, size, size)
+                } else {
+                    satd_u16(&src, size, &pred, size, size)
+                };
+                let bit_cost = lambda_sad
+                    * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                    / scale;
+                let cost = satd as f64 + mbits_weight * bit_cost;
                 let (class, family) = classify_mode(m);
                 rough_costs.push(ModeCost {
                     mode: m,
@@ -313,9 +458,15 @@ where
                 for &m in mode_list.iter().filter(|&&m| (2..=34).contains(&m)) {
                     let off = intra_angs::slot_offset(m, rough_log2);
                     let slot = &batch[off..off + n];
-                    let satd = satd_u16(&src, size, slot, size, size);
-                    let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
-                    let cost = satd as f64 + mbits_weight * lambda_sad * mbits as f64 / scale;
+                    let satd = if use_x265_sa8d {
+                        sa8d_u16(&src, size, slot, size, size)
+                    } else {
+                        satd_u16(&src, size, slot, size, size)
+                    };
+                    let bit_cost = lambda_sad
+                        * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                        / scale;
+                    let cost = satd as f64 + mbits_weight * bit_cost;
                     let (class, family) = classify_mode(m);
                     rough_costs.push(ModeCost {
                         mode: m,
@@ -330,9 +481,15 @@ where
                 for &m in mode_list.iter().filter(|&&m| (2..=34).contains(&m)) {
                     let mode = IntraPredMode::from_u8(m).unwrap();
                     self.predict_into(state, x0, y0, rough_log2, 0, mode, &mut pred);
-                    let satd = satd_u16(&src, size, &pred, size, size);
-                    let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
-                    let cost = satd as f64 + mbits_weight * lambda_sad * mbits as f64 / scale;
+                    let satd = if use_x265_sa8d {
+                        sa8d_u16(&src, size, &pred, size, size)
+                    } else {
+                        satd_u16(&src, size, &pred, size, size)
+                    };
+                    let bit_cost = lambda_sad
+                        * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                        / scale;
+                    let cost = satd as f64 + mbits_weight * bit_cost;
                     let (class, family) = classify_mode(m);
                     rough_costs.push(ModeCost {
                         mode: m,
@@ -478,6 +635,68 @@ where
             recon,
         });
         (ranked, cheap_winner)
+    }
+
+    /// x265-shaped simple RDO ranker: luma only, no optional TU split, no overlay
+    /// push, and no rejected-candidate `TtPlan` allocation.
+    #[allow(clippy::too_many_arguments)]
+    fn rank_x265_simple_rdo_modes(
+        &mut self,
+        state: &mut Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_cb_size: u8,
+        mpm_u8: [u8; 3],
+        lambda: f64,
+        scale: f64,
+        shortlist: &[u8],
+        evidence: &RoughBlockEvidence,
+    ) -> Vec<SimpleRdoResult> {
+        let mut ranked: Vec<SimpleRdoResult> = Vec::with_capacity(shortlist.len());
+
+        // Leaf-major batched evaluation: each TU leaf samples source + builds the
+        // intra reference border once, then evaluates all candidate modes. This
+        // is byte-identical to the old mode-major loop but eliminates the
+        // per-mode source resample and border rebuild (the LumaCheap hot cost).
+        let cheap_timer = StillSearchLedger::start_timer();
+        let mut acc = std::mem::take(&mut self.workspace.block_scratch.simple_rdo_accum);
+        self.eval_simple_rdo_luma_modes(state, x0, y0, log2_cb_size, 0, shortlist, lambda, &mut acc);
+        // Preserve the per-mode LumaCheap call accounting (one per candidate mode)
+        // so the work ledger stays comparable across this refactor.
+        for _ in 0..shortlist.len() {
+            self.workspace.ledger.bump(WorkBucket::LumaCheap);
+        }
+        self.workspace
+            .ledger
+            .finish_timer(WorkBucket::LumaCheap, cheap_timer);
+
+        for a in &acc {
+            let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, a.mode);
+            let total = a.cost + lambda * mbits as f64 / scale;
+            let rough_rank = evidence
+                .rough_costs
+                .iter()
+                .position(|mc| mc.mode == a.mode)
+                .unwrap_or(usize::MAX);
+            ranked.push(SimpleRdoResult {
+                mode: a.mode,
+                cost: total,
+                dist: 0,
+                bits: 0,
+                cbf: a.cbf,
+                rough_rank,
+            });
+        }
+        acc.clear();
+        self.workspace.block_scratch.simple_rdo_accum = acc;
+
+        ranked.sort_by(|a, b| {
+            a.cost
+                .partial_cmp(&b.cost)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.mode.cmp(&b.mode))
+        });
+        ranked
     }
 
     /// Sum of SATD-based chroma costs for the full CU-area chroma
@@ -819,6 +1038,20 @@ where
             None => (999, false),
         };
         let delta = current_cost - best_all_cost;
+        let delta_x1000 = (delta * 1000.0).round() as i64;
+        state.stats.luma_oracle_samples += 1;
+        state.stats.luma_oracle_mode_misses += u64::from(current_mode != best_all_mode);
+        state.stats.luma_oracle_shortlist_hits += u64::from(best_all_in_shortlist);
+        state.stats.luma_oracle_cheap_top_hits += u64::from(best_all_in_cheap_topn);
+        state.stats.luma_oracle_rough_rank_sum += best_all_rough_rank as u64;
+        if best_all_cheap_rank != 999 {
+            state.stats.luma_oracle_cheap_rank_sum += best_all_cheap_rank as u64;
+            state.stats.luma_oracle_cheap_rank_count += 1;
+        }
+        state.stats.luma_oracle_delta_cost_x1000 += delta_x1000;
+        if current_mode != best_all_mode {
+            state.stats.luma_oracle_miss_delta_cost_x1000 += delta_x1000;
+        }
 
         eprintln!(
             "ORACLE: {},{},{},{},{},{},{},{},{},{},{},{},{:.1},{:.1},{:.1}",
@@ -838,6 +1071,139 @@ where
             best_all_cost,
             delta,
         );
+
+        if super::env::x265_rmd_audit_enabled() {
+            emit_x265_rmd_audit(
+                state,
+                &self.workspace.price_base,
+                x0,
+                y0,
+                log2_cb_size,
+                mpm_u8,
+                rough,
+                best_all_mode,
+            );
+        }
+
+        if current_mode != best_all_mode && super::env::luma_miss_audit_enabled() {
+            emit_luma_miss_audit(
+                state,
+                &self.workspace.price_base,
+                x0,
+                y0,
+                log2_cb_size,
+                mpm_u8,
+                rough,
+                shortlist,
+                cheap_ranked,
+                exact_top,
+                current_mode,
+                current_cost,
+                best_sl_mode,
+                best_sl_cost,
+                best_all_mode,
+                best_all_cost,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn oracle_luma_exact_cost(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_cb_size: u8,
+        mpm_u8: [u8; 3],
+        lambda: f64,
+        scale: f64,
+        mode: u8,
+    ) -> f64 {
+        let mark = self.overlay.mark();
+        let cfg = super::tu::ExactEvalConfig {
+            quant: super::eval::QuantMode::HardQuantSearch,
+            residual_pricing: super::eval::ResidualPricingMode::Exact,
+            scope: super::tu::TtEvalScope::LumaOnly,
+            tu: state.effort_template.tu_exact,
+            retain_coeff: false,
+        };
+        let (_, tt_cost) =
+            self.decide_tt_with_config(state, x0, y0, log2_cb_size, 0, mode, lambda, cfg);
+        self.overlay.truncate(mark);
+        let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+        tt_cost + lambda * mbits as f64 / scale
+    }
+
+    fn predict_x265_rmd_planar_into_u8(
+        &self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        dst: &mut [u8],
+    ) {
+        let tile_bounds = state.tile_clamp_bounds(x0, y0, 0);
+        let overlay = &self.overlay;
+        let (uf, ft, center, bit_depth) =
+            bpg_hevc_decode::hevc::intra::build_reference_borders_with_reader(
+                &state.frame,
+                x0,
+                y0,
+                log2_size,
+                0,
+                true,
+                |c, rx, ry| {
+                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
+                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
+                            return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
+                        }
+                    }
+                    overlay.sample(c, rx, ry)
+                },
+            );
+        let size = 1usize << log2_size;
+        let border = if matches!(size, 8 | 16 | 32) {
+            &ft
+        } else {
+            &uf
+        };
+        primitives::pred_planar_u8(dst, border, center, log2_size, 0, bit_depth);
+    }
+
+    fn predict_x265_rmd_planar_into_u16(
+        &self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        dst: &mut [u16],
+    ) {
+        let tile_bounds = state.tile_clamp_bounds(x0, y0, 0);
+        let overlay = &self.overlay;
+        let (uf, ft, center, bit_depth) =
+            bpg_hevc_decode::hevc::intra::build_reference_borders_with_reader(
+                &state.frame,
+                x0,
+                y0,
+                log2_size,
+                0,
+                true,
+                |c, rx, ry| {
+                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
+                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
+                            return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
+                        }
+                    }
+                    overlay.sample(c, rx, ry)
+                },
+            );
+        let size = 1usize << log2_size;
+        let border = if matches!(size, 8 | 16 | 32) {
+            &ft
+        } else {
+            &uf
+        };
+        primitives::pred_planar_u16(dst, border, center, log2_size, 0, bit_depth);
     }
 
     pub(super) fn predict_all_angular_into_u8(
@@ -898,6 +1264,47 @@ where
                 },
             );
         primitives::intra_pred_allangs(dst, &uf, &ft, center, log2_size, 0, bit_depth);
+    }
+
+    /// Re-evaluate the cheap winner with full components and TU-split enabled,
+    /// matching x265 `codeIntraLumaQT`/`estIntraPredQT` remeasure semantics.
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_x265_shape_winner(
+        &mut self,
+        state: &mut Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_cb_size: u8,
+        mpm_u8: [u8; 3],
+        lambda: f64,
+        scale: f64,
+        mode: u8,
+    ) -> ExactModeWinner<TtPlan, O::Saved> {
+        let exact_timer = StillSearchLedger::start_timer();
+        let mark = self.overlay.mark();
+        let cfg = super::tu::ExactEvalConfig {
+            quant: super::eval::QuantMode::HardQuantSearch,
+            residual_pricing: super::eval::ResidualPricingMode::Exact,
+            scope: super::tu::TtEvalScope::FullComponents,
+            tu: state.effort_template.tu_exact,
+            retain_coeff: true,
+        };
+        let (tt, tt_cost) =
+            self.decide_tt_with_config(state, x0, y0, log2_cb_size, 0, mode, lambda, cfg);
+        let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+        let cost = tt_cost + lambda * mbits as f64 / scale;
+        record_exact_stats(state, mode, tt_cost);
+        let recon = self.overlay.detach_from(mark);
+        self.workspace.ledger.bump(WorkBucket::LumaExact);
+        self.workspace
+            .ledger
+            .finish_timer(WorkBucket::LumaExact, exact_timer);
+        ExactModeWinner {
+            mode,
+            tt,
+            recon,
+            cost,
+        }
     }
 }
 
@@ -1139,6 +1546,382 @@ fn build_exact_set(
     }
 
     out.into_vec()
+}
+
+/// Build x265's RMD candidate set for the Slow audit path.
+///
+/// Mirrors `Search::estIntraPredQT`: keep the best-cost modes admitted by a
+/// 25% window over the best rough cost, force in `mpm[0]`, and cap with x265's
+/// placebo `maxCandCount = 2 + rdLevel + (depth >> 1)`. The window has an
+/// env-only diagnostic overrides for the window and cap so oracle runs can
+/// separate Still265 rough-cost model misses from simple-RDO ranking misses.
+fn build_x265_shape_shortlist(
+    state: &Encoder<'_>,
+    price_base: &Contexts,
+    rough: &[ModeCost],
+    mpm_u8: [u8; 3],
+    log2_cb_size: u8,
+) -> Vec<u8> {
+    const X265_PLACEBO_RD_LEVEL: usize = 6;
+
+    let depth = CTB_LOG2.saturating_sub(log2_cb_size) as usize;
+    let x265_max_cand_count = 2 + X265_PLACEBO_RD_LEVEL + (depth >> 1);
+    let max_cand_count = super::env::x265_rmd_cap(x265_max_cand_count);
+    if !super::env::x265_rmd_integer_cost_enabled() {
+        return build_x265_shape_shortlist_fractional(rough, mpm_u8, max_cand_count);
+    }
+
+    let mut mode_costs = [None::<u64>; 35];
+    for mc in rough {
+        let bits = x265_rmd_luma_mode_bits_no_carry(price_base, mpm_u8, mc.mode);
+        mode_costs[mc.mode as usize] = Some(x265_rd_sad_cost(
+            mc.satd,
+            bits,
+            state.cur_qp_y,
+            state.bit_depth,
+        ));
+    }
+    let best_cost = mode_costs
+        .iter()
+        .flatten()
+        .copied()
+        .min()
+        .unwrap_or(u64::MAX);
+    let padded_best = x265_rmd_padded_best(best_cost);
+    let mut list: Vec<(u8, u64)> = Vec::with_capacity(max_cand_count);
+
+    for mode in 0u8..35 {
+        let Some(cost) = mode_costs[mode as usize] else {
+            continue;
+        };
+        if cost < padded_best || mode == mpm_u8[0] {
+            update_x265_candidate_list(mode, cost, max_cand_count, &mut list);
+        }
+    }
+
+    list.into_iter().map(|(mode, _)| mode).collect()
+}
+
+fn build_x265_shape_shortlist_fractional(
+    rough: &[ModeCost],
+    mpm_u8: [u8; 3],
+    max_cand_count: usize,
+) -> Vec<u8> {
+    let best_cost = rough.first().map_or(f64::INFINITY, |mc| mc.cost);
+    let padded_best = best_cost * super::env::x265_rmd_window();
+    let mut list: Vec<(u8, f64)> = Vec::with_capacity(max_cand_count);
+
+    for mc in rough {
+        if mc.cost < padded_best || mc.mode == mpm_u8[0] {
+            update_x265_candidate_list_fractional(mc.mode, mc.cost, max_cand_count, &mut list);
+        }
+    }
+
+    list.into_iter().map(|(mode, _)| mode).collect()
+}
+
+fn x265_rmd_padded_best(best_cost: u64) -> u64 {
+    let window = super::env::x265_rmd_window();
+    if (window - 1.25).abs() < f64::EPSILON {
+        best_cost + (best_cost >> 2)
+    } else {
+        ((best_cost as f64) * window).ceil() as u64
+    }
+}
+
+fn update_x265_candidate_list(
+    mode: u8,
+    cost: u64,
+    max_cand_count: usize,
+    list: &mut Vec<(u8, u64)>,
+) {
+    if list.iter().any(|(m, _)| *m == mode) {
+        return;
+    }
+    if list.len() < max_cand_count {
+        list.push((mode, cost));
+        list.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        return;
+    }
+
+    if let Some((worst_idx, (_, worst_cost))) =
+        list.iter().enumerate().max_by(|a, b| a.1.1.cmp(&b.1.1))
+    {
+        if cost < *worst_cost {
+            list[worst_idx] = (mode, cost);
+            list.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+}
+
+fn update_x265_candidate_list_fractional(
+    mode: u8,
+    cost: f64,
+    max_cand_count: usize,
+    list: &mut Vec<(u8, f64)>,
+) {
+    if list.iter().any(|(m, _)| *m == mode) {
+        return;
+    }
+    if list.len() < max_cand_count {
+        list.push((mode, cost));
+        list.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        return;
+    }
+
+    if let Some((worst_idx, (_, worst_cost))) = list.iter().enumerate().max_by(|a, b| {
+        a.1.1
+            .partial_cmp(&b.1.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }) {
+        if cost < *worst_cost {
+            list[worst_idx] = (mode, cost);
+            list.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        }
+    }
+}
+
+fn emit_x265_rmd_audit(
+    state: &Encoder<'_>,
+    price_base: &Contexts,
+    x0: u32,
+    y0: u32,
+    log2_cb_size: u8,
+    mpm_u8: [u8; 3],
+    rough: &[ModeCost],
+    oracle_mode: u8,
+) {
+    let mut whole_ranked: Vec<(u8, u64, u32)> = rough
+        .iter()
+        .map(|mc| {
+            let bits = x265_rmd_luma_mode_bits_no_carry(price_base, mpm_u8, mc.mode);
+            (
+                mc.mode,
+                x265_rd_sad_cost(mc.satd, bits, state.cur_qp_y, state.bit_depth),
+                bits,
+            )
+        })
+        .collect();
+    whole_ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    let frac_rank = rough
+        .iter()
+        .position(|mc| mc.mode == oracle_mode)
+        .map_or(999, |r| r + 1);
+    let whole_rank = whole_ranked
+        .iter()
+        .position(|(mode, _, _)| *mode == oracle_mode)
+        .map_or(999, |r| r + 1);
+    let whole_best_cost = whole_ranked.first().map_or(u64::MAX, |(_, cost, _)| *cost);
+    let whole_oracle_cost = whole_ranked
+        .iter()
+        .find(|(mode, _, _)| *mode == oracle_mode)
+        .map_or(u64::MAX, |(_, cost, _)| *cost);
+    let whole_ratio = if whole_best_cost > 0 && whole_oracle_cost < u64::MAX {
+        whole_oracle_cost as f64 / whole_best_cost as f64
+    } else {
+        f64::INFINITY
+    };
+    let whole_bits = whole_ranked
+        .iter()
+        .find(|(mode, _, _)| *mode == oracle_mode)
+        .map_or(999, |(_, _, bits)| *bits as usize);
+
+    let mut carry_best_modes: Vec<u8> = Vec::new();
+    let mut carry_rank_min = usize::MAX;
+    let mut carry_rank_max = 0usize;
+    for carry in x265_rmd_luma_mode_carry_representatives(price_base) {
+        let mut ranked: Vec<(u8, u64)> = rough
+            .iter()
+            .map(|mc| {
+                let bits = x265_rmd_luma_mode_bits_with_carry(price_base, mpm_u8, mc.mode, carry);
+                (
+                    mc.mode,
+                    x265_rd_sad_cost(mc.satd, bits, state.cur_qp_y, state.bit_depth),
+                )
+            })
+            .collect();
+        ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        if let Some((best, _)) = ranked.first()
+            && !carry_best_modes.contains(best)
+        {
+            carry_best_modes.push(*best);
+        }
+        let rank = ranked
+            .iter()
+            .position(|(mode, _)| *mode == oracle_mode)
+            .map_or(999, |r| r + 1);
+        carry_rank_min = carry_rank_min.min(rank);
+        carry_rank_max = carry_rank_max.max(rank);
+    }
+    carry_best_modes.sort_unstable();
+
+    eprintln!(
+        "RMD_AUDIT: {},{},{},oracle={},frac_best={},frac_rank={},whole_best={},whole_rank={},whole_cost={},whole_ratio={:.3},whole_bits={},carry_rank_min={},carry_rank_max={},carry_bests={:?}",
+        x0,
+        y0,
+        log2_cb_size,
+        oracle_mode,
+        rough.first().map_or(255, |mc| mc.mode),
+        frac_rank,
+        whole_ranked.first().map_or(255, |(mode, _, _)| *mode),
+        whole_rank,
+        whole_oracle_cost,
+        whole_ratio,
+        whole_bits,
+        carry_rank_min,
+        carry_rank_max,
+        carry_best_modes,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_luma_miss_audit(
+    state: &Encoder<'_>,
+    price_base: &Contexts,
+    x0: u32,
+    y0: u32,
+    log2_cb_size: u8,
+    mpm_u8: [u8; 3],
+    rough: &[ModeCost],
+    shortlist: &[u8],
+    cheap_ranked: Option<&[CheapMode]>,
+    exact_top: usize,
+    current_mode: u8,
+    current_cost: f64,
+    best_sl_mode: u8,
+    best_sl_cost: f64,
+    best_all_mode: u8,
+    best_all_cost: f64,
+) {
+    let best_all_in_shortlist = shortlist.contains(&best_all_mode);
+    let best_all_cheap_rank = cheap_ranked.and_then(|cr| {
+        cr.iter()
+            .position(|cm| cm.mode == best_all_mode)
+            .map(|idx| idx + 1)
+    });
+    let best_all_in_cheap_topn = cheap_ranked.is_some_and(|cr| {
+        exact_top > 0 && cr.iter().take(exact_top).any(|cm| cm.mode == best_all_mode)
+    });
+
+    let cause = if !best_all_in_shortlist {
+        "rmd_admission"
+    } else if !best_all_in_cheap_topn {
+        "simple_rdo_rank"
+    } else {
+        "final_materialize"
+    };
+
+    let best_rough_cost = rough.first().map_or(f64::INFINITY, |mc| mc.cost);
+    let padded_rough_cost = best_rough_cost * super::env::x265_rmd_window();
+    let oracle_rough = rough.iter().find(|mc| mc.mode == best_all_mode);
+    let oracle_rough_cost = oracle_rough.map_or(f64::INFINITY, |mc| mc.cost);
+    let oracle_rough_rank = rough
+        .iter()
+        .position(|mc| mc.mode == best_all_mode)
+        .map_or(999, |idx| idx + 1);
+    let oracle_rough_ratio = if best_rough_cost.is_finite() && best_rough_cost > 0.0 {
+        oracle_rough_cost / best_rough_cost
+    } else {
+        f64::INFINITY
+    };
+    let oracle_passes_window = oracle_rough_cost < padded_rough_cost || best_all_mode == mpm_u8[0];
+    let depth = CTB_LOG2.saturating_sub(log2_cb_size) as usize;
+    let x265_cap = super::env::x265_rmd_cap(2 + 6 + (depth >> 1));
+    let mut whole_ranked: Vec<(u8, u64)> = rough
+        .iter()
+        .map(|mc| {
+            let bits = x265_rmd_luma_mode_bits_no_carry(price_base, mpm_u8, mc.mode);
+            (
+                mc.mode,
+                x265_rd_sad_cost(mc.satd, bits, state.cur_qp_y, state.bit_depth),
+            )
+        })
+        .collect();
+    whole_ranked.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let best_whole_cost = whole_ranked.first().map_or(u64::MAX, |(_, cost)| *cost);
+    let padded_whole_cost = x265_rmd_padded_best(best_whole_cost);
+    let oracle_whole = whole_ranked
+        .iter()
+        .find(|(mode, _)| *mode == best_all_mode)
+        .copied();
+    let oracle_whole_rank = whole_ranked
+        .iter()
+        .position(|(mode, _)| *mode == best_all_mode)
+        .map_or(999, |idx| idx + 1);
+    let oracle_whole_cost = oracle_whole.map_or(u64::MAX, |(_, cost)| cost);
+    let oracle_whole_ratio = if best_whole_cost > 0 && oracle_whole_cost < u64::MAX {
+        oracle_whole_cost as f64 / best_whole_cost as f64
+    } else {
+        f64::INFINITY
+    };
+    let rmd_drop_reason = if best_all_in_shortlist {
+        "admitted"
+    } else if oracle_rough.is_none() {
+        "not_scored"
+    } else if !oracle_passes_window {
+        "out_of_window"
+    } else {
+        "evicted_by_cap"
+    };
+
+    eprintln!(
+        "MISS_AUDIT: {},{},{},cause={},cur={},all={},sl={},cur_full={:.1},all_full={:.1},sl_full={:.1},delta={:.1},rough_rank={},rough_cost={:.1},rough_ratio={:.3},window_cost={:.1},whole_rank={},whole_cost={},whole_ratio={:.3},whole_window={},cap={},rmd_drop={},cheap_rank={},exact_top={},shortlist={:?},rough_top={},cheap_top={}",
+        x0,
+        y0,
+        log2_cb_size,
+        cause,
+        current_mode,
+        best_all_mode,
+        best_sl_mode,
+        current_cost,
+        best_all_cost,
+        best_sl_cost,
+        current_cost - best_all_cost,
+        oracle_rough_rank,
+        oracle_rough_cost,
+        oracle_rough_ratio,
+        padded_rough_cost,
+        oracle_whole_rank,
+        oracle_whole_cost,
+        oracle_whole_ratio,
+        padded_whole_cost,
+        x265_cap,
+        rmd_drop_reason,
+        best_all_cheap_rank.unwrap_or(999),
+        exact_top,
+        shortlist,
+        format_rough_top(rough, 8),
+        format_cheap_top(cheap_ranked, 8),
+    );
+}
+
+fn format_rough_top(rough: &[ModeCost], n: usize) -> String {
+    let mut out = String::from("[");
+    for (idx, mc) in rough.iter().take(n).enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{}:{:.1}", mc.mode, mc.cost);
+    }
+    out.push(']');
+    out
+}
+
+fn format_cheap_top(cheap_ranked: Option<&[CheapMode]>, n: usize) -> String {
+    let Some(cheap_ranked) = cheap_ranked else {
+        return "[]".to_string();
+    };
+
+    let mut out = String::from("[");
+    for (idx, cm) in cheap_ranked.iter().take(n).enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        let _ = write!(out, "{}:{:.1}", cm.mode, cm.cost);
+    }
+    out.push(']');
+    out
 }
 
 const ALL_INTRA_MODES: [u8; 35] = [
