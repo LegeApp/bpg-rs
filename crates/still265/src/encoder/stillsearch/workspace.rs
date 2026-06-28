@@ -40,6 +40,11 @@ pub(super) struct CtuWorkspace {
     /// Number of TU split evaluations skipped due to zero-residual early
     /// termination in this CTU.
     pub(super) tu_split_early_terminations: u64,
+    /// Per-TU-depth evaluation work for this CTU, indexed by `log2_size`
+    /// (TU sizes 4/8/16/32 = log2 2/3/4/5). Counts `eval_tt_leaf` /
+    /// `eval_tt_split` calls. Merged into `EncodeStats` in `build_ctu`.
+    pub(super) tu_leaf_by_log2: [u64; 7],
+    pub(super) tu_split_by_log2: [u64; 7],
 }
 
 impl Default for CtuWorkspace {
@@ -54,6 +59,8 @@ impl Default for CtuWorkspace {
             last_8x8_rough_satd: f64::INFINITY,
             substage: SubstageProfile::default(),
             tu_split_early_terminations: 0,
+            tu_leaf_by_log2: [0; 7],
+            tu_split_by_log2: [0; 7],
         }
     }
 }
@@ -65,6 +72,8 @@ impl CtuWorkspace {
         self.block_scratch.clear_ctu();
         self.substage = SubstageProfile::default();
         self.tu_split_early_terminations = 0;
+        self.tu_leaf_by_log2 = [0; 7];
+        self.tu_split_by_log2 = [0; 7];
     }
 
     /// Seed the trial-pricing entry context with the live CTU-entry context.

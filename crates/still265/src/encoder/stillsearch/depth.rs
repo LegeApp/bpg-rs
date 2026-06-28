@@ -140,6 +140,10 @@ where
             .saturating_add(self.workspace.substage.residual_price_ns);
         state.stats.substage_calls += self.workspace.substage.calls;
         state.stats.tu_split_early_terminations += self.workspace.tu_split_early_terminations;
+        for i in 0..7 {
+            state.stats.tu_leaf_by_log2[i] += self.workspace.tu_leaf_by_log2[i];
+            state.stats.tu_split_by_log2[i] += self.workspace.tu_split_by_log2[i];
+        }
         cu
     }
 }
@@ -213,5 +217,58 @@ where
         self.predict_into(state, x0, y0, log2_size, c_idx, mode, tmp_u16);
         debug_assert!(dst.len() >= n);
         crate::primitives::narrow_u16_to_u8(tmp_u16, dst, n);
+    }
+
+    /// Exact 8-bit prediction through the Still265 primitive table. The border
+    /// is built once with overlay-first reads, then a planar/DC/angular slot
+    /// fills the destination directly.
+    pub(super) fn predict_exact_into_u8(
+        &self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+        mode: bpg_hevc_decode::hevc::slice::IntraPredMode,
+        dst: &mut [u8],
+    ) {
+        let tile_bounds = state.tile_clamp_bounds(x0, y0, c_idx);
+        let overlay = &self.overlay;
+        let (uf, ft, center, bit_depth) =
+            bpg_hevc_decode::hevc::intra::build_reference_borders_with_reader(
+                &state.frame,
+                x0,
+                y0,
+                log2_size,
+                c_idx,
+                true,
+                |c, rx, ry| {
+                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
+                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
+                            return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
+                        }
+                    }
+                    overlay.sample(c, rx, ry)
+                },
+            );
+        let mode_u8 = mode.as_u8();
+        let size = 1usize << log2_size;
+        let border = if bpg_hevc_decode::hevc::intra::reference_filter_applies(size, mode_u8) {
+            &ft
+        } else {
+            &uf
+        };
+
+        match mode {
+            bpg_hevc_decode::hevc::slice::IntraPredMode::Planar => {
+                crate::primitives::pred_planar_u8(dst, border, center, log2_size, c_idx, bit_depth)
+            }
+            bpg_hevc_decode::hevc::slice::IntraPredMode::Dc => {
+                crate::primitives::pred_dc_u8(dst, border, center, log2_size, c_idx, bit_depth)
+            }
+            _ => crate::primitives::pred_angular_u8(
+                dst, border, center, log2_size, c_idx, mode_u8, bit_depth,
+            ),
+        }
     }
 }

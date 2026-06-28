@@ -85,6 +85,7 @@ where
         };
 
         if should_skip_split {
+            state.stats.cu_early_term_by_log2[log2_cb_size as usize] += 1;
             self.overlay.reattach(leaf_saved);
             if let CuPlan::Leaf(ref leaf) = leaf_plan {
                 state.store_mode(x0, y0, log2_cb_size, leaf.luma_mode);
@@ -103,6 +104,7 @@ where
         let split_total = split_cost + lambda * entropy_bits(model, 1) as f64 / scale;
 
         if split_total < leaf_total {
+            state.stats.cu_splits_taken_by_log2[log2_cb_size as usize] += 1;
             #[cfg(test)]
             super::api::CU_SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (split_plan, split_total)
@@ -300,6 +302,7 @@ where
         ct_depth: u8,
     ) -> (CuPlan, f64) {
         state.stats.cu_trials += 1;
+        state.stats.cu_trials_by_log2[log2_cb_size as usize] += 1;
         state.set_ct_depth(x0, y0, log2_cb_size, ct_depth);
 
         let mpm = super::intra_mpm(state, x0, y0);
