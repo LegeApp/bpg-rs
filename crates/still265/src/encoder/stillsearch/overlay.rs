@@ -144,6 +144,9 @@ impl ReconOverlay8 {
         {
             OVL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             OVL_ITERS.fetch_add(self.patches.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            if c_idx != 0 {
+                OVL_CALLS_CHROMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         for p in self.patches.iter().rev() {
             if p.c_idx == c_idx && x >= p.x && y >= p.y && x < p.x + p.width && y < p.y + p.height {
@@ -160,6 +163,8 @@ impl ReconOverlay8 {
 pub static OVL_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 #[cfg(feature = "overlay-probe")]
 pub static OVL_ITERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "overlay-probe")]
+pub static OVL_CALLS_CHROMA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl ReconOverlay16 {
     pub(super) fn clear(&mut self) {

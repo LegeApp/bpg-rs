@@ -13,7 +13,7 @@ mod write;
 /// Temporary overlay-probe accessor (feature `overlay-probe`): returns
 /// (sample_calls, patch_iters) from the CTU recon overlay scans.
 #[cfg(feature = "overlay-probe")]
-pub(crate) fn overlay_probe_counts() -> (u64, u64) {
+pub(crate) fn overlay_probe_counts() -> (u64, u64, u64) {
     stillsearch::overlay_probe_counts()
 }
 

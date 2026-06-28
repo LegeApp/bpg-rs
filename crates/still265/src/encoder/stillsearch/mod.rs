@@ -38,11 +38,12 @@ pub(super) use api::StillSearch;
 
 /// Temporary overlay-probe accessor (feature `overlay-probe`).
 #[cfg(feature = "overlay-probe")]
-pub(super) fn overlay_probe_counts() -> (u64, u64) {
+pub(super) fn overlay_probe_counts() -> (u64, u64, u64) {
     use std::sync::atomic::Ordering;
     (
         overlay::OVL_CALLS.load(Ordering::Relaxed),
         overlay::OVL_ITERS.load(Ordering::Relaxed),
+        overlay::OVL_CALLS_CHROMA.load(Ordering::Relaxed),
     )
 }
 
