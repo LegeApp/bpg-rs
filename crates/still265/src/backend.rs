@@ -174,6 +174,17 @@ impl HevcEncoder for RustStillHevcEncoder {
                 "  primitive_backend: {}",
                 crate::primitives::PRIMITIVES.backend
             );
+            let dct_hist = crate::primitives::wide::dct_size_histogram();
+            let dct_total: u64 = dct_hist.iter().sum();
+            if dct_total > 0 {
+                eprintln!(
+                    "  dct_size_histogram: 4x4={} ({:.1}%)  8x8={} ({:.1}%)  16x16={} ({:.1}%)  32x32={} ({:.1}%)",
+                    dct_hist[0], 100.0 * dct_hist[0] as f64 / dct_total as f64,
+                    dct_hist[1], 100.0 * dct_hist[1] as f64 / dct_total as f64,
+                    dct_hist[2], 100.0 * dct_hist[2] as f64 / dct_total as f64,
+                    dct_hist[3], 100.0 * dct_hist[3] as f64 / dct_total as f64,
+                );
+            }
         }
         Ok(annexb)
     }

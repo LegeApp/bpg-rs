@@ -14,6 +14,8 @@
 //! All arithmetic stays integer and within proven bounds (see the per-kernel
 //! comments), so the SIMD reduction order does not change the result.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use super::round_shift;
 use bpg_hevc_decode::hevc::intra::{
     INTRA_BORDER_CENTER, INTRA_BORDER_LEN, INTRA_PRED_ANGLE, INV_ANGLE, reference_filter_applies,
@@ -743,25 +745,62 @@ fn fwd_dct_nxn_wide(residual: &[i16], out: &mut [i16], n: usize, bit_depth: u8) 
     }
 }
 
+#[cfg(feature = "dct-histogram")]
+static DCT_COUNT_4: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "dct-histogram")]
+static DCT_COUNT_8: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "dct-histogram")]
+static DCT_COUNT_16: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "dct-histogram")]
+static DCT_COUNT_32: AtomicU64 = AtomicU64::new(0);
+
+/// Returns [count4, count8, count16, count32] accumulated since process start.
+///
+/// Always returns zeros unless built with the `dct-histogram` feature; callers
+/// treat an all-zero result as "instrumentation disabled".
+#[cfg(feature = "dct-histogram")]
+pub fn dct_size_histogram() -> [u64; 4] {
+    [
+        DCT_COUNT_4.load(Ordering::Relaxed),
+        DCT_COUNT_8.load(Ordering::Relaxed),
+        DCT_COUNT_16.load(Ordering::Relaxed),
+        DCT_COUNT_32.load(Ordering::Relaxed),
+    ]
+}
+
+/// See the `dct-histogram`-gated variant above; returns zeros when disabled.
+#[cfg(not(feature = "dct-histogram"))]
+pub fn dct_size_histogram() -> [u64; 4] {
+    [0; 4]
+}
+
 // DST-4 is not hot enough to warrant vectorization beyond the scalar path.
 pub fn fwd_dst4(residual: &[i16], out: &mut [i16], bit_depth: u8) {
     super::scalar::fwd_dst4_scalar(residual, out, bit_depth);
 }
 
 pub fn fwd_dct4(residual: &[i16], out: &mut [i16], bit_depth: u8) {
-    fwd_dct_nxn_wide(residual, out, 4, bit_depth);
+    #[cfg(feature = "dct-histogram")]
+    DCT_COUNT_4.fetch_add(1, Ordering::Relaxed);
+    super::scalar::fwd_dct4_butterfly(residual, out, bit_depth);
 }
 
 pub fn fwd_dct8(residual: &[i16], out: &mut [i16], bit_depth: u8) {
-    fwd_dct_nxn_wide(residual, out, 8, bit_depth);
+    #[cfg(feature = "dct-histogram")]
+    DCT_COUNT_8.fetch_add(1, Ordering::Relaxed);
+    super::scalar::fwd_dct8_butterfly(residual, out, bit_depth);
 }
 
 pub fn fwd_dct16(residual: &[i16], out: &mut [i16], bit_depth: u8) {
-    fwd_dct_nxn_wide(residual, out, 16, bit_depth);
+    #[cfg(feature = "dct-histogram")]
+    DCT_COUNT_16.fetch_add(1, Ordering::Relaxed);
+    super::scalar::fwd_dct16_butterfly(residual, out, bit_depth);
 }
 
 pub fn fwd_dct32(residual: &[i16], out: &mut [i16], bit_depth: u8) {
-    fwd_dct_nxn_wide(residual, out, 32, bit_depth);
+    #[cfg(feature = "dct-histogram")]
+    DCT_COUNT_32.fetch_add(1, Ordering::Relaxed);
+    super::scalar::fwd_dct32_butterfly(residual, out, bit_depth);
 }
 
 // ─── Phase 2: u8 coverage ─────────────────────────────────────────────────
