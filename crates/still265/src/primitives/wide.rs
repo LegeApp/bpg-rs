@@ -14,6 +14,7 @@
 //! All arithmetic stays integer and within proven bounds (see the per-kernel
 //! comments), so the SIMD reduction order does not change the result.
 
+#[cfg(feature = "dct-histogram")]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::round_shift;
@@ -385,6 +386,42 @@ pub fn intra_pred_allangs(
     c_idx: u8,
     bit_depth: u8,
 ) {
+    allangs_into::<u16>(dst, unfiltered, filtered, center, log2_size, c_idx, bit_depth);
+}
+
+/// Output sample type for the angular predictors. Values are always clamped to
+/// `[0, max_val]` (and thus to `[0, 255]` for 8-bit) before storing, so the
+/// narrowing cast is lossless — `u8` output is byte-identical to computing `u16`
+/// and then narrowing with [`narrow_u16_to_u8`].
+pub trait PredSample: Copy {
+    /// Store a value already clamped into the sample's range.
+    fn from_clamped(v: i32) -> Self;
+}
+impl PredSample for u16 {
+    #[inline(always)]
+    fn from_clamped(v: i32) -> u16 {
+        v as u16
+    }
+}
+impl PredSample for u8 {
+    #[inline(always)]
+    fn from_clamped(v: i32) -> u8 {
+        v as u8
+    }
+}
+
+/// Generic core of [`intra_pred_allangs`] / [`pred_allangs_u8`]. Writes all 33
+/// angular modes (2..=34) into `dst` with the sample type `T`, avoiding any
+/// intermediate buffer for the `u8` path.
+fn allangs_into<T: PredSample>(
+    dst: &mut [T],
+    unfiltered: &[i32],
+    filtered: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
     let n = 1usize << log2_size;
     let area = n * n;
     let max_val = (1i32 << bit_depth) - 1;
@@ -408,8 +445,8 @@ pub fn intra_pred_allangs(
 /// Vertical-mode (>=18) angular prediction into a `n`-stride slot, mirroring the
 /// `mode >= 18` branch of the decoder's `predict_angular` with the inner row
 /// convolution vectorized.
-fn predict_vertical_simd(
-    slot: &mut [u16],
+fn predict_vertical_simd<T: PredSample>(
+    slot: &mut [T],
     n: usize,
     mode: u8,
     max_val: i32,
@@ -461,19 +498,19 @@ fn predict_vertical_simd(
                 let r = ((a * w0 + b * f + bias) >> 5u32).max(zero).min(max_v);
                 let arr = r.to_array();
                 for k in 0..8 {
-                    slot[row_off + px + k] = arr[k] as u16;
+                    slot[row_off + px + k] = T::from_clamped(arr[k]);
                 }
                 px += 8;
             }
             while px < n {
                 let v = ((32 - i_fact) * ref_arr[base + px] + i_fact * ref_arr[base + px + 1] + 16)
                     >> 5;
-                slot[row_off + px] = v.clamp(0, max_val) as u16;
+                slot[row_off + px] = T::from_clamped(v.clamp(0, max_val));
                 px += 1;
             }
         } else {
             for px in 0..n {
-                slot[row_off + px] = ref_arr[base + px].clamp(0, max_val) as u16;
+                slot[row_off + px] = T::from_clamped(ref_arr[base + px].clamp(0, max_val));
             }
         }
     }
@@ -482,7 +519,7 @@ fn predict_vertical_simd(
     if mode == 26 && n < 32 {
         for py in 0..n {
             let pred = border[center + 1] + ((border[center - 1 - py] - border[center]) >> 1);
-            slot[py * n] = pred.clamp(0, max_val) as u16;
+            slot[py * n] = T::from_clamped(pred.clamp(0, max_val));
         }
     }
 }
@@ -492,8 +529,8 @@ fn predict_vertical_simd(
 /// loop gathers from the reference array, so this implementation flips the
 /// loops: for one output column, rows are contiguous in the reference array and
 /// can be processed with `i32x8`, then scattered into the column.
-fn predict_horizontal_simd(
-    slot: &mut [u16],
+fn predict_horizontal_simd<T: PredSample>(
+    slot: &mut [T],
     n: usize,
     mode: u8,
     max_val: i32,
@@ -545,14 +582,14 @@ fn predict_horizontal_simd(
                 let r = ((a * w0 + b * f + bias) >> 5u32).max(zero).min(max_v);
                 let arr = r.to_array();
                 for k in 0..8 {
-                    slot[(py + k) * n + px] = arr[k] as u16;
+                    slot[(py + k) * n + px] = T::from_clamped(arr[k]);
                 }
                 py += 8;
             }
             while py < n {
                 let v = ((32 - i_fact) * ref_arr[base + py] + i_fact * ref_arr[base + py + 1] + 16)
                     >> 5;
-                slot[py * n + px] = v.clamp(0, max_val) as u16;
+                slot[py * n + px] = T::from_clamped(v.clamp(0, max_val));
                 py += 1;
             }
         } else {
@@ -563,12 +600,12 @@ fn predict_horizontal_simd(
                         .min(max_v);
                 let arr = r.to_array();
                 for k in 0..8 {
-                    slot[(py + k) * n + px] = arr[k] as u16;
+                    slot[(py + k) * n + px] = T::from_clamped(arr[k]);
                 }
                 py += 8;
             }
             while py < n {
-                slot[py * n + px] = ref_arr[base + py].clamp(0, max_val) as u16;
+                slot[py * n + px] = T::from_clamped(ref_arr[base + py].clamp(0, max_val));
                 py += 1;
             }
         }
@@ -578,7 +615,7 @@ fn predict_horizontal_simd(
     if mode == 10 && n < 32 {
         for px in 0..n {
             let pred = border[center - 1] + ((border[center + 1 + px] - border[center]) >> 1);
-            slot[px] = pred.clamp(0, max_val) as u16;
+            slot[px] = T::from_clamped(pred.clamp(0, max_val));
         }
     }
 }
@@ -586,7 +623,11 @@ fn predict_horizontal_simd(
 // ─── Phase 5: native u8 rough intra prediction ────────────────────────────
 
 /// Batched all-angular prediction to u8 for the 8-bit rough path.
-/// Equivalent to `intra_pred_allangs` (wide vectorized) + batch narrow.
+///
+/// Writes u8 samples directly via [`allangs_into`] — no intermediate u16 buffer
+/// and no separate narrowing pass. Byte-identical to the previous
+/// `intra_pred_allangs` + [`narrow_u16_to_u8`] sequence because every sample is
+/// clamped to `[0, 255]` before the store (enforced by `allangs_simd_matches_scalar`).
 pub fn pred_allangs_u8(
     dst: &mut [u8],
     unfiltered: &[i32],
@@ -596,15 +637,11 @@ pub fn pred_allangs_u8(
     c_idx: u8,
     bit_depth: u8,
 ) {
+    debug_assert_eq!(bit_depth, 8, "pred_allangs_u8 is only for 8-bit content");
     let n = 1usize << log2_size;
-    let area = n * n;
-    let total = super::intra::angs::ANGULAR_MODES * area;
+    let total = super::intra::angs::ANGULAR_MODES * n * n;
     debug_assert!(dst.len() >= total);
-    let mut tmp = vec![0u16; total];
-    intra_pred_allangs(
-        &mut tmp, unfiltered, filtered, center, log2_size, c_idx, bit_depth,
-    );
-    narrow_u16_to_u8(&tmp, dst, total);
+    allangs_into::<u8>(dst, unfiltered, filtered, center, log2_size, c_idx, bit_depth);
 }
 
 // ─── Phase 4: coefficient/residual tools ──────────────────────────────────
