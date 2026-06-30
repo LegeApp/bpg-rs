@@ -378,6 +378,19 @@ pub struct CheapMode {
     pub rough_rank: usize,
 }
 
+/// Compact result from a simple-RDO (luma-only, no-TU-split, no-overlay)
+/// evaluation. Intended for the Phase 2 lightweight evaluator used in
+/// x265shape cheap ranking.
+#[derive(Clone, Copy, Debug)]
+pub struct SimpleRdoResult {
+    pub mode: u8,
+    pub cost: f64,
+    pub dist: u64,
+    pub bits: u64,
+    pub cbf: bool,
+    pub rough_rank: usize,
+}
+
 // ══════════════════════════════════════════════
 // Level 2 — Exact
 // ══════════════════════════════════════════════
@@ -392,6 +405,9 @@ pub enum ExactUsage {
     PromotedModes,
     /// Run exact for the full shortlist (bypass cheap ranking).
     AllShortlist,
+    /// x265-shaped Slow audit path: RMD window, simple luma RDO for candidates,
+    /// then one split-enabled winner remeasure.
+    X265Shape,
 }
 
 /// Configuration for the exact RD search pass on promoted modes.
@@ -564,9 +580,9 @@ pub struct EffortTemplate {
 }
 
 impl EffortTemplate {
-    /// True if this template is a reference/oracle tier.
+    /// True if this template is the expensive comparison/oracle tier.
     pub fn is_reference(&self) -> bool {
-        matches!(self.name, Effort::Placebo | Effort::Reference)
+        matches!(self.name, Effort::Placebo)
     }
 }
 
@@ -576,19 +592,7 @@ impl EffortTemplate {
 
 /// Map the old wide `Effort` enum to the three canonical presets.
 pub fn canonical_effort(e: Effort) -> Effort {
-    match e {
-        Effort::Floor
-        | Effort::FloorPlus
-        | Effort::FloorPlus2
-        | Effort::FloorShallow
-        | Effort::Fastest
-        | Effort::Fast
-        | Effort::FastAdaptive => Effort::Fast,
-        Effort::Slow | Effort::SlowPlus | Effort::Balanced | Effort::Good | Effort::Best => {
-            Effort::Slow
-        }
-        Effort::Placebo | Effort::Reference => Effort::Placebo,
-    }
+    e
 }
 
 /// Return the canonical template for a given effort.
@@ -599,8 +603,16 @@ pub fn template(effort: Effort) -> &'static EffortTemplate {
         Effort::Fast => &FAST,
         Effort::Slow => &SLOW,
         Effort::Placebo => &PLACEBO,
-        _ => unreachable!(),
     }
+}
+
+/// Return the encode-time template for the stable preset.
+///
+/// Production presets are no longer silently mutated by audit environment
+/// variables; diagnostics should be expressed as explicit experiment overlays.
+#[inline]
+pub fn template_for_encode(effort: Effort) -> EffortTemplate {
+    *template(effort)
 }
 
 // ══════════════════════════════════════════════
@@ -746,23 +758,10 @@ pub(crate) static FAST: EffortTemplate = EffortTemplate {
 };
 
 /// Slow — main quality / archival preset.
-
-/// Same staged pipeline as Fast, but spends precise work broadly
-/// enough to recover most of the last 5-10 % of compression that
-/// Placebo achieves.  Uses x265-like selective refinement: cheap
-/// work broadly, exact work narrowly.
 ///
-/// Target: near-Placebo output at a fraction of the cost.
-/// Validate by oracle miss counters, not by PSNR at fixed QP alone.
-///
-/// ### Key budgets (from presets2.md)
-/// - Shortlist: 7-8 modes, protect representation + 1-2 family diversity slots.
-/// - Exact: 3-4 modes including category challengers (within 10 % margin).
-/// - TU: leaf-first, conservative zero/low-residual early terminate.
-/// - CU: leaf-first, conservative early terminate, preanalysis hints only with strong evidence.
-/// - NxN: enabled with light rough gate (SATD > 0), no directional requirement.
-/// - Chroma: winner-only, up to 2 candidates, exact residual pricing.
-/// - Final: RDOQ finalization always on.
+/// This is the measured x265shape search budget: one stable pipeline, precise
+/// enough for production uniform-QP encodes, without requiring diagnostic env
+/// routing.
 pub(crate) static SLOW: EffortTemplate = EffortTemplate {
     name: Effort::Slow,
     oracle: false,
@@ -771,7 +770,7 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
 
     luma: LumaSearchPolicy {
         rough: RoughLumaPolicy {
-            mode_set: RmdModeSet::Step4,
+            mode_set: RmdModeSet::Exhaustive,
             score_all_modes: true,
             use_mode_bits: true,
             angular_family_detection: true,
@@ -787,14 +786,11 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
         },
         cheap: CheapLumaPolicy {
             enabled: true,
-            max_ranked_modes: 1,
+            max_ranked_modes: 0,
             scope: ComponentScope::LumaOnly,
             allow_optional_tu_split: false,
-            residual_price: ResidualPriceLevel::Approx,
+            residual_price: ResidualPriceLevel::Exact,
             quant: TrialQuant::HardQuant,
-            // Chroma SATD cost in the cheap pass makes the ranking accurate
-            // enough to trust exactly 1 promoted mode to the exact pass,
-            // matching x265's leaf-RDO economy.
             chroma_satd_in_cheap: false,
         },
         exact: ExactLumaPolicy {
@@ -809,12 +805,12 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
                 include_best_rough_pd_if_angular_wins_cheap: false,
                 cheap_close_margin: 1.10,
             },
-            exact_usage: ExactUsage::Disabled,
+            exact_usage: ExactUsage::X265Shape,
         },
     },
 
     tu: TuSearchPolicy {
-        min_split_log2: 3,
+        min_split_log2: 2,
         leaf_first: true,
         split_search: SplitSearch::EvaluateBoth,
         zero_residual_early_terminate: true,
@@ -826,7 +822,7 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
     tu_exact: TuExactPolicy {
         split_mode: TuSplitMode::EvaluateBoth,
         max_extra_depth: 2, // Must not exceed MAX_INTRA_TT_DEPTH (2) — the write path uses that constant.
-        min_split_log2: 3,
+        min_split_log2: 2,
         leaf_first: true,
         zero_residual_early_terminate: true,
         low_residual_early_terminate: true,
@@ -846,7 +842,7 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
     nxn: NxnSearchPolicy {
         enabled: true,
         rough_gate_enabled: true,
-        rough_satd_threshold: 4000.0,
+        rough_satd_threshold: 1000.0,
         require_directional_or_texture: false,
         exact_eval: true,
     },
@@ -866,10 +862,10 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
     },
 
     rdoq_trials: RdoqTrialPolicy {
-        mode: TrialRdoqMode::Off,
+        mode: TrialRdoqMode::ExactOnly,
         close_margin: 1.00,
-        max_rdoq_modes: 0,
-        level: 0,
+        max_rdoq_modes: 35,
+        level: 2,
     },
 
     preanalysis: PreanalysisTemplate {
@@ -940,7 +936,7 @@ pub(crate) static PLACEBO: EffortTemplate = EffortTemplate {
     },
 
     tu: TuSearchPolicy {
-        min_split_log2: 3,
+        min_split_log2: 2,
         leaf_first: true,
         split_search: SplitSearch::EvaluateBoth,
         zero_residual_early_terminate: false,
@@ -952,7 +948,7 @@ pub(crate) static PLACEBO: EffortTemplate = EffortTemplate {
     tu_exact: TuExactPolicy {
         split_mode: TuSplitMode::EvaluateBoth,
         max_extra_depth: 2,
-        min_split_log2: 3,
+        min_split_log2: 2,
         leaf_first: true,
         zero_residual_early_terminate: false,
         low_residual_early_terminate: false,
@@ -1074,7 +1070,6 @@ impl EffortTemplate {
             Effort::Fast => true,
             Effort::Slow => desc.qp >= 38,
             Effort::Placebo => false,
-            _ => false,
         };
 
         let tu_split = if canonical == Effort::Placebo {
@@ -1156,7 +1151,6 @@ impl EffortTemplate {
                 }
             }
             Effort::Placebo => self.luma.exact.max_modes,
-            _ => self.luma.exact.max_modes,
         }
     }
 
@@ -1173,7 +1167,6 @@ impl EffortTemplate {
                 }
             }
             Effort::Placebo => self.chroma.max_candidates,
-            _ => self.chroma.max_candidates,
         }
     }
 }
@@ -1202,7 +1195,6 @@ fn angular_prune_var_threshold_8bit(effort: Effort) -> Option<i64> {
         Effort::Fast => Some(32),
         Effort::Slow => None,
         Effort::Placebo => None,
-        _ => unreachable!(),
     }
 }
 
@@ -1418,7 +1410,6 @@ impl RdoqPassBudget {
                     1
                 }
             }
-            _ => 0,
         }
     }
 }
@@ -1517,4 +1508,38 @@ fn write_budget(f: &mut fmt::Formatter<'_>, qp: i32, budget: BlockSearchBudget) 
         "    angular_prune={:?} rmd_prune_factor={:?} allow_cu_early_term={}",
         budget.angular_prune, budget.rmd_prune_factor, budget.allow_cu_early_terminate
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_slow_is_x265shape() {
+        assert_eq!(SLOW.luma.rough.mode_set, RmdModeSet::Exhaustive);
+        assert!(SLOW.luma.rough.score_all_modes);
+        assert_eq!(SLOW.luma.cheap.max_ranked_modes, 0);
+        assert_eq!(SLOW.luma.cheap.residual_price, ResidualPriceLevel::Exact);
+        assert_eq!(SLOW.luma.exact.exact_usage, ExactUsage::X265Shape);
+        assert_eq!(SLOW.luma.exact.promote.max_exact_modes, 1);
+        assert!(!SLOW.luma.cheap.chroma_satd_in_cheap);
+        assert!(
+            !SLOW
+                .luma
+                .exact
+                .promote
+                .include_best_rough_angular_if_pd_wins_cheap
+        );
+        assert!(
+            !SLOW
+                .luma
+                .exact
+                .promote
+                .include_best_rough_pd_if_angular_wins_cheap
+        );
+        assert_eq!(SLOW.nxn.rough_satd_threshold, 1000.0);
+        assert_eq!(SLOW.rdoq_trials.mode, TrialRdoqMode::ExactOnly);
+        assert_eq!(SLOW.rdoq_trials.max_rdoq_modes, 35);
+        assert_eq!(SLOW.rdoq_trials.level, 2);
+    }
 }

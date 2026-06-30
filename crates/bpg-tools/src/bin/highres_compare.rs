@@ -6,25 +6,28 @@
 //! natively with `--native`), then compares process-level `bpgenc` time with
 //! in-process still265 encode timing.
 //!
-//! ⚠️ EFFORT IS MOSTLY INERT. The StillSearch v2 core runs one search shape
-//! regardless of tier; the only surviving effort dependence is the PartNxN
-//! gate (`part_nxn_enabled`, on for best/slowplus/placebo/reference) plus a
-//! couple of AQ/analysis-cache bits. So `best` exercises the full core
-//! including 8x8 NxN, while `balanced` skips NxN — but neither changes rough/
-//! TU/CU search depth. The default is `best` (full core). The legacy preset
-//! ladder and its README timings belong to the removed rdo2 core; compare
-//! those by hand until StillSearch reintroduces real effort policies
-//! (plan Phase 15).
+//! Effort is now intentionally three-tiered. `fast`, `slow`, and `placebo` are
+//! the only real budgets; old names such as `balanced`, `best`, and `slowplus`
+//! are accepted as aliases for harness compatibility and collapse to `slow`.
 //!
-//! ⚠️ QP-AXIS OFFSET — READ BEFORE INTERPRETING QP-MATCHED NUMBERS. still265's
-//! effective quantiser is roughly **2 QP steps COARSER** than x265/bpgenc at the
-//! same nominal `-q`/`qp`. At equal nominal QP still265 makes a smaller file and
-//! retains fewer/weaker coefficients; rust QP24 ≈ bpgenc QP26 in coefficient
-//! count/bytes (measured 4 MP 2026-06-23, `bpg-decision-diff`). So an equal-QP
-//! C-vs-rust row is NOT an equal-rate comparison and OVERSTATES the quality gap
-//! by most of ~1 dB — always compare at matched BYTES (the real equal-bitrate
-//! deficit in textured regions is ~0.6 dB, an RDOQ coefficient-strength gap, not
-//! the full equal-QP gap). This fact keeps getting rediscovered; hence this note.
+//! ⚠️ QP-MAPPING OFFSET — READ BEFORE INTERPRETING QP-MATCHED NUMBERS. The `-q`
+//! CLI value maps to a DIFFERENT actual HEVC QP in the two encoders:
+//!   bpgenc `-qN`  →  actual HEVC QP (N − 3)   (offset lives in x265's
+//!                    placebo+tune-ssim preset; libbpg passes -q straight to
+//!                    x265 rc.qp with no offset)
+//!   still265 `-qN` →  actual HEVC QP N        (1:1, the cleaner convention)
+//! VERIFIED EXACT (offset == 3, not "~2") at the bitstream level by back-solving
+//! the DC dequant scale: bpgenc -q{20,24,27,30,32} == still265 -q{17,21,24,27,29}
+//! produce BIT-IDENTICAL coefficient levels (2026-06-29, `BPG_STILL_DUMP`).
+//! At equal ACTUAL QP the quantiser is bit-exact; the old "still265 is ~2 QP
+//! coarser / makes smaller files" story was THIS mapping, NOT a quant deficit.
+//!
+//! To compare fairly this harness treats `--qp` as the ACTUAL HEVC QP for BOTH
+//! encoders: it passes `--qp` to still265 unchanged and `--qp + BPGENC_QP_OFFSET`
+//! to bpgenc (see [`BPGENC_QP_OFFSET`]). Equal-nominal-QP rows are NOT equal-rate.
+//! The real remaining gap is RDOQ / coefficient-decimation efficiency (still265
+//! retains ~35% more luma coeffs at equal actual QP); judge it by BD-rate / equal
+//! BYTES, never fixed nominal QP. (BD-rate is itself offset-invariant.)
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
@@ -41,6 +44,14 @@ use still265::{DeblockMode, Effort, SaoMode};
 
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+
+/// bpgenc `-qN` encodes at actual HEVC QP `N - BPGENC_QP_OFFSET` (the offset is
+/// applied inside x265's placebo+tune-ssim preset; libbpg passes `-q` straight to
+/// `x265 rc.qp`). still265 `--qp N` is HEVC QP `N` exactly. Verified == 3 at the
+/// bitstream level across QP 17..29 (bit-identical coeff levels for bpgenc -q{N+3}
+/// vs still265 -q{N}; `BPG_STILL_DUMP`, 2026-06-29). To compare at equal ACTUAL
+/// HEVC QP this harness adds the offset to the bpgenc `-q` value only.
+const BPGENC_QP_OFFSET: u8 = 3;
 
 #[derive(Parser)]
 #[command(
@@ -145,21 +156,17 @@ fn parse_efforts(s: &str) -> Result<Vec<EffortArg>, String> {
         .map(|name| {
             let trimmed = name.trim().to_lowercase();
             match trimmed.as_str() {
-                "floor" => Ok(EffortArg::Floor),
-                "floorplus" => Ok(EffortArg::FloorPlus),
-                "floorplus2" => Ok(EffortArg::FloorPlus2),
-                "floorshallow" => Ok(EffortArg::FloorShallow),
-                "slow" => Ok(EffortArg::Slow),
-                "slowplus" => Ok(EffortArg::SlowPlus),
-                "fastest" => Ok(EffortArg::Fastest),
-                "fastadaptive" => Ok(EffortArg::FastAdaptive),
-                "fast" => Ok(EffortArg::Fast),
-                "balanced" => Ok(EffortArg::Balanced),
-                "good" => Ok(EffortArg::Good),
-                "best" => Ok(EffortArg::Best),
+                "floor" | "floorplus" | "floor-plus" | "floorplus2" | "floor-plus2"
+                | "floorshallow" | "floor-shallow" | "fastest" | "fastadaptive" | "fast" => {
+                    Ok(EffortArg::Fast)
+                }
+                "slow" | "slowplus" | "slow-plus" | "balanced" | "good" | "best" => {
+                    Ok(EffortArg::Slow)
+                }
                 "placebo" => Ok(EffortArg::Placebo),
-                "reference" => Ok(EffortArg::Reference),
-                _ => Err(format!("unknown effort '{trimmed}'; valid: floor, floorplus, floorplus2, floorshallow, slow, slowplus, fastest, fastadaptive, fast, balanced, good, best, placebo, reference")),
+                _ => Err(format!(
+                    "unknown effort '{trimmed}'; valid: fast, slow, placebo"
+                )),
             }
         })
         .collect()
@@ -173,39 +180,17 @@ struct Size {
 
 #[derive(Clone, Copy, Debug)]
 enum EffortArg {
-    Floor,
-    FloorPlus,
-    FloorPlus2,
-    FloorShallow,
-    Slow,
-    SlowPlus,
-    Fastest,
-    FastAdaptive,
     Fast,
-    Balanced,
-    Good,
-    Best,
+    Slow,
     Placebo,
-    Reference,
 }
 
 impl EffortArg {
     fn as_str(self) -> &'static str {
         match self {
-            EffortArg::Floor => "floor",
-            EffortArg::FloorPlus => "floorplus",
-            EffortArg::FloorPlus2 => "floorplus2",
-            EffortArg::FloorShallow => "floorshallow",
-            EffortArg::Slow => "slow",
-            EffortArg::SlowPlus => "slowplus",
-            EffortArg::Fastest => "fastest",
-            EffortArg::FastAdaptive => "fastadaptive",
             EffortArg::Fast => "fast",
-            EffortArg::Balanced => "balanced",
-            EffortArg::Good => "good",
-            EffortArg::Best => "best",
+            EffortArg::Slow => "slow",
             EffortArg::Placebo => "placebo",
-            EffortArg::Reference => "reference",
         }
     }
 }
@@ -213,20 +198,9 @@ impl EffortArg {
 impl From<EffortArg> for Effort {
     fn from(value: EffortArg) -> Self {
         match value {
-            EffortArg::Floor => Effort::Floor,
-            EffortArg::FloorPlus => Effort::FloorPlus,
-            EffortArg::FloorPlus2 => Effort::FloorPlus2,
-            EffortArg::FloorShallow => Effort::FloorShallow,
-            EffortArg::Slow => Effort::Slow,
-            EffortArg::SlowPlus => Effort::SlowPlus,
-            EffortArg::Fastest => Effort::Fastest,
-            EffortArg::FastAdaptive => Effort::FastAdaptive,
             EffortArg::Fast => Effort::Fast,
-            EffortArg::Balanced => Effort::Balanced,
-            EffortArg::Good => Effort::Good,
-            EffortArg::Best => Effort::Best,
+            EffortArg::Slow => Effort::Slow,
             EffortArg::Placebo => Effort::Placebo,
-            EffortArg::Reference => Effort::Reference,
         }
     }
 }
@@ -725,11 +699,15 @@ fn run_c_bpgenc(
     args: &Args,
 ) -> Result<CResult, Box<dyn std::error::Error>> {
     let start = Instant::now();
+    // `args.qp` is the target ACTUAL HEVC QP. bpgenc's -q maps to HEVC QP
+    // (q - BPGENC_QP_OFFSET), so add the offset to land at the same actual QP as
+    // still265 (which uses `args.qp` directly). Clamp to the valid 0..=51 range.
+    let bpgenc_q = (args.qp as u16 + BPGENC_QP_OFFSET as u16).min(51) as u8;
     let mut cmd = Command::new(bpgenc);
     cmd.arg("-o")
         .arg(out)
         .arg("-q")
-        .arg(args.qp.to_string())
+        .arg(bpgenc_q.to_string())
         .arg("-f")
         .arg(args.format.bpgenc_arg())
         .arg("-b")

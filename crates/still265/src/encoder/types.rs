@@ -86,6 +86,16 @@ pub struct EncodeStats {
     pub cu_trials: u64,
     pub cu_early_terminations: u64,
     pub cu_split_bound_aborts: u64,
+    /// Per-CU-depth evaluation work, indexed directly by `log2_cb_size`
+    /// (CU sizes 8/16/32/64 = log2 3/4/5/6; TU sizes 4/8/16/32 = log2 2/3/4/5).
+    /// These mirror x265's `DETAILED_CU_STATS` "Intra RDO calls per depth" so the
+    /// two encoders' per-depth work is directly comparable. Printed via
+    /// `--debug-stats`.
+    pub cu_trials_by_log2: [u64; 7],
+    pub cu_splits_taken_by_log2: [u64; 7],
+    pub cu_early_term_by_log2: [u64; 7],
+    pub tu_leaf_by_log2: [u64; 7],
+    pub tu_split_by_log2: [u64; 7],
     pub floorplus_ctus: u64,
     pub floorplus_repair_attempts: u64,
     pub floorplus_enhanced_leaf_wins: u64,
@@ -188,6 +198,17 @@ pub struct EncodeStats {
     pub luma_exact_dc_count: u64,
     pub luma_exact_angular_tt_cost_x1000: u64,
     pub luma_exact_angular_count: u64,
+    /// Sampled luma oracle diagnostics. Populated only when
+    /// `BPG_STILLSEARCH_LUMA_ORACLE=1`.
+    pub luma_oracle_samples: u64,
+    pub luma_oracle_mode_misses: u64,
+    pub luma_oracle_shortlist_hits: u64,
+    pub luma_oracle_cheap_top_hits: u64,
+    pub luma_oracle_rough_rank_sum: u64,
+    pub luma_oracle_cheap_rank_sum: u64,
+    pub luma_oracle_cheap_rank_count: u64,
+    pub luma_oracle_delta_cost_x1000: i64,
+    pub luma_oracle_miss_delta_cost_x1000: i64,
     pub region_class_counts: [u64; crate::preanalysis::NUM_CLASSES],
     pub luma_winner_rank_counts: [u64; 5],
     pub chroma_winner_rank_counts: [u64; 6],
@@ -244,6 +265,15 @@ impl EncodeStats {
         self.luma_exact_dc_count += other.luma_exact_dc_count;
         self.luma_exact_angular_tt_cost_x1000 += other.luma_exact_angular_tt_cost_x1000;
         self.luma_exact_angular_count += other.luma_exact_angular_count;
+        self.luma_oracle_samples += other.luma_oracle_samples;
+        self.luma_oracle_mode_misses += other.luma_oracle_mode_misses;
+        self.luma_oracle_shortlist_hits += other.luma_oracle_shortlist_hits;
+        self.luma_oracle_cheap_top_hits += other.luma_oracle_cheap_top_hits;
+        self.luma_oracle_rough_rank_sum += other.luma_oracle_rough_rank_sum;
+        self.luma_oracle_cheap_rank_sum += other.luma_oracle_cheap_rank_sum;
+        self.luma_oracle_cheap_rank_count += other.luma_oracle_cheap_rank_count;
+        self.luma_oracle_delta_cost_x1000 += other.luma_oracle_delta_cost_x1000;
+        self.luma_oracle_miss_delta_cost_x1000 += other.luma_oracle_miss_delta_cost_x1000;
         self.substage_predict_ns = self
             .substage_predict_ns
             .saturating_add(other.substage_predict_ns);
@@ -305,6 +335,58 @@ impl fmt::Display for EncodeStats {
                 self.luma_exact_angular_tt_cost_x1000
             )
         )?;
+        if self.luma_oracle_samples > 0 {
+            let samples = self.luma_oracle_samples as f64;
+            let pct = |n: u64| n as f64 / samples * 100.0;
+            let avg_delta = self.luma_oracle_delta_cost_x1000 as f64 / samples / 1000.0;
+            let avg_miss_delta = if self.luma_oracle_mode_misses == 0 {
+                0.0
+            } else {
+                self.luma_oracle_miss_delta_cost_x1000 as f64
+                    / self.luma_oracle_mode_misses as f64
+                    / 1000.0
+            };
+            let avg_rough_rank = self.luma_oracle_rough_rank_sum as f64 / samples;
+            let avg_cheap_rank = if self.luma_oracle_cheap_rank_count == 0 {
+                f64::NAN
+            } else {
+                self.luma_oracle_cheap_rank_sum as f64 / self.luma_oracle_cheap_rank_count as f64
+            };
+            let shortlist_misses = self
+                .luma_oracle_samples
+                .saturating_sub(self.luma_oracle_shortlist_hits);
+            let simple_rdo_misses = self
+                .luma_oracle_shortlist_hits
+                .saturating_sub(self.luma_oracle_cheap_top_hits);
+            writeln!(
+                f,
+                "  luma_oracle: samples={} misses={} ({:.1}%) shortlist_hits={} ({:.1}%) cheap_top_hits={} ({:.1}%)",
+                self.luma_oracle_samples,
+                self.luma_oracle_mode_misses,
+                pct(self.luma_oracle_mode_misses),
+                self.luma_oracle_shortlist_hits,
+                pct(self.luma_oracle_shortlist_hits),
+                self.luma_oracle_cheap_top_hits,
+                pct(self.luma_oracle_cheap_top_hits),
+            )?;
+            writeln!(
+                f,
+                "  luma_oracle: shortlist_misses={} ({:.1}%) simple_rdo_misses={} ({:.1}% of admitted)",
+                shortlist_misses,
+                pct(shortlist_misses),
+                simple_rdo_misses,
+                if self.luma_oracle_shortlist_hits == 0 {
+                    0.0
+                } else {
+                    simple_rdo_misses as f64 / self.luma_oracle_shortlist_hits as f64 * 100.0
+                },
+            )?;
+            writeln!(
+                f,
+                "  luma_oracle: avg_rough_rank={:.2} avg_cheap_rank={:.2} avg_delta_cost={:.1} avg_miss_delta_cost={:.1}",
+                avg_rough_rank, avg_cheap_rank, avg_delta, avg_miss_delta,
+            )?;
+        }
         // Per-bucket wall times (only populated when BPG_STILLSEARCH_PROFILE=1).
         let total_ns: u64 = self.stillsearch_ledger_ns.iter().sum();
         if total_ns > 0 {

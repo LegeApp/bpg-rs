@@ -25,9 +25,7 @@
 //!   `slice_sao_* || !slice_deblocking_filter_disabled` reduces to
 //!   `slice_sao_*` — present (and written as 1) iff `config.sao !=
 //!   SaoMode::Off`.
-//! - `pps.tiles_enabled_flag == false` and
-//!   `pps.entropy_coding_sync_enabled_flag == false`, so
-//!   `num_entry_point_offsets` is absent (implicitly 0).
+//! - `num_entry_point_offsets` is present when tiles or WPP are enabled.
 //! - `pps.slice_segment_header_extension_present_flag == false`.
 //!
 //! After these fields comes `byte_alignment()`: `alignment_bit_equal_to_one`
@@ -44,6 +42,7 @@ use crate::{ChromaFormat, StillHevcConfig};
 pub fn write_slice_segment_header(
     config: &StillHevcConfig,
     tiles: Option<(u32, u32)>,
+    wpp: bool,
     entry_sizes: &[u32],
 ) -> Vec<u8> {
     let mut w = BitWriter::new();
@@ -85,9 +84,9 @@ pub fn write_slice_segment_header(
     // presence condition `slice_sao_* || !slice_deblocking_filter_disabled`
     // is false).
 
-    // Entry point offsets (present iff tiles or WPP are enabled in the PPS;
-    // here only tiles). One offset per tile substream except the last.
-    if tiles.is_some() {
+    // Entry point offsets (present iff tiles or WPP are enabled in the PPS).
+    // One offset per substream except the last.
+    if tiles.is_some() || wpp {
         w.write_ue_golomb(entry_sizes.len() as u32); // num_entry_point_offsets
         if !entry_sizes.is_empty() {
             // Each entry size is a NAL substream byte length and must be >= 1

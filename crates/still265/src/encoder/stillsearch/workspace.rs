@@ -8,6 +8,14 @@ use crate::contexts::Contexts;
 use crate::rdoq::RdoqScratch;
 use crate::residual::ResidualPricingScratch;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SsimRdNorm {
+    pub(super) valid: bool,
+    pub(super) qp: i32,
+    pub(super) f_dc_den: u64,
+    pub(super) f_ac_den: u64,
+}
+
 /// Per-CTU substage profile accumulators for `eval_component_8`.
 /// Populated only when `BPG_STILLSEARCH_PROFILE=1`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -37,9 +45,16 @@ pub(super) struct CtuWorkspace {
     /// Per-CTU substage profile (eval_component_8 breakdown). Zero when
     /// profiling is disabled.
     pub(super) substage: SubstageProfile,
+    /// Per-component CTU source normalization for the opt-in SSIM-RD cost.
+    pub(super) ssim_rd_norm: [SsimRdNorm; 3],
     /// Number of TU split evaluations skipped due to zero-residual early
     /// termination in this CTU.
     pub(super) tu_split_early_terminations: u64,
+    /// Per-TU-depth evaluation work for this CTU, indexed by `log2_size`
+    /// (TU sizes 4/8/16/32 = log2 2/3/4/5). Counts `eval_tt_leaf` /
+    /// `eval_tt_split` calls. Merged into `EncodeStats` in `build_ctu`.
+    pub(super) tu_leaf_by_log2: [u64; 7],
+    pub(super) tu_split_by_log2: [u64; 7],
 }
 
 impl Default for CtuWorkspace {
@@ -53,7 +68,10 @@ impl Default for CtuWorkspace {
             rdoq_scratch: RdoqScratch::default(),
             last_8x8_rough_satd: f64::INFINITY,
             substage: SubstageProfile::default(),
+            ssim_rd_norm: [SsimRdNorm::default(); 3],
             tu_split_early_terminations: 0,
+            tu_leaf_by_log2: [0; 7],
+            tu_split_by_log2: [0; 7],
         }
     }
 }
@@ -64,7 +82,10 @@ impl CtuWorkspace {
         self.ledger.clear_ctu();
         self.block_scratch.clear_ctu();
         self.substage = SubstageProfile::default();
+        self.ssim_rd_norm = [SsimRdNorm::default(); 3];
         self.tu_split_early_terminations = 0;
+        self.tu_leaf_by_log2 = [0; 7];
+        self.tu_split_by_log2 = [0; 7];
     }
 
     /// Seed the trial-pricing entry context with the live CTU-entry context.
@@ -93,6 +114,8 @@ pub(super) struct BlockScratch {
     pub(super) component_pred_u8: Vec<u8>,
     pub(super) component_recon_u8: Vec<u8>,
     pub(super) component_pred_tmp_u16: Vec<u16>,
+    /// Reusable per-mode accumulators for the batched simple-RDO ranker.
+    pub(super) simple_rdo_accum: Vec<super::tu::SimpleRdoAccum>,
 }
 
 impl BlockScratch {
@@ -112,6 +135,7 @@ impl BlockScratch {
         self.component_pred_u8.clear();
         self.component_recon_u8.clear();
         self.component_pred_tmp_u16.clear();
+        self.simple_rdo_accum.clear();
     }
 
     pub(super) fn residual_i16_for_log2(&mut self, log2_size: u8) -> &mut Vec<i16> {

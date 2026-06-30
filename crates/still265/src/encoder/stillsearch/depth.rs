@@ -88,14 +88,13 @@ where
         self.source.reset_from_ctu(state, x0, y0, log2_cb_size);
         self.overlay.clear();
 
-        let lambda = super::price::rd_lambda(state.cur_qp_y);
         let (plan, _cost) = self.decide_cu(state, x0, y0, log2_cb_size, ct_depth);
 
         // Winner-only RDOQ finalize: discard the hard-quant trial recon, then
         // re-code the chosen plan in decoder order with RDOQ, rebuilding coeffs/
         // recon/CBFs. Search decided the structure; this only refines coding.
         self.overlay.clear();
-        let plan = self.finalize_cu(state, plan, x0, y0, log2_cb_size, lambda);
+        let plan = self.finalize_cu(state, plan, x0, y0, log2_cb_size);
 
         let final_commit_timer = StillSearchLedger::start_timer();
         self.overlay.commit_to_frame(&mut state.frame);
@@ -140,6 +139,10 @@ where
             .saturating_add(self.workspace.substage.residual_price_ns);
         state.stats.substage_calls += self.workspace.substage.calls;
         state.stats.tu_split_early_terminations += self.workspace.tu_split_early_terminations;
+        for i in 0..7 {
+            state.stats.tu_leaf_by_log2[i] += self.workspace.tu_leaf_by_log2[i];
+            state.stats.tu_split_by_log2[i] += self.workspace.tu_split_by_log2[i];
+        }
         cu
     }
 }
@@ -214,4 +217,122 @@ where
         debug_assert!(dst.len() >= n);
         crate::primitives::narrow_u16_to_u8(tmp_u16, dst, n);
     }
+
+    /// Build the intra reference borders (unfiltered + filtered, plus the center
+    /// index and bit depth) for one block, reading overlay-first with
+    /// tile-boundary clamping. These borders are *identical* across all candidate
+    /// intra modes for a block as long as the overlay is unchanged, so callers
+    /// that try many modes (cheap/exact ranking) should build once via this and
+    /// reuse with [`predict_exact_from_refs_u8`] instead of rebuilding per mode.
+    pub(super) fn build_intra_refs_for_block(
+        &self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+    ) -> IntraRefs {
+        let tile_bounds = state.tile_clamp_bounds(x0, y0, c_idx);
+        let overlay = &self.overlay;
+        let (uf, ft, center, bit_depth) =
+            bpg_hevc_decode::hevc::intra::build_reference_borders_with_reader(
+                &state.frame,
+                x0,
+                y0,
+                log2_size,
+                c_idx,
+                true,
+                |c, rx, ry| {
+                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
+                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
+                            return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
+                        }
+                    }
+                    overlay.sample(c, rx, ry)
+                },
+            );
+        IntraRefs {
+            uf,
+            ft,
+            center,
+            bit_depth,
+        }
+    }
+
+    /// Predict one block from prebuilt [`IntraRefs`] into `dst`. Pure function of
+    /// the refs + mode; does no overlay reads.
+    #[inline]
+    pub(super) fn predict_exact_from_refs_u8(
+        &self,
+        refs: &IntraRefs,
+        log2_size: u8,
+        c_idx: u8,
+        mode: bpg_hevc_decode::hevc::slice::IntraPredMode,
+        dst: &mut [u8],
+    ) {
+        let mode_u8 = mode.as_u8();
+        let size = 1usize << log2_size;
+        let border = if bpg_hevc_decode::hevc::intra::reference_filter_applies(size, mode_u8) {
+            &refs.ft
+        } else {
+            &refs.uf
+        };
+        match mode {
+            bpg_hevc_decode::hevc::slice::IntraPredMode::Planar => {
+                crate::primitives::pred_planar_u8(
+                    dst,
+                    border,
+                    refs.center,
+                    log2_size,
+                    c_idx,
+                    refs.bit_depth,
+                )
+            }
+            bpg_hevc_decode::hevc::slice::IntraPredMode::Dc => crate::primitives::pred_dc_u8(
+                dst,
+                border,
+                refs.center,
+                log2_size,
+                c_idx,
+                refs.bit_depth,
+            ),
+            _ => crate::primitives::pred_angular_u8(
+                dst,
+                border,
+                refs.center,
+                log2_size,
+                c_idx,
+                mode_u8,
+                refs.bit_depth,
+            ),
+        }
+    }
+
+    /// Exact 8-bit prediction through the Still265 primitive table. Builds the
+    /// border then predicts; the [`build_intra_refs_for_block`] /
+    /// [`predict_exact_from_refs_u8`] split lets hot loops amortize the build.
+    pub(super) fn predict_exact_into_u8(
+        &self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+        mode: bpg_hevc_decode::hevc::slice::IntraPredMode,
+        dst: &mut [u8],
+    ) {
+        let refs = self.build_intra_refs_for_block(state, x0, y0, log2_size, c_idx);
+        self.predict_exact_from_refs_u8(&refs, log2_size, c_idx, mode, dst);
+    }
+}
+
+/// Prebuilt intra reference borders for one block, reusable across all candidate
+/// modes while the overlay is unchanged. The borders are fixed-size stack arrays
+/// (no heap), so copying/holding one is cheap.
+#[derive(Clone, Copy)]
+pub(super) struct IntraRefs {
+    pub(super) uf: [i32; bpg_hevc_decode::hevc::intra::INTRA_BORDER_LEN],
+    pub(super) ft: [i32; bpg_hevc_decode::hevc::intra::INTRA_BORDER_LEN],
+    pub(super) center: usize,
+    pub(super) bit_depth: u8,
 }

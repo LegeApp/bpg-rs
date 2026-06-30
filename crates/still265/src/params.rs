@@ -18,8 +18,9 @@
 //!   `slice_sao_luma_flag`/`slice_sao_chroma_flag` in the slice header.
 //!   `SaoMode::On` sets this flag, and `slice.rs` writes those two flags
 //!   (see `crate::sao` for the per-CTU SAO syntax this then requires).
-//! - `entropy_coding_sync_enabled_flag = false` (oracle: true) — avoids
-//!   `num_entry_point_offsets` parsing in the slice header.
+//! - `entropy_coding_sync_enabled_flag` follows the resolved encoder WPP mode.
+//!   It defaults off for serial/tile streams and on only when the encoder emits
+//!   row substreams with entry-point offsets.
 //! - `deblocking_filter_control_present_flag = false` — avoids
 //!   `deblocking_filter_override_flag` and friends in the slice header.
 //!
@@ -129,10 +130,14 @@ mod tests {
             bit_depth: 8,
             chroma: ChromaFormat::Yuv420,
             qp: 28,
-            effort: crate::Effort::Balanced,
+            effort: crate::Effort::Slow,
             sao: crate::SaoMode::Off,
             deblock,
             adaptive_qp: false,
+            aq_mode: crate::AqMode::Off,
+            aq_strength: 0.35,
+            aq_clamp: 2,
+            two_pass_gate: true,
         }
     }
 
@@ -148,7 +153,8 @@ mod tests {
     }
 
     fn check_pps_rbsp_terminates_config(config: &StillHevcConfig) {
-        let pps = write_pps(config, effective_tile_dims(config));
+        let wpp = effective_wpp_enabled(config);
+        let pps = write_pps(config, effective_tile_dims(config), wpp);
         let mut r = BitReader::new(&pps);
         let ue = |r: &mut BitReader| r.read_ue_golomb().unwrap();
 
@@ -177,7 +183,11 @@ mod tests {
         r.read_bits(1); // weighted_bipred_flag
         r.read_bits(1); // transquant_bypass_enabled_flag
         assert_eq!(r.read_bits(1), 0, "tiles_enabled_flag"); // no tile cols/rows loop
-        r.read_bits(1); // entropy_coding_sync_enabled_flag
+        assert_eq!(
+            r.read_bits(1),
+            wpp as u32,
+            "entropy_coding_sync_enabled_flag"
+        );
         r.read_bits(1); // pps_loop_filter_across_slices_enabled_flag
         let deblock_ctrl = r.read_bits(1); // deblocking_filter_control_present_flag
         if deblock_ctrl == 1 {
@@ -214,7 +224,7 @@ mod tests {
         check_pps_rbsp_terminates(crate::DeblockMode::On);
     }
 
-    /// With adaptive QP active (any non-reference tier, every chroma format), the
+    /// With adaptive QP active (every chroma format except gray), the
     /// PPS must set `cu_qp_delta_enabled_flag = 1`, emit `diff_cu_qp_delta_depth`,
     /// and still terminate cleanly for a conformant decoder.
     #[test]
@@ -252,11 +262,7 @@ mod tests {
     /// carries `cu_qp_delta_enabled_flag = 0`.
     #[test]
     fn pps_aq_off_for_high_quality_tiers() {
-        for effort in [
-            crate::Effort::Best,
-            crate::Effort::Placebo,
-            crate::Effort::Reference,
-        ] {
+        for effort in [crate::Effort::Slow, crate::Effort::Placebo] {
             let mut config = test_config(crate::DeblockMode::On);
             config.effort = effort;
             assert!(!crate::aq_active(&config));
@@ -419,6 +425,47 @@ fn tile_core_count() -> u32 {
         .unwrap_or(1)
 }
 
+fn explicit_tile_request() -> bool {
+    std::env::var("BPG_TILES")
+        .ok()
+        .map(|v| {
+            let s = v.trim();
+            !(s.is_empty()
+                || s.eq_ignore_ascii_case("auto")
+                || s == "0"
+                || s.eq_ignore_ascii_case("off")
+                || s.eq_ignore_ascii_case("none"))
+        })
+        .unwrap_or(false)
+}
+
+fn wpp_env_allows_auto() -> bool {
+    std::env::var("BPG_WPP")
+        .ok()
+        .map(|v| {
+            let s = v.trim();
+            !(s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none"))
+        })
+        .unwrap_or(true)
+}
+
+/// Resolved encoder WPP mode. WPP v1 is intentionally uniform-QP only: mutable
+/// AQ predictor state remains serial until QP targets and syntax prediction are
+/// split cleanly.
+pub fn effective_wpp_enabled(config: &StillHevcConfig) -> bool {
+    if !wpp_env_allows_auto() || explicit_tile_request() || crate::aq_active(config) {
+        return false;
+    }
+    if !crate::effort::template(config.effort).parallel_analysis {
+        return false;
+    }
+    if tile_core_count() <= 1 {
+        return false;
+    }
+    let ctb = 1u32 << 6;
+    config.width.div_ceil(ctb) > 1 && config.height.div_ceil(ctb) > 1
+}
+
 /// Uniform auto-grid (Phase 5a): choose `cols x rows` so the tile count is as
 /// close to `cores` as possible *without overshooting* (extra tiles past the
 /// core count only cost bytes from broken cross-tile prediction with no added
@@ -473,7 +520,7 @@ fn tile_capable(config: &StillHevcConfig) -> bool {
 /// `BPG_TILES=COLSxROWS` works for any tile-capable effort — but the auto-grid
 /// default is currently scoped to the Slow tier, the validated tiled config.
 fn auto_tile_effort(effort: crate::Effort) -> bool {
-    matches!(effort, crate::Effort::Slow | crate::Effort::SlowPlus)
+    matches!(effort, crate::Effort::Slow)
 }
 
 /// Effective tile grid `(columns, rows)` for this encode, or `None` when tiles
@@ -491,6 +538,9 @@ fn auto_tile_effort(effort: crate::Effort) -> bool {
 /// the single source of truth shared by [`write_pps`], the slice header, and the
 /// encoder, so they always agree on the partition.
 pub fn effective_tile_dims(config: &StillHevcConfig) -> Option<(u32, u32)> {
+    if effective_wpp_enabled(config) {
+        return None;
+    }
     if !tile_capable(config) {
         return None;
     }
@@ -539,9 +589,9 @@ pub fn effective_tile_dims(config: &StillHevcConfig) -> Option<(u32, u32)> {
     }
 }
 
-/// `tiles` is the resolved partition from [`effective_tile_dims`], passed in by
-/// the caller so the PPS, slice header, and encoder share one computation.
-pub fn write_pps(config: &StillHevcConfig, tiles: Option<(u32, u32)>) -> Vec<u8> {
+/// `tiles` and `wpp` are the resolved partition mode, passed in by the caller so
+/// the PPS, slice header, and encoder share one computation.
+pub fn write_pps(config: &StillHevcConfig, tiles: Option<(u32, u32)>, wpp: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     w.write_ue_golomb(0); // pps_pic_parameter_set_id
@@ -576,7 +626,7 @@ pub fn write_pps(config: &StillHevcConfig, tiles: Option<(u32, u32)>) -> Vec<u8>
     w.write_bit(0); // weighted_bipred_flag
     w.write_bit(0); // transquant_bypass_enabled_flag
     w.write_bit(tiles.is_some() as u32); // tiles_enabled_flag
-    w.write_bit(0); // entropy_coding_sync_enabled_flag (see module docs)
+    w.write_bit(wpp as u32); // entropy_coding_sync_enabled_flag
     if let Some((cols, rows)) = tiles {
         w.write_ue_golomb(cols - 1); // num_tile_columns_minus1
         w.write_ue_golomb(rows - 1); // num_tile_rows_minus1

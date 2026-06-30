@@ -12,7 +12,7 @@
 //!
 //! let cfg = StillHevcConfig {
 //!     width: 4096, height: 3072, bit_depth: 8, chroma: ChromaFormat::Yuv420,
-//!     qp: 28, effort: Effort::Best, sao: SaoMode::On, deblock: DeblockMode::On,
+//!     qp: 28, effort: Effort::Slow, sao: SaoMode::On, deblock: DeblockMode::On,
 //!     adaptive_qp: false,
 //! };
 //! // How much RAM will one encode of this size take?
@@ -80,12 +80,10 @@ fn plane_samples(w: u32, h: u32, chroma: ChromaFormat) -> u64 {
 }
 
 /// Whether `config` runs the frame-cloning parallel wavefront path. Mirrors the
-/// encoder's `best2_parallel` gate for non-reference tiers (AQ off, not disabled
-/// by env) and the always-parallel `Placebo` tier.
+/// encoder's wavefront gate for uniform-QP tiers (AQ off, not disabled by env).
 fn is_parallel(config: &StillHevcConfig) -> bool {
     match config.effort {
         Effort::Placebo => true,
-        Effort::Reference => false,
         _ => {
             !crate::aq_active(config)
                 && std::env::var("BPG_BEST2_PARALLEL")
@@ -249,6 +247,10 @@ mod tests {
             sao: SaoMode::On,
             deblock: DeblockMode::On,
             adaptive_qp: false,
+            aq_mode: crate::AqMode::Off,
+            aq_strength: 0.35,
+            aq_clamp: 2,
+            two_pass_gate: true,
         }
     }
 
@@ -264,16 +266,11 @@ mod tests {
     }
 
     #[test]
-    fn aq_or_reference_configs_have_no_worker_frames() {
+    fn aq_configs_have_no_worker_frames() {
         let mut fast_aq = cfg(1024, 768, Effort::Fast, ChromaFormat::Yuv420);
         fast_aq.adaptive_qp = true;
         let fast_aq = estimate_memory(&fast_aq);
         assert_eq!(fast_aq.worker_frames, 0);
-
-        let reference = estimate_memory(&cfg(1024, 768, Effort::Reference, ChromaFormat::Yuv420));
-        assert_eq!(reference.worker_frames, 0);
-        // A serial encode's peak is ~one frame + source + slack.
-        assert!(reference.peak_bytes >= reference.frame_bytes + reference.source_bytes);
     }
 
     #[test]
@@ -284,9 +281,9 @@ mod tests {
         {
             return;
         }
-        let balanced = estimate_memory(&cfg(1024, 768, Effort::Balanced, ChromaFormat::Yuv420));
-        assert!(balanced.worker_frames > 0);
-        assert!(balanced.worker_frames <= 12);
+        let slow = estimate_memory(&cfg(1024, 768, Effort::Slow, ChromaFormat::Yuv420));
+        assert!(slow.worker_frames > 0);
+        assert!(slow.worker_frames <= 12);
     }
 
     #[test]

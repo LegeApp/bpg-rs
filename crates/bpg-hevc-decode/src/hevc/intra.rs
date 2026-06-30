@@ -409,6 +409,49 @@ fn predict_intra_from_border(
     }
 }
 
+/// Planar intra prediction from an already-collected reference border.
+///
+/// This is the same scalar reference used by [`predict_intra_into`], exposed so
+/// encoder-side primitive dispatch can build borders once and call exact
+/// prediction kernels directly.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_planar_from_border(
+    plane: &mut [u16],
+    stride: usize,
+    log2_size: u8,
+    bit_depth: u8,
+    border: &[i32],
+    center: usize,
+) {
+    let size = 1u32 << log2_size;
+    let max_val = (1i32 << bit_depth) - 1;
+    predict_planar(
+        plane, stride, 0, 0, size, log2_size, max_val, border, center,
+    );
+}
+
+/// DC intra prediction from an already-collected reference border.
+///
+/// This is the same scalar reference used by [`predict_intra_into`], exposed so
+/// encoder-side primitive dispatch can build borders once and call exact
+/// prediction kernels directly.
+#[allow(clippy::too_many_arguments)]
+pub fn predict_dc_from_border(
+    plane: &mut [u16],
+    stride: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+    border: &[i32],
+    center: usize,
+) {
+    let size = 1u32 << log2_size;
+    let max_val = (1i32 << bit_depth) - 1;
+    predict_dc(
+        plane, stride, 0, 0, size, log2_size, c_idx, max_val, border, center,
+    );
+}
+
 /// Intra prediction reference sample filtering (H.265 8.4.4.2.3)
 ///
 /// Applies [1,2,1]/4 low-pass filter to reference samples before prediction.

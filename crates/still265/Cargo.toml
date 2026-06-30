@@ -25,6 +25,14 @@ default = ["wide-simd"]
 # Marker feature for profiling builds. Keep profiling-only instrumentation
 # behind this feature if it would perturb normal release measurements.
 flamegraph = []
+# Counts forward-DCT calls per transform size (4/8/16/32) and exposes them via
+# `primitives::wide::dct_size_histogram()`. Off by default — the per-call
+# atomic increment perturbs ForwardXform measurements. Enable for profiling
+# the transform-size distribution.
+dct-histogram = []
+# Temporary: count overlay.sample calls + patch iterations to confirm the
+# per-call border-rebuild cost hypothesis. Remove after the investigation.
+overlay-probe = []
 # Enable the wide-SIMD portable kernel layer (default). Disable with
 # `--no-default-features` to build a fully scalar binary (useful for testing
 # the scalar reference path without the BPG_PRIMITIVES env override).

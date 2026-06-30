@@ -75,6 +75,103 @@ pub fn satd_u16_scalar(a: &[u16], stride_a: usize, b: &[u16], stride_b: usize, s
     satd_by(a, stride_a, b, stride_b, size, |v| v as i32)
 }
 
+fn hadamard8_1d(v: &mut [i32; 8]) {
+    let a0 = v[0] + v[4];
+    let a1 = v[1] + v[5];
+    let a2 = v[2] + v[6];
+    let a3 = v[3] + v[7];
+    let a4 = v[0] - v[4];
+    let a5 = v[1] - v[5];
+    let a6 = v[2] - v[6];
+    let a7 = v[3] - v[7];
+
+    let b0 = a0 + a2;
+    let b1 = a1 + a3;
+    let b2 = a0 - a2;
+    let b3 = a1 - a3;
+    let b4 = a4 + a6;
+    let b5 = a5 + a7;
+    let b6 = a4 - a6;
+    let b7 = a5 - a7;
+
+    v[0] = b0 + b1;
+    v[1] = b4 + b5;
+    v[2] = b2 + b3;
+    v[3] = b6 + b7;
+    v[4] = b0 - b1;
+    v[5] = b4 - b5;
+    v[6] = b2 - b3;
+    v[7] = b6 - b7;
+}
+
+fn sa8d_8x8_by<T: Copy>(
+    a: &[T],
+    stride_a: usize,
+    b: &[T],
+    stride_b: usize,
+    by: usize,
+    bx: usize,
+    to_i32: &impl Fn(T) -> i32,
+) -> u32 {
+    let mut tmp = [[0i32; 8]; 8];
+    for y in 0..8 {
+        for x in 0..8 {
+            tmp[y][x] =
+                to_i32(a[(by + y) * stride_a + bx + x]) - to_i32(b[(by + y) * stride_b + bx + x]);
+        }
+        hadamard8_1d(&mut tmp[y]);
+    }
+
+    let mut sum = 0u32;
+    for x in 0..8 {
+        let mut col = [0i32; 8];
+        for y in 0..8 {
+            col[y] = tmp[y][x];
+        }
+        hadamard8_1d(&mut col);
+        for v in col {
+            sum = sum.saturating_add(v.unsigned_abs());
+        }
+    }
+    (sum + 2) >> 2
+}
+
+fn sa8d_by<T: Copy>(
+    a: &[T],
+    stride_a: usize,
+    b: &[T],
+    stride_b: usize,
+    size: usize,
+    to_i32: impl Fn(T) -> i32,
+) -> u32 {
+    assert!(matches!(size, 4 | 8 | 16 | 32));
+    assert!(stride_a >= size && stride_b >= size);
+    assert!(a.len() >= stride_a * (size - 1) + size);
+    assert!(b.len() >= stride_b * (size - 1) + size);
+
+    if size == 4 {
+        return satd_by(a, stride_a, b, stride_b, size, to_i32);
+    }
+
+    let mut sum = 0u32;
+    for by in (0..size).step_by(8) {
+        for bx in (0..size).step_by(8) {
+            sum += sa8d_8x8_by(a, stride_a, b, stride_b, by, bx, &to_i32);
+        }
+    }
+    sum
+}
+
+/// x265-style CU SA8D: 4x4 SATD for 4x4, 8x8 Hadamard tiles otherwise.
+pub fn sa8d_u8_scalar(a: &[u8], stride_a: usize, b: &[u8], stride_b: usize, size: usize) -> u32 {
+    sa8d_by(a, stride_a, b, stride_b, size, |v| v as i32)
+}
+
+/// x265-style CU SA8D for 10/12-bit samples.
+pub fn sa8d_u16_scalar(a: &[u16], stride_a: usize, b: &[u16], stride_b: usize, size: usize) -> u32 {
+    sa8d_by(a, stride_a, b, stride_b, size, |v| v as i32)
+}
+
 // ─── SSD ───────────────────────────────────────────────────────────────────
 
 /// Sum of squared differences over an 8-bit `size`×`size` block.
@@ -483,4 +580,307 @@ pub fn fwd_dct16_scalar(residual: &[i16], out: &mut [i16], bit_depth: u8) {
 /// Canonical scalar 2-D DCT-32 (32×32).
 pub fn fwd_dct32_scalar(residual: &[i16], out: &mut [i16], bit_depth: u8) {
     fwd_dct_nxn(residual, out, 32, bit_depth);
+}
+
+// ─── Butterfly forward DCT ────────────────────────────────────────────────
+// Algebraically equivalent to fwd_dctN_scalar (same coefficients, same
+// round_shift), but factored through the DCT butterfly to reduce multiply-add
+// count: ~O(N·log N) vs O(N²) for the matrix multiply.
+//
+// Coefficient correctness: build_dct_matrix uses HEVC_DCT_BASE, which exactly
+// matches x265 g_t4/8/16/32 (verified). The butterfly is a pure algebraic
+// refactoring of the same dot products, so output is bit-identical.
+
+#[inline(always)]
+fn butterfly4_1d(src: &[i16], dst: &mut [i16], line: usize, shift: i32) {
+    for j in 0..line {
+        let s = &src[j * 4..j * 4 + 4];
+        let e0 = s[0] as i32 + s[3] as i32;
+        let e1 = s[1] as i32 + s[2] as i32;
+        let o0 = s[0] as i32 - s[3] as i32;
+        let o1 = s[1] as i32 - s[2] as i32;
+        dst[0 * line + j] = round_shift(64 * e0 + 64 * e1, shift);
+        dst[2 * line + j] = round_shift(64 * e0 - 64 * e1, shift);
+        dst[1 * line + j] = round_shift(83 * o0 + 36 * o1, shift);
+        dst[3 * line + j] = round_shift(36 * o0 - 83 * o1, shift);
+    }
+}
+
+/// Butterfly 2-D DCT-4. Bit-identical to `fwd_dct4_scalar`.
+pub fn fwd_dct4_butterfly(residual: &[i16], out: &mut [i16], bit_depth: u8) {
+    debug_assert_eq!(residual.len(), 16);
+    debug_assert!(out.len() >= 16);
+    let shift1 = 1i32 + bit_depth as i32 - 8;
+    let mut tmp = [0i16; 16];
+    butterfly4_1d(residual, &mut tmp, 4, shift1);
+    butterfly4_1d(&tmp, out, 4, 8);
+}
+
+#[inline(always)]
+fn butterfly8_1d(src: &[i16], dst: &mut [i16], line: usize, shift: i32) {
+    for j in 0..line {
+        let s = &src[j * 8..j * 8 + 8];
+        let e0 = s[0] as i32 + s[7] as i32;
+        let e1 = s[1] as i32 + s[6] as i32;
+        let e2 = s[2] as i32 + s[5] as i32;
+        let e3 = s[3] as i32 + s[4] as i32;
+        let o0 = s[0] as i32 - s[7] as i32;
+        let o1 = s[1] as i32 - s[6] as i32;
+        let o2 = s[2] as i32 - s[5] as i32;
+        let o3 = s[3] as i32 - s[4] as i32;
+        let ee0 = e0 + e3;
+        let ee1 = e1 + e2;
+        let eo0 = e0 - e3;
+        let eo1 = e1 - e2;
+        dst[0 * line + j] = round_shift(64 * ee0 + 64 * ee1, shift);
+        dst[4 * line + j] = round_shift(64 * ee0 - 64 * ee1, shift);
+        dst[2 * line + j] = round_shift(83 * eo0 + 36 * eo1, shift);
+        dst[6 * line + j] = round_shift(36 * eo0 - 83 * eo1, shift);
+        dst[1 * line + j] = round_shift(89 * o0 + 75 * o1 + 50 * o2 + 18 * o3, shift);
+        dst[3 * line + j] = round_shift(75 * o0 - 18 * o1 - 89 * o2 - 50 * o3, shift);
+        dst[5 * line + j] = round_shift(50 * o0 - 89 * o1 + 18 * o2 + 75 * o3, shift);
+        dst[7 * line + j] = round_shift(18 * o0 - 50 * o1 + 75 * o2 - 89 * o3, shift);
+    }
+}
+
+/// Butterfly 2-D DCT-8. Bit-identical to `fwd_dct8_scalar`.
+pub fn fwd_dct8_butterfly(residual: &[i16], out: &mut [i16], bit_depth: u8) {
+    debug_assert_eq!(residual.len(), 64);
+    debug_assert!(out.len() >= 64);
+    let shift1 = 2i32 + bit_depth as i32 - 8;
+    let mut tmp = [0i16; 64];
+    butterfly8_1d(residual, &mut tmp, 8, shift1);
+    butterfly8_1d(&tmp, out, 8, 9);
+}
+
+#[allow(clippy::too_many_lines)]
+#[inline(always)]
+fn butterfly16_1d(src: &[i16], dst: &mut [i16], line: usize, shift: i32) {
+    for j in 0..line {
+        let s = &src[j * 16..j * 16 + 16];
+        let e0 = s[0] as i32 + s[15] as i32;
+        let e1 = s[1] as i32 + s[14] as i32;
+        let e2 = s[2] as i32 + s[13] as i32;
+        let e3 = s[3] as i32 + s[12] as i32;
+        let e4 = s[4] as i32 + s[11] as i32;
+        let e5 = s[5] as i32 + s[10] as i32;
+        let e6 = s[6] as i32 + s[9] as i32;
+        let e7 = s[7] as i32 + s[8] as i32;
+        let o0 = s[0] as i32 - s[15] as i32;
+        let o1 = s[1] as i32 - s[14] as i32;
+        let o2 = s[2] as i32 - s[13] as i32;
+        let o3 = s[3] as i32 - s[12] as i32;
+        let o4 = s[4] as i32 - s[11] as i32;
+        let o5 = s[5] as i32 - s[10] as i32;
+        let o6 = s[6] as i32 - s[9] as i32;
+        let o7 = s[7] as i32 - s[8] as i32;
+        let ee0 = e0 + e7;
+        let ee1 = e1 + e6;
+        let ee2 = e2 + e5;
+        let ee3 = e3 + e4;
+        let eo0 = e0 - e7;
+        let eo1 = e1 - e6;
+        let eo2 = e2 - e5;
+        let eo3 = e3 - e4;
+        let eee0 = ee0 + ee3;
+        let eee1 = ee1 + ee2;
+        let eeo0 = ee0 - ee3;
+        let eeo1 = ee1 - ee2;
+        // EEE: k=0,8
+        dst[0 * line + j] = round_shift(64 * eee0 + 64 * eee1, shift);
+        dst[8 * line + j] = round_shift(64 * eee0 - 64 * eee1, shift);
+        // EEO: k=4,12
+        dst[4 * line + j] = round_shift(83 * eeo0 + 36 * eeo1, shift);
+        dst[12 * line + j] = round_shift(36 * eeo0 - 83 * eeo1, shift);
+        // EO: k=2,6,10,14
+        dst[2 * line + j] = round_shift(89 * eo0 + 75 * eo1 + 50 * eo2 + 18 * eo3, shift);
+        dst[6 * line + j] = round_shift(75 * eo0 - 18 * eo1 - 89 * eo2 - 50 * eo3, shift);
+        dst[10 * line + j] = round_shift(50 * eo0 - 89 * eo1 + 18 * eo2 + 75 * eo3, shift);
+        dst[14 * line + j] = round_shift(18 * eo0 - 50 * eo1 + 75 * eo2 - 89 * eo3, shift);
+        // O: k=1,3,5,7,9,11,13,15
+        dst[1 * line + j] = round_shift(
+            90 * o0 + 87 * o1 + 80 * o2 + 70 * o3 + 57 * o4 + 43 * o5 + 25 * o6 + 9 * o7,
+            shift,
+        );
+        dst[3 * line + j] = round_shift(
+            87 * o0 + 57 * o1 + 9 * o2 - 43 * o3 - 80 * o4 - 90 * o5 - 70 * o6 - 25 * o7,
+            shift,
+        );
+        dst[5 * line + j] = round_shift(
+            80 * o0 + 9 * o1 - 70 * o2 - 87 * o3 - 25 * o4 + 57 * o5 + 90 * o6 + 43 * o7,
+            shift,
+        );
+        dst[7 * line + j] = round_shift(
+            70 * o0 - 43 * o1 - 87 * o2 + 9 * o3 + 90 * o4 + 25 * o5 - 80 * o6 - 57 * o7,
+            shift,
+        );
+        dst[9 * line + j] = round_shift(
+            57 * o0 - 80 * o1 - 25 * o2 + 90 * o3 - 9 * o4 - 87 * o5 + 43 * o6 + 70 * o7,
+            shift,
+        );
+        dst[11 * line + j] = round_shift(
+            43 * o0 - 90 * o1 + 57 * o2 + 25 * o3 - 87 * o4 + 70 * o5 + 9 * o6 - 80 * o7,
+            shift,
+        );
+        dst[13 * line + j] = round_shift(
+            25 * o0 - 70 * o1 + 90 * o2 - 80 * o3 + 43 * o4 + 9 * o5 - 57 * o6 + 87 * o7,
+            shift,
+        );
+        dst[15 * line + j] = round_shift(
+            9 * o0 - 25 * o1 + 43 * o2 - 57 * o3 + 70 * o4 - 80 * o5 + 87 * o6 - 90 * o7,
+            shift,
+        );
+    }
+}
+
+/// Butterfly 2-D DCT-16. Bit-identical to `fwd_dct16_scalar`.
+pub fn fwd_dct16_butterfly(residual: &[i16], out: &mut [i16], bit_depth: u8) {
+    debug_assert_eq!(residual.len(), 256);
+    debug_assert!(out.len() >= 256);
+    let shift1 = 3i32 + bit_depth as i32 - 8;
+    let mut tmp = [0i16; 256];
+    butterfly16_1d(residual, &mut tmp, 16, shift1);
+    butterfly16_1d(&tmp, out, 16, 10);
+}
+
+// DCT-32 butterfly coefficient tables (first N/2 elements per row only; the
+// second half is antisymmetric and absorbed into the O[] butterfly values).
+// O[k] rows (k=1,3,…,31 → indices 0..16 in table), 16 coefficients each.
+const DCT32_O: [[i32; 16]; 16] = [
+    [
+        90, 90, 88, 85, 82, 78, 73, 67, 61, 54, 46, 38, 31, 22, 13, 4,
+    ], // k=1
+    [
+        90, 82, 67, 46, 22, -4, -31, -54, -73, -85, -90, -88, -78, -61, -38, -13,
+    ], // k=3
+    [
+        88, 67, 31, -13, -54, -82, -90, -78, -46, -4, 38, 73, 90, 85, 61, 22,
+    ], // k=5
+    [
+        85, 46, -13, -67, -90, -73, -22, 38, 82, 88, 54, -4, -61, -90, -78, -31,
+    ], // k=7
+    [
+        82, 22, -54, -90, -61, 13, 78, 85, 31, -46, -90, -67, 4, 73, 88, 38,
+    ], // k=9
+    [
+        78, -4, -82, -73, 13, 85, 67, -22, -88, -61, 31, 90, 54, -38, -90, -46,
+    ], // k=11
+    [
+        73, -31, -90, -22, 78, 67, -38, -90, -13, 82, 61, -46, -88, -4, 85, 54,
+    ], // k=13
+    [
+        67, -54, -78, 38, 85, -22, -90, 4, 90, 13, -88, -31, 82, 46, -73, -61,
+    ], // k=15
+    [
+        61, -73, -46, 82, 31, -88, -13, 90, -4, -90, 22, 85, -38, -78, 54, 67,
+    ], // k=17
+    [
+        54, -85, -4, 88, -46, -61, 82, 13, -90, 38, 67, -78, -22, 90, -31, -73,
+    ], // k=19
+    [
+        46, -90, 38, 54, -90, 31, 61, -88, 22, 67, -85, 13, 73, -82, 4, 78,
+    ], // k=21
+    [
+        38, -88, 73, -4, -67, 90, -46, -31, 85, -78, 13, 61, -90, 54, 22, -82,
+    ], // k=23
+    [
+        31, -78, 90, -61, 4, 54, -88, 82, -38, -22, 73, -90, 67, -13, -46, 85,
+    ], // k=25
+    [
+        22, -61, 85, -90, 73, -38, -4, 46, -78, 90, -82, 54, -13, -31, 67, -88,
+    ], // k=27
+    [
+        13, -38, 61, -78, 88, -90, 85, -73, 54, -31, 4, 22, -46, 67, -82, 90,
+    ], // k=29
+    [
+        4, -13, 22, -31, 38, -46, 54, -61, 67, -73, 78, -82, 85, -88, 90, -90,
+    ], // k=31
+];
+// EO[k] rows (k=2,6,…,30 → indices 0..8 in table), 8 coefficients each.
+const DCT32_EO: [[i32; 8]; 8] = [
+    [90, 87, 80, 70, 57, 43, 25, 9],      // k=2
+    [87, 57, 9, -43, -80, -90, -70, -25], // k=6
+    [80, 9, -70, -87, -25, 57, 90, 43],   // k=10
+    [70, -43, -87, 9, 90, 25, -80, -57],  // k=14
+    [57, -80, -25, 90, -9, -87, 43, 70],  // k=18
+    [43, -90, 57, 25, -87, 70, 9, -80],   // k=22
+    [25, -70, 90, -80, 43, 9, -57, 87],   // k=26
+    [9, -25, 43, -57, 70, -80, 87, -90],  // k=30
+];
+// EEO[k] rows (k=4,12,20,28 → indices 0..4), 4 coefficients each.
+const DCT32_EEO: [[i32; 4]; 4] = [
+    [89, 75, 50, 18],    // k=4
+    [75, -18, -89, -50], // k=12
+    [50, -89, 18, 75],   // k=20
+    [18, -50, 75, -89],  // k=28
+];
+
+#[inline(always)]
+fn dot16(a: [i32; 16], c: &[i32; 16]) -> i32 {
+    let mut s = 0i32;
+    for i in 0..16 {
+        s += a[i] * c[i];
+    }
+    s
+}
+
+#[inline(always)]
+fn dot8(a: [i32; 8], c: &[i32; 8]) -> i32 {
+    let mut s = 0i32;
+    for i in 0..8 {
+        s += a[i] * c[i];
+    }
+    s
+}
+
+#[inline(always)]
+fn dot4(a: [i32; 4], c: &[i32; 4]) -> i32 {
+    a[0] * c[0] + a[1] * c[1] + a[2] * c[2] + a[3] * c[3]
+}
+
+fn butterfly32_1d(src: &[i16], dst: &mut [i16], line: usize, shift: i32) {
+    for j in 0..line {
+        let s = &src[j * 32..j * 32 + 32];
+        let o: [i32; 16] = std::array::from_fn(|k| s[k] as i32 - s[31 - k] as i32);
+        let e: [i32; 16] = std::array::from_fn(|k| s[k] as i32 + s[31 - k] as i32);
+        let eo: [i32; 8] = std::array::from_fn(|k| e[k] - e[15 - k]);
+        let ee: [i32; 8] = std::array::from_fn(|k| e[k] + e[15 - k]);
+        let eeo: [i32; 4] = std::array::from_fn(|k| ee[k] - ee[7 - k]);
+        let eee: [i32; 4] = std::array::from_fn(|k| ee[k] + ee[7 - k]);
+        let eeeo0 = eee[0] - eee[3];
+        let eeeo1 = eee[1] - eee[2];
+        let eeee0 = eee[0] + eee[3];
+        let eeee1 = eee[1] + eee[2];
+
+        // EEEE: k=0,16
+        dst[0 * line + j] = round_shift(64 * eeee0 + 64 * eeee1, shift);
+        dst[16 * line + j] = round_shift(64 * eeee0 - 64 * eeee1, shift);
+        // EEEO: k=8,24
+        dst[8 * line + j] = round_shift(83 * eeeo0 + 36 * eeeo1, shift);
+        dst[24 * line + j] = round_shift(36 * eeeo0 - 83 * eeeo1, shift);
+        // EEO: k=4,12,20,28
+        let eeo4 = [eeo[0], eeo[1], eeo[2], eeo[3]];
+        for (i, c) in DCT32_EEO.iter().enumerate() {
+            dst[(4 + i * 8) * line + j] = round_shift(dot4(eeo4, c), shift);
+        }
+        // EO: k=2,6,10,14,18,22,26,30
+        let eo8 = [eo[0], eo[1], eo[2], eo[3], eo[4], eo[5], eo[6], eo[7]];
+        for (i, c) in DCT32_EO.iter().enumerate() {
+            dst[(2 + i * 4) * line + j] = round_shift(dot8(eo8, c), shift);
+        }
+        // O: k=1,3,5,...,31
+        for (i, c) in DCT32_O.iter().enumerate() {
+            dst[(1 + i * 2) * line + j] = round_shift(dot16(o, c), shift);
+        }
+    }
+}
+
+/// Butterfly 2-D DCT-32. Bit-identical to `fwd_dct32_scalar`.
+pub fn fwd_dct32_butterfly(residual: &[i16], out: &mut [i16], bit_depth: u8) {
+    debug_assert_eq!(residual.len(), 1024);
+    debug_assert!(out.len() >= 1024);
+    let shift1 = 4i32 + bit_depth as i32 - 8;
+    let mut tmp = [0i16; 1024];
+    butterfly32_1d(residual, &mut tmp, 32, shift1);
+    butterfly32_1d(&tmp, out, 32, 11);
 }

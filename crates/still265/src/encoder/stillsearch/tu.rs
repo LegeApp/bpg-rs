@@ -11,12 +11,40 @@ use super::emit;
 use super::eval::{QuantMode, ResidualPricingMode};
 use super::ledger::WorkBucket;
 use super::overlay::OverlayCache;
-use super::plan::TtPlan;
+use super::plan::{ParentChromaPlan, TtPlan};
 use super::price::split_flag_bits;
 use super::source::CtuSourceCache;
 use crate::encoder::types::{
-    MAX_INTRA_TT_DEPTH, MAX_TB_LOG2, chroma_pred_mode, chroma_tb_geom, has_chroma_tb,
+    MAX_INTRA_TT_DEPTH, MAX_TB_LOG2, MIN_TB_LOG2, chroma_pred_mode, chroma_tb_geom, has_chroma_tb,
 };
+
+/// Per-mode accumulator for the batched, leaf-major simple-RDO ranker
+/// ([`StillSearchDepth::eval_simple_rdo_luma_modes`]). One per candidate mode;
+/// each TU leaf adds its luma RD cost (plus the `split=false` flag bits) and ORs
+/// in its coded-block flag.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SimpleRdoAccum {
+    pub(super) mode: u8,
+    pub(super) cost: f64,
+    pub(super) cbf: bool,
+}
+
+impl SimpleRdoAccum {
+    #[inline]
+    fn new(mode: u8) -> Self {
+        Self {
+            mode,
+            cost: 0.0,
+            cbf: false,
+        }
+    }
+
+    #[inline]
+    fn add_leaf(&mut self, cost: f64, cbf: bool) {
+        self.cost += cost;
+        self.cbf |= cbf;
+    }
+}
 
 /// Scope of transform-tree evaluation: luma-only (for fast mode/TU search)
 /// or full luma+chroma (for winner re-evaluation and finalize).
@@ -46,6 +74,79 @@ where
     S: CtuSourceCache,
     O: OverlayCache,
 {
+    #[inline]
+    fn effective_tu_min_split_log2(&self, base: u8) -> u8 {
+        super::env::tu_min_split_log2_override().unwrap_or(base)
+    }
+
+    #[inline]
+    fn tu_split_cost_bias(&self, log2_size: u8) -> f64 {
+        let pixels = 1u64 << (2 * log2_size);
+        let per_px = super::env::tu_split_bias_per_px()
+            + if log2_size == 3 {
+                super::env::tu_4x4_bias_per_px()
+            } else {
+                0.0
+            };
+        per_px * pixels as f64
+    }
+
+    #[inline]
+    fn force_tu_split(&self, log2_size: u8) -> bool {
+        super::env::tu_force_split_log2().is_some_and(|v| v == log2_size)
+    }
+
+    #[inline]
+    fn target_4x4_possible(&self, log2_size: u8, syntax_can_split: bool) -> bool {
+        syntax_can_split && log2_size == 3 && super::env::tu_target_4x4_enabled()
+    }
+
+    fn target_4x4_admit(
+        &self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        leaf_tt: &TtPlan,
+        leaf_cost: f64,
+    ) -> bool {
+        if leaf_has_no_luma_residual(leaf_tt) {
+            return false;
+        }
+        let (var, mean_range) = self.source_stats_8x8(state, x0, y0);
+        if var < super::env::tu_target_var_min() {
+            return false;
+        }
+        let cost_per_px = leaf_cost / 64.0;
+        cost_per_px >= super::env::tu_target_cost_min()
+            || mean_range >= super::env::tu_target_mean_range_min()
+    }
+
+    fn source_stats_8x8(&self, state: &Encoder<'_>, x0: u32, y0: u32) -> (f64, f64) {
+        let shift = state.bit_depth.saturating_sub(8) as u32;
+        let mut sum = 0.0f64;
+        let mut sum2 = 0.0f64;
+        let mut qsum = [0.0f64; 4];
+        for y in 0..8u32 {
+            for x in 0..8u32 {
+                let v = (self.source.sample(0, x0 + x, y0 + y) >> shift) as f64;
+                sum += v;
+                sum2 += v * v;
+                let q = ((y >= 4) as usize) * 2 + (x >= 4) as usize;
+                qsum[q] += v;
+            }
+        }
+        let mean = sum / 64.0;
+        let var = (sum2 / 64.0) - mean * mean;
+        let mut min_q = f64::INFINITY;
+        let mut max_q = f64::NEG_INFINITY;
+        for s in qsum {
+            let m = s / 16.0;
+            min_q = min_q.min(m);
+            max_q = max_q.max(m);
+        }
+        (var.max(0.0), max_q - min_q)
+    }
+
     /// Decide one transform-tree node: full leaf vs four split children, by RD
     /// cost. On return the overlay holds exactly the winner's recon patches for
     /// this region (loser patches are rewound).
@@ -60,14 +161,19 @@ where
         lambda: f64,
     ) -> (TtPlan, f64) {
         let must_split = log2_size > MAX_TB_LOG2;
-        let can_split = !must_split
+        let syntax_can_split = !must_split
             && state.cat != 2
-            && log2_size > state.effort_template.tu.min_split_log2
+            && log2_size > MIN_TB_LOG2
             && trafo_depth < MAX_INTRA_TT_DEPTH;
+        let can_split = syntax_can_split
+            && log2_size
+                > self.effective_tu_min_split_log2(state.effort_template.tu.min_split_log2);
+        let target_4x4_possible =
+            !can_split && self.target_4x4_possible(log2_size, syntax_can_split);
 
         // Determine evaluation scope from the effort template. Luma-only search
         // skips chroma evaluation during luma mode/TU trials; chroma is
-        // re-attached only for the winner. Reference/Placebo templates enable
+        // re-attached only for the winner. Placebo templates enable
         // full chroma evaluation for the oracle.
         let scope = if state.effort_template.chroma.timing == ChromaTiming::DuringExactTrials {
             TtEvalScope::FullComponents
@@ -93,7 +199,7 @@ where
                 lambda,
             );
         }
-        if !can_split {
+        if !can_split && !target_4x4_possible {
             return self.eval_tt_leaf(
                 state,
                 x0,
@@ -119,7 +225,7 @@ where
             log2_size,
             trafo_depth,
             luma_mode,
-            true,
+            can_split || target_4x4_possible,
             lambda,
             QuantMode::HardQuantSearch,
             residual_pricing,
@@ -127,6 +233,12 @@ where
             scope,
         );
         let leaf_saved = self.overlay.detach_from(mark0);
+        let target_4x4_admit =
+            target_4x4_possible && self.target_4x4_admit(state, x0, y0, &leaf_tt, leaf_cost);
+        if !can_split && !target_4x4_admit {
+            self.overlay.reattach(leaf_saved);
+            return (leaf_tt, leaf_cost);
+        }
 
         // TU early termination: skip split search when the leaf is good
         // enough.  Three levels of gate:
@@ -140,11 +252,12 @@ where
             let num_px = 1u64 << (2 * log2_size);
             let leaf_cost_per_px = leaf_cost / num_px as f64;
 
-            let skip = tu_policy.zero_residual_early_terminate
-                && leaf_has_no_luma_residual(&leaf_tt)
-                || tu_policy.low_residual_early_terminate
-                    && leaf_cost_per_px < tu_policy.low_distortion_per_px
-                || tu_policy.split_search == SplitSearch::ForceLeaf;
+            let skip = !self.force_tu_split(log2_size)
+                && !target_4x4_admit
+                && (tu_policy.zero_residual_early_terminate && leaf_has_no_luma_residual(&leaf_tt)
+                    || tu_policy.low_residual_early_terminate
+                        && leaf_cost_per_px < tu_policy.low_distortion_per_px
+                    || tu_policy.split_search == SplitSearch::ForceLeaf);
 
             if skip {
                 self.workspace.tu_split_early_terminations += 1;
@@ -164,7 +277,8 @@ where
             lambda,
         );
 
-        if split_cost < leaf_cost {
+        let split_cmp_cost = split_cost - self.tu_split_cost_bias(log2_size);
+        if self.force_tu_split(log2_size) || split_cmp_cost < leaf_cost {
             #[cfg(test)]
             super::api::SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (split_tt, split_cost)
@@ -196,6 +310,7 @@ where
         scope: TtEvalScope,
     ) -> (TtPlan, f64) {
         self.workspace.ledger.bump(WorkBucket::TuLeaf);
+        self.workspace.tu_leaf_by_log2[log2_size as usize] += 1;
 
         let cat = state.cat;
         let qp_y = state.cur_qp_y;
@@ -353,7 +468,8 @@ where
         }
 
         let split_flag_coded = state.cat != 2
-            && log2_size > state.effort_template.tu.min_split_log2
+            && log2_size
+                > self.effective_tu_min_split_log2(state.effort_template.tu.min_split_log2)
             && trafo_depth < MAX_INTRA_TT_DEPTH;
         self.eval_tt_luma_leaf(
             state,
@@ -380,6 +496,7 @@ where
         lambda: f64,
     ) -> (TtPlan, f64) {
         self.workspace.ledger.bump(WorkBucket::TuLeaf);
+        self.workspace.tu_leaf_by_log2[log2_size as usize] += 1;
 
         let luma_pred = IntraPredMode::from_u8(luma_mode).unwrap_or(IntraPredMode::Dc);
         let luma = self.eval_component(
@@ -424,6 +541,322 @@ where
         (tt, cost)
     }
 
+    /// Lightweight luma-leaf evaluation that skips overlay push and TtPlan
+    /// construction. Returns (cost, cbf) — enough for cheap-mode ranking.
+    /// Matches [`eval_tt_luma_leaf`] in cost semantics.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_tt_luma_leaf_cheap(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        luma_mode: u8,
+        code_split_flag: bool,
+        lambda: f64,
+    ) -> (f64, bool) {
+        let luma_pred = IntraPredMode::from_u8(luma_mode).unwrap_or(IntraPredMode::Dc);
+        let luma = self.eval_component_no_overlay(
+            state,
+            x0,
+            y0,
+            log2_size,
+            0,
+            luma_pred,
+            state.cur_qp_y,
+            trafo_depth,
+            lambda,
+            QuantMode::HardQuantSearch,
+            if super::env::luma_cheap_residual_price_exact(
+                state.effort_template.luma.cheap.residual_price
+                    == crate::effort::ResidualPriceLevel::Exact,
+            ) {
+                ResidualPricingMode::Exact
+            } else {
+                ResidualPricingMode::Skip
+            },
+            false,
+        );
+        let mut cost = luma.cost;
+        if code_split_flag {
+            let bits = split_flag_bits(&self.workspace.price_base, log2_size, false);
+            cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
+        }
+        (cost, luma.cbf)
+    }
+
+    /// Lightweight rank-only evaluation that handles forced-split and leaf TU
+    /// cases. Does not push to overlay, does not allocate TtPlan.
+    /// Returns (RD_cost, luma_cbf).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn eval_simple_rdo_luma(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        luma_mode: u8,
+        lambda: f64,
+    ) -> (f64, bool) {
+        let must_split = log2_size > MAX_TB_LOG2;
+        if must_split {
+            let half = 1u32 << (log2_size - 1);
+            let kid_log2 = log2_size - 1;
+            let kid_depth = trafo_depth + 1;
+            let (c0, _) =
+                self.eval_simple_rdo_luma(state, x0, y0, kid_log2, kid_depth, luma_mode, lambda);
+            let (c1, _) = self.eval_simple_rdo_luma(
+                state,
+                x0 + half,
+                y0,
+                kid_log2,
+                kid_depth,
+                luma_mode,
+                lambda,
+            );
+            let (c2, _) = self.eval_simple_rdo_luma(
+                state,
+                x0,
+                y0 + half,
+                kid_log2,
+                kid_depth,
+                luma_mode,
+                lambda,
+            );
+            let (c3, _) = self.eval_simple_rdo_luma(
+                state,
+                x0 + half,
+                y0 + half,
+                kid_log2,
+                kid_depth,
+                luma_mode,
+                lambda,
+            );
+            (c0 + c1 + c2 + c3, false)
+        } else {
+            let split_flag_coded = state.cat != 2
+                && log2_size > state.effort_template.tu.min_split_log2
+                && trafo_depth < MAX_INTRA_TT_DEPTH;
+            self.eval_tt_luma_leaf_cheap(
+                state,
+                x0,
+                y0,
+                log2_size,
+                trafo_depth,
+                luma_mode,
+                split_flag_coded,
+                lambda,
+            )
+        }
+    }
+
+    /// Batched, leaf-major x265-shape simple RDO. Equivalent to calling
+    /// [`eval_simple_rdo_luma`] once per mode, but each concrete TU leaf samples
+    /// its source and builds its intra reference border **once**, then evaluates
+    /// every candidate mode against them — eliminating the per-mode source
+    /// resample and border rebuild that dominated `LumaCheap`. Byte-identical to
+    /// the per-mode path (same leaf cost, same `split_false` bits, same child sum
+    /// order).
+    pub(super) fn eval_simple_rdo_luma_modes(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        modes: &[u8],
+        lambda: f64,
+        out: &mut Vec<SimpleRdoAccum>,
+    ) {
+        out.clear();
+        out.extend(modes.iter().copied().map(SimpleRdoAccum::new));
+        self.eval_simple_rdo_luma_modes_accum(state, x0, y0, log2_size, trafo_depth, lambda, out);
+    }
+
+    fn eval_simple_rdo_luma_modes_accum(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        lambda: f64,
+        accum: &mut [SimpleRdoAccum],
+    ) {
+        if log2_size > MAX_TB_LOG2 {
+            // Forced split: recurse children in decoder/z-order, accumulating
+            // each child leaf's per-mode cost into the same accumulators.
+            let half = 1u32 << (log2_size - 1);
+            let kid_log2 = log2_size - 1;
+            let kid_depth = trafo_depth + 1;
+            self.eval_simple_rdo_luma_modes_accum(
+                state, x0, y0, kid_log2, kid_depth, lambda, accum,
+            );
+            self.eval_simple_rdo_luma_modes_accum(
+                state,
+                x0 + half,
+                y0,
+                kid_log2,
+                kid_depth,
+                lambda,
+                accum,
+            );
+            self.eval_simple_rdo_luma_modes_accum(
+                state,
+                x0,
+                y0 + half,
+                kid_log2,
+                kid_depth,
+                lambda,
+                accum,
+            );
+            self.eval_simple_rdo_luma_modes_accum(
+                state,
+                x0 + half,
+                y0 + half,
+                kid_log2,
+                kid_depth,
+                lambda,
+                accum,
+            );
+            return;
+        }
+
+        let split_flag_coded = state.cat != 2
+            && log2_size > state.effort_template.tu.min_split_log2
+            && trafo_depth < MAX_INTRA_TT_DEPTH;
+        let split_false_cost = if split_flag_coded {
+            let bits = split_flag_bits(&self.workspace.price_base, log2_size, false);
+            lambda * bits as f64 / CabacEstimator::SCALE as f64
+        } else {
+            0.0
+        };
+
+        self.eval_tt_luma_leaf_cheap_modes(
+            state,
+            x0,
+            y0,
+            log2_size,
+            trafo_depth,
+            lambda,
+            split_false_cost,
+            accum,
+        );
+    }
+
+    /// Leaf-major batched cheap leaf evaluator. Mirrors the per-mode
+    /// `eval_tt_luma_leaf_cheap`, which does not bump `TuLeaf` (cheap-path work is
+    /// accounted under `LumaCheap`), so this doesn't either.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_tt_luma_leaf_cheap_modes(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        lambda: f64,
+        split_false_cost: f64,
+        accum: &mut [SimpleRdoAccum],
+    ) {
+        if state.bit_depth == 8 {
+            self.eval_tt_luma_leaf_cheap_modes_8(
+                state,
+                x0,
+                y0,
+                log2_size,
+                trafo_depth,
+                lambda,
+                split_false_cost,
+                accum,
+            );
+            return;
+        }
+        // High-bit-depth keeps the per-mode path (less hot).
+        for a in accum.iter_mut() {
+            let (cost, cbf) = self.eval_tt_luma_leaf_cheap(
+                state,
+                x0,
+                y0,
+                log2_size,
+                trafo_depth,
+                a.mode,
+                false,
+                lambda,
+            );
+            a.add_leaf(cost + split_false_cost, cbf);
+        }
+    }
+
+    /// 8-bit leaf-major inner loop: sample source + build refs once, then predict
+    /// and evaluate each mode against the shared source/refs.
+    #[allow(clippy::too_many_arguments)]
+    fn eval_tt_luma_leaf_cheap_modes_8(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        lambda: f64,
+        split_false_cost: f64,
+        accum: &mut [SimpleRdoAccum],
+    ) {
+        let size = 1usize << log2_size;
+        let n = size * size;
+
+        // Source and reference borders are identical for every candidate mode at
+        // this leaf (simple RDO never pushes candidate recon to the overlay).
+        let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
+        src.resize(n, 0);
+        self.source.sample_block_u8(0, x0, y0, size, &mut src);
+        let refs = self.build_intra_refs_for_block(state, x0, y0, log2_size, 0);
+
+        let residual_pricing = if super::env::luma_cheap_residual_price_exact(
+            state.effort_template.luma.cheap.residual_price
+                == crate::effort::ResidualPriceLevel::Exact,
+        ) {
+            ResidualPricingMode::Exact
+        } else {
+            ResidualPricingMode::Skip
+        };
+
+        let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
+        pred.resize(n, 0);
+
+        for a in accum.iter_mut() {
+            let mode = IntraPredMode::from_u8(a.mode).unwrap_or(IntraPredMode::Dc);
+            self.predict_exact_from_refs_u8(&refs, log2_size, 0, mode, &mut pred);
+            let trial = self.eval_component_8_from_src_pred(
+                state,
+                x0,
+                y0,
+                log2_size,
+                0,
+                mode,
+                state.cur_qp_y,
+                trafo_depth,
+                lambda,
+                if super::env::rdoq_search_enabled() {
+                    QuantMode::RdoqTrial { level: 2 }
+                } else {
+                    QuantMode::HardQuantSearch
+                },
+                residual_pricing,
+                false,
+                false,
+                &src,
+                &pred,
+            );
+            a.add_leaf(trial.cost + split_false_cost, trial.cbf);
+        }
+
+        self.workspace.block_scratch.component_src_u8 = src;
+        self.workspace.block_scratch.component_pred_u8 = pred;
+    }
+
     fn eval_tt_forced_split_no_optional(
         &mut self,
         state: &Encoder<'_>,
@@ -435,6 +868,7 @@ where
         lambda: f64,
     ) -> (TtPlan, f64) {
         self.workspace.ledger.bump(WorkBucket::TuSplit);
+        self.workspace.tu_split_by_log2[log2_size as usize] += 1;
 
         let half = 1u32 << (log2_size - 1);
         let kid_log2 = log2_size - 1;
@@ -483,6 +917,118 @@ where
         (tt, c0 + c1 + c2 + c3)
     }
 
+    fn eval_tt_split_parent_chroma(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        trafo_depth: u8,
+        luma_mode: u8,
+        lambda: f64,
+        quant_mode: QuantMode,
+        retain_coeff: bool,
+    ) -> Option<(ParentChromaPlan, f64)> {
+        if log2_size != 3 || !matches!(state.cat, 1 | 2) {
+            return None;
+        }
+        let cx = x0 / 2;
+        let cy = if state.cat == 1 { y0 / 2 } else { y0 };
+        let clog2 = 2;
+        let step = 1u32 << clog2;
+        let chroma_mode = chroma_pred_mode(state.cat, luma_mode);
+        let pred_mode = IntraPredMode::from_u8(chroma_mode).unwrap_or(IntraPredMode::Dc);
+        let qp_c = state.cur_qp_c;
+
+        let cb0 = self.eval_component(
+            state,
+            cx,
+            cy,
+            clog2,
+            1,
+            pred_mode,
+            qp_c,
+            trafo_depth,
+            lambda,
+            quant_mode,
+            ResidualPricingMode::Exact,
+            retain_coeff,
+        );
+        let mut cost = cb0.cost;
+        let cb1 = if state.cat == 2 {
+            let cb = self.eval_component(
+                state,
+                cx,
+                cy + step,
+                clog2,
+                1,
+                pred_mode,
+                qp_c,
+                trafo_depth,
+                lambda,
+                quant_mode,
+                ResidualPricingMode::Exact,
+                retain_coeff,
+            );
+            cost += cb.cost;
+            Some(cb)
+        } else {
+            None
+        };
+
+        let cr0 = self.eval_component(
+            state,
+            cx,
+            cy,
+            clog2,
+            2,
+            pred_mode,
+            qp_c,
+            trafo_depth,
+            lambda,
+            quant_mode,
+            ResidualPricingMode::Exact,
+            retain_coeff,
+        );
+        cost += cr0.cost;
+        let cr1 = if state.cat == 2 {
+            let cr = self.eval_component(
+                state,
+                cx,
+                cy + step,
+                clog2,
+                2,
+                pred_mode,
+                qp_c,
+                trafo_depth,
+                lambda,
+                quant_mode,
+                ResidualPricingMode::Exact,
+                retain_coeff,
+            );
+            cost += cr.cost;
+            Some(cr)
+        } else {
+            None
+        };
+
+        Some((
+            ParentChromaPlan {
+                log2_size: clog2,
+                chroma_mode,
+                cb: cb0.into_plan_block(),
+                cb1: cb1
+                    .map(super::eval::BlockTrial::into_plan_block)
+                    .unwrap_or_else(emit::empty_block),
+                cr: cr0.into_plan_block(),
+                cr1: cr1
+                    .map(super::eval::BlockTrial::into_plan_block)
+                    .unwrap_or_else(emit::empty_block),
+            },
+            cost,
+        ))
+    }
+
     /// Evaluate this node as a split into four child transform trees.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn eval_tt_split(
@@ -497,6 +1043,7 @@ where
         lambda: f64,
     ) -> (TtPlan, f64) {
         self.workspace.ledger.bump(WorkBucket::TuSplit);
+        self.workspace.tu_split_by_log2[log2_size as usize] += 1;
 
         let half = 1u32 << (log2_size - 1);
         let kid_log2 = log2_size - 1;
@@ -521,6 +1068,21 @@ where
         let cbf_cr1 = kids.iter().any(TtPlan::cbf_cr1);
 
         let mut cost = c0 + c1 + c2 + c3;
+        let mut parent_chroma = None;
+        if let Some((pc, pc_cost)) = self.eval_tt_split_parent_chroma(
+            state,
+            x0,
+            y0,
+            log2_size,
+            trafo_depth,
+            luma_mode,
+            lambda,
+            QuantMode::HardQuantSearch,
+            true,
+        ) {
+            cost += pc_cost;
+            parent_chroma = Some(pc);
+        }
         if code_split_flag {
             let bits = split_flag_bits(&self.workspace.price_base, log2_size, true);
             cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
@@ -533,7 +1095,7 @@ where
             cbf_cr,
             cbf_cb1,
             cbf_cr1,
-            parent_chroma: None,
+            parent_chroma,
             kids,
         };
         (tt, cost)
@@ -556,12 +1118,20 @@ where
         cfg: ExactEvalConfig,
     ) -> (TtPlan, f64) {
         let must_split = log2_size > MAX_TB_LOG2;
-        let can_split = !must_split
+        let syntax_can_split = !must_split
             && state.cat != 2
-            && log2_size > cfg.tu.min_split_log2
+            && log2_size > MIN_TB_LOG2
             && trafo_depth < cfg.tu.max_extra_depth;
+        let can_split =
+            syntax_can_split && log2_size > self.effective_tu_min_split_log2(cfg.tu.min_split_log2);
+        let target_4x4_possible =
+            !can_split && self.target_4x4_possible(log2_size, syntax_can_split);
 
-        if must_split || matches!(cfg.tu.split_mode, crate::effort::TuSplitMode::ForceSplit) {
+        if must_split
+            || can_split
+                && (matches!(cfg.tu.split_mode, crate::effort::TuSplitMode::ForceSplit)
+                    || self.force_tu_split(log2_size))
+        {
             return self.eval_tt_split_with_config(
                 state,
                 x0,
@@ -574,7 +1144,9 @@ where
                 cfg,
             );
         }
-        if !can_split || matches!(cfg.tu.split_mode, crate::effort::TuSplitMode::Disabled) {
+        if (!can_split && !target_4x4_possible)
+            || matches!(cfg.tu.split_mode, crate::effort::TuSplitMode::Disabled)
+        {
             return self.eval_tt_leaf(
                 state,
                 x0,
@@ -600,7 +1172,7 @@ where
             log2_size,
             trafo_depth,
             luma_mode,
-            true,
+            can_split || target_4x4_possible,
             lambda,
             cfg.quant,
             cfg.residual_pricing,
@@ -608,18 +1180,22 @@ where
             cfg.scope,
         );
         let leaf_saved = self.overlay.detach_from(mark0);
+        let target_4x4_admit =
+            target_4x4_possible && self.target_4x4_admit(state, x0, y0, &leaf_tt, leaf_cost);
+        if !can_split && !target_4x4_admit {
+            self.overlay.reattach(leaf_saved);
+            return (leaf_tt, leaf_cost);
+        }
 
         // TU early termination gates (driven by config).
         {
             let num_px = 1u64 << (2 * log2_size);
             let leaf_cost_per_px = leaf_cost / num_px as f64;
-            let skip = cfg.tu.zero_residual_early_terminate && leaf_has_no_luma_residual(&leaf_tt)
-                || cfg.tu.low_residual_early_terminate
-                    && leaf_cost_per_px < cfg.tu.low_distortion_per_px
-                || matches!(
-                    cfg.tu.split_mode,
-                    crate::effort::TuSplitMode::LeafFirstEarlyTerminate
-                );
+            let skip = !self.force_tu_split(log2_size)
+                && !target_4x4_admit
+                && (cfg.tu.zero_residual_early_terminate && leaf_has_no_luma_residual(&leaf_tt)
+                    || cfg.tu.low_residual_early_terminate
+                        && leaf_cost_per_px < cfg.tu.low_distortion_per_px);
             if skip {
                 self.workspace.tu_split_early_terminations += 1;
                 self.overlay.reattach(leaf_saved);
@@ -639,7 +1215,8 @@ where
             cfg,
         );
 
-        if split_cost < leaf_cost {
+        let split_cmp_cost = split_cost - self.tu_split_cost_bias(log2_size);
+        if split_cmp_cost < leaf_cost {
             #[cfg(test)]
             super::api::SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (split_tt, split_cost)
@@ -668,6 +1245,7 @@ where
         cfg: ExactEvalConfig,
     ) -> (TtPlan, f64) {
         self.workspace.ledger.bump(WorkBucket::TuSplit);
+        self.workspace.tu_split_by_log2[log2_size as usize] += 1;
 
         let half = 1u32 << (log2_size - 1);
         let kid_log2 = log2_size - 1;
@@ -712,6 +1290,23 @@ where
         let cbf_cr1 = kids.iter().any(TtPlan::cbf_cr1);
 
         let mut cost = c0 + c1 + c2 + c3;
+        let mut parent_chroma = None;
+        if cfg.scope == TtEvalScope::FullComponents {
+            if let Some((pc, pc_cost)) = self.eval_tt_split_parent_chroma(
+                state,
+                x0,
+                y0,
+                log2_size,
+                trafo_depth,
+                luma_mode,
+                lambda,
+                cfg.quant,
+                cfg.retain_coeff,
+            ) {
+                cost += pc_cost;
+                parent_chroma = Some(pc);
+            }
+        }
         if code_split_flag {
             let bits = split_flag_bits(&self.workspace.price_base, log2_size, true);
             cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
@@ -724,7 +1319,7 @@ where
             cbf_cr,
             cbf_cb1,
             cbf_cr1,
-            parent_chroma: None,
+            parent_chroma,
             kids,
         };
         (tt, cost)

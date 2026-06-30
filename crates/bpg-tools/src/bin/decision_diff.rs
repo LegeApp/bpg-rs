@@ -10,12 +10,20 @@
 //!
 //! Usage:
 //!   bpg-decision-diff --source img.png --rust rust.bpg --c c.bpg
+//!   bpg-decision-diff --source img.png --rust pass1.bpg --c c.bpg \
+//!     --write-rust-aq-map aq.csv
 //!
-//! Motivation: the ~1 dB equal-bitrate luma gap to the reference is uniform-QP
-//! vs uniform-QP (AQ is inert in bpgenc's intra CQP path), broadband, and
-//! texture-concentrated. "Reference keeps more coefficients but reconstructs no
-//! better" points at the predicted block — this tool tests it directly.
+//! ⚠️ QP MAPPING: bpgenc `-qN` is actual HEVC QP (N−3); still265 `--qp N` is QP N
+//! (verified exact, 2026-06-29). For an equal-ACTUAL-QP diff, encode the inputs as
+//! `bpgenc -q(N+3)` vs `still265 --qp N`. Comparing equal-NOMINAL-q `.bpg`s puts C
+//! 3 QP steps finer and is misleading.
+//!
+//! Motivation: at equal actual QP the quantiser is bit-exact, yet still265 retains
+//! ~35% more luma coefficients (RD-inefficiently) — the gap is RDOQ / coefficient
+//! decimation, not prediction/transform. This tool surfaces that: compare nz,
+//! abs-level, and residual energy per coded pixel at matched TU size.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use bpg_hevc_decode::hevc::debug::{self, DecisionLog};
@@ -49,6 +57,99 @@ fn classify(var: f64) -> Class {
         Class::Textured
     } else {
         Class::Mid
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DecisionClass {
+    Smooth,
+    Mid,
+    Texture,
+}
+const DECISION_CLASSES: [DecisionClass; 3] = [
+    DecisionClass::Smooth,
+    DecisionClass::Mid,
+    DecisionClass::Texture,
+];
+
+impl DecisionClass {
+    fn name(self) -> &'static str {
+        match self {
+            DecisionClass::Smooth => "decision-smooth",
+            DecisionClass::Mid => "decision-mid",
+            DecisionClass::Texture => "decision-texture",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            DecisionClass::Smooth => 0,
+            DecisionClass::Mid => 1,
+            DecisionClass::Texture => 2,
+        }
+    }
+}
+
+fn class_index(c: Class) -> usize {
+    match c {
+        Class::Smooth => 0,
+        Class::Mid => 1,
+        Class::Textured => 2,
+    }
+}
+
+fn decision_class_from_features(
+    pu_per_ctu: f64,
+    angular_pct: f64,
+    tu4_pct: f64,
+    mean_tu_log2: f64,
+    nz_per_px: f64,
+    residual_energy_per_px: f64,
+) -> DecisionClass {
+    // A deliberately simple, inspectable signal from final coding decisions.
+    // It should be treated as a CTU behavior class, not a source-image oracle:
+    // "this region made the encoder behave like texture".
+    let mut score = 0u8;
+    if pu_per_ctu > 8.0 {
+        score += 1;
+    }
+    if pu_per_ctu > 16.0 {
+        score += 1;
+    }
+    if angular_pct > 60.0 {
+        score += 1;
+    }
+    if tu4_pct > 20.0 {
+        score += 1;
+    }
+    if tu4_pct > 40.0 {
+        score += 1;
+    }
+    if mean_tu_log2 < 3.4 {
+        score += 1;
+    }
+    if mean_tu_log2 < 3.0 {
+        score += 1;
+    }
+    if nz_per_px > 0.08 {
+        score += 1;
+    }
+    if nz_per_px > 0.22 {
+        score += 1;
+    }
+    if residual_energy_per_px > 80.0 {
+        score += 1;
+    }
+    if residual_energy_per_px > 300.0 {
+        score += 1;
+    }
+
+    if score <= 2 {
+        DecisionClass::Smooth
+    } else if score >= 6 {
+        DecisionClass::Texture
+    } else {
+        DecisionClass::Mid
     }
 }
 
@@ -268,6 +369,297 @@ fn pct(num: u64, den: u64) -> f64 {
     }
 }
 
+#[derive(Default, Clone)]
+struct CtuDecisionFeatures {
+    pu_area: u64,
+    pu_count: u64,
+    angular_area: u64,
+    tu_area: u64,
+    tu_count: u64,
+    tu4_area: u64,
+    tu_log2_area_sum: u64,
+    nz: u64,
+    abs_level_sum: u64,
+    residual_energy: u64,
+}
+
+impl CtuDecisionFeatures {
+    fn add_pu(&mut self, log2_size: u8, luma_mode: u8) {
+        let area = 1u64 << (2 * log2_size);
+        self.pu_area += area;
+        self.pu_count += 1;
+        if luma_mode >= 2 {
+            self.angular_area += area;
+        }
+    }
+
+    fn add_tu(&mut self, log2_size: u8, nz: u32, abs_level_sum: u64, residual_energy: u64) {
+        let area = 1u64 << (2 * log2_size);
+        self.tu_area += area;
+        self.tu_count += 1;
+        if log2_size == 2 {
+            self.tu4_area += area;
+        }
+        self.tu_log2_area_sum += area * log2_size as u64;
+        self.nz += nz as u64;
+        self.abs_level_sum += abs_level_sum;
+        self.residual_energy += residual_energy;
+    }
+
+    fn decision_class(&self) -> DecisionClass {
+        let pu_per_ctu = self.pu_count as f64;
+        let angular_pct = pct(self.angular_area, self.pu_area);
+        let tu4_pct = pct(self.tu4_area, self.tu_area);
+        let mean_tu_log2 = if self.tu_area == 0 {
+            6.0
+        } else {
+            self.tu_log2_area_sum as f64 / self.tu_area as f64
+        };
+        let px = self.tu_area.max(1) as f64;
+        decision_class_from_features(
+            pu_per_ctu,
+            angular_pct,
+            tu4_pct,
+            mean_tu_log2,
+            self.nz as f64 / px,
+            self.residual_energy as f64 / px,
+        )
+    }
+}
+
+#[derive(Default)]
+struct DecisionClassAgg {
+    count: u64,
+    pu_count: u64,
+    angular_area: u64,
+    pu_area: u64,
+    tu_count: u64,
+    tu_area: u64,
+    tu4_area: u64,
+    tu_log2_area_sum: u64,
+    nz: u64,
+    abs_level_sum: u64,
+    residual_energy: u64,
+}
+
+impl DecisionClassAgg {
+    fn add(&mut self, f: &CtuDecisionFeatures) {
+        self.count += 1;
+        self.pu_count += f.pu_count;
+        self.angular_area += f.angular_area;
+        self.pu_area += f.pu_area;
+        self.tu_count += f.tu_count;
+        self.tu_area += f.tu_area;
+        self.tu4_area += f.tu4_area;
+        self.tu_log2_area_sum += f.tu_log2_area_sum;
+        self.nz += f.nz;
+        self.abs_level_sum += f.abs_level_sum;
+        self.residual_energy += f.residual_energy;
+    }
+}
+
+fn ctu_features(log: &DecisionLog, luma: &Luma) -> Vec<CtuDecisionFeatures> {
+    const CTU: usize = 64;
+    let cols = luma.w.div_ceil(CTU);
+    let rows = luma.h.div_ceil(CTU);
+    let mut out = vec![CtuDecisionFeatures::default(); cols * rows];
+    let idx = |x: u32, y: u32| -> usize {
+        let cx = (x as usize / CTU).min(cols.saturating_sub(1));
+        let cy = (y as usize / CTU).min(rows.saturating_sub(1));
+        cy * cols + cx
+    };
+    for pu in &log.pus {
+        out[idx(pu.x, pu.y)].add_pu(pu.log2_size, pu.luma_mode);
+    }
+    for tu in &log.tus {
+        if tu.c_idx == 0 {
+            out[idx(tu.x, tu.y)].add_tu(tu.log2_size, tu.nz, tu.abs_level_sum, tu.residual_energy);
+        }
+    }
+    out
+}
+
+fn print_decision_texture_signal(rust: &DecisionLog, c: &DecisionLog, luma: &Luma) {
+    const CTU: usize = 64;
+    let cols = luma.w.div_ceil(CTU);
+    let rows = luma.h.div_ceil(CTU);
+    let r = ctu_features(rust, luma);
+    let cref = ctu_features(c, luma);
+    let mut r_conf = [[0u64; 3]; 3];
+    let mut c_conf = [[0u64; 3]; 3];
+    let mut r_agg: [[DecisionClassAgg; 3]; 3] = Default::default();
+    let mut c_agg: [[DecisionClassAgg; 3]; 3] = Default::default();
+    let mut compare = [[0u64; 3]; 3]; // [source class][rust smoother, equal, C smoother]
+
+    for cy in 0..rows {
+        for cx in 0..cols {
+            let i = cy * cols + cx;
+            let source_class =
+                classify(luma.block_variance((cx * CTU) as u32, (cy * CTU) as u32, CTU));
+            let si = class_index(source_class);
+            let rd = r[i].decision_class();
+            let cd = cref[i].decision_class();
+            r_conf[si][rd.index()] += 1;
+            c_conf[si][cd.index()] += 1;
+            r_agg[si][rd.index()].add(&r[i]);
+            c_agg[si][cd.index()].add(&cref[i]);
+            match rd.cmp(&cd) {
+                std::cmp::Ordering::Less => compare[si][0] += 1,
+                std::cmp::Ordering::Equal => compare[si][1] += 1,
+                std::cmp::Ordering::Greater => compare[si][2] += 1,
+            }
+        }
+    }
+
+    println!("\n================ decision-derived CTU texture signal ================");
+    println!(
+        "(64x64 CTUs; decision class uses only final PU/TU/coeff decisions, not source pixels)"
+    );
+    for (name, conf) in [("rust(still265)", r_conf), ("c(bpgenc)", c_conf)] {
+        println!("\n  {name}: source variance class -> decision class");
+        println!(
+            "  {:<20} {:>10} {:>10} {:>10} {:>10}",
+            "source", "ctus", "smooth%", "mid%", "texture%"
+        );
+        for (si, class) in CLASSES.iter().enumerate() {
+            let total: u64 = conf[si].iter().sum();
+            println!(
+                "  {:<20} {:>10} {:>9.1}% {:>9.1}% {:>9.1}%",
+                class.name(),
+                total,
+                pct(conf[si][0], total),
+                pct(conf[si][1], total),
+                pct(conf[si][2], total),
+            );
+        }
+    }
+
+    println!("\n  rust vs C decision class on same source CTUs");
+    println!(
+        "  {:<20} {:>10} {:>14} {:>10} {:>14}",
+        "source", "ctus", "rust smoother%", "equal%", "C smoother%"
+    );
+    for (si, class) in CLASSES.iter().enumerate() {
+        let total: u64 = compare[si].iter().sum();
+        println!(
+            "  {:<20} {:>10} {:>13.1}% {:>9.1}% {:>13.1}%",
+            class.name(),
+            total,
+            pct(compare[si][0], total),
+            pct(compare[si][1], total),
+            pct(compare[si][2], total),
+        );
+    }
+
+    println!("\n  rust feature means by source class x decision class");
+    println!(
+        "  {:<20} {:<16} {:>6} {:>8} {:>9} {:>8} {:>9} {:>9} {:>10}",
+        "source", "decision", "ctus", "PU/ctu", "angular%", "TU4%", "meanTU", "nz/px", "E/px"
+    );
+    for (si, source_class) in CLASSES.iter().enumerate() {
+        for dc in DECISION_CLASSES {
+            let a = &r_agg[si][dc.index()];
+            if a.count == 0 {
+                continue;
+            }
+            let mean_tu = if a.tu_area == 0 {
+                0.0
+            } else {
+                a.tu_log2_area_sum as f64 / a.tu_area as f64
+            };
+            let px = a.tu_area.max(1) as f64;
+            println!(
+                "  {:<20} {:<16} {:>6} {:>8.2} {:>8.1}% {:>7.1}% {:>9.2} {:>9.3} {:>10.1}",
+                source_class.name(),
+                dc.name(),
+                a.count,
+                a.pu_count as f64 / a.count as f64,
+                pct(a.angular_area, a.pu_area),
+                pct(a.tu4_area, a.tu_area),
+                mean_tu,
+                a.nz as f64 / px,
+                a.residual_energy as f64 / px,
+            );
+        }
+    }
+}
+
+fn aq_offset_for_signals(source: Class, decision: DecisionClass) -> i32 {
+    // SSIM/perceptual-AQ direction: protect flat/smooth cells from banding
+    // (negative QP offset) and spend fewer bits in high-texture masking regions
+    // (positive offset). The first-pass decision behavior only nudges the
+    // source-derived offset so this remains a diagnostic, not a new hidden tune.
+    let source_off = match source {
+        Class::Smooth => -2,
+        Class::Mid => 0,
+        Class::Textured => 2,
+    };
+    let decision_off = match decision {
+        DecisionClass::Smooth => -1,
+        DecisionClass::Mid => 0,
+        DecisionClass::Texture => 1,
+    };
+    (source_off + decision_off).clamp(-4, 4)
+}
+
+fn write_rust_aq_map(
+    path: &PathBuf,
+    rust: &DecisionLog,
+    luma: &Luma,
+) -> Result<(), Box<dyn std::error::Error>> {
+    const QG: usize = 32;
+    const CTU: usize = 64;
+    let qg_cols = luma.w.div_ceil(QG);
+    let qg_rows = luma.h.div_ceil(QG);
+    let ctu_cols = luma.w.div_ceil(CTU);
+    let features = ctu_features(rust, luma);
+    let mut hist = [0u64; 9]; // offsets -4..=4
+    let mut file = std::fs::File::create(path)?;
+    writeln!(file, "# x,y,offset,source_class,decision_class,source_var")?;
+    writeln!(
+        file,
+        "# Offsets are CTU-coherent: one 64x64 source+decision class duplicated to covered 32x32 QGs."
+    )?;
+    writeln!(
+        file,
+        "# Consume with: BPG_AQ_OFFSET_MAP={} bpg-tools encode ...",
+        path.display()
+    )?;
+    for qgy in 0..qg_rows {
+        for qgx in 0..qg_cols {
+            let x = qgx * QG;
+            let y = qgy * QG;
+            let ctu_x = (x / CTU).min(ctu_cols.saturating_sub(1));
+            let ctu_y = y / CTU;
+            let ctu_origin_x = ctu_x * CTU;
+            let ctu_origin_y = ctu_y * CTU;
+            let source_var = luma.block_variance(ctu_origin_x as u32, ctu_origin_y as u32, CTU);
+            let source_class = classify(source_var);
+            let decision = features[ctu_y * ctu_cols + ctu_x].decision_class();
+            let offset = aq_offset_for_signals(source_class, decision);
+            hist[(offset + 4) as usize] += 1;
+            writeln!(
+                file,
+                "{x},{y},{offset},{},{},{source_var:.3}",
+                source_class.name(),
+                decision.name()
+            )?;
+        }
+    }
+    println!("\n================ wrote rust first-pass AQ map ================");
+    println!("  {}", path.display());
+    println!("  {:<8} {:>10} {:>10}", "offset", "qgs", "share");
+    let total = (qg_cols * qg_rows) as u64;
+    for (i, &n) in hist.iter().enumerate() {
+        if n == 0 {
+            continue;
+        }
+        let off = i as i32 - 4;
+        println!("  {off:>+3}      {n:>10} {:>9.1}%", pct(n, total));
+    }
+    Ok(())
+}
+
 fn print_class(class: Class, r: &ClassStats, c: &ClassStats) {
     println!("\n=== {} ===", class.name());
     println!(
@@ -335,12 +727,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut source: Option<PathBuf> = None;
     let mut rust: Option<PathBuf> = None;
     let mut cref: Option<PathBuf> = None;
+    let mut write_rust_aq: Option<PathBuf> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--source" => source = args.next().map(PathBuf::from),
             "--rust" => rust = args.next().map(PathBuf::from),
             "--c" => cref = args.next().map(PathBuf::from),
+            "--write-rust-aq-map" => write_rust_aq = args.next().map(PathBuf::from),
             other => return Err(format!("unknown arg {other}").into()),
         }
     }
@@ -398,6 +792,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     print_tu_map_diff(&rust_log, &c_log, &luma);
+    print_decision_texture_signal(&rust_log, &c_log, &luma);
+    if let Some(path) = write_rust_aq {
+        write_rust_aq_map(&path, &rust_log, &luma)?;
+    }
 
     let rust_stats = aggregate(&rust_log, &luma);
     let c_stats = aggregate(&c_log, &luma);

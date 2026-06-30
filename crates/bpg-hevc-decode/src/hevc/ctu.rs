@@ -160,6 +160,10 @@ pub struct SliceContext<'a> {
     current_qpy: i32,
     /// Last QPY from previous quantization group (for prediction)
     last_qpy_in_prev_qg: i32,
+    /// libbpg/FFmpeg rolling QP predictor, updated when a CU ends on a QG boundary.
+    qpy_pred: i32,
+    /// Whether the next QG is the first QP group in the slice.
+    first_qp_group: bool,
     /// Current quantization group position
     current_qg_x: i32,
     current_qg_y: i32,
@@ -306,6 +310,8 @@ impl<'a> SliceContext<'a> {
             qp_map_stride,
             current_qpy: slice_qp,
             last_qpy_in_prev_qg: slice_qp,
+            qpy_pred: slice_qp,
+            first_qp_group: true,
             current_qg_x: -1,
             current_qg_y: -1,
             sao_map: SaoMap::new(sps.pic_width_in_ctbs(), sps.pic_height_in_ctbs()),
@@ -322,6 +328,21 @@ impl<'a> SliceContext<'a> {
         for (i, init_val) in INIT_VALUES.iter().enumerate() {
             self.ctx[i].init(*init_val, slice_qp);
         }
+    }
+
+    /// Reset the local QP predictor state at tile/substream starts. libbpg keeps
+    /// this state in the local CABAC context, so tile-independent substreams must
+    /// not carry QG prediction across tile boundaries.
+    fn reset_qp_prediction(&mut self) {
+        let slice_qp = self.header.slice_qp_y;
+        self.current_qpy = slice_qp;
+        self.last_qpy_in_prev_qg = slice_qp;
+        self.qpy_pred = slice_qp;
+        self.first_qp_group = true;
+        self.current_qg_x = -1;
+        self.current_qg_y = -1;
+        self.is_cu_qp_delta_coded = false;
+        self.cu_qp_delta = 0;
     }
 
     /// Map each substream's cumulative entry-point offset (NAL-domain, incl.
@@ -396,12 +417,11 @@ impl<'a> SliceContext<'a> {
         // WPP: saved context models from CTB column 1 of previous row
         let mut wpp_saved_ctx: Option<[super::cabac::ContextModel; context::NUM_CONTEXTS]> = None;
 
-        // Tile substream starts (RBSP-domain), and the next one to consume. Each
-        // tile is an independent CABAC substream; we seek the engine to its start
-        // via the entry-point offsets rather than relying on the previous tile's
-        // engine position (CABAC reads ahead, so that position is not the
-        // substream boundary — the cause of the cross-tile desync).
-        let sub_starts = if tiles_enabled {
+        // Tile/WPP substream starts (RBSP-domain), and the next one to consume.
+        // We seek the engine via entry-point offsets rather than relying on the
+        // previous engine position (CABAC reads ahead, so that position is not
+        // necessarily the substream boundary).
+        let sub_starts = if tiles_enabled || wpp {
             Self::rbsp_substream_starts(self.slice_data, &self.header.entry_point_offsets)
         } else {
             Vec::new()
@@ -500,6 +520,7 @@ impl<'a> SliceContext<'a> {
                 }
                 entry_idx += 1;
                 self.reset_contexts();
+                self.reset_qp_prediction();
                 if std::env::var_os("BPG_TILE_DEBUG").is_some() {
                     let (bp, _, _) = self.cabac.get_position();
                     eprintln!(
@@ -513,7 +534,12 @@ impl<'a> SliceContext<'a> {
                 }
             } else if wpp && next_y != self.ctb_y {
                 let _eoss = self.cabac.decode_terminate()?;
-                self.cabac.reinit();
+                if let Some(&start) = sub_starts.get(entry_idx) {
+                    self.cabac = CabacDecoder::new(&self.slice_data[start..])?;
+                } else {
+                    self.cabac.reinit();
+                }
+                entry_idx += 1;
             }
         }
 
@@ -808,6 +834,12 @@ impl<'a> SliceContext<'a> {
             if x1 < pic_width && y1 < pic_height {
                 self.decode_coding_quadtree(x1, y1, log2_cb_size - 1, ct_depth + 1, frame)?;
             }
+
+            let qp_block_mask =
+                (1u32 << (self.sps.log2_ctb_size() - self.pps.diff_cu_qp_delta_depth)) - 1;
+            if ((x0 + cb_size) & qp_block_mask) == 0 && ((y0 + cb_size) & qp_block_mask) == 0 {
+                self.qpy_pred = self.current_qpy;
+            }
         } else {
             // Decode the coding unit
             self.decode_coding_unit(x0, y0, log2_cb_size, ct_depth, frame)?;
@@ -926,7 +958,7 @@ impl<'a> SliceContext<'a> {
         self.cu_log2_size = log2_cb_size;
 
         // Decode quantization parameters at CU start (H.265 8.6.1)
-        self.decode_quantization_parameters(x0, y0, x0, y0);
+        self.decode_quantization_parameters(x0, y0, log2_cb_size);
         self.store_qpy(x0, y0, log2_cb_size, self.current_qpy);
 
         // Set ct_depth for this CU (used by split_cu_flag context derivation)
@@ -1135,6 +1167,12 @@ impl<'a> SliceContext<'a> {
                     o
                 );
             }
+        }
+
+        let qp_block_mask =
+            (1u32 << (self.sps.log2_ctb_size() - self.pps.diff_cu_qp_delta_depth)) - 1;
+        if ((x0 + cb_size) & qp_block_mask) == 0 && ((y0 + cb_size) & qp_block_mask) == 0 {
+            self.qpy_pred = self.current_qpy;
         }
 
         Ok(())
@@ -1520,11 +1558,15 @@ impl<'a> SliceContext<'a> {
             self.cu_qp_delta = cu_qp_delta_abs as i32 * (1 - 2 * cu_qp_delta_sign as i32);
             se_trace("cu_qp_delta", self.cu_qp_delta as i64, &self.cabac);
 
+            if self.first_qp_group || (self.current_qg_x == 0 && self.current_qg_y == 0) {
+                self.first_qp_group = false;
+            }
+
             // Re-derive quantization parameters with the actual delta
             let cu_x = self.cu_base_x;
             let cu_y = self.cu_base_y;
             let cu_log2 = self.cu_log2_size;
-            self.decode_quantization_parameters(x0, y0, cu_x, cu_y);
+            self.decode_quantization_parameters(cu_x, cu_y, cu_log2);
             // Store QPY in the QP map for neighbor lookups
             self.store_qpy(cu_x, cu_y, cu_log2, self.current_qpy);
         }
@@ -1673,6 +1715,13 @@ impl<'a> SliceContext<'a> {
             None
         };
 
+        // Forensic block dump (env-gated, BPG_STILL_DUMP). Snapshot the coded
+        // levels before they are dequantized in place.
+        let dump_match = super::debug::dump_target()
+            .is_some_and(|(dx, dy, dl, dc)| dx == x0 && dy == y0 && dl == log2_size && dc == c_idx);
+        let dump_levels: Option<Vec<i16>> =
+            dump_match.then(|| coeff_buf.coeffs[..num_coeffs].to_vec());
+
         // Dequantize coefficients in-place
         let coeffs = &mut coeff_buf.coeffs;
 
@@ -1719,6 +1768,8 @@ impl<'a> SliceContext<'a> {
             transform::dequantize(&mut coeffs[..num_coeffs], dequant_params);
         }
 
+        let dump_dequant: Option<Vec<i16>> = dump_match.then(|| coeffs[..num_coeffs].to_vec());
+
         // Apply inverse transform (or skip for transform_skip mode)
         // Reuse persistent buffer — transform writes all size*size elements, no zeroing needed
         let residual = &mut self.residual_buf;
@@ -1759,6 +1810,19 @@ impl<'a> SliceContext<'a> {
             });
         }
 
+        // Forensic dump: capture the prediction block (the plane still holds it
+        // here, before the residual add) for the env-selected target.
+        let dump_pred: Option<Vec<u16>> = dump_match.then(|| {
+            let (plane, stride) = frame.plane(c_idx);
+            let mut p = vec![0u16; size * size];
+            for py in 0..size {
+                for px in 0..size {
+                    p[py * size + px] = plane[(y0 as usize + py) * stride + x0 as usize + px];
+                }
+            }
+            p
+        });
+
         // Add residual to prediction — single SIMD dispatch for entire block
         let max_val = (1i32 << bit_depth) - 1;
         let (plane, stride) = frame.plane_mut(c_idx);
@@ -1788,6 +1852,28 @@ impl<'a> SliceContext<'a> {
                     }
                 }
             }
+        }
+
+        if dump_match {
+            let (plane, stride) = frame.plane(c_idx);
+            let mut rec = vec![0u16; size * size];
+            for py in 0..size {
+                for px in 0..size {
+                    rec[py * size + px] = plane[(y0 as usize + py) * stride + x0 as usize + px];
+                }
+            }
+            super::debug::dump_decode_block(
+                x0,
+                y0,
+                log2_size,
+                c_idx,
+                dump_levels.as_deref().unwrap_or(&[]),
+                dump_dequant.as_deref().unwrap_or(&[]),
+                &residual[..num_coeffs],
+                dump_pred.as_deref().unwrap_or(&[]),
+                &rec,
+                size,
+            );
         }
 
         Ok(())
@@ -2121,10 +2207,9 @@ impl<'a> SliceContext<'a> {
     /// Matching libde265's decode_quantization_parameters()
     fn decode_quantization_parameters(
         &mut self,
-        x0: u32,
-        _y0: u32,
         x_cu_base: u32,
         y_cu_base: u32,
+        _log2_cb_size: u8,
     ) {
         let log2_min_cu_qp_delta_size = self.sps.log2_ctb_size() - self.pps.diff_cu_qp_delta_depth;
         let qg_mask = (1u32 << log2_min_cu_qp_delta_size) - 1;
@@ -2140,41 +2225,22 @@ impl<'a> SliceContext<'a> {
             self.current_qg_y = y_qg;
         }
 
-        // Determine QP prediction
-        let ctb_mask = ((1u32 << self.sps.log2_ctb_size()) - 1) as i32;
-        let first_in_ctb_row = x_qg == 0 && (y_qg & ctb_mask) == 0;
-
-        let first_ctb_in_slice = self.header.slice_segment_address;
-        let slice_start_x = (first_ctb_in_slice % self.sps.pic_width_in_ctbs()) as i32
-            * (1 << self.sps.log2_ctb_size());
-        let slice_start_y = (first_ctb_in_slice / self.sps.pic_width_in_ctbs()) as i32
-            * (1 << self.sps.log2_ctb_size());
-        let first_qg_in_slice = slice_start_x == x_qg && slice_start_y == y_qg;
-
-        let qp_y_pred = if first_qg_in_slice
-            || (first_in_ctb_row && self.pps.entropy_coding_sync_enabled_flag)
-        {
+        let ctb_size = self.sps.ctb_size();
+        let ctb_mask = ctb_size - 1;
+        let qp_y_pred = if self.first_qp_group || (x_qg == 0 && y_qg == 0) {
             self.header.slice_qp_y
         } else {
-            self.last_qpy_in_prev_qg
+            self.qpy_pred
         };
 
-        // Get neighbor QP values for averaging
-        let qp_y_a = if x_qg > 0 {
-            // Check if left neighbor is in same CTB
+        // Get neighbor QP values for averaging. Availability intentionally
+        // mirrors libbpg's get_qPy_pred().
+        let qp_y_a = if x_qg > 0 && (x_cu_base & ctb_mask) != 0 && ((x_qg as u32) & ctb_mask) != 0 {
             let left_x = (x_qg - 1) as u32;
             let left_y = y_qg as u32;
-            // Simplified: check if in same CTB
-            let ctb_size = self.sps.ctb_size();
-            let our_ctb_x = x0 / ctb_size;
             let left_ctb_x = left_x / ctb_size;
-            if our_ctb_x == left_ctb_x || (x_qg as u32) < ctb_size {
-                // Left neighbor might be in previous CTB, use prediction
-                if left_ctb_x == self.ctb_x {
-                    self.get_qpy_at(left_x, left_y)
-                } else {
-                    qp_y_pred
-                }
+            if left_ctb_x == self.ctb_x {
+                self.get_qpy_at(left_x, left_y)
             } else {
                 qp_y_pred
             }
@@ -2182,10 +2248,9 @@ impl<'a> SliceContext<'a> {
             qp_y_pred
         };
 
-        let qp_y_b = if y_qg > 0 {
+        let qp_y_b = if y_qg > 0 && (y_cu_base & ctb_mask) != 0 && ((y_qg as u32) & ctb_mask) != 0 {
             let above_x = x_qg as u32;
             let above_y = (y_qg - 1) as u32;
-            let ctb_size = self.sps.ctb_size();
             let above_ctb_y = above_y / ctb_size;
             if above_ctb_y == self.ctb_y {
                 self.get_qpy_at(above_x, above_y)
