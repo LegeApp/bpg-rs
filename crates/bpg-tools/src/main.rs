@@ -13,7 +13,7 @@ use bpg_decode::{detect_container_kind, ContainerKind, DecodedFrame, DecoderConf
 use bpg_encode::{encode_still_image, EncoderTuning, HevcEncoder};
 use bpg_image::{ChromaFormat, ColorSpace, Image};
 use still265::backend::RustStillHevcEncoder;
-use still265::{DeblockMode, Effort, SaoMode};
+use still265::{AqMode, DeblockMode, Effort, SaoMode};
 
 #[derive(Parser)]
 #[command(name = "bpg-tools", about = "Rust BPG encoder")]
@@ -30,41 +30,81 @@ enum Command {
     Decode(DecodeArgs),
 }
 
-/// CLI mirror of `still265::Effort` (HandBrake/x265-style ladder).
+/// Public effort budget. Old ladder names are parse aliases only.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum EffortArg {
-    Floor,
-    FloorPlus,
-    FloorPlus2,
-    FloorShallow,
-    Fastest,
-    Slow,
-    SlowPlus,
+    #[value(
+        alias = "fastest",
+        alias = "fastadaptive",
+        alias = "floor",
+        alias = "floorplus",
+        alias = "floor-plus",
+        alias = "floorplus2",
+        alias = "floor-plus2",
+        alias = "floorshallow",
+        alias = "floor-shallow"
+    )]
     Fast,
-    Balanced,
-    Good,
-    Best,
+    #[value(
+        alias = "balanced",
+        alias = "good",
+        alias = "best",
+        alias = "slowplus",
+        alias = "slow-plus"
+    )]
+    Slow,
     Placebo,
-    Reference,
 }
 
 impl From<EffortArg> for Effort {
     fn from(e: EffortArg) -> Self {
         match e {
-            EffortArg::Floor => Effort::Floor,
-            EffortArg::FloorPlus => Effort::FloorPlus,
-            EffortArg::FloorPlus2 => Effort::FloorPlus2,
-            EffortArg::FloorShallow => Effort::FloorShallow,
-            EffortArg::Slow => Effort::Slow,
-            EffortArg::SlowPlus => Effort::SlowPlus,
-            EffortArg::Fastest => Effort::Fastest,
             EffortArg::Fast => Effort::Fast,
-            EffortArg::Balanced => Effort::Balanced,
-            EffortArg::Good => Effort::Good,
-            EffortArg::Best => Effort::Best,
+            EffortArg::Slow => Effort::Slow,
             EffortArg::Placebo => Effort::Placebo,
-            EffortArg::Reference => Effort::Reference,
         }
+    }
+}
+
+/// Adaptive-quantization preset (`--aq`). Default `off` (uniform QP). The
+/// `perceptual*` presets redistribute QP around the picture mean (MS-SSIM
+/// leaning); the `*-mild` variants halve the strength. `legacy-shrink`,
+/// `psnr-probe`, and `positive-probe` are diagnostics, not quality features.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AqArg {
+    Off,
+    LegacyShrink,
+    PerceptualMild,
+    Perceptual,
+    PerceptualChromaMild,
+    PerceptualChroma,
+    PsnrProbe,
+    PositiveProbe,
+    /// Two-pass measured AQ (the reliable path): pass-1 measures coded
+    /// complexity, pass-2 redistributes QP. Works on Slow and Placebo.
+    TwoPass,
+}
+
+impl AqArg {
+    /// The canonical preset name, shared with the library
+    /// ([`still265::aq_preset`]) so the CLI and API stay in lock-step.
+    fn preset_name(self) -> &'static str {
+        match self {
+            AqArg::Off => "off",
+            AqArg::LegacyShrink => "legacy-shrink",
+            AqArg::PerceptualMild => "perceptual-mild",
+            AqArg::Perceptual => "perceptual",
+            AqArg::PerceptualChromaMild => "perceptual-chroma-mild",
+            AqArg::PerceptualChroma => "perceptual-chroma",
+            AqArg::PsnrProbe => "psnr-probe",
+            AqArg::PositiveProbe => "positive-probe",
+            AqArg::TwoPass => "two-pass",
+        }
+    }
+
+    /// `(mode, strength, clamp)` from the shared library preset table.
+    fn resolve(self) -> (AqMode, f32, u8) {
+        still265::aq_preset(self.preset_name()).expect("known AQ preset")
     }
 }
 
@@ -126,8 +166,29 @@ struct EncodeArgs {
     compress_level: u8,
 
     /// RD-search effort.
-    #[arg(long, value_enum, default_value_t = EffortArg::Balanced)]
+    #[arg(long, value_enum, default_value_t = EffortArg::Slow)]
     effort: EffortArg,
+
+    /// Adaptive quantization mode. `off` (default) is uniform QP.
+    /// `perceptual-mild`/`perceptual` redistribute QP by luma activity;
+    /// `perceptual-chroma-mild`/`perceptual-chroma` add chroma activity.
+    /// `legacy-shrink`, `psnr-probe`, and `positive-probe` are diagnostics.
+    #[arg(long = "aq", value_enum, default_value_t = AqArg::Off)]
+    aq: AqArg,
+
+    /// Override the AQ preset strength (x265 --aq-strength). For tuning sweeps.
+    #[arg(long = "aq-strength")]
+    aq_strength: Option<f32>,
+
+    /// Override the AQ preset clamp (max |QP offset|). For tuning sweeps.
+    #[arg(long = "aq-clamp")]
+    aq_clamp: Option<u8>,
+
+    /// Disable the two-pass AQ candidate-compare gate (`--aq two-pass`). By
+    /// default two-pass keeps its AQ result only when it is a perceptual RD win
+    /// over uniform; this forces the AQ result unconditionally (for A/B).
+    #[arg(long = "no-two-pass-gate")]
+    no_two_pass_gate: bool,
 
     /// Print Rust-backend analysis counters after encoding.
     #[arg(long)]
@@ -535,10 +596,15 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         DeblockMode::On
     };
+    let (aq_mode, preset_strength, preset_clamp) = args.aq.resolve();
+    let aq_strength = args.aq_strength.unwrap_or(preset_strength);
+    let aq_clamp = args.aq_clamp.unwrap_or(preset_clamp);
     let backend = RustStillHevcEncoder::new(args.effort.into())
         .with_debug_stats(args.debug_stats)
         .with_sao(sao)
-        .with_deblock(deblock);
+        .with_deblock(deblock)
+        .with_aq(aq_mode, aq_strength, aq_clamp)
+        .with_two_pass_gate(!args.no_two_pass_gate);
     let caps = backend.caps();
     if !caps.supports_bit_depth(args.bit_depth) {
         return Err(format!(
@@ -1156,19 +1222,9 @@ fn join_u64s(values: &[u64]) -> String {
 
 fn effort_name(effort: EffortArg) -> &'static str {
     match effort {
-        EffortArg::Floor => "floor",
-        EffortArg::FloorPlus => "floor-plus",
-        EffortArg::FloorPlus2 => "floor-plus2",
-        EffortArg::FloorShallow => "floor-shallow",
-        EffortArg::Slow => "slow",
-        EffortArg::SlowPlus => "slow-plus",
-        EffortArg::Fastest => "fastest",
         EffortArg::Fast => "fast",
-        EffortArg::Balanced => "balanced",
-        EffortArg::Good => "good",
-        EffortArg::Best => "best",
+        EffortArg::Slow => "slow",
         EffortArg::Placebo => "placebo",
-        EffortArg::Reference => "reference",
     }
 }
 

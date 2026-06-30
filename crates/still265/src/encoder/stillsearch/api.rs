@@ -75,10 +75,14 @@ mod tests {
             bit_depth: 8,
             chroma: ChromaFormat::Yuv420,
             qp: 27,
-            effort: Effort::Balanced,
+            effort: Effort::Slow,
             sao: SaoMode::Off,
             deblock: DeblockMode::Off,
             adaptive_qp: false,
+            aq_mode: crate::AqMode::Off,
+            aq_strength: 0.35,
+            aq_clamp: 2,
+            two_pass_gate: true,
         };
         super::LUMA_NONDC_PICKS.store(0, Ordering::Relaxed);
         let _ = encode(
@@ -123,10 +127,14 @@ mod tests {
             bit_depth: 8,
             chroma: ChromaFormat::Yuv420,
             qp: 27,
-            effort: Effort::Balanced,
+            effort: Effort::Slow,
             sao: SaoMode::Off,
             deblock: DeblockMode::Off,
             adaptive_qp: false,
+            aq_mode: crate::AqMode::Off,
+            aq_strength: 0.35,
+            aq_clamp: 2,
+            two_pass_gate: true,
         };
         super::CU_SPLIT_WINS.store(0, Ordering::Relaxed);
         let _ = encode(
@@ -165,10 +173,14 @@ mod tests {
             bit_depth: 8,
             chroma: ChromaFormat::Yuv420,
             qp: 27,
-            effort: Effort::Balanced,
+            effort: Effort::Slow,
             sao: SaoMode::Off,
             deblock: DeblockMode::Off,
             adaptive_qp: false,
+            aq_mode: crate::AqMode::Off,
+            aq_strength: 0.35,
+            aq_clamp: 2,
+            two_pass_gate: true,
         };
 
         super::SPLIT_WINS.store(0, Ordering::Relaxed);

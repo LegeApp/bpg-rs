@@ -11,7 +11,7 @@
 //! It reuses the *same* RD framework as the greedy path — coefficient-domain
 //! SSE distortion, the same `lambda`, the same 1/32768-bit rate units — so its
 //! decisions are directly comparable. Selected per [`Effort`] tier
-//! (`Placebo`/`Reference` keep exact greedy; the practical tiers use this) and
+//! (`Placebo` keeps exact greedy; the practical tiers use this) and
 //! overridable via `BPG_RDOQ_SINGLESCAN`. It is *not* byte-identical to the
 //! greedy path.
 //!
@@ -45,6 +45,22 @@ const SCALE_BITS: i32 = 15;
 
 /// One bypass bin in 1/32768-bit units.
 const BYPASS_BITS: u64 = CabacEstimator::SCALE;
+
+/// Diagnostic multiplier on the RDOQ rate/distortion lambda
+/// (`BPG_RDOQ_LAMBDA_SCALE`, default 1.0). >1 penalizes bits more, <1 keeps
+/// more. This is intentionally separate from StillSearch's pixel-domain lambda
+/// gate so RDOQ unit changes can be swept without perturbing mode decisions.
+fn rdoq_lambda_scale() -> f64 {
+    use std::sync::OnceLock;
+    static V: OnceLock<f64> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BPG_RDOQ_LAMBDA_SCALE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+    })
+}
 
 /// Number of `coeff_abs_level_remaining` bins for `value` at Rice parameter
 /// `rice` (truncated-Rice prefix + EGk), matching `encode_coeff_abs_level_remaining`.
@@ -179,6 +195,106 @@ pub struct RdoqResult<'a> {
     pub nnz: u32,
 }
 
+/// `BPG_RDOQ_REFINE` gate (default off). Post-RDOQ coordinate-descent that
+/// minimizes pixel-domain SSE + lambda * exact-CABAC residual bits (priced from
+/// the frozen `price_base` contexts).
+///
+/// DIAGNOSTIC / RD-NEGATIVE — DO NOT ENABLE BY DEFAULT. The `rdoq_optimality_tests`
+/// self-test shows RDOQ sits ~1.5% above this objective's coordinate-descent
+/// optimum, but wiring the refinement into a real encode is **RD-negative**
+/// (4MP q28/30/32: bigger files, equal/worse decoded PSNR, ≈−0.03 dB at equal
+/// bytes). recon==decode still holds, and SDH is off in the Slow path, so the
+/// loss is not a round-trip or sign-hiding bug: the frozen-context
+/// `estimate_residual_bits` diverges from the real evolving-context coded cost,
+/// so aggressively optimizing it over-fits. Conclusion: RDOQ coefficient
+/// *selection* is effectively well-calibrated for real coding; the 1.5% is an
+/// artifact of the offline objective, not recoverable real RD. Kept as a probe.
+pub fn rdoq_refine_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BPG_RDOQ_REFINE")
+            .ok()
+            .map(|s| matches!(s.trim(), "1" | "true" | "on"))
+            .unwrap_or(false)
+    })
+}
+
+/// Coordinate-descent refinement of RDOQ `levels` toward the true-RD optimum.
+/// Candidates per position: `{0, |L|-1, |L|, |L|+1}` with the level's (or
+/// coefficient's) sign — the same RD-relevant neighborhood the trellis chooses
+/// among. Returns the refined nnz. `residual` is the pixel-domain residual the
+/// transform was taken of, used for exact SSE distortion via `reconstruct_residual`.
+#[allow(clippy::too_many_arguments)]
+pub fn refine_rdoq_levels(
+    base_ctxs: &Contexts,
+    coeffs: &[i16],
+    residual: &[i16],
+    levels: &mut [i16],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+) -> u32 {
+    use crate::residual::{ResidualPricingScratch, estimate_residual_bits_into};
+    use crate::transform::reconstruct_residual;
+    let mut scratch = ResidualPricingScratch::default();
+    let cost = |levels: &[i16], scratch: &mut ResidualPricingScratch| -> f64 {
+        let recon = reconstruct_residual(levels, log2_size, qp, bit_depth, is_dst4);
+        let dist: f64 = residual
+            .iter()
+            .zip(&recon)
+            .map(|(&r, &c)| {
+                let d = r as i64 - c as i64;
+                (d * d) as f64
+            })
+            .sum();
+        let bits =
+            estimate_residual_bits_into(base_ctxs, levels, log2_size, c_idx, scan, false, scratch);
+        dist + lambda * bits as f64 / CabacEstimator::SCALE as f64
+    };
+    let mut best = cost(levels, &mut scratch);
+    loop {
+        let mut improved = false;
+        for i in 0..levels.len() {
+            let sign: i32 = if levels[i] != 0 {
+                levels[i].signum() as i32
+            } else if coeffs[i] != 0 {
+                coeffs[i].signum() as i32
+            } else {
+                continue; // zero coeff stays zero
+            };
+            let m = levels[i].unsigned_abs() as i32;
+            let cands = [
+                0i16,
+                (sign * (m - 1).max(0)) as i16,
+                (sign * (m + 1)) as i16,
+            ];
+            for &cand in &cands {
+                if cand == levels[i] {
+                    continue;
+                }
+                let save = levels[i];
+                levels[i] = cand;
+                let c = cost(levels, &mut scratch);
+                if c + 1e-6 < best {
+                    best = c;
+                    improved = true;
+                } else {
+                    levels[i] = save;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+    levels.iter().filter(|&&l| l != 0).count() as u32
+}
+
 /// Single-scan RDOQ: choose quantized levels for `coeffs` directly from the
 /// transform coefficients. Returns `(levels, nnz)` with the same layout as
 /// `transform::quantize`.
@@ -240,11 +356,17 @@ pub fn rdoq_single_scan_into<'scratch>(
     let round = 1i64 << (qbits - 1); // round-to-nearest center for the candidate level
 
     let dq = DequantParams::new(log2_size, qp, bit_depth);
-    // Scale lambda from pixel-domain SSE to coefficient-domain SSE:
-    // coefficient-domain distortion needs `lambda / 2^scaleBits` to match
-    // x265's approach of scaling the coefficient squared error up instead.
+    // Scale lambda from pixel-domain SSE to coefficient-domain SSE.
+    //
+    // x265 computes RDOQ as:
+    //   ((coeff - dequant(level))^2 << scaleBits) + lambda2 * cabac_frac_bits
+    // where `cabac_frac_bits` is already in 1/32768-bit units. Since this code
+    // keeps the coefficient squared error unshifted, the equivalent multiplier
+    // for those same fractional-bit units is `lambda / 2^scaleBits`. Do not
+    // divide by CabacEstimator::SCALE here; that conversion is only for costs
+    // expressed as `lambda * real_bits` against pixel-domain SSE.
     let scale_bits = SCALE_BITS - 2 * transform_shift;
-    let lam = lambda / (CabacEstimator::SCALE as f64 * (1u64 << scale_bits as u32) as f64);
+    let lam = rdoq_lambda_scale() * lambda / (1u64 << scale_bits as u32) as f64;
     let bits = |ci: usize, bin: u8| -> u64 { ctxs.models[ci].entropy_bits(bin) as u64 };
 
     // Frozen representative greater1/greater2 contexts (greater1_ctx = 1, first
@@ -366,7 +488,19 @@ pub fn rdoq_single_scan_into<'scratch>(
             let mut best_levbits = 0u64;
             let mut best_distl = dist0;
             let mut best_cost = dist0 + lam * sig0 as f64;
-            for l in (q - 1).max(1)..=(q + 1) {
+            // Match x265's RDOQ refinement boundary: start from the
+            // round-to-nearest quantized level, never resurrect an initial
+            // zero, and only compare the kept level with one step down.
+            if q == 0 {
+                let rec = &mut recs[rank];
+                rec.dist0 = dist0;
+                rec.dist_l = dist0;
+                rec.level = 0;
+                rec.rd_normal = best_cost;
+                rec.rd_last = f64::INFINITY;
+                continue;
+            }
+            for l in (q - 1).max(1)..=q {
                 let dl = abs - dq.apply(l as i16) as i64;
                 let dist = (dl * dl) as f64;
                 let mb = if level2 {
@@ -562,5 +696,281 @@ pub fn rdoq_single_scan_into<'scratch>(
     RdoqResult {
         levels: &mut scratch.levels,
         nnz,
+    }
+}
+
+#[cfg(test)]
+mod rdoq_optimality_tests {
+    //! Self-contained RDOQ selection-quality probe. Block distortion is
+    //! `SSE(residual, reconstruct_residual(levels))` — prediction/reference
+    //! independent — so we can feed a known residual through still265's RDOQ and
+    //! compare its TRUE rate-distortion cost against a coordinate-descent optimum
+    //! (candidates {0, |hq|-1, |hq|, |hq|+1} per coefficient, the RD-relevant
+    //! neighborhood x265's trellis also chooses among). If a cheap local search
+    //! consistently beats RDOQ on TRUE RD, the trellis is leaving bits on the
+    //! table; if not, RDOQ selection is near-optimal and the still265-vs-x265
+    //! gap is NOT in coefficient selection.
+    use super::rdoq_single_scan;
+    use crate::cabac::CabacEstimator;
+    use crate::contexts::Contexts;
+    use crate::residual::{ScanOrder, estimate_residual_bits};
+    use crate::transform::{forward_transform, quantize, reconstruct_residual};
+
+    fn lambda(qp: i32) -> f64 {
+        0.57 * 2f64.powf((qp as f64 - 12.0) / 3.0)
+    }
+
+    fn true_rd(
+        levels: &[i16],
+        residual: &[i16],
+        log2: u8,
+        qp: i32,
+        bd: u8,
+        scan: ScanOrder,
+        lam: f64,
+    ) -> (f64, f64, u64) {
+        let recon = reconstruct_residual(levels, log2, qp, bd, false);
+        let dist: f64 = residual
+            .iter()
+            .zip(&recon)
+            .map(|(&r, &c)| {
+                let d = r as i64 - c as i64;
+                (d * d) as f64
+            })
+            .sum();
+        let mut ctx = Contexts::new(qp);
+        let bits = estimate_residual_bits(&mut ctx, levels, log2, 0, scan, false);
+        (
+            dist + lam * bits as f64 / CabacEstimator::SCALE as f64,
+            dist,
+            bits,
+        )
+    }
+
+    /// Coordinate-descent over the per-coefficient RD-relevant candidate set,
+    /// starting from `start`, minimizing true RD.
+    fn optimize(
+        start: &[i16],
+        hq: &[i16],
+        coeffs: &[i16],
+        residual: &[i16],
+        log2: u8,
+        qp: i32,
+        bd: u8,
+        scan: ScanOrder,
+        lam: f64,
+    ) -> Vec<i16> {
+        let mut cur = start.to_vec();
+        let mut best = true_rd(&cur, residual, log2, qp, bd, scan, lam).0;
+        loop {
+            let mut improved = false;
+            for i in 0..cur.len() {
+                let center = hq[i];
+                let sign: i16 = if center != 0 {
+                    center.signum()
+                } else if coeffs[i] != 0 {
+                    coeffs[i].signum()
+                } else {
+                    1
+                };
+                let m = center.unsigned_abs() as i32;
+                let cands = [
+                    0i16,
+                    (sign as i32 * (m - 1).max(0)) as i16,
+                    (sign as i32 * m) as i16,
+                    (sign as i32 * (m + 1)) as i16,
+                ];
+                for &cand in &cands {
+                    if cand == cur[i] {
+                        continue;
+                    }
+                    let save = cur[i];
+                    cur[i] = cand;
+                    let c = true_rd(&cur, residual, log2, qp, bd, scan, lam).0;
+                    if c + 1e-6 < best {
+                        best = c;
+                        improved = true;
+                    } else {
+                        cur[i] = save;
+                    }
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+        cur
+    }
+
+    /// Deterministic Laplacian-ish residual generator (seeded LCG).
+    fn make_residual(n: usize, scale: f64, seed: u64) -> Vec<i16> {
+        let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (1u64 << 31) as f64
+        };
+        (0..n)
+            .map(|_| {
+                let u = next().max(1e-6);
+                let sign = if next() < 0.5 { -1.0 } else { 1.0 };
+                (sign * -scale * u.ln()).round().clamp(-90.0, 90.0) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rdoq_vs_bruteforce_optimum() {
+        let log2: u8 = 3; // 8x8 luma
+        let n = 1usize << (2 * log2);
+        let bd = 8u8;
+        let scan = ScanOrder::Diagonal;
+        let mut agg_rdoq_excess = 0.0f64; // % over optimum
+        let mut agg_hq_excess = 0.0f64;
+        let mut count = 0;
+        let mut rdoq_beaten = 0;
+        println!(
+            "\n  qp scale seed | nnz(hq/rdoq/opt) | RD hq / rdoq / opt | rdoq-excess% hq-excess%"
+        );
+        for qp in [22i32, 28, 34] {
+            let lam = lambda(qp);
+            for &scale in &[6.0f64, 12.0, 22.0] {
+                for seed in 0..6u64 {
+                    let residual = make_residual(n, scale, seed * 131 + qp as u64);
+                    let coeffs = forward_transform(&residual, log2, false, bd);
+                    let (hq, _) = quantize(&coeffs, log2, qp, bd);
+                    let ctx = Contexts::new(qp);
+                    let (rdoq, _) =
+                        rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true);
+                    if hq.iter().all(|&l| l == 0) && rdoq.iter().all(|&l| l == 0) {
+                        continue;
+                    }
+                    let opt_from_hq =
+                        optimize(&hq, &hq, &coeffs, &residual, log2, qp, bd, scan, lam);
+                    let opt_from_rdoq =
+                        optimize(&rdoq, &hq, &coeffs, &residual, log2, qp, bd, scan, lam);
+                    let rd_hq = true_rd(&hq, &residual, log2, qp, bd, scan, lam).0;
+                    let rd_rdoq = true_rd(&rdoq, &residual, log2, qp, bd, scan, lam).0;
+                    let rd_o1 = true_rd(&opt_from_hq, &residual, log2, qp, bd, scan, lam).0;
+                    let rd_o2 = true_rd(&opt_from_rdoq, &residual, log2, qp, bd, scan, lam).0;
+                    let rd_opt = rd_o1.min(rd_o2);
+                    let nz = |v: &[i16]| v.iter().filter(|&&l| l != 0).count();
+                    let rdoq_excess = 100.0 * (rd_rdoq - rd_opt) / rd_opt.max(1.0);
+                    let hq_excess = 100.0 * (rd_hq - rd_opt) / rd_opt.max(1.0);
+                    agg_rdoq_excess += rdoq_excess;
+                    agg_hq_excess += hq_excess;
+                    count += 1;
+                    if rd_opt + 1.0 < rd_rdoq {
+                        rdoq_beaten += 1;
+                    }
+                    if seed < 2 {
+                        println!(
+                            "  {qp:2} {scale:4.0} {seed:4} | {:2}/{:2}/{:2} | {:9.0} {:9.0} {:9.0} | {:+6.2}% {:+6.2}%",
+                            nz(&hq),
+                            nz(&rdoq),
+                            nz(&opt_from_rdoq),
+                            rd_hq,
+                            rd_rdoq,
+                            rd_opt,
+                            rdoq_excess,
+                            hq_excess
+                        );
+                    }
+                }
+            }
+        }
+        println!(
+            "\n  AGGREGATE over {count} blocks: mean RDOQ excess over local-opt = {:.3}%, \
+             mean hard-quant excess = {:.3}%, RDOQ beaten in {rdoq_beaten}/{count} blocks",
+            agg_rdoq_excess / count as f64,
+            agg_hq_excess / count as f64
+        );
+    }
+}
+
+#[cfg(test)]
+mod context_drift_sizing {
+    //! Sizes the agent's "rate-context fidelity" suspect: still265 prices all
+    //! in-CTU trial decisions from `price_base` frozen at CTU entry, but real
+    //! coded bits use the CABAC context evolving block-by-block. This measures
+    //! how much a textured block's exact CABAC bit cost moves between a fresh
+    //! CTU-entry context and one drifted by ~30 prior textured blocks (mid-CTU).
+    //! If the per-block drift is tiny, the frozen-context approximation cannot
+    //! account for the ~0.3 dB texture gap and the running-context RD build is
+    //! not worth it.
+    use crate::contexts::Contexts;
+    use crate::residual::{ScanOrder, estimate_residual_bits};
+    use crate::transform::{forward_transform, quantize};
+
+    fn make_residual(n: usize, scale: f64, seed: u64) -> Vec<i16> {
+        let mut s = seed.wrapping_add(0x9E3779B97F4A7C15);
+        let mut next = || {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((s >> 33) as f64) / (1u64 << 31) as f64
+        };
+        (0..n)
+            .map(|_| {
+                let u = next().max(1e-6);
+                let sign = if next() < 0.5 { -1.0 } else { 1.0 };
+                (sign * -scale * u.ln()).round().clamp(-90.0, 90.0) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn context_drift_pricing_magnitude() {
+        let log2 = 3u8;
+        let n = 1usize << (2 * log2);
+        let bd = 8u8;
+        let scan = ScanOrder::Diagonal;
+        let drift_blocks = 30; // ~mid-CTU position (64 8x8 blocks per 64x64 CTU)
+        for qp in [22i32, 28, 34] {
+            for &scale in &[8.0f64, 18.0] {
+                let mut sum_fresh = 0i64;
+                let mut sum_drift = 0i64;
+                let mut sum_abs_delta = 0i64;
+                let trials = 40;
+                for t in 0..trials {
+                    let coeffs = forward_transform(
+                        &make_residual(n, scale, t * 7 + qp as u64),
+                        log2,
+                        false,
+                        bd,
+                    );
+                    let (levels, _) = quantize(&coeffs, log2, qp, bd);
+                    // (a) fresh CTU-entry context
+                    let mut cf = Contexts::new(qp);
+                    let bf = estimate_residual_bits(&mut cf, &levels, log2, 0, scan, false) as i64;
+                    // (b) context drifted by coding `drift_blocks` prior textured blocks
+                    let mut cd = Contexts::new(qp);
+                    for k in 0..drift_blocks {
+                        let pc = forward_transform(
+                            &make_residual(n, scale, 9000 + t * 131 + k * 17 + qp as u64),
+                            log2,
+                            false,
+                            bd,
+                        );
+                        let (pl, _) = quantize(&pc, log2, qp, bd);
+                        let _ = estimate_residual_bits(&mut cd, &pl, log2, 0, scan, false);
+                    }
+                    let bd2 = estimate_residual_bits(&mut cd, &levels, log2, 0, scan, false) as i64;
+                    sum_fresh += bf;
+                    sum_drift += bd2;
+                    sum_abs_delta += (bf - bd2).abs();
+                }
+                let scale_u = crate::cabac::CabacEstimator::SCALE as f64;
+                let mf = sum_fresh as f64 / trials as f64 / scale_u;
+                let md = sum_drift as f64 / trials as f64 / scale_u;
+                println!(
+                    "  qp{qp} scale{scale:4.0}: fresh={mf:7.1}b drift={md:7.1}b  mean_signed_delta={:+.2}b ({:+.2}%)  mean_abs_delta={:.2}b",
+                    md - mf,
+                    100.0 * (md - mf) / mf,
+                    sum_abs_delta as f64 / trials as f64 / scale_u
+                );
+            }
+        }
     }
 }

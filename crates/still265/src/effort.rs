@@ -580,9 +580,9 @@ pub struct EffortTemplate {
 }
 
 impl EffortTemplate {
-    /// True if this template is a reference/oracle tier.
+    /// True if this template is the expensive comparison/oracle tier.
     pub fn is_reference(&self) -> bool {
-        matches!(self.name, Effort::Placebo | Effort::Reference)
+        matches!(self.name, Effort::Placebo)
     }
 }
 
@@ -592,19 +592,7 @@ impl EffortTemplate {
 
 /// Map the old wide `Effort` enum to the three canonical presets.
 pub fn canonical_effort(e: Effort) -> Effort {
-    match e {
-        Effort::Floor
-        | Effort::FloorPlus
-        | Effort::FloorPlus2
-        | Effort::FloorShallow
-        | Effort::Fastest
-        | Effort::Fast
-        | Effort::FastAdaptive => Effort::Fast,
-        Effort::Slow | Effort::SlowPlus | Effort::Balanced | Effort::Good | Effort::Best => {
-            Effort::Slow
-        }
-        Effort::Placebo | Effort::Reference => Effort::Placebo,
-    }
+    e
 }
 
 /// Return the canonical template for a given effort.
@@ -615,129 +603,16 @@ pub fn template(effort: Effort) -> &'static EffortTemplate {
         Effort::Fast => &FAST,
         Effort::Slow => &SLOW,
         Effort::Placebo => &PLACEBO,
-        _ => unreachable!(),
     }
 }
 
-/// Env-gated Slow audit variant selector used to compare the legacy cheap-only
-/// Slow path against promoted-exact alternatives before serious SIMD work.
-pub const SLOW_AUDIT_VARIANT_ENV: &str = "BPG_STILLSEARCH_SLOW_AUDIT_VARIANT";
-
-/// Return the encode-time template, including temporary audit variants.
+/// Return the encode-time template for the stable preset.
 ///
-/// Default behavior is byte-for-byte the canonical template. When
-/// `BPG_STILLSEARCH_SLOW_AUDIT_VARIANT` is set for a Slow-family encode:
-///
-/// - `A` / `legacy`: legacy cheap-top-1 Slow.
-/// - `B`: cheap-rank 4 modes, exact promoted 1 mode.
-/// - `C` / `default`: canonical Slow, cheap-rank 4 with 2 promoted exact modes
-///   and category challengers.
-/// - `D`: legacy cheap-top-1 Slow, but include chroma SATD in cheap ranking.
-/// - `x265shape`: x265 `estIntraPredQT`-shaped RMD window + simple RDO +
-///   split-enabled winner remeasure.
+/// Production presets are no longer silently mutated by audit environment
+/// variables; diagnostics should be expressed as explicit experiment overlays.
 #[inline]
 pub fn template_for_encode(effort: Effort) -> EffortTemplate {
-    let mut out = *template(effort);
-    if canonical_effort(effort) == Effort::Slow {
-        apply_slow_audit_variant_from_env(&mut out);
-    }
-    out
-}
-
-fn apply_slow_audit_variant_from_env(template: &mut EffortTemplate) {
-    let Ok(raw) = std::env::var(SLOW_AUDIT_VARIANT_ENV) else {
-        return;
-    };
-    if !apply_slow_audit_variant(template, &raw) {
-        let other = raw.trim();
-        eprintln!("warning: unknown {SLOW_AUDIT_VARIANT_ENV}={other:?}; using current Slow");
-    }
-}
-
-fn apply_slow_audit_variant(template: &mut EffortTemplate, raw: &str) -> bool {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "default" | "c" | "x265-like" => configure_slow_promoted_exact_two(template),
-        "x265shape" | "x265-shape" | "x265_shape" => configure_slow_x265_shape(template),
-        "a" | "legacy" | "cheap-only" | "current" => configure_slow_legacy_cheap_only(template),
-        "b" => configure_slow_promoted_exact_one(template),
-        "d" => {
-            configure_slow_legacy_cheap_only(template);
-            template.luma.cheap.chroma_satd_in_cheap = true;
-        }
-        _ => return false,
-    }
-    true
-}
-
-fn configure_slow_legacy_cheap_only(template: &mut EffortTemplate) {
-    template.luma.cheap.max_ranked_modes = 1;
-    template.luma.cheap.chroma_satd_in_cheap = false;
-    template.luma.exact.exact_usage = ExactUsage::Disabled;
-    template.luma.exact.promote.max_exact_modes = 1;
-    template
-        .luma
-        .exact
-        .promote
-        .include_best_rough_angular_if_pd_wins_cheap = false;
-    template
-        .luma
-        .exact
-        .promote
-        .include_best_rough_pd_if_angular_wins_cheap = false;
-}
-
-fn configure_slow_promoted_exact_one(template: &mut EffortTemplate) {
-    template.luma.cheap.max_ranked_modes = 4;
-    template.luma.cheap.chroma_satd_in_cheap = false;
-    template.luma.exact.exact_usage = ExactUsage::PromotedModes;
-    template.luma.exact.promote.max_exact_modes = 1;
-    template
-        .luma
-        .exact
-        .promote
-        .include_best_rough_angular_if_pd_wins_cheap = false;
-    template
-        .luma
-        .exact
-        .promote
-        .include_best_rough_pd_if_angular_wins_cheap = false;
-}
-
-fn configure_slow_promoted_exact_two(template: &mut EffortTemplate) {
-    template.luma.cheap.max_ranked_modes = 4;
-    template.luma.cheap.chroma_satd_in_cheap = false;
-    template.luma.exact.exact_usage = ExactUsage::PromotedModes;
-    template.luma.exact.promote.max_exact_modes = 2;
-    template
-        .luma
-        .exact
-        .promote
-        .include_best_rough_angular_if_pd_wins_cheap = true;
-    template
-        .luma
-        .exact
-        .promote
-        .include_best_rough_pd_if_angular_wins_cheap = true;
-}
-
-fn configure_slow_x265_shape(template: &mut EffortTemplate) {
-    template.luma.rough.mode_set = RmdModeSet::Exhaustive;
-    template.luma.rough.score_all_modes = true;
-    template.luma.cheap.max_ranked_modes = 0;
-    template.luma.cheap.chroma_satd_in_cheap = false;
-    template.luma.cheap.residual_price = ResidualPriceLevel::Exact;
-    template.luma.exact.exact_usage = ExactUsage::X265Shape;
-    template.luma.exact.promote.max_exact_modes = 1;
-    template
-        .luma
-        .exact
-        .promote
-        .include_best_rough_angular_if_pd_wins_cheap = false;
-    template
-        .luma
-        .exact
-        .promote
-        .include_best_rough_pd_if_angular_wins_cheap = false;
+    *template(effort)
 }
 
 // ══════════════════════════════════════════════
@@ -883,24 +758,10 @@ pub(crate) static FAST: EffortTemplate = EffortTemplate {
 };
 
 /// Slow — main quality / archival preset.
-
-/// Same staged pipeline as Fast, but spends precise work where oracle evidence
-/// shows the cheap path is not reliable enough to finalize alone. The legacy
-/// cheap-top-1 Slow path is still available through
-/// `BPG_STILLSEARCH_SLOW_AUDIT_VARIANT=A` for comparison.
 ///
-/// Target: near-Placebo output at a fraction of the cost.
-/// Validate by oracle miss counters, not by PSNR at fixed QP alone.
-///
-/// ### Key budgets (from presets2.md)
-/// - Shortlist: 7-8 modes, protect representation + 1-2 family diversity slots.
-/// - Exact: promote 1-2 cheap-ranked modes, with category challengers to avoid
-///   finalizing planar/DC versus angular mistakes too early.
-/// - TU: leaf-first, conservative zero/low-residual early terminate.
-/// - CU: leaf-first, conservative early terminate, preanalysis hints only with strong evidence.
-/// - NxN: enabled with light rough gate (SATD > 0), no directional requirement.
-/// - Chroma: winner-only, up to 2 candidates, exact residual pricing.
-/// - Final: RDOQ finalization always on.
+/// This is the measured x265shape search budget: one stable pipeline, precise
+/// enough for production uniform-QP encodes, without requiring diagnostic env
+/// routing.
 pub(crate) static SLOW: EffortTemplate = EffortTemplate {
     name: Effort::Slow,
     oracle: false,
@@ -909,7 +770,7 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
 
     luma: LumaSearchPolicy {
         rough: RoughLumaPolicy {
-            mode_set: RmdModeSet::Step4,
+            mode_set: RmdModeSet::Exhaustive,
             score_all_modes: true,
             use_mode_bits: true,
             angular_family_detection: true,
@@ -925,10 +786,10 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
         },
         cheap: CheapLumaPolicy {
             enabled: true,
-            max_ranked_modes: 4,
+            max_ranked_modes: 0,
             scope: ComponentScope::LumaOnly,
             allow_optional_tu_split: false,
-            residual_price: ResidualPriceLevel::Approx,
+            residual_price: ResidualPriceLevel::Exact,
             quant: TrialQuant::HardQuant,
             chroma_satd_in_cheap: false,
         },
@@ -938,18 +799,18 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
             residual_price: ResidualPriceLevel::Exact,
             quant: TrialQuant::HardQuant,
             promote: ExactPromotionPolicy {
-                max_exact_modes: 2,
+                max_exact_modes: 1,
                 include_cheap_winner: true,
-                include_best_rough_angular_if_pd_wins_cheap: true,
-                include_best_rough_pd_if_angular_wins_cheap: true,
+                include_best_rough_angular_if_pd_wins_cheap: false,
+                include_best_rough_pd_if_angular_wins_cheap: false,
                 cheap_close_margin: 1.10,
             },
-            exact_usage: ExactUsage::PromotedModes,
+            exact_usage: ExactUsage::X265Shape,
         },
     },
 
     tu: TuSearchPolicy {
-        min_split_log2: 3,
+        min_split_log2: 2,
         leaf_first: true,
         split_search: SplitSearch::EvaluateBoth,
         zero_residual_early_terminate: true,
@@ -961,7 +822,7 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
     tu_exact: TuExactPolicy {
         split_mode: TuSplitMode::EvaluateBoth,
         max_extra_depth: 2, // Must not exceed MAX_INTRA_TT_DEPTH (2) — the write path uses that constant.
-        min_split_log2: 3,
+        min_split_log2: 2,
         leaf_first: true,
         zero_residual_early_terminate: true,
         low_residual_early_terminate: true,
@@ -981,7 +842,7 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
     nxn: NxnSearchPolicy {
         enabled: true,
         rough_gate_enabled: true,
-        rough_satd_threshold: 4000.0,
+        rough_satd_threshold: 1000.0,
         require_directional_or_texture: false,
         exact_eval: true,
     },
@@ -1001,10 +862,10 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
     },
 
     rdoq_trials: RdoqTrialPolicy {
-        mode: TrialRdoqMode::Off,
+        mode: TrialRdoqMode::ExactOnly,
         close_margin: 1.00,
-        max_rdoq_modes: 0,
-        level: 0,
+        max_rdoq_modes: 35,
+        level: 2,
     },
 
     preanalysis: PreanalysisTemplate {
@@ -1075,7 +936,7 @@ pub(crate) static PLACEBO: EffortTemplate = EffortTemplate {
     },
 
     tu: TuSearchPolicy {
-        min_split_log2: 3,
+        min_split_log2: 2,
         leaf_first: true,
         split_search: SplitSearch::EvaluateBoth,
         zero_residual_early_terminate: false,
@@ -1087,7 +948,7 @@ pub(crate) static PLACEBO: EffortTemplate = EffortTemplate {
     tu_exact: TuExactPolicy {
         split_mode: TuSplitMode::EvaluateBoth,
         max_extra_depth: 2,
-        min_split_log2: 3,
+        min_split_log2: 2,
         leaf_first: true,
         zero_residual_early_terminate: false,
         low_residual_early_terminate: false,
@@ -1209,7 +1070,6 @@ impl EffortTemplate {
             Effort::Fast => true,
             Effort::Slow => desc.qp >= 38,
             Effort::Placebo => false,
-            _ => false,
         };
 
         let tu_split = if canonical == Effort::Placebo {
@@ -1291,7 +1151,6 @@ impl EffortTemplate {
                 }
             }
             Effort::Placebo => self.luma.exact.max_modes,
-            _ => self.luma.exact.max_modes,
         }
     }
 
@@ -1308,7 +1167,6 @@ impl EffortTemplate {
                 }
             }
             Effort::Placebo => self.chroma.max_candidates,
-            _ => self.chroma.max_candidates,
         }
     }
 }
@@ -1337,7 +1195,6 @@ fn angular_prune_var_threshold_8bit(effort: Effort) -> Option<i64> {
         Effort::Fast => Some(32),
         Effort::Slow => None,
         Effort::Placebo => None,
-        _ => unreachable!(),
     }
 }
 
@@ -1553,7 +1410,6 @@ impl RdoqPassBudget {
                     1
                 }
             }
-            _ => 0,
         }
     }
 }
@@ -1658,118 +1514,32 @@ fn write_budget(f: &mut fmt::Formatter<'_>, qp: i32, budget: BlockSearchBudget) 
 mod tests {
     use super::*;
 
-    fn slow_variant(name: &str) -> EffortTemplate {
-        let mut t = SLOW;
-        assert!(apply_slow_audit_variant(&mut t, name));
-        t
-    }
-
     #[test]
-    fn canonical_slow_uses_promoted_exact_two() {
-        assert_eq!(SLOW.luma.cheap.max_ranked_modes, 4);
-        assert_eq!(SLOW.luma.exact.exact_usage, ExactUsage::PromotedModes);
-        assert_eq!(SLOW.luma.exact.promote.max_exact_modes, 2);
+    fn canonical_slow_is_x265shape() {
+        assert_eq!(SLOW.luma.rough.mode_set, RmdModeSet::Exhaustive);
+        assert!(SLOW.luma.rough.score_all_modes);
+        assert_eq!(SLOW.luma.cheap.max_ranked_modes, 0);
+        assert_eq!(SLOW.luma.cheap.residual_price, ResidualPriceLevel::Exact);
+        assert_eq!(SLOW.luma.exact.exact_usage, ExactUsage::X265Shape);
+        assert_eq!(SLOW.luma.exact.promote.max_exact_modes, 1);
+        assert!(!SLOW.luma.cheap.chroma_satd_in_cheap);
         assert!(
-            SLOW.luma
+            !SLOW
+                .luma
                 .exact
                 .promote
                 .include_best_rough_angular_if_pd_wins_cheap
         );
         assert!(
-            SLOW.luma
+            !SLOW
+                .luma
                 .exact
                 .promote
                 .include_best_rough_pd_if_angular_wins_cheap
         );
-    }
-
-    #[test]
-    fn slow_audit_variant_a_is_legacy_cheap_only_slow() {
-        let t = slow_variant("A");
-        assert_eq!(t.luma.cheap.max_ranked_modes, 1);
-        assert_eq!(t.luma.exact.exact_usage, ExactUsage::Disabled);
-        assert!(!t.luma.cheap.chroma_satd_in_cheap);
-    }
-
-    #[test]
-    fn slow_audit_variant_b_enables_one_promoted_exact_mode() {
-        let t = slow_variant("B");
-        assert_eq!(t.luma.cheap.max_ranked_modes, 4);
-        assert_eq!(t.luma.exact.exact_usage, ExactUsage::PromotedModes);
-        assert_eq!(t.luma.exact.promote.max_exact_modes, 1);
-        assert!(
-            !t.luma
-                .exact
-                .promote
-                .include_best_rough_angular_if_pd_wins_cheap
-        );
-        assert!(
-            !t.luma
-                .exact
-                .promote
-                .include_best_rough_pd_if_angular_wins_cheap
-        );
-    }
-
-    #[test]
-    fn slow_audit_variant_c_enables_two_promoted_exact_modes_with_challengers() {
-        let t = slow_variant("C");
-        assert_eq!(t.luma.cheap.max_ranked_modes, 4);
-        assert_eq!(t.luma.exact.exact_usage, ExactUsage::PromotedModes);
-        assert_eq!(t.luma.exact.promote.max_exact_modes, 2);
-        assert!(
-            t.luma
-                .exact
-                .promote
-                .include_best_rough_angular_if_pd_wins_cheap
-        );
-        assert!(
-            t.luma
-                .exact
-                .promote
-                .include_best_rough_pd_if_angular_wins_cheap
-        );
-    }
-
-    #[test]
-    fn slow_audit_variant_d_keeps_search_shape_but_adds_chroma_satd() {
-        let t = slow_variant("D");
-        assert_eq!(t.luma.cheap.max_ranked_modes, 1);
-        assert_eq!(t.luma.exact.exact_usage, ExactUsage::Disabled);
-        assert!(t.luma.cheap.chroma_satd_in_cheap);
-    }
-
-    #[test]
-    fn slow_audit_variant_x265shape_uses_simple_rdo_funnel() {
-        let t = slow_variant("x265shape");
-        assert_eq!(t.luma.rough.mode_set, RmdModeSet::Exhaustive);
-        assert!(t.luma.rough.score_all_modes);
-        assert_eq!(t.luma.cheap.max_ranked_modes, 0);
-        assert_eq!(t.luma.cheap.residual_price, ResidualPriceLevel::Exact);
-        assert_eq!(t.luma.exact.exact_usage, ExactUsage::X265Shape);
-        assert_eq!(t.luma.exact.promote.max_exact_modes, 1);
-        assert!(!t.luma.cheap.chroma_satd_in_cheap);
-        assert!(
-            !t.luma
-                .exact
-                .promote
-                .include_best_rough_angular_if_pd_wins_cheap
-        );
-        assert!(
-            !t.luma
-                .exact
-                .promote
-                .include_best_rough_pd_if_angular_wins_cheap
-        );
-    }
-
-    #[test]
-    fn slow_audit_variant_rejects_unknown_names() {
-        let mut t = SLOW;
-        assert!(!apply_slow_audit_variant(&mut t, "wat"));
-        assert_eq!(
-            t.luma.cheap.max_ranked_modes,
-            SLOW.luma.cheap.max_ranked_modes
-        );
+        assert_eq!(SLOW.nxn.rough_satd_threshold, 1000.0);
+        assert_eq!(SLOW.rdoq_trials.mode, TrialRdoqMode::ExactOnly);
+        assert_eq!(SLOW.rdoq_trials.max_rdoq_modes, 35);
+        assert_eq!(SLOW.rdoq_trials.level, 2);
     }
 }

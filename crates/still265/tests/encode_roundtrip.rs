@@ -3,8 +3,14 @@
 //! samples the encoder reconstructed, with a sane PSNR against the source.
 
 use bpg_hevc_decode::hevc::decode;
+use std::sync::{Mutex, OnceLock};
 use still265::encoder::{Source, encode, encode_with_stats};
 use still265::{ChromaFormat, DeblockMode, Effort, SaoMode, StillHevcConfig};
+
+fn env_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 /// Build a smooth 4:2:0 YCbCr source (gradients predict well under Planar),
 /// scaled to the given bit depth.
@@ -247,10 +253,14 @@ fn cfg_chroma(w: u32, h: u32, qp: u8, bd: u8, chroma: ChromaFormat) -> StillHevc
         bit_depth: bd,
         chroma,
         qp,
-        effort: Effort::Balanced,
+        effort: Effort::Slow,
         sao: SaoMode::Off,
         deblock: DeblockMode::Off,
         adaptive_qp: false,
+        aq_mode: still265::AqMode::Off,
+        aq_strength: 0.35,
+        aq_clamp: 2,
+        two_pass_gate: true,
     }
 }
 
@@ -666,27 +676,11 @@ fn gray_non_ctu_aligned() {
 
 #[test]
 fn all_effort_tiers_round_trip() {
-    // Every tier of the effort ladder must produce a stream the decoder accepts
-    // and reconstructs bit-exactly. Textured 4:2:0 so 8x8 PartNxN actually fires
-    // on the tiers that enable it (Fast..Best), exercising both the winner-direct
-    // (Best) and plan/final-code (Fast/Balanced/Good) paths.
+    // Every public effort budget must produce a stream the decoder accepts and
+    // reconstructs bit-exactly. Textured 4:2:0 so 8x8 PartNxN can fire.
     let (w, h, qp, bd) = (96u32, 80, 30, 8);
     let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, bd);
-    for effort in [
-        Effort::Floor,
-        Effort::FloorPlus,
-        Effort::FloorPlus2,
-        Effort::FloorShallow,
-        Effort::Slow,
-        Effort::SlowPlus,
-        Effort::Fastest,
-        Effort::Fast,
-        Effort::Balanced,
-        Effort::Good,
-        Effort::Best,
-        Effort::Placebo,
-        Effort::Reference,
-    ] {
+    for effort in [Effort::Fast, Effort::Slow, Effort::Placebo] {
         let config = StillHevcConfig {
             effort,
             ..cfg(w, h, qp, bd)
@@ -748,7 +742,7 @@ fn best_sao_replay_round_trip() {
     for (w, h, qp) in [(128u32, 128u32, 30u8), (96, 96, 34)] {
         let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, 8);
         let config = StillHevcConfig {
-            effort: Effort::Best,
+            effort: Effort::Slow,
             ..cfg_sao(w, h, qp, 8, ChromaFormat::Yuv420)
         };
         let (bytes, recon) = encode(
@@ -790,7 +784,7 @@ fn best_partnxn_round_trip() {
     for (w, h, qp) in [(128u32, 128u32, 18u8), (96, 96, 34)] {
         let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, 8);
         let config = StillHevcConfig {
-            effort: Effort::Best,
+            effort: Effort::Slow,
             ..cfg(w, h, qp, 8)
         };
         let (bytes, recon, _stats) = encode_with_stats(
@@ -853,7 +847,7 @@ fn best_partnxn_422_round_trip() {
     }
 
     let config = StillHevcConfig {
-        effort: Effort::Best,
+        effort: Effort::Slow,
         ..cfg_chroma(w, h, qp, 8, ChromaFormat::Yuv422)
     };
     let (_bytes, _recon, _stats) = encode_with_stats(
@@ -876,7 +870,7 @@ fn best_partnxn_444_round_trip() {
     cb.fill(128);
     cr.fill(128);
     let config = StillHevcConfig {
-        effort: Effort::Best,
+        effort: Effort::Slow,
         ..cfg_chroma(w, h, qp, 8, ChromaFormat::Yuv444)
     };
     let (_bytes, _recon, _stats) = encode_with_stats(
@@ -941,6 +935,10 @@ fn yuv422_adaptive_qp_round_trip() {
     let (y, cb, cr) = make_textured_source_422(w as usize, h as usize, bd);
     let config = StillHevcConfig {
         adaptive_qp: true, // opt into per-CU AQ (uniform-QP is now the default)
+        aq_mode: still265::AqMode::Off,
+        aq_strength: 0.35,
+        aq_clamp: 2,
+        two_pass_gate: true,
         ..cfg_chroma(w, h, 34, bd, ChromaFormat::Yuv422)
     };
     assert!(still265::aq_active(&config));
@@ -972,6 +970,83 @@ fn yuv422_adaptive_qp_round_trip() {
         &recon.cr_plane,
         decoded.width.div_ceil(2) as usize,
         "4:2:2 AQ: cr recon",
+    );
+}
+
+fn run_external_aq_offset_map_round_trip(map_body: &str, label: &str) {
+    let _guard = env_lock().lock().unwrap();
+    let w = 96u32;
+    let h = 96u32;
+    let bd = 8u8;
+    let path = std::env::temp_dir().join(format!(
+        "still265_external_aq_{}_{}.csv",
+        std::process::id(),
+        label
+    ));
+    std::fs::write(&path, format!("# x,y,offset\n{map_body}")).unwrap();
+    unsafe {
+        std::env::set_var("BPG_AQ_OFFSET_MAP", &path);
+    }
+
+    let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, bd);
+    let config = cfg(w, h, 30, bd);
+    assert!(still265::aq_active(&config));
+    let (bytes, recon) = encode(
+        &config,
+        Source {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+        },
+    );
+    let decoded = decode(&bytes).expect("decoder must accept external-AQ stream");
+    unsafe {
+        std::env::remove_var("BPG_AQ_OFFSET_MAP");
+    }
+    let _ = std::fs::remove_file(path);
+
+    assert_plane_eq(
+        &decoded.y_plane,
+        &recon.y_plane,
+        decoded.width as usize,
+        "external AQ: luma recon",
+    );
+    assert_plane_eq(
+        &decoded.cb_plane,
+        &recon.cb_plane,
+        decoded.width.div_ceil(2) as usize,
+        "external AQ: cb recon",
+    );
+    assert_plane_eq(
+        &decoded.cr_plane,
+        &recon.cr_plane,
+        decoded.width.div_ceil(2) as usize,
+        "external AQ: cr recon",
+    );
+}
+
+/// External immutable AQ maps are the boundary for two-pass AQ experiments. A
+/// zero-offset map should activate AQ syntax without changing reconstruction.
+#[test]
+#[ignore = "manual env-var AQ test; BPG_AQ_OFFSET_MAP is process-global and contaminates parallel tests"]
+fn external_aq_zero_offset_map_round_trip() {
+    run_external_aq_offset_map_round_trip(
+        "0,0,0\n32,0,0\n64,0,0\n0,32,0\n32,32,0\n64,32,0\n0,64,0\n32,64,0\n64,64,0\n",
+        "zero",
+    );
+}
+
+/// Historical regression for real two-pass AQ: nonzero 4:2:0 external maps must
+/// not desync the decoder from the encoder reconstruction. The non-ignored
+/// coverage lives in `external_aq_correctness.rs`; this duplicate remains
+/// ignored because `BPG_AQ_OFFSET_MAP` is process-global inside this larger
+/// parallel test binary.
+#[test]
+#[ignore = "manual env-var AQ test; covered by external_aq_correctness.rs"]
+fn external_aq_nonzero_offset_map_round_trip() {
+    run_external_aq_offset_map_round_trip(
+        "0,0,-2\n32,0,1\n64,0,2\n0,32,0\n32,32,-1\n64,32,2\n0,64,1\n32,64,-2\n64,64,0\n",
+        "nonzero",
     );
 }
 

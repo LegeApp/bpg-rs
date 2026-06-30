@@ -8,6 +8,14 @@ use crate::contexts::Contexts;
 use crate::rdoq::RdoqScratch;
 use crate::residual::ResidualPricingScratch;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct SsimRdNorm {
+    pub(super) valid: bool,
+    pub(super) qp: i32,
+    pub(super) f_dc_den: u64,
+    pub(super) f_ac_den: u64,
+}
+
 /// Per-CTU substage profile accumulators for `eval_component_8`.
 /// Populated only when `BPG_STILLSEARCH_PROFILE=1`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -37,6 +45,8 @@ pub(super) struct CtuWorkspace {
     /// Per-CTU substage profile (eval_component_8 breakdown). Zero when
     /// profiling is disabled.
     pub(super) substage: SubstageProfile,
+    /// Per-component CTU source normalization for the opt-in SSIM-RD cost.
+    pub(super) ssim_rd_norm: [SsimRdNorm; 3],
     /// Number of TU split evaluations skipped due to zero-residual early
     /// termination in this CTU.
     pub(super) tu_split_early_terminations: u64,
@@ -58,6 +68,7 @@ impl Default for CtuWorkspace {
             rdoq_scratch: RdoqScratch::default(),
             last_8x8_rough_satd: f64::INFINITY,
             substage: SubstageProfile::default(),
+            ssim_rd_norm: [SsimRdNorm::default(); 3],
             tu_split_early_terminations: 0,
             tu_leaf_by_log2: [0; 7],
             tu_split_by_log2: [0; 7],
@@ -71,6 +82,7 @@ impl CtuWorkspace {
         self.ledger.clear_ctu();
         self.block_scratch.clear_ctu();
         self.substage = SubstageProfile::default();
+        self.ssim_rd_norm = [SsimRdNorm::default(); 3];
         self.tu_split_early_terminations = 0;
         self.tu_leaf_by_log2 = [0; 7];
         self.tu_split_by_log2 = [0; 7];

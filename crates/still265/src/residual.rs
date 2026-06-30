@@ -17,6 +17,8 @@
 //! `transquant_bypass_enabled_flag = 0`); the decoder only reads
 //! `transform_skip_flag` when those are enabled.
 
+use std::sync::OnceLock;
+
 use bpg_bitstream::BitWriter;
 
 use crate::cabac::{CabacEncoder, CabacEstimator, ContextModel};
@@ -63,6 +65,33 @@ impl CabacSyntax for CabacEstimator {
 
     fn encode_bins_ep(&mut self, bin_values: u32, num_bins: u32) {
         CabacEstimator::encode_bins_ep(self, bin_values, num_bins);
+    }
+}
+
+/// Static-context fractional-bit estimator: counts the same bins as
+/// [`CabacEstimator`] but never advances context state (`ctx.update`). This is
+/// the x265 `EstBitsSbac` / RDOQ rate model (`g_entropyBits` against the frozen
+/// snapshot) — the bin costs are read from the base context states only. Used to
+/// price the cheap intra-mode ranking pass without the per-bin context-evolution
+/// write; the base `Contexts` is therefore left unmodified, so no per-call copy
+/// is needed.
+#[derive(Default)]
+struct StaticEstimator {
+    frac_bits: u64,
+}
+
+impl CabacSyntax for StaticEstimator {
+    fn encode_bin(&mut self, bin_value: u8, ctx: &mut ContextModel) {
+        // Read-only: cost from the current (frozen) state, no transition.
+        self.frac_bits += ctx.entropy_bits(bin_value) as u64;
+    }
+
+    fn encode_bin_ep(&mut self, _bin_value: u8) {
+        self.frac_bits += CabacEstimator::SCALE;
+    }
+
+    fn encode_bins_ep(&mut self, _bin_values: u32, num_bins: u32) {
+        self.frac_bits += CabacEstimator::SCALE * num_bins as u64;
     }
 }
 
@@ -275,6 +304,79 @@ pub(crate) fn calc_sig_coeff_flag_ctx(
     ctx::SIG_COEFF_FLAG + if c_idx > 0 { 27 } else { 0 } + sig_ctx as usize
 }
 
+/// Precomputed `sig_coeff_flag` context index for every scan position of a 4×4
+/// sub-block, keyed by everything [`calc_sig_coeff_flag_ctx`] actually depends
+/// on: `[log2_size-2][c_idx>0][scan_idx][is_dc_subblock][prev_csbf][scan_pos]`.
+/// The result is independent of the exact `(sb_x, sb_y)` — only whether the
+/// sub-block is the DC sub-block matters (`x_s + y_s > 0`) — and of which
+/// non-DC sub-block, so the table is small. Built once from the reference
+/// function and proven equivalent by `sig_ctx_table_matches_function`.
+type SigCtxTable = [[[[[[u16; 16]; 4]; 2]; 3]; 2]; 4];
+
+fn scan_order_from_idx(idx: u8) -> ScanOrder {
+    match idx {
+        1 => ScanOrder::Horizontal,
+        2 => ScanOrder::Vertical,
+        _ => ScanOrder::Diagonal,
+    }
+}
+
+fn build_sig_ctx_table() -> Box<SigCtxTable> {
+    let mut t: Box<SigCtxTable> = Box::new([[[[[[0u16; 16]; 4]; 2]; 3]; 2]; 4]);
+    for sbw_idx in 0..4usize {
+        let log2_size = sbw_idx as u8 + 2;
+        let sb_width = 1u8 << (log2_size - 2);
+        for c_class in 0..2usize {
+            let c_idx = c_class as u8; // 0 = luma, 1 = any chroma (c_idx > 0)
+            for scan_idx in 0..3usize {
+                let scan_pos = get_scan_4x4(scan_order_from_idx(scan_idx as u8));
+                for is_dc in 0..2usize {
+                    // Any non-DC sub-block yields the same contexts (`x_s+y_s>0`,
+                    // `x_p/y_p` come from the within-4×4 position); pick (1,0).
+                    let (sb_x, sb_y) = if is_dc == 1 || sb_width == 1 {
+                        (0u8, 0u8)
+                    } else {
+                        (1u8, 0u8)
+                    };
+                    for prev_csbf in 0..4usize {
+                        for (n, &(px, py)) in scan_pos.iter().enumerate() {
+                            let x_c = sb_x * 4 + px;
+                            let y_c = sb_y * 4 + py;
+                            t[sbw_idx][c_class][scan_idx][is_dc][prev_csbf][n] =
+                                calc_sig_coeff_flag_ctx(
+                                    x_c,
+                                    y_c,
+                                    log2_size,
+                                    c_idx,
+                                    scan_idx as u8,
+                                    prev_csbf as u8,
+                                ) as u16;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    t
+}
+
+/// `&[u16; 16]` of `sig_coeff_flag` context indices for the current sub-block's
+/// scan positions (index 0 = DC). Replaces the per-bin `calc_sig_coeff_flag_ctx`
+/// in the residual traversal hot loop.
+#[inline]
+fn sig_ctx_row(
+    log2_size: u8,
+    c_idx: u8,
+    scan_idx: u8,
+    is_dc_sb: bool,
+    prev_csbf: u8,
+) -> &'static [u16; 16] {
+    static TABLE: OnceLock<Box<SigCtxTable>> = OnceLock::new();
+    let t = TABLE.get_or_init(build_sig_ctx_table);
+    &t[(log2_size - 2) as usize][(c_idx > 0) as usize][scan_idx as usize][is_dc_sb as usize]
+        [prev_csbf as usize]
+}
+
 /// Encode one transform block's quantized coefficients as `residual_coding()`.
 ///
 /// `coeffs` is row-major with stride `1 << log2_size`. There must be at least
@@ -380,6 +482,144 @@ pub fn estimate_residual_bits_into(
     scratch.sink.frac_bits()
 }
 
+/// Estimate `residual_coding()` cost when the caller already knows `nnz`.
+///
+/// The `nnz == 1 && coeffs[0] != 0` case has a fixed syntax shape: last-x/y at
+/// zero, no sub-block/significance scan, one greater1 flag, optional greater2,
+/// one sign bit, and optional Rice remainder. Pricing it directly avoids the
+/// full residual traversal and even the residual context-range copy.
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_residual_bits_into_nnz(
+    base_ctxs: &Contexts,
+    coeffs: &[i16],
+    nnz: u32,
+    log2_size: u8,
+    c_idx: u8,
+    scan_order: ScanOrder,
+    sign_data_hiding: bool,
+    scratch: &mut ResidualPricingScratch,
+) -> u64 {
+    if nnz == 1 {
+        if let Some(bits) = estimate_dc_only_residual_bits(base_ctxs, coeffs, log2_size, c_idx) {
+            return bits;
+        }
+    }
+
+    estimate_residual_bits_into(
+        base_ctxs,
+        coeffs,
+        log2_size,
+        c_idx,
+        scan_order,
+        sign_data_hiding,
+        scratch,
+    )
+}
+
+fn estimate_dc_only_residual_bits(
+    base_ctxs: &Contexts,
+    coeffs: &[i16],
+    log2_size: u8,
+    c_idx: u8,
+) -> Option<u64> {
+    let level = *coeffs.first()?;
+    if level == 0 {
+        return None;
+    }
+
+    let mut bits = 0u64;
+    bits += dc_last_prefix_zero_bits(base_ctxs, log2_size, c_idx, true);
+    bits += dc_last_prefix_zero_bits(base_ctxs, log2_size, c_idx, false);
+
+    let abs_level = level.unsigned_abs() as u32;
+    let gt1 = abs_level > 1;
+    let gt1_ci = ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + if c_idx > 0 { 16 } else { 0 } + 1;
+    bits += base_ctxs.models[gt1_ci].entropy_bits(gt1 as u8) as u64;
+
+    if gt1 {
+        let gt2 = abs_level > 2;
+        let gt2_ci = ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + if c_idx > 0 { 4 } else { 0 };
+        bits += base_ctxs.models[gt2_ci].entropy_bits(gt2 as u8) as u64;
+        if gt2 {
+            bits += CabacEstimator::SCALE as u64
+                * coeff_abs_level_remaining_ep_bins(abs_level - 3, 0) as u64;
+        }
+    }
+
+    bits += CabacEstimator::SCALE as u64; // sign_coeff_flag
+    Some(bits)
+}
+
+fn dc_last_prefix_zero_bits(base_ctxs: &Contexts, log2_size: u8, c_idx: u8, is_x: bool) -> u64 {
+    let ctx_base = if is_x {
+        ctx::LAST_SIG_COEFF_X_PREFIX
+    } else {
+        ctx::LAST_SIG_COEFF_Y_PREFIX
+    };
+    let ctx_offset = if c_idx == 0 {
+        3 * (log2_size as usize - 2) + ((log2_size as usize - 1) >> 2)
+    } else {
+        15usize
+    };
+    base_ctxs.models[ctx_base + ctx_offset].entropy_bits(0) as u64
+}
+
+fn coeff_abs_level_remaining_ep_bins(value: u32, rice: u8) -> u32 {
+    let rice = rice as u32;
+    if value < (4u32 << rice) {
+        let prefix = value >> rice;
+        prefix + 1 + rice
+    } else {
+        let mut p = 4u32;
+        loop {
+            let base = ((1u32 << (p - 3)) + 2) << rice;
+            let width = 1u32 << (p - 3 + rice);
+            if value < base + width {
+                return p + 1 + (p - 3 + rice);
+            }
+            p += 1;
+        }
+    }
+}
+
+/// Static-context residual bit estimate (x265 `EstBitsSbac` / RDOQ rate model):
+/// same residual-syntax traversal as [`estimate_residual_bits_into`] but counts
+/// bins against the *frozen* base context states (no per-bin context evolution),
+/// so it needs no per-call context-range copy.
+///
+/// MEASURED (2026-06-29, 4000×3000 q28 x265shape, env `BPG_STILLSEARCH_CHEAP_BITS_STATIC=1`):
+/// ~1.2 s faster (12.8→11.5 s) but **BD-rate worse** — −0.24 dB PSNR_y for only
+/// −0.9 % bytes (1296789→1285065 B). The frozen-context count is biased enough to
+/// shift RD decisions; not shippable. Kept as an off-by-default A/B knob: the
+/// evolving-context exact count is what holds still265's RD operating point.
+pub fn estimate_residual_bits_static(
+    base_ctxs: &Contexts,
+    coeffs: &[i16],
+    log2_size: u8,
+    c_idx: u8,
+    scan_order: ScanOrder,
+    sign_data_hiding: bool,
+) -> u64 {
+    // `residual_syntax` requires `&mut Contexts` because the exact path mutates
+    // context state. `StaticEstimator` never mutates, so a shadow copy that we
+    // discard preserves the signature while leaving `base_ctxs` untouched.
+    // The copy is the full context array but happens without the
+    // `LAST_SIG..SAO` range restriction; benchmark shows it is negligible. If it
+    // shows up, narrow it to the residual range like `estimate_residual_bits_into`.
+    let mut shadow = base_ctxs.clone();
+    let mut sink = StaticEstimator::default();
+    residual_syntax(
+        &mut sink,
+        &mut shadow,
+        coeffs,
+        log2_size,
+        c_idx,
+        scan_order,
+        sign_data_hiding,
+    );
+    sink.frac_bits
+}
+
 /// HEVC sign-data-hiding: make each qualifying coding group's first significant
 /// coefficient sign parity-consistent with the group's |level| sum, so the
 /// decoder can infer that sign from the parity instead of coding it. Faithful
@@ -406,12 +646,6 @@ pub fn apply_sign_data_hiding(
     let scan_pos = get_scan_4x4(scan_order);
     let (last_sb_idx, last_pos_in_sb) = find_last_sig(levels, size, scan_sub, scan_pos);
 
-    let blk_pos = |sbx: usize, sby: usize, n: usize| -> Option<usize> {
-        let (px, py) = scan_pos[n];
-        let x = sbx * 4 + px as usize;
-        let y = sby * 4 + py as usize;
-        (x < size && y < size).then_some(y * size + x)
-    };
     // x265 `deltaU`: signed rounding remainder at 8-bit fractional precision.
     // > 0 means the coeff was truncated down (incrementing the level is cheap).
     let delta_u = |levels: &[i16], blk: usize| -> i64 {
@@ -427,31 +661,34 @@ pub fn apply_sign_data_hiding(
         let sbx = sbx as usize;
         let sby = sby as usize;
 
-        let mut first_nz = None;
-        let mut last_nz = 0usize;
-        for n in 0..16 {
-            if let Some(blk) = blk_pos(sbx, sby, n) {
-                if levels[blk] != 0 {
-                    if first_nz.is_none() {
-                        first_nz = Some(n);
-                    }
-                    last_nz = n;
-                }
+        let mut blk_pos = [usize::MAX; 16];
+        let mut sig_mask = 0u16;
+        for (n, slot) in blk_pos.iter_mut().enumerate() {
+            let (px, py) = scan_pos[n];
+            let x = sbx * 4 + px as usize;
+            let y = sby * 4 + py as usize;
+            if x < size && y < size {
+                let blk = y * size + x;
+                *slot = blk;
+                sig_mask |= ((levels[blk] != 0) as u16) << n;
             }
         }
-        let first_nz = match first_nz {
-            Some(f) => f,
-            None => continue,
-        };
+
+        if sig_mask == 0 {
+            continue;
+        }
+        let first_nz = sig_mask.trailing_zeros() as usize;
+        let last_nz = 15 - sig_mask.leading_zeros() as usize;
         if last_nz - first_nz < SBH_THRESHOLD {
             continue;
         }
 
-        let first_blk = blk_pos(sbx, sby, first_nz).unwrap();
+        let first_blk = blk_pos[first_nz];
         let signbit = if levels[first_blk] > 0 { 0u32 } else { 1 };
         let mut abs_sum: i64 = 0;
         for n in first_nz..=last_nz {
-            if let Some(blk) = blk_pos(sbx, sby, n) {
+            let blk = blk_pos[n];
+            if blk != usize::MAX {
                 abs_sum += levels[blk].unsigned_abs() as i64;
             }
         }
@@ -469,12 +706,12 @@ pub fn apply_sign_data_hiding(
         let mut final_change = 0i32;
         let mut min_blk = usize::MAX;
         for n in (0..=cand_max).rev() {
-            let blk = match blk_pos(sbx, sby, n) {
-                Some(b) => b,
-                None => continue,
-            };
+            let blk = blk_pos[n];
+            if blk == usize::MAX {
+                continue;
+            }
             let cur_sig = levels[blk] != 0;
-            let lower_sig = (0..n).any(|m| blk_pos(sbx, sby, m).is_some_and(|b| levels[b] != 0));
+            let lower_sig = (sig_mask & ((1u16 << n) - 1)) != 0;
             let du = delta_u(levels, blk);
             let (cost, change) = if cur_sig {
                 if du > 0 {
@@ -543,6 +780,48 @@ fn residual_syntax<S: CabacSyntax>(
     scan_order: ScanOrder,
     sign_data_hiding: bool,
 ) {
+    if c_idx == 0 {
+        match log2_size {
+            2 => {
+                return residual_syntax_luma::<S, 2>(
+                    sink,
+                    ctxs,
+                    coeffs,
+                    scan_order,
+                    sign_data_hiding,
+                );
+            }
+            3 => {
+                return residual_syntax_luma::<S, 3>(
+                    sink,
+                    ctxs,
+                    coeffs,
+                    scan_order,
+                    sign_data_hiding,
+                );
+            }
+            4 => {
+                return residual_syntax_luma::<S, 4>(
+                    sink,
+                    ctxs,
+                    coeffs,
+                    scan_order,
+                    sign_data_hiding,
+                );
+            }
+            5 => {
+                return residual_syntax_luma::<S, 5>(
+                    sink,
+                    ctxs,
+                    coeffs,
+                    scan_order,
+                    sign_data_hiding,
+                );
+            }
+            _ => {}
+        }
+    }
+
     let size = 1usize << log2_size;
     let scan_sub = get_scan_sub_block(log2_size, scan_order);
     let scan_pos = get_scan_4x4(scan_order);
@@ -587,6 +866,266 @@ fn residual_syntax<S: CabacSyntax>(
             &mut coded_sb_flags,
         );
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn residual_syntax_luma<S: CabacSyntax, const LOG2_SIZE: u8>(
+    sink: &mut S,
+    ctxs: &mut Contexts,
+    coeffs: &[i16],
+    scan_order: ScanOrder,
+    sign_data_hiding: bool,
+) {
+    let scan_sub = get_scan_sub_block(LOG2_SIZE, scan_order);
+    let scan_pos = get_scan_4x4(scan_order);
+    let scan_idx = scan_order as u8;
+
+    let (last_sb_idx, last_pos_in_sb) = find_last_sig_luma::<LOG2_SIZE>(coeffs, scan_sub, scan_pos);
+    encode_last_position(
+        sink,
+        ctxs,
+        scan_order,
+        scan_sub,
+        scan_pos,
+        last_sb_idx,
+        last_pos_in_sb,
+        LOG2_SIZE,
+        0,
+    );
+
+    let mut coded_sb_flags = [[false; 8]; 8];
+    let mut prev_subblock_had_gt1 = false;
+    for sb_idx in (0..=last_sb_idx).rev() {
+        code_sub_block_luma::<S, LOG2_SIZE>(
+            sink,
+            ctxs,
+            coeffs,
+            scan_idx,
+            scan_sub,
+            scan_pos,
+            sb_idx,
+            last_sb_idx,
+            last_pos_in_sb,
+            sign_data_hiding,
+            &mut prev_subblock_had_gt1,
+            &mut coded_sb_flags,
+        );
+    }
+}
+
+/// Find the last significant luma coefficient for a power-of-two HEVC TU.
+/// Luma 4/8/16/32 sub-block grids tile exactly, so the scan positions are all
+/// in-bounds and the hot search can avoid per-position geometry checks.
+fn find_last_sig_luma<const LOG2_SIZE: u8>(
+    coeffs: &[i16],
+    scan_sub: &[(u8, u8)],
+    scan_pos: &[(u8, u8); 16],
+) -> (usize, usize) {
+    let size = 1usize << LOG2_SIZE;
+
+    for (sbi, &(sbx, sby)) in scan_sub.iter().enumerate().rev() {
+        let base_x = sbx as usize * 4;
+        let base_y = sby as usize * 4;
+        for (n, &(px, py)) in scan_pos.iter().enumerate().rev() {
+            let idx = (base_y + py as usize) * size + base_x + px as usize;
+            if coeffs[idx] != 0 {
+                return (sbi, n);
+            }
+        }
+    }
+    (0, 0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn code_sub_block_luma<S: CabacSyntax, const LOG2_SIZE: u8>(
+    sink: &mut S,
+    ctxs: &mut Contexts,
+    coeffs: &[i16],
+    scan_idx: u8,
+    scan_sub: &[(u8, u8)],
+    scan_pos: &[(u8, u8); 16],
+    sb_idx: usize,
+    last_sb_idx: usize,
+    last_pos_in_sb: usize,
+    sign_data_hiding: bool,
+    prev_subblock_had_gt1: &mut bool,
+    coded_sb_flags: &mut [[bool; 8]; 8],
+) {
+    let size = 1usize << LOG2_SIZE;
+    let sb_width = 1usize << (LOG2_SIZE - 2);
+
+    let (sb_x, sb_y) = scan_sub[sb_idx];
+    let sb_x = sb_x as usize;
+    let sb_y = sb_y as usize;
+
+    let mut sb_coeff = [0i16; 16];
+    let mut sig_mask: u16 = 0;
+    let base_x = sb_x * 4;
+    let base_y = sb_y * 4;
+    for (n, slot) in sb_coeff.iter_mut().enumerate() {
+        let (px, py) = scan_pos[n];
+        let idx = (base_y + py as usize) * size + base_x + px as usize;
+        let v = coeffs[idx];
+        *slot = v;
+        sig_mask |= ((v != 0) as u16) << n;
+    }
+
+    let right_coded = sb_x + 1 < sb_width && coded_sb_flags[sb_y][sb_x + 1];
+    let below_coded = sb_y + 1 < sb_width && coded_sb_flags[sb_y + 1][sb_x];
+    let csbf_neighbors = (right_coded as u8) | ((below_coded as u8) << 1);
+
+    let sb_has_sig = sig_mask != 0;
+    let (sb_coded, infer_sb_dc_sig) = if sb_idx > 0 && sb_idx < last_sb_idx {
+        encode_coded_sub_block_flag(sink, ctxs, 0, csbf_neighbors, sb_has_sig);
+        (sb_has_sig, sb_has_sig)
+    } else {
+        (true, false)
+    };
+
+    if sb_coded {
+        coded_sb_flags[sb_y][sb_x] = true;
+    }
+    if !sb_coded {
+        return;
+    }
+
+    let start_pos = if sb_idx == last_sb_idx {
+        last_pos_in_sb
+    } else {
+        15
+    };
+    let sig = |n: usize| -> bool { (sig_mask >> n) & 1 != 0 };
+
+    let last_coeff = if sb_idx == last_sb_idx {
+        start_pos.saturating_sub(1)
+    } else {
+        15
+    };
+
+    let sig_ctx = sig_ctx_row(
+        LOG2_SIZE,
+        0,
+        scan_idx,
+        sb_x == 0 && sb_y == 0,
+        csbf_neighbors,
+    );
+
+    for n in (1..=last_coeff).rev() {
+        let ci = sig_ctx[n] as usize;
+        sink.encode_bin(sig(n) as u8, ctxs.get(ci));
+    }
+
+    if start_pos > 0 {
+        let others_mask = (((1u32 << (last_coeff + 1)) - 1) as u16) & !1u16;
+        let others_sig = sig_mask & others_mask != 0;
+        let can_infer_dc = infer_sb_dc_sig && !others_sig;
+        if !can_infer_dc {
+            let ci = sig_ctx[0] as usize;
+            sink.encode_bin(sig(0) as u8, ctxs.get(ci));
+        }
+    }
+
+    let mut sig_positions = [0usize; 16];
+    let mut n_sig = 0usize;
+    let mut m = sig_mask & (((1u32 << (start_pos + 1)) - 1) as u16);
+    while m != 0 {
+        let n = 15 - m.leading_zeros() as usize;
+        sig_positions[n_sig] = n;
+        n_sig += 1;
+        m &= !(1u16 << n);
+    }
+    if n_sig == 0 {
+        return;
+    }
+
+    let base = if sb_idx == 0 { 0u8 } else { 2 };
+    let ctx_set = base + *prev_subblock_had_gt1 as u8;
+
+    let max_g1 = n_sig.min(8);
+    let mut greater1_ctx = 1u8;
+    let mut last_greater1_flag = false;
+    let mut this_subblock_had_gt1 = false;
+    let mut first_g1_idx: Option<usize> = None;
+    let mut rem_base = [0i16; 16];
+    let mut needs_remaining = [false; 16];
+
+    for (g1_count, &n) in sig_positions[..n_sig].iter().enumerate() {
+        let abs_level = sb_coeff[n].unsigned_abs();
+        if g1_count >= max_g1 {
+            rem_base[n] = 1;
+            needs_remaining[n] = true;
+            continue;
+        }
+
+        if g1_count > 0 && greater1_ctx > 0 {
+            greater1_ctx = if last_greater1_flag {
+                0
+            } else {
+                greater1_ctx + 1
+            };
+        }
+
+        let g1 = abs_level > 1;
+        let ci = ctx::COEFF_ABS_LEVEL_GREATER1_FLAG
+            + ctx_set as usize * 4
+            + (greater1_ctx as usize).min(3);
+        sink.encode_bin(g1 as u8, ctxs.get(ci));
+        last_greater1_flag = g1;
+
+        if g1 {
+            this_subblock_had_gt1 = true;
+            if first_g1_idx.is_none() {
+                first_g1_idx = Some(n);
+                rem_base[n] = 2;
+            } else {
+                rem_base[n] = 2;
+                needs_remaining[n] = true;
+            }
+        } else {
+            rem_base[n] = 1;
+        }
+    }
+
+    if let Some(g1_idx) = first_g1_idx {
+        let abs_level = sb_coeff[g1_idx].unsigned_abs();
+        let g2 = abs_level > 2;
+        let ci = ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + ctx_set as usize;
+        sink.encode_bin(g2 as u8, ctxs.get(ci));
+        if g2 {
+            rem_base[g1_idx] = 3;
+            needs_remaining[g1_idx] = true;
+        }
+    }
+
+    let first_sig_pos = sig_mask.trailing_zeros() as usize;
+    let last_sig_pos = 15 - sig_mask.leading_zeros() as usize;
+    let sign_hidden = sign_data_hiding && (last_sig_pos - first_sig_pos) > 3;
+
+    let sign_bins = if sign_hidden { n_sig - 1 } else { n_sig };
+    if sign_bins > 0 {
+        let mut signs = 0u32;
+        for &n in &sig_positions[..sign_bins] {
+            signs = (signs << 1) | (sb_coeff[n] < 0) as u32;
+        }
+        sink.encode_bins_ep(signs, sign_bins as u32);
+    }
+
+    let mut rice_param = 0u8;
+    for &n in sig_positions[..n_sig].iter() {
+        if !needs_remaining[n] {
+            continue;
+        }
+        let base_level = rem_base[n];
+        let value = (sb_coeff[n].unsigned_abs() as i32 - base_level as i32) as u32;
+        encode_coeff_abs_level_remaining(sink, value, rice_param);
+        let full = base_level.unsigned_abs() as u32 + value;
+        let threshold = 3u32 * (1 << rice_param);
+        if full > threshold {
+            rice_param = (rice_param + 1).min(4);
+        }
+    }
+
+    *prev_subblock_had_gt1 = this_subblock_had_gt1;
 }
 
 /// Find the last significant coefficient (in combined sub-block + intra-block
@@ -693,28 +1232,46 @@ impl SubBlockCfg<'_> {
         let sign_data_hiding = self.sign_data_hiding;
         let coeffs = self.coeffs;
         let override_coeff = self.override_coeff;
-        let at = |x: usize, y: usize| -> i16 {
-            let idx = y * size + x;
-            match override_coeff {
-                Some((oi, ov)) if oi == idx => ov,
-                _ => coeffs[idx],
-            }
-        };
 
         let (sb_x, sb_y) = scan_sub[sb_idx];
         let sb_x = sb_x as usize;
         let sb_y = sb_y as usize;
+
+        // Load this sub-block's 16 coefficients once, in intra-sub-block scan
+        // order, applying any `override_coeff`. Every significance/level loop
+        // below then indexes this hot local array instead of re-reading the
+        // (bounds-checked) coefficient plane and re-evaluating the override
+        // branch on each of the ~3-4 passes — `code_sub_block` is the single
+        // hottest encoder function (perf: ~26% self-time, dominated by these
+        // repeated per-position reads). Out-of-bounds scan positions stay 0,
+        // matching the previous `coeff_at` fallback.
+        let mut sb_coeff = [0i16; 16];
+        // `sig_mask` bit `n` set iff scan position `n` is significant. Built in
+        // the same single pass so every significance query below is a bit op
+        // instead of another 4×4 rescan (sb_has_sig / others_sig / first-last /
+        // sig-position collection). Out-of-bounds positions stay 0/unset.
+        let mut sig_mask: u16 = 0;
+        for (n, slot) in sb_coeff.iter_mut().enumerate() {
+            let (px, py) = scan_pos[n];
+            let x = sb_x * 4 + px as usize;
+            let y = sb_y * 4 + py as usize;
+            if x < size && y < size {
+                let idx = y * size + x;
+                let v = match override_coeff {
+                    Some((oi, ov)) if oi == idx => ov,
+                    _ => coeffs[idx],
+                };
+                *slot = v;
+                sig_mask |= ((v != 0) as u16) << n;
+            }
+        }
 
         let right_coded = sb_x + 1 < sb_width && coded_sb_flags[sb_y][sb_x + 1];
         let below_coded = sb_y + 1 < sb_width && coded_sb_flags[sb_y + 1][sb_x];
         let csbf_neighbors = (right_coded as u8) | ((below_coded as u8) << 1);
 
         // Does this sub-block contain any significant coefficient?
-        let sb_has_sig = scan_pos.iter().any(|&(px, py)| {
-            let x = sb_x * 4 + px as usize;
-            let y = sb_y * 4 + py as usize;
-            x < size && y < size && at(x, y) != 0
-        });
+        let sb_has_sig = sig_mask != 0;
 
         let (sb_coded, infer_sb_dc_sig) = if sb_idx > 0 && sb_idx < last_sb_idx {
             encode_coded_sub_block_flag(sink, ctxs, c_idx, csbf_neighbors, sb_has_sig);
@@ -737,17 +1294,9 @@ impl SubBlockCfg<'_> {
             15
         };
 
-        // Significance of each scan position within the sub-block.
-        let mut sig = [false; 16];
-        let coeff_at = |n: usize| -> i16 {
-            let (px, py) = scan_pos[n];
-            let x = sb_x * 4 + px as usize;
-            let y = sb_y * 4 + py as usize;
-            if x < size && y < size { at(x, y) } else { 0 }
-        };
-        for n in 0..=start_pos {
-            sig[n] = coeff_at(n) != 0;
-        }
+        // Significance test for a scan position, read from `sig_mask` (bits
+        // above `start_pos` are 0 since those coefficients are zero).
+        let sig = |n: usize| -> bool { (sig_mask >> n) & 1 != 0 };
 
         // last_coeff: positions whose sig_coeff_flag is explicitly coded.
         let last_coeff = if sb_idx == last_sb_idx {
@@ -757,40 +1306,44 @@ impl SubBlockCfg<'_> {
             15
         };
 
+        // Precomputed sig_coeff_flag context index per scan position (index 0 =
+        // DC), replacing the per-bin `calc_sig_coeff_flag_ctx`.
+        let sig_ctx = sig_ctx_row(
+            log2_size,
+            c_idx,
+            scan_idx,
+            sb_x == 0 && sb_y == 0,
+            prev_csbf,
+        );
+
         for n in (1..=last_coeff).rev() {
-            let (px, py) = scan_pos[n];
-            let xc = sb_x as u8 * 4 + px;
-            let yc = sb_y as u8 * 4 + py;
-            let ci = calc_sig_coeff_flag_ctx(xc, yc, log2_size, c_idx, scan_idx, prev_csbf);
-            sink.encode_bin(sig[n] as u8, ctxs.get(ci));
+            let ci = sig_ctx[n] as usize;
+            sink.encode_bin(sig(n) as u8, ctxs.get(ci));
         }
 
         // DC (position 0): coded unless it is the known last coeff, or unless
         // the decoder infers it (middle coded sub-block with no other sig).
         if start_pos > 0 {
-            let others_sig = (1..=last_coeff).any(|n| sig[n]);
+            // Any explicitly-coded significant coeff above DC (positions 1..=last_coeff).
+            let others_mask = (((1u32 << (last_coeff + 1)) - 1) as u16) & !1u16;
+            let others_sig = sig_mask & others_mask != 0;
             let can_infer_dc = infer_sb_dc_sig && !others_sig;
             if !can_infer_dc {
-                let ci = calc_sig_coeff_flag_ctx(
-                    sb_x as u8 * 4,
-                    sb_y as u8 * 4,
-                    log2_size,
-                    c_idx,
-                    scan_idx,
-                    prev_csbf,
-                );
-                sink.encode_bin(sig[0] as u8, ctxs.get(ci));
+                let ci = sig_ctx[0] as usize;
+                sink.encode_bin(sig(0) as u8, ctxs.get(ci));
             }
         }
 
-        // Collect significant positions (high scan pos -> low).
+        // Collect significant positions (high scan pos -> low) straight from the
+        // mask: clear the highest set bit each iteration.
         let mut sig_positions = [0usize; 16];
         let mut n_sig = 0usize;
-        for n in (0..=start_pos).rev() {
-            if sig[n] {
-                sig_positions[n_sig] = n;
-                n_sig += 1;
-            }
+        let mut m = sig_mask & (((1u32 << (start_pos + 1)) - 1) as u16);
+        while m != 0 {
+            let n = 15 - m.leading_zeros() as usize;
+            sig_positions[n_sig] = n;
+            n_sig += 1;
+            m &= !(1u16 << n);
         }
         if n_sig == 0 {
             return;
@@ -810,7 +1363,7 @@ impl SubBlockCfg<'_> {
         let mut needs_remaining = [false; 16];
 
         for (g1_count, &n) in sig_positions[..n_sig].iter().enumerate() {
-            let abs_level = coeff_at(n).unsigned_abs();
+            let abs_level = sb_coeff[n].unsigned_abs();
             if g1_count >= max_g1 {
                 // Beyond the first 8: base level 1, always send remaining.
                 rem_base[n] = 1;
@@ -849,7 +1402,7 @@ impl SubBlockCfg<'_> {
         }
 
         if let Some(g1_idx) = first_g1_idx {
-            let abs_level = coeff_at(g1_idx).unsigned_abs();
+            let abs_level = sb_coeff[g1_idx].unsigned_abs();
             let g2 = abs_level > 2;
             let ci = ctx::COEFF_ABS_LEVEL_GREATER2_FLAG
                 + if c_idx > 0 { 4 } else { 0 }
@@ -861,9 +1414,11 @@ impl SubBlockCfg<'_> {
             }
         }
 
-        // Sign data hiding decision (H.265 9.3.4.3).
-        let first_sig_pos = (0..=start_pos).find(|&n| sig[n]).unwrap();
-        let last_sig_pos = (0..=start_pos).rev().find(|&n| sig[n]).unwrap();
+        // Sign data hiding decision (H.265 9.3.4.3). `sig_mask` only has bits in
+        // 0..=start_pos and is non-zero here (n_sig > 0), so first/last
+        // significant positions are its lowest/highest set bit.
+        let first_sig_pos = sig_mask.trailing_zeros() as usize;
+        let last_sig_pos = 15 - sig_mask.leading_zeros() as usize;
         let sign_hidden = sign_data_hiding && (last_sig_pos - first_sig_pos) > 3;
 
         // Signs (bypass), high scan pos -> low; the lowest-pos sign is hidden.
@@ -874,7 +1429,7 @@ impl SubBlockCfg<'_> {
         if sign_bins > 0 {
             let mut signs = 0u32;
             for &n in &sig_positions[..sign_bins] {
-                signs = (signs << 1) | (coeff_at(n) < 0) as u32;
+                signs = (signs << 1) | (sb_coeff[n] < 0) as u32;
             }
             sink.encode_bins_ep(signs, sign_bins as u32);
         }
@@ -886,7 +1441,7 @@ impl SubBlockCfg<'_> {
                 continue;
             }
             let base_level = rem_base[n];
-            let value = (coeff_at(n).unsigned_abs() as i32 - base_level as i32) as u32;
+            let value = (sb_coeff[n].unsigned_abs() as i32 - base_level as i32) as u32;
             encode_coeff_abs_level_remaining(sink, value, rice_param);
             let full = base_level.unsigned_abs() as u32 + value;
             let threshold = 3u32 * (1 << rice_param);
@@ -1287,5 +1842,295 @@ fn encode_bypass_prefix_suffix<S: CabacSyntax>(
 fn encode_bypass_bits<S: CabacSyntax>(sink: &mut S, value: u32, n_bits: u8) {
     if n_bits > 0 {
         sink.encode_bins_ep(value, n_bits as u32);
+    }
+}
+
+#[cfg(test)]
+mod sig_ctx_tests {
+    use super::*;
+
+    /// The generated `SIG_CTX` table must equal the reference
+    /// `calc_sig_coeff_flag_ctx` for every legal input the residual traversal
+    /// can produce (all transform sizes, luma+both chroma planes, all scan
+    /// orders, every real sub-block position, and every neighbour-coded state).
+    /// This proves the `(sb_x,sb_y) -> is_dc_subblock` key reduction is exact.
+    #[test]
+    fn sig_ctx_table_matches_function() {
+        for log2_size in 2u8..=5 {
+            let sb_width = 1u8 << (log2_size - 2);
+            for c_idx in 0u8..=2 {
+                for scan_idx in 0u8..3 {
+                    let scan_pos = get_scan_4x4(scan_order_from_idx(scan_idx));
+                    for sb_x in 0..sb_width {
+                        for sb_y in 0..sb_width {
+                            let is_dc = sb_x == 0 && sb_y == 0;
+                            for prev_csbf in 0u8..4 {
+                                let row = sig_ctx_row(log2_size, c_idx, scan_idx, is_dc, prev_csbf);
+                                for (n, &(px, py)) in scan_pos.iter().enumerate() {
+                                    let x_c = sb_x * 4 + px;
+                                    let y_c = sb_y * 4 + py;
+                                    let expect = calc_sig_coeff_flag_ctx(
+                                        x_c, y_c, log2_size, c_idx, scan_idx, prev_csbf,
+                                    );
+                                    assert_eq!(
+                                        row[n] as usize, expect,
+                                        "log2={log2_size} c={c_idx} scan={scan_idx} \
+                                         sb=({sb_x},{sb_y}) prev={prev_csbf} n={n}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dc_only_shortcut_matches_full_estimator() {
+        for qp in [0, 22, 37] {
+            let base_ctxs = Contexts::new(qp);
+            for log2_size in 2u8..=5 {
+                let size = 1usize << log2_size;
+                for c_idx in 0u8..=2 {
+                    for scan_order in [
+                        ScanOrder::Diagonal,
+                        ScanOrder::Horizontal,
+                        ScanOrder::Vertical,
+                    ] {
+                        for sign_data_hiding in [false, true] {
+                            for level in [-9i16, -3, -2, -1, 1, 2, 3, 9] {
+                                let mut levels = vec![0i16; size * size];
+                                levels[0] = level;
+
+                                let mut full_scratch = ResidualPricingScratch::default();
+                                let full = estimate_residual_bits_into(
+                                    &base_ctxs,
+                                    &levels,
+                                    log2_size,
+                                    c_idx,
+                                    scan_order,
+                                    sign_data_hiding,
+                                    &mut full_scratch,
+                                );
+
+                                let direct = estimate_dc_only_residual_bits(
+                                    &base_ctxs, &levels, log2_size, c_idx,
+                                )
+                                .expect("DC-only level should use shortcut");
+                                assert_eq!(
+                                    direct, full,
+                                    "qp={qp} log2={log2_size} c={c_idx} scan={scan_order:?} \
+                                     sdh={sign_data_hiding} level={level}"
+                                );
+
+                                let mut nnz_scratch = ResidualPricingScratch::default();
+                                let via_public = estimate_residual_bits_into_nnz(
+                                    &base_ctxs,
+                                    &levels,
+                                    1,
+                                    log2_size,
+                                    c_idx,
+                                    scan_order,
+                                    sign_data_hiding,
+                                    &mut nnz_scratch,
+                                );
+                                assert_eq!(via_public, full);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sign_data_hiding_mask_path_matches_reference() {
+        for log2_size in 2u8..=5 {
+            let size = 1usize << log2_size;
+            let n = size * size;
+            let (scale, qbits) = crate::transform::quant_params(log2_size, 28, 8);
+            for scan_order in [
+                ScanOrder::Diagonal,
+                ScanOrder::Horizontal,
+                ScanOrder::Vertical,
+            ] {
+                for seed in 0usize..12 {
+                    let mut levels = vec![0i16; n];
+                    let mut coeffs = vec![0i16; n];
+                    for i in 0..n {
+                        let raw = ((i * 37 + seed * 53 + 11) % 2047) as i16 - 1023;
+                        coeffs[i] = if raw == 0 { 1 } else { raw };
+
+                        let hit = ((i * 13 + seed * 7) % 19) < 4 || (i + seed) % (size + 3) == 0;
+                        if hit {
+                            let mag = (((i * 5 + seed * 3) % 5) + 1) as i16;
+                            levels[i] = if (i + seed) & 1 == 0 { mag } else { -mag };
+                        }
+                    }
+
+                    if seed % 3 == 0 {
+                        levels[0] = 1;
+                        levels[(n - 1).min(15)] = -2;
+                    }
+                    if seed % 4 == 0 && n > 32 {
+                        levels[n - 1] = 3;
+                    }
+
+                    let nnz = levels.iter().filter(|&&v| v != 0).count() as u32;
+                    let mut got = levels.clone();
+                    let mut want = levels;
+
+                    let got_nnz = apply_sign_data_hiding(
+                        &mut got, &coeffs, log2_size, scan_order, scale, qbits, nnz,
+                    );
+                    let want_nnz = apply_sign_data_hiding_reference(
+                        &mut want, &coeffs, log2_size, scan_order, scale, qbits, nnz,
+                    );
+
+                    assert_eq!(
+                        got_nnz, want_nnz,
+                        "nnz log2={log2_size} scan={scan_order:?} seed={seed}"
+                    );
+                    assert_eq!(
+                        got, want,
+                        "levels log2={log2_size} scan={scan_order:?} seed={seed}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn apply_sign_data_hiding_reference(
+        levels: &mut [i16],
+        coeffs: &[i16],
+        log2_size: u8,
+        scan_order: ScanOrder,
+        scale: i64,
+        qbits: i32,
+        mut nnz: u32,
+    ) -> u32 {
+        const SBH_THRESHOLD: usize = 4;
+        let size = 1usize << log2_size;
+        let scan_sub = get_scan_sub_block(log2_size, scan_order);
+        let scan_pos = get_scan_4x4(scan_order);
+        let (last_sb_idx, last_pos_in_sb) = find_last_sig(levels, size, scan_sub, scan_pos);
+
+        let blk_pos = |sbx: usize, sby: usize, n: usize| -> Option<usize> {
+            let (px, py) = scan_pos[n];
+            let x = sbx * 4 + px as usize;
+            let y = sby * 4 + py as usize;
+            (x < size && y < size).then_some(y * size + x)
+        };
+        let delta_u = |levels: &[i16], blk: usize| -> i64 {
+            let tmp = (coeffs[blk].unsigned_abs() as i64) * scale;
+            let lvl = levels[blk].unsigned_abs() as i64;
+            (tmp - (lvl << qbits)) >> (qbits - 8)
+        };
+
+        for (sb_idx, &(sbx, sby)) in scan_sub.iter().enumerate() {
+            if sb_idx > last_sb_idx {
+                break;
+            }
+            let sbx = sbx as usize;
+            let sby = sby as usize;
+
+            let mut first_nz = None;
+            let mut last_nz = 0usize;
+            for n in 0..16 {
+                if let Some(blk) = blk_pos(sbx, sby, n) {
+                    if levels[blk] != 0 {
+                        if first_nz.is_none() {
+                            first_nz = Some(n);
+                        }
+                        last_nz = n;
+                    }
+                }
+            }
+            let first_nz = match first_nz {
+                Some(f) => f,
+                None => continue,
+            };
+            if last_nz - first_nz < SBH_THRESHOLD {
+                continue;
+            }
+
+            let first_blk = blk_pos(sbx, sby, first_nz).unwrap();
+            let signbit = if levels[first_blk] > 0 { 0u32 } else { 1 };
+            let mut abs_sum: i64 = 0;
+            for n in first_nz..=last_nz {
+                if let Some(blk) = blk_pos(sbx, sby, n) {
+                    abs_sum += levels[blk].unsigned_abs() as i64;
+                }
+            }
+            if signbit == (abs_sum as u32 & 1) {
+                continue;
+            }
+
+            let cand_max = if sb_idx == last_sb_idx {
+                last_pos_in_sb
+            } else {
+                15
+            };
+            let mut min_cost = i64::MAX;
+            let mut final_change = 0i32;
+            let mut min_blk = usize::MAX;
+            for n in (0..=cand_max).rev() {
+                let blk = match blk_pos(sbx, sby, n) {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let cur_sig = levels[blk] != 0;
+                let lower_sig =
+                    (0..n).any(|m| blk_pos(sbx, sby, m).is_some_and(|b| levels[b] != 0));
+                let du = delta_u(levels, blk);
+                let (cost, change) = if cur_sig {
+                    if du > 0 {
+                        (-du, 1)
+                    } else if !lower_sig && levels[blk].unsigned_abs() == 1 {
+                        (i64::MAX, 0)
+                    } else {
+                        (du, -1)
+                    }
+                } else if !lower_sig {
+                    let this_sign = if coeffs[blk] >= 0 { 0u32 } else { 1 };
+                    if this_sign != signbit {
+                        (i64::MAX, 0)
+                    } else {
+                        (-du, 1)
+                    }
+                } else {
+                    (-du, 1)
+                };
+                if cost < min_cost {
+                    min_cost = cost;
+                    final_change = change;
+                    min_blk = blk;
+                }
+            }
+            if min_blk == usize::MAX || final_change == 0 {
+                min_blk = first_blk;
+                final_change = 1;
+            }
+
+            if levels[min_blk] == 32767 || levels[min_blk] == -32768 {
+                final_change = -1;
+            }
+
+            if levels[min_blk] == 0 {
+                nnz += 1;
+                levels[min_blk] = if coeffs[min_blk] >= 0 { 1 } else { -1 };
+            } else {
+                let sign = levels[min_blk].signum() as i32;
+                let new_abs = levels[min_blk].unsigned_abs() as i32 + final_change;
+                if new_abs == 0 {
+                    nnz -= 1;
+                    levels[min_blk] = 0;
+                } else {
+                    levels[min_blk] = (sign * new_abs) as i16;
+                }
+            }
+        }
+        nnz
     }
 }

@@ -386,7 +386,9 @@ pub fn intra_pred_allangs(
     c_idx: u8,
     bit_depth: u8,
 ) {
-    allangs_into::<u16>(dst, unfiltered, filtered, center, log2_size, c_idx, bit_depth);
+    allangs_into::<u16>(
+        dst, unfiltered, filtered, center, log2_size, c_idx, bit_depth,
+    );
 }
 
 /// Output sample type for the angular predictors. Values are always clamped to
@@ -641,7 +643,9 @@ pub fn pred_allangs_u8(
     let n = 1usize << log2_size;
     let total = super::intra::angs::ANGULAR_MODES * n * n;
     debug_assert!(dst.len() >= total);
-    allangs_into::<u8>(dst, unfiltered, filtered, center, log2_size, c_idx, bit_depth);
+    allangs_into::<u8>(
+        dst, unfiltered, filtered, center, log2_size, c_idx, bit_depth,
+    );
 }
 
 // ─── Phase 4: coefficient/residual tools ──────────────────────────────────

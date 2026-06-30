@@ -13,8 +13,8 @@ use super::types::{QG_LOG2, chroma_qp_from_luma};
 
 /// Adaptive-quantization writer state — the encoder-side mirror of the decoder's
 /// `decode_quantization_parameters` QP-prediction machine
-/// (`bpg-hevc-decode::hevc::ctu`). Inert (`active == false`) on the byte-exact
-/// reference tiers; otherwise every field tracks the decoder's
+/// (`bpg-hevc-decode::hevc::ctu`). Inert (`active == false`) for uniform-QP
+/// encodes; otherwise every field tracks the decoder's
 /// per-quantization-group state in decoding order so that the `cu_qp_delta` the
 /// encoder emits resolves, on the decoder, back to the exact QP the encoder
 /// quantized with.
@@ -28,7 +28,7 @@ use super::types::{QG_LOG2, chroma_qp_from_luma};
 /// (not CU-boundary), exactly as the decoder does.
 #[derive(Clone)]
 pub(super) struct AqState {
-    /// Adaptive QP active for this encode (every non-reference tier).
+    /// Adaptive QP active for this encode.
     pub(super) active: bool,
     /// `6 * (bit_depth − 8)` — the QP bit-depth offset (H.265 8.6.1). All
     /// prediction arithmetic is in the *without-offset* `QpY` domain `[0,51]`
@@ -40,6 +40,11 @@ pub(super) struct AqState {
     pub(super) current_qpy: i32,
     /// `lastQpYinPrevQG` — `current_qpy` as of the previous quantization group.
     pub(super) last_qpy_prev_qg: i32,
+    /// libbpg/FFmpeg-style rolling QP predictor, updated when a CU ends exactly
+    /// on a QG boundary.
+    pub(super) qpy_pred: i32,
+    /// Whether the next QG is the first QP group in the slice.
+    pub(super) first_qp_group: bool,
     /// Top-left luma position of the current quantization group (or −1 / unset).
     pub(super) qg_x: i32,
     pub(super) qg_y: i32,
@@ -53,6 +58,11 @@ pub(super) struct AqState {
     pub(super) pred: i32,
     /// Target `QpY` (without offset) for the CU currently being written.
     pub(super) cu_target: i32,
+    /// Current CU geometry, needed to mirror the decoder's CU-level QP-map
+    /// writes before and after the first coded TU carries `cu_qp_delta`.
+    pub(super) cu_x: u32,
+    pub(super) cu_y: u32,
+    pub(super) cu_log2_size: u8,
     /// Memo for [`Encoder::aq_qg_target`]: the QG origin (`& !31`) the cached
     /// `target` was computed for, or `(-1, -1)` when unset. The QG target is a
     /// pure function of QG position (slice QP + importance), so it is computed
@@ -64,8 +74,7 @@ pub(super) struct AqState {
 }
 
 impl AqState {
-    /// The inert state used off the adaptive-QP path (the reference tiers, and
-    /// parallel workers, which only run on the `Placebo` tier).
+    /// The inert state used off the adaptive-QP path and by parallel workers.
     pub(super) fn inert() -> Self {
         AqState {
             active: false,
@@ -73,12 +82,17 @@ impl AqState {
             slice_qp_y: 0,
             current_qpy: 0,
             last_qpy_prev_qg: 0,
+            qpy_pred: 0,
+            first_qp_group: true,
             qg_x: -1,
             qg_y: -1,
             coded: false,
             cu_qp_delta: 0,
             pred: 0,
             cu_target: 0,
+            cu_x: 0,
+            cu_y: 0,
+            cu_log2_size: 0,
             target_qg: (-1, -1),
             target: 0,
         }
@@ -92,6 +106,8 @@ impl AqState {
     pub(super) fn reset_for_slice(&mut self) {
         self.current_qpy = self.slice_qp_y;
         self.last_qpy_prev_qg = self.slice_qp_y;
+        self.qpy_pred = self.slice_qp_y;
+        self.first_qp_group = true;
         self.qg_x = -1;
         self.qg_y = -1;
         self.coded = false;
@@ -121,20 +137,55 @@ impl<'a> super::Encoder<'a> {
         let mask = (1u32 << QG_LOG2) - 1;
         let (qx, qy) = ((x0 & !mask) as i32, (y0 & !mask) as i32);
         if (qx, qy) != self.aq.target_qg {
-            let offset = if let Some((perceptual, strength)) = self.best_aq {
-                // `Best` bidirectional variance AQ: steer on the cell's raw
-                // local complexity, around the picture mean (rate-neutral).
-                let var = self.analysis.variance_at(qx as u32, qy as u32);
-                crate::preanalysis::aq_qp_offset_variance(
-                    var,
-                    self.analysis.frame_mean_log2var(),
-                    strength,
-                    perceptual,
-                )
+            let offset = if let Some(map) = &self.aq_offset_map {
+                // Experiment path: immutable external per-QG offset map.
+                map.offset_at(qx as u32, qy as u32)
             } else {
-                // Default tiers: one-directional perceptual importance offset.
-                let imp = self.analysis.importance_at(qx as u32, qy as u32, QG_LOG2);
-                crate::preanalysis::aq_qp_offset(imp)
+                use crate::AqMode::*;
+                use crate::preanalysis as pre;
+                let analysis = &self.analysis;
+                let (qx, qy) = (qx as u32, qy as u32);
+                let strength = self.aq_strength;
+                let clamp = self.aq_clamp;
+                match self.aq_mode {
+                    Off => 0,
+                    LegacyShrink => {
+                        // One-directional importance shrink (legacy default).
+                        let imp = analysis.importance_at(qx, qy, QG_LOG2);
+                        pre::aq_qp_offset(imp)
+                    }
+                    Perceptual => pre::aq_qp_offset_variance(
+                        analysis.variance_at(qx, qy),
+                        analysis.frame_mean_log2var(),
+                        strength,
+                        true,
+                        clamp,
+                    ),
+                    PsnrProbe => pre::aq_qp_offset_variance(
+                        analysis.variance_at(qx, qy),
+                        analysis.frame_mean_log2var(),
+                        strength,
+                        false,
+                        clamp,
+                    ),
+                    PerceptualChroma => pre::aq_qp_offset_chroma(
+                        analysis.variance_at(qx, qy),
+                        analysis.chroma_activity_at(qx, qy),
+                        analysis.frame_mean_log2activity(),
+                        strength,
+                        clamp,
+                    ),
+                    PositiveProbe => pre::aq_qp_offset_positive(
+                        analysis.variance_at(qx, qy),
+                        analysis.frame_min_log2var(),
+                        analysis.frame_max_log2var(),
+                        clamp,
+                    ),
+                    // Two-pass measured AQ always supplies an in-memory
+                    // `aq_offset_map` for pass 2 (handled by the branch above);
+                    // with no map it degrades to uniform.
+                    TwoPassMeasured => 0,
+                }
             };
             self.aq.target = (self.aq.slice_qp_y + offset).clamp(0, 51);
             self.aq.target_qg = (qx, qy);
@@ -183,7 +234,10 @@ impl<'a> super::Encoder<'a> {
     /// At a coding-unit (leaf) start in the writer: compute `qPY_PRED` from the
     /// QG-boundary neighbours and the current (possibly already-coded) QG delta,
     /// exactly as `decode_quantization_parameters`, and record the CU's target.
-    pub(super) fn aq_cu_begin(&mut self, cu_x: u32, cu_y: u32) {
+    pub(super) fn aq_cu_begin(&mut self, cu_x: u32, cu_y: u32, cu_log2_size: u8) {
+        self.aq.cu_x = cu_x;
+        self.aq.cu_y = cu_y;
+        self.aq.cu_log2_size = cu_log2_size;
         let qg_mask = (1u32 << QG_LOG2) - 1;
         let x_qg = (cu_x & !qg_mask) as i32;
         let y_qg = (cu_y & !qg_mask) as i32;
@@ -193,26 +247,25 @@ impl<'a> super::Encoder<'a> {
             self.aq.qg_y = y_qg;
         }
 
-        // qPY_PRED initial: slice QP at the first QG of the slice (entropy-sync /
-        // WPP is disabled here, so the first-CTB-row case never applies), else the
-        // last QP of the previous QG.
-        let first_qg_in_slice = x_qg == 0 && y_qg == 0;
-        let pred0 = if first_qg_in_slice {
+        // libbpg/FFmpeg get_qPy_pred(): start from the slice QP for the first
+        // QP group, otherwise from the rolling qPy_pred saved at QG boundaries.
+        let pred0 = if self.aq.first_qp_group || (x_qg == 0 && y_qg == 0) {
             self.aq.slice_qp_y
         } else {
-            self.aq.last_qpy_prev_qg
+            self.aq.qpy_pred
         };
 
         let ctb_size = 1u32 << super::types::CTB_LOG2;
         let ctb_x = cu_x / ctb_size;
         let ctb_y = cu_y / ctb_size;
+        let ctb_mask = ctb_size - 1;
 
-        // qpYA (left): available only when the QG-left neighbour is in the same CTB.
-        let qp_y_a = if x_qg > 0 {
+        // qpYA/qpYB availability follows libbpg: the CU base and QG base must
+        // both be nonzero within the current CTB.
+        let qp_y_a = if x_qg > 0 && (cu_x & ctb_mask) != 0 && ((x_qg as u32) & ctb_mask) != 0 {
             let left_x = (x_qg as u32) - 1;
             let left_ctb_x = left_x / ctb_size;
-            let our_ctb_x = cu_x / ctb_size;
-            if (our_ctb_x == left_ctb_x || (x_qg as u32) < ctb_size) && left_ctb_x == ctb_x {
+            if left_ctb_x == ctb_x {
                 self.aq_get_qpy_at(left_x, y_qg as u32)
             } else {
                 pred0
@@ -221,8 +274,7 @@ impl<'a> super::Encoder<'a> {
             pred0
         };
 
-        // qpYB (above): available only when the QG-above neighbour is in the same CTB.
-        let qp_y_b = if y_qg > 0 {
+        let qp_y_b = if y_qg > 0 && (cu_y & ctb_mask) != 0 && ((y_qg as u32) & ctb_mask) != 0 {
             let above_y = (y_qg as u32) - 1;
             if above_y / ctb_size == ctb_y {
                 self.aq_get_qpy_at(x_qg as u32, above_y)
@@ -237,6 +289,22 @@ impl<'a> super::Encoder<'a> {
         self.aq.pred = pred;
         self.aq.current_qpy = self.aq_resolve_qpy(pred, self.aq.cu_qp_delta);
         self.aq.cu_target = self.aq_qg_target(cu_x, cu_y);
+        self.frame
+            .store_block_qp(cu_x, cu_y, 1u32 << cu_log2_size, self.aq.current_qpy as i8);
+    }
+
+    /// Finish the QP state update that libbpg performs after both
+    /// `hls_coding_unit` and split `hls_coding_quadtree` nodes: when the node's
+    /// bottom-right corner lands on a QG boundary, its resolved QP becomes the
+    /// rolling prediction for later QGs. The split-node case matters on
+    /// partially outside picture edges, where forced splits can otherwise leave
+    /// the predictor one QG behind stock/libbpg.
+    pub(super) fn aq_node_end(&mut self, x0: u32, y0: u32, log2_size: u8) {
+        let mask = (1u32 << QG_LOG2) - 1;
+        let size = 1u32 << log2_size;
+        if ((x0 + size) & mask) == 0 && ((y0 + size) & mask) == 0 {
+            self.aq.qpy_pred = self.aq.current_qpy;
+        }
     }
 
     /// At the CU's first coded TU: resolve and record the QG's `cu_qp_delta`
@@ -246,8 +314,17 @@ impl<'a> super::Encoder<'a> {
     pub(super) fn aq_take_cu_qp_delta(&mut self) -> i32 {
         let delta = self.aq.cu_target - self.aq.pred;
         self.aq.coded = true;
+        if self.aq.first_qp_group || (self.aq.qg_x == 0 && self.aq.qg_y == 0) {
+            self.aq.first_qp_group = false;
+        }
         self.aq.cu_qp_delta = delta;
         self.aq.current_qpy = self.aq_resolve_qpy(self.aq.pred, delta);
+        self.frame.store_block_qp(
+            self.aq.cu_x,
+            self.aq.cu_y,
+            1u32 << self.aq.cu_log2_size,
+            self.aq.current_qpy as i8,
+        );
         delta
     }
 }

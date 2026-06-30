@@ -218,3 +218,129 @@ pub fn reconstruct_residual_into(
     dequantize(coeffs, log2_size, qp, bit_depth);
     inverse_transform_into(coeffs, log2_size, is_intra_4x4_luma, bit_depth, residual);
 }
+
+#[cfg(test)]
+mod fwd_ref_tests {
+    //! Independent reference check of the forward transform's two-stage integer
+    //! shift/rounding against `forward_transform`. A per-coefficient mismatch
+    //! here would read as the flat, bitrate-independent luma gap to x265.
+    use super::*;
+
+    // Canonical HEVC integer DCT matrices (rows = frequencies).
+    const DCT4: [[i32; 4]; 4] = [
+        [64, 64, 64, 64],
+        [83, 36, -36, -83],
+        [64, -64, -64, 64],
+        [36, -83, 83, -36],
+    ];
+    // HEVC DST-VII (intra 4x4 luma).
+    const DST4: [[i32; 4]; 4] = [
+        [29, 55, 74, 84],
+        [74, 74, 0, -74],
+        [84, -29, -74, 55],
+        [55, -84, 74, -29],
+    ];
+    const DCT8: [[i32; 8]; 8] = [
+        [64, 64, 64, 64, 64, 64, 64, 64],
+        [89, 75, 50, 18, -18, -50, -75, -89],
+        [83, 36, -36, -83, -83, -36, 36, 83],
+        [75, -18, -89, -50, 50, 89, 18, -75],
+        [64, -64, -64, 64, 64, -64, -64, 64],
+        [50, -89, 18, 75, -75, -18, 89, -50],
+        [36, -83, 83, -36, -36, 83, -83, 36],
+        [18, -50, 75, -89, 89, -75, 50, -18],
+    ];
+
+    /// Reference 2-D forward transform with HEVC shifts:
+    /// pass1 shift = log2 - 1 + (bd-8); pass2 shift = log2 + 6. Output is
+    /// row-major coeff[freq_y * n + freq_x].
+    fn reference_fwd(
+        residual: &[i16],
+        mat: &dyn Fn(usize, usize) -> i32,
+        n: usize,
+        bd: i32,
+    ) -> Vec<i32> {
+        let log2 = (n.trailing_zeros()) as i32;
+        let shift1 = log2 - 1 + (bd - 8);
+        let shift2 = log2 + 6;
+        let add1 = if shift1 > 0 { 1i64 << (shift1 - 1) } else { 0 };
+        let add2 = 1i64 << (shift2 - 1);
+        // Pass 1: transform rows -> tmp[y][kx]
+        let mut tmp = vec![0i64; n * n];
+        for y in 0..n {
+            for kx in 0..n {
+                let mut acc = 0i64;
+                for x in 0..n {
+                    acc += mat(kx, x) as i64 * residual[y * n + x] as i64;
+                }
+                tmp[y * n + kx] = (acc + add1) >> shift1;
+            }
+        }
+        // Pass 2: transform columns -> out[ky][kx]
+        let mut out = vec![0i32; n * n];
+        for kx in 0..n {
+            for ky in 0..n {
+                let mut acc = 0i64;
+                for y in 0..n {
+                    acc += mat(ky, y) as i64 * tmp[y * n + kx];
+                }
+                out[ky * n + kx] = ((acc + add2) >> shift2) as i32;
+            }
+        }
+        out
+    }
+
+    fn run_case(n: usize, is_dst: bool, seed: u64) {
+        let log2 = n.trailing_zeros() as u8;
+        // Deterministic pseudo-random residual in [-255,255].
+        let mut st = seed;
+        let mut res = vec![0i16; n * n];
+        for v in res.iter_mut() {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *v = ((st >> 33) as i32 % 511 - 255) as i16;
+        }
+        let rust = forward_transform(&res, log2, is_dst, 8);
+        let getm = |k: usize, x: usize| -> i32 {
+            if is_dst {
+                DST4[k][x]
+            } else if n == 4 {
+                DCT4[k][x]
+            } else {
+                DCT8[k][x]
+            }
+        };
+        let reference = reference_fwd(&res, &getm, n, 8);
+        let mut max_diff = 0i32;
+        let mut n_diff = 0usize;
+        for i in 0..n * n {
+            let d = (rust[i] as i32 - reference[i]).abs();
+            if d != 0 {
+                n_diff += 1;
+            }
+            max_diff = max_diff.max(d);
+        }
+        eprintln!(
+            "fwd_ref n={n} dst={is_dst} seed={seed}: max_diff={max_diff} n_diff={n_diff}/{}",
+            n * n
+        );
+        if max_diff > 0 {
+            eprintln!("  rust[0..8]={:?}", &rust[..8.min(rust.len())]);
+            eprintln!("  ref [0..8]={:?}", &reference[..8.min(reference.len())]);
+        }
+        assert_eq!(
+            max_diff, 0,
+            "rust forward transform != HEVC reference (n={n}, dst={is_dst})"
+        );
+    }
+
+    #[test]
+    fn forward_transform_matches_hevc_reference() {
+        for seed in [1u64, 42, 12345] {
+            run_case(4, false, seed); // 4x4 DCT
+            run_case(4, true, seed); // 4x4 DST (intra luma)
+            run_case(8, false, seed); // 8x8 DCT
+        }
+    }
+}

@@ -23,6 +23,7 @@ use super::emit;
 use super::eval::{QuantMode, ResidualPricingMode};
 use super::overlay::OverlayCache;
 use super::plan::{CuLeafPlan, CuPlan, ParentChromaPlan, TtPlan};
+use super::price::rd_lambda;
 use super::source::CtuSourceCache;
 
 impl<S, O> StillSearchDepth<S, O>
@@ -34,12 +35,11 @@ where
     /// finalized plan (RDOQ coeffs/CBFs) and leaving RDOQ recon in the overlay.
     pub(super) fn finalize_cu(
         &mut self,
-        state: &Encoder<'_>,
+        state: &mut Encoder<'_>,
         plan: CuPlan,
         x0: u32,
         y0: u32,
         log2_cb_size: u8,
-        lambda: f64,
     ) -> CuPlan {
         match plan {
             CuPlan::Split { kids } => {
@@ -57,52 +57,53 @@ where
                 let mut kids = kids.into_iter();
 
                 if let Some(kid) = kids.next() {
-                    out.push(self.finalize_cu(state, kid, x0, y0, kid_log2, lambda));
+                    out.push(self.finalize_cu(state, kid, x0, y0, kid_log2));
                 }
                 if x1 < state.display_width {
                     if let Some(kid) = kids.next() {
-                        out.push(self.finalize_cu(state, kid, x1, y0, kid_log2, lambda));
+                        out.push(self.finalize_cu(state, kid, x1, y0, kid_log2));
                     }
                 }
                 if y1 < state.display_height {
                     if let Some(kid) = kids.next() {
-                        out.push(self.finalize_cu(state, kid, x0, y1, kid_log2, lambda));
+                        out.push(self.finalize_cu(state, kid, x0, y1, kid_log2));
                     }
                 }
                 if x1 < state.display_width && y1 < state.display_height {
                     if let Some(kid) = kids.next() {
-                        out.push(self.finalize_cu(state, kid, x1, y1, kid_log2, lambda));
+                        out.push(self.finalize_cu(state, kid, x1, y1, kid_log2));
                     }
                 }
                 CuPlan::Split { kids: out }
             }
             CuPlan::Leaf(leaf) => {
-                CuPlan::Leaf(self.finalize_cu_leaf(state, leaf, x0, y0, log2_cb_size, lambda))
+                CuPlan::Leaf(self.finalize_cu_leaf(state, leaf, x0, y0, log2_cb_size))
             }
         }
     }
 
     fn finalize_cu_leaf(
         &mut self,
-        state: &Encoder<'_>,
+        state: &mut Encoder<'_>,
         leaf: CuLeafPlan,
         x0: u32,
         y0: u32,
         log2_cb_size: u8,
-        lambda: f64,
     ) -> CuLeafPlan {
-        let tt = self.finalize_tt(state, leaf.tt, x0, y0, log2_cb_size, lambda);
+        if state.aq.active {
+            state.aq_set_cu_qp(x0, y0);
+        }
+        let tt = self.finalize_tt(state, leaf.tt, x0, y0, log2_cb_size);
         CuLeafPlan { tt, ..leaf }
     }
 
     fn finalize_tt(
         &mut self,
-        state: &Encoder<'_>,
+        state: &mut Encoder<'_>,
         tt: TtPlan,
         x0: u32,
         y0: u32,
         log2_size: u8,
-        lambda: f64,
     ) -> TtPlan {
         match tt {
             // A leaf carries its own luma mode (a PartNxN PU stores its per-PU
@@ -110,6 +111,10 @@ where
             // `code_split_flag` argument only affects the returned cost, which
             // the finalizer discards, so `false` is fine.
             TtPlan::Leaf(l) => {
+                if state.aq.active {
+                    state.aq_set_cu_qp(x0, y0);
+                }
+                let lambda = rd_lambda(state.cur_qp_y);
                 let (new_tt, _) = self.eval_tt_leaf(
                     state,
                     x0,
@@ -119,7 +124,11 @@ where
                     l.luma_mode,
                     false,
                     lambda,
-                    QuantMode::RdoqFinal,
+                    if super::env::final_rdoq_enabled() {
+                        QuantMode::RdoqFinal
+                    } else {
+                        QuantMode::HardQuantSearch
+                    },
                     ResidualPricingMode::Exact,
                     true,
                     super::tu::TtEvalScope::FullComponents,
@@ -138,12 +147,12 @@ where
                 let offs = [(0, 0), (half, 0), (0, half), (half, half)];
                 let mut new_kids = Vec::with_capacity(4);
                 for (kid, (dx, dy)) in kids.into_iter().zip(offs) {
-                    new_kids.push(self.finalize_tt(state, kid, x0 + dx, y0 + dy, kid_log2, lambda));
+                    new_kids.push(self.finalize_tt(state, kid, x0 + dx, y0 + dy, kid_log2));
                 }
                 // Chroma at the split node (PartNxN 4:2:0/4:2:2 parent chroma)
                 // is coded after the luma sub-blocks, matching decoder order.
                 let new_parent =
-                    parent_chroma.map(|pc| self.finalize_parent_chroma(state, x0, y0, pc, lambda));
+                    parent_chroma.map(|pc| self.finalize_parent_chroma(state, x0, y0, pc));
                 let cbf_cb = new_kids.iter().any(TtPlan::cbf_cb)
                     || new_parent.as_ref().is_some_and(|p| p.cb.cbf);
                 let cbf_cr = new_kids.iter().any(TtPlan::cbf_cr)
@@ -170,12 +179,15 @@ where
     /// `eval_part_nxn_parent_chroma_subsampled`'s geometry.
     fn finalize_parent_chroma(
         &mut self,
-        state: &Encoder<'_>,
+        state: &mut Encoder<'_>,
         x0: u32,
         y0: u32,
         pc: ParentChromaPlan,
-        lambda: f64,
     ) -> ParentChromaPlan {
+        if state.aq.active {
+            state.aq_set_cu_qp(x0, y0);
+        }
+        let lambda = rd_lambda(state.cur_qp_y);
         let clog2 = pc.log2_size;
         let cx = x0 / 2;
         let cy = if state.cat == 1 { y0 / 2 } else { y0 };
@@ -183,7 +195,11 @@ where
         let pred_mode = IntraPredMode::from_u8(chroma_pred_mode(state.cat, pc.chroma_mode))
             .unwrap_or(IntraPredMode::Dc);
         let qp_c = state.cur_qp_c;
-        let m = QuantMode::RdoqFinal;
+        let m = if super::env::final_rdoq_enabled() {
+            QuantMode::RdoqFinal
+        } else {
+            QuantMode::HardQuantSearch
+        };
 
         let cb0 = self.eval_component(
             state,

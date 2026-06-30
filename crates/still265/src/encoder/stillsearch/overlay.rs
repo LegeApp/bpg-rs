@@ -143,7 +143,10 @@ impl ReconOverlay8 {
         #[cfg(feature = "overlay-probe")]
         {
             OVL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            OVL_ITERS.fetch_add(self.patches.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            OVL_ITERS.fetch_add(
+                self.patches.len() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             if c_idx != 0 {
                 OVL_CALLS_CHROMA.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }

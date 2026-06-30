@@ -88,14 +88,13 @@ where
         self.source.reset_from_ctu(state, x0, y0, log2_cb_size);
         self.overlay.clear();
 
-        let lambda = super::price::rd_lambda(state.cur_qp_y);
         let (plan, _cost) = self.decide_cu(state, x0, y0, log2_cb_size, ct_depth);
 
         // Winner-only RDOQ finalize: discard the hard-quant trial recon, then
         // re-code the chosen plan in decoder order with RDOQ, rebuilding coeffs/
         // recon/CBFs. Search decided the structure; this only refines coding.
         self.overlay.clear();
-        let plan = self.finalize_cu(state, plan, x0, y0, log2_cb_size, lambda);
+        let plan = self.finalize_cu(state, plan, x0, y0, log2_cb_size);
 
         let final_commit_timer = StillSearchLedger::start_timer();
         self.overlay.commit_to_frame(&mut state.frame);
@@ -279,14 +278,16 @@ where
             &refs.uf
         };
         match mode {
-            bpg_hevc_decode::hevc::slice::IntraPredMode::Planar => crate::primitives::pred_planar_u8(
-                dst,
-                border,
-                refs.center,
-                log2_size,
-                c_idx,
-                refs.bit_depth,
-            ),
+            bpg_hevc_decode::hevc::slice::IntraPredMode::Planar => {
+                crate::primitives::pred_planar_u8(
+                    dst,
+                    border,
+                    refs.center,
+                    log2_size,
+                    c_idx,
+                    refs.bit_depth,
+                )
+            }
             bpg_hevc_decode::hevc::slice::IntraPredMode::Dc => crate::primitives::pred_dc_u8(
                 dst,
                 border,
@@ -328,6 +329,7 @@ where
 /// Prebuilt intra reference borders for one block, reusable across all candidate
 /// modes while the overlay is unchanged. The borders are fixed-size stack arrays
 /// (no heap), so copying/holding one is cheap.
+#[derive(Clone, Copy)]
 pub(super) struct IntraRefs {
     pub(super) uf: [i32; bpg_hevc_decode::hevc::intra::INTRA_BORDER_LEN],
     pub(super) ft: [i32; bpg_hevc_decode::hevc::intra::INTRA_BORDER_LEN],

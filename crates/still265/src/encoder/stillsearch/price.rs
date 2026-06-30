@@ -4,8 +4,14 @@ use crate::cabac::{CabacEstimator, ContextModel};
 use crate::contexts::{Contexts, ctx};
 
 /// HEVC luma RD lambda (HM/x265 `0.57 * 2^((qp-12)/3)`), in pixel-SSE units.
+///
+/// `BPG_STILLSEARCH_LAMBDA_SCALE` is an explicit quality/bitrate diagnostic
+/// knob: values below 1.0 spend more bits for lower distortion, values above
+/// 1.0 save bits. It is deliberately process-global/cached like the other
+/// StillSearch env gates; set it before starting an encode.
 pub(super) fn rd_lambda(qp: i32) -> f64 {
-    0.57f64 * 2f64.powf((qp as f64 - 12.0) / 3.0)
+    let base = 0.57f64 * 2f64.powf((qp as f64 - 12.0) / 3.0);
+    base * super::env::lambda_scale()
 }
 
 /// x265 SAD-domain lambda used by `calcRdSADCost` during RMD/SA8D ranking.

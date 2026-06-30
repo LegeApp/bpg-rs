@@ -37,11 +37,11 @@ pub use intra::angs as intra_angs;
 pub use scalar::{
     abs_sum_i16_scalar, add_clip_u8_scalar, add_clip_u16_scalar, count_nonzero_scalar,
     dequantize_scalar, forward_dct_1d, fwd_dct4_butterfly, fwd_dct4_scalar, fwd_dct8_butterfly,
-    fwd_dct8_scalar, fwd_dct16_butterfly, fwd_dct16_scalar, fwd_dct32_butterfly,
-    fwd_dct32_scalar, fwd_dst4_scalar, last_nonzero_scalar, narrow_u16_to_u8_scalar,
-    quantize_scalar, sa8d_u8_scalar, sa8d_u16_scalar, sao_stats_bo_scalar, sao_stats_e0_scalar,
-    sao_stats_e1_scalar, sao_stats_e2_scalar, sao_stats_e3_scalar, satd_u8_scalar, satd_u16_scalar,
-    ssd_u8_scalar, ssd_u16_scalar, sub_residual_scalar, sub_residual_u8_scalar,
+    fwd_dct8_scalar, fwd_dct16_butterfly, fwd_dct16_scalar, fwd_dct32_butterfly, fwd_dct32_scalar,
+    fwd_dst4_scalar, last_nonzero_scalar, narrow_u16_to_u8_scalar, quantize_scalar, sa8d_u8_scalar,
+    sa8d_u16_scalar, sao_stats_bo_scalar, sao_stats_e0_scalar, sao_stats_e1_scalar,
+    sao_stats_e2_scalar, sao_stats_e3_scalar, satd_u8_scalar, satd_u16_scalar, ssd_u8_scalar,
+    ssd_u16_scalar, sub_residual_scalar, sub_residual_u8_scalar,
 };
 
 // ─── DCT matrix infrastructure ────────────────────────────────────────────

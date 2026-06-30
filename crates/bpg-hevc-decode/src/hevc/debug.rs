@@ -96,6 +96,86 @@ pub fn log_tu(rec: TuRecord) {
     }
 }
 
+/// Parsed `BPG_STILL_DUMP=x,y,log2[,c_idx]` forensic target (shared with the
+/// encoder so the same coordinate dumps from both sides). `None` when unset.
+#[cfg(feature = "std")]
+pub fn dump_target() -> Option<(u32, u32, u8, u8)> {
+    use std::sync::OnceLock;
+    static VALUE: OnceLock<Option<(u32, u32, u8, u8)>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let raw = std::env::var("BPG_STILL_DUMP").ok()?;
+        let mut it = raw.split(',').map(|s| s.trim());
+        let x = it.next()?.parse::<u32>().ok()?;
+        let y = it.next()?.parse::<u32>().ok()?;
+        let log2 = it.next()?.parse::<u8>().ok()?;
+        let c_idx = it.next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+        Some((x, y, log2, c_idx))
+    })
+}
+
+/// Forensic dump of one decoded TU's residual pipeline (env-gated by
+/// `BPG_STILL_DUMP`). Mirrors the encoder's `dump_block_pipeline` field-for-field
+/// so a C-produced `.bpg` (decoded bit-exactly) can be diffed against still265's
+/// own dump for the same coordinate — no x265 patch needed.
+#[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
+pub fn dump_decode_block(
+    x0: u32,
+    y0: u32,
+    _log2_size: u8,
+    c_idx: u8,
+    levels: &[i16],
+    dequant: &[i16],
+    residual: &[i16],
+    pred: &[u16],
+    recon: &[u16],
+    size: usize,
+) {
+    use std::fmt::Write as _;
+    let nnz = levels.iter().filter(|&&l| l != 0).count();
+    let mut s = String::with_capacity(4096);
+    let _ = writeln!(
+        s,
+        "=== C-DECODE BLOCK DUMP x={x0} y={y0} size={size} c_idx={c_idx} nnz={nnz} ==="
+    );
+    let grid = |s: &mut String, label: &str, get: &dyn Fn(usize) -> i64| {
+        let _ = writeln!(s, "[{label}]");
+        for r in 0..size {
+            for c in 0..size {
+                let _ = write!(s, "{:6}", get(r * size + c));
+            }
+            let _ = writeln!(s);
+        }
+    };
+    grid(&mut s, "PRED", &|i| {
+        pred.get(i).copied().unwrap_or(0) as i64
+    });
+    grid(&mut s, "LEVELS", &|i| {
+        levels.get(i).copied().unwrap_or(0) as i64
+    });
+    grid(&mut s, "DEQUANT", &|i| {
+        dequant.get(i).copied().unwrap_or(0) as i64
+    });
+    grid(&mut s, "INV_RESIDUAL", &|i| {
+        residual.get(i).copied().unwrap_or(0) as i64
+    });
+    grid(&mut s, "RECON", &|i| {
+        recon.get(i).copied().unwrap_or(0) as i64
+    });
+    let res_e: i64 = (0..size * size)
+        .map(|i| {
+            let v = residual.get(i).copied().unwrap_or(0) as i64;
+            v * v
+        })
+        .sum();
+    let abs_level: i64 = levels.iter().map(|&l| l.unsigned_abs() as i64).sum();
+    let _ = writeln!(
+        s,
+        "[SUMMARY] residual_energy={res_e} abs_level_sum={abs_level}"
+    );
+    eprint!("{s}");
+}
+
 /// No-op stubs for `no_std` (no global allocator-backed mutex available).
 #[cfg(not(feature = "std"))]
 pub fn log_pu(_rec: PuRecord) {}

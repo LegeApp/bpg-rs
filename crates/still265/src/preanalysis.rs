@@ -16,9 +16,8 @@
 //! mode decision (`AnalysisMaps::policy_at`) and adaptive-QP planning
 //! (`importance_at`). The map itself is read-only; its `importance` scalar drives
 //! both search-budget steering (no syntax change) and the encoder's per-CU
-//! adaptive QP. Steering applies to the source-steered non-reference tiers
-//! (`Fast`/`Balanced`/`Good`); `Fastest` uses the map only for AQ, and
-//! `Best`/`Placebo`/`Reference` keep inert search steering and uniform QP.
+//! adaptive QP. Steering applies to production tiers whose templates enable it;
+//! `Placebo` keeps inert search steering and uniform QP.
 
 use crate::Effort;
 use crate::encoder::Source;
@@ -108,6 +107,29 @@ pub struct AnalysisMaps {
     /// is proportional to how its log-variance deviates from this mean. 0 when
     /// the map is empty / the analysis pass didn't run.
     frame_mean_log2var: f32,
+    /// Picture min/max of `log2(1 + cell.variance)` — the dynamic range the
+    /// rank-based `PositiveProbe` control map ([`aq_qp_offset_positive`]) spreads
+    /// its shrink offset across. Both 0 when the map is empty.
+    frame_min_log2var: f32,
+    frame_max_log2var: f32,
+    /// Picture mean of the chroma-aware activity
+    /// (`log2(1 + luma_var) + CHROMA_AQ_WEIGHT * log2(1 + chroma_activity)`),
+    /// the reference point for [`aq_qp_offset_chroma`] (Prangnell 2017-style
+    /// luma+chroma QG activity). 0 when the map is empty.
+    frame_mean_activity: f32,
+}
+
+/// Optional external per-QG QP-offset map for two-pass AQ experiments.
+///
+/// Loaded from `BPG_AQ_OFFSET_MAP` when present. The file is intentionally
+/// simple CSV/text: each useful row starts with `x,y,offset`, where `x`/`y` are
+/// luma sample coordinates (normally 32x32 QG origins) and `offset` is added to
+/// the slice QP. Extra columns are ignored, so diagnostic tools can append
+/// labels after the first three fields.
+pub struct AqOffsetMap {
+    cells_x: u32,
+    cells_y: u32,
+    offsets: Vec<i8>,
 }
 
 /// Encoder-side search-budget steering derived from a cell's [`RegionClass`].
@@ -132,20 +154,20 @@ pub struct SearchPolicy {
     pub chroma_rd_bias: i8,
     /// Force this CU to be coded as a leaf (skip the split RD trial) on
     /// very-low-importance flat regions. `false` defers to the normal split RD
-    /// comparison. Always `false` on the byte-exact reference tiers.
+    /// comparison. Always `false` when the selected template disables steering.
     pub force_leaf: bool,
     /// Prefer building split structure before the leaf path on structured
     /// regions. This is a search-order hint unless upgraded to
     /// [`Self::force_split`] by the effort resolver.
     pub prefer_split: bool,
     /// Force this CU/TU to split on high-importance structured regions. `false`
-    /// defers to the normal split RD comparison. Always `false` on the
-    /// byte-exact reference tiers.
+    /// defers to the normal split RD comparison. Always `false` when the
+    /// selected template disables steering.
     pub force_split: bool,
     /// RMD cost-curve pruning factor for luma mode candidates. `Some(f)` drops
     /// rough-mode candidates whose cost exceeds `f ×` the best (shi2013 knee /
     /// xiong2016 average-cost); `None` keeps the full effort-derived candidate
-    /// set (the reference tiers).
+    /// set.
     pub rmd_prune_factor: Option<f64>,
 }
 
@@ -160,6 +182,72 @@ pub const INERT: SearchPolicy = SearchPolicy {
     force_split: false,
     rmd_prune_factor: None,
 };
+
+/// Whether an external AQ offset map was requested. This is the syntax gate:
+/// the PPS writer and encoder must both agree that `cu_qp_delta` syntax can
+/// appear before the map is loaded with picture dimensions.
+pub fn external_aq_map_requested() -> bool {
+    std::env::var("BPG_AQ_OFFSET_MAP")
+        .ok()
+        .map(|s| !s.trim().is_empty() && s.trim() != "0")
+        .unwrap_or(false)
+}
+
+/// Load `BPG_AQ_OFFSET_MAP` for the current picture. Bad rows are ignored; if no
+/// valid row lands inside the image's 32x32 QG grid, the caller gets `None`.
+pub fn load_external_aq_offset_map(width: u32, height: u32) -> Option<AqOffsetMap> {
+    let path = std::env::var("BPG_AQ_OFFSET_MAP").ok()?;
+    let path = path.trim();
+    if path.is_empty() || path == "0" {
+        return None;
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("BPG_AQ_OFFSET_MAP: could not read {path}: {err}");
+            return None;
+        }
+    };
+    let cells_x = width.div_ceil(CELL).max(1);
+    let cells_y = height.div_ceil(CELL).max(1);
+    let mut offsets = vec![0i8; (cells_x * cells_y) as usize];
+    let mut used = 0u32;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut fields = line
+            .split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .filter(|s| !s.is_empty());
+        let Some(x) = fields.next().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Some(y) = fields.next().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        let Some(offset) = fields.next().and_then(|s| s.parse::<i32>().ok()) else {
+            continue;
+        };
+        if x < 0 || y < 0 {
+            continue;
+        }
+        let cx = ((x as u32) >> CELL_LOG2).min(cells_x.saturating_sub(1));
+        let cy = ((y as u32) >> CELL_LOG2).min(cells_y.saturating_sub(1));
+        offsets[(cy * cells_x + cx) as usize] = offset.clamp(-12, 12) as i8;
+        used += 1;
+    }
+    if used == 0 {
+        eprintln!("BPG_AQ_OFFSET_MAP: no usable x,y,offset rows in {path}");
+        None
+    } else {
+        Some(AqOffsetMap {
+            cells_x,
+            cells_y,
+            offsets,
+        })
+    }
+}
 
 // --- Classification thresholds (8-bit units / q8 shares). Seeded from the
 // psnrtune-dev feature distributions; tuned empirically on the test-set. ---
@@ -178,9 +266,9 @@ const CHROMA_HI: u16 = 96; // combined Cb+Cr 8-bit variance — genuinely busy c
 
 /// Build the per-cell analysis map from the source picture.
 ///
-/// Always run for the non-reference tiers (the reference tiers use
-/// [`AnalysisMaps::empty`] instead). A cheap second cell-grid-level pass fills
-/// the contextual features (`global_contrast_q8`, `center_surround_q8`,
+/// Run when search steering or AQ needs source analysis. A cheap second
+/// cell-grid-level pass fills the contextual features (`global_contrast_q8`,
+/// `center_surround_q8`,
 /// `importance_q8`) that drive adaptive QP and rough-mode pruning, on top of the
 /// per-cell local features that drive `class`.
 pub fn analyze(width: u32, height: u32, bit_depth: u8, cat: u8, src: Source<'_>) -> AnalysisMaps {
@@ -212,18 +300,33 @@ pub fn analyze(width: u32, height: u32, bit_depth: u8, cat: u8, src: Source<'_>)
 
     fill_contextual_features(&mut cells, cells_x, cells_y);
 
-    let frame_mean_log2var = if cells.is_empty() {
-        0.0
-    } else {
-        let sum: f32 = cells.iter().map(|c| ((1 + c.variance) as f32).log2()).sum();
-        sum / cells.len() as f32
-    };
+    let (frame_mean_log2var, frame_min_log2var, frame_max_log2var, frame_mean_activity) =
+        if cells.is_empty() {
+            (0.0, 0.0, 0.0, 0.0)
+        } else {
+            let n = cells.len() as f32;
+            let mut sum_lv = 0.0f32;
+            let mut sum_act = 0.0f32;
+            let mut min_lv = f32::INFINITY;
+            let mut max_lv = f32::NEG_INFINITY;
+            for c in &cells {
+                let lv = ((1 + c.variance) as f32).log2();
+                sum_lv += lv;
+                sum_act += combined_activity(c.variance, c.chroma_activity);
+                min_lv = min_lv.min(lv);
+                max_lv = max_lv.max(lv);
+            }
+            (sum_lv / n, min_lv, max_lv, sum_act / n)
+        };
 
     AnalysisMaps {
         cells_x,
         cells_y,
         cells,
         frame_mean_log2var,
+        frame_min_log2var,
+        frame_max_log2var,
+        frame_mean_activity,
     }
 }
 
@@ -319,8 +422,28 @@ pub fn aq_qp_offset(importance_q8: u16) -> i32 {
     (1.0 + (1.0 - t) * 7.0).round() as i32 // +1..+8
 }
 
-/// Maximum magnitude (in QP steps) of the bidirectional variance AQ offset.
-const VAR_AQ_CLAMP: f32 = 8.0;
+/// Default magnitude (in QP steps) the bidirectional variance AQ offset is
+/// clamped to when the caller does not pass an explicit clamp. The configurable
+/// `--aq` presets use `aq_clamp = 2`; this is the legacy `BPG_PLACEBO_AQ`
+/// default.
+pub const VAR_AQ_CLAMP: f32 = 8.0;
+
+/// Weight applied to the chroma log-activity term when combining it with the
+/// luma log-variance into a single chroma-aware QG activity (Prangnell 2017's
+/// luma+chroma activity for QP selection). Chroma carries less perceptual rate
+/// than luma, so it is down-weighted rather than summed 1:1.
+pub const CHROMA_AQ_WEIGHT: f32 = 0.35;
+
+/// Chroma-aware QG activity: luma log-variance plus a down-weighted chroma
+/// log-activity. `chroma_activity` is the per-cell combined Cb+Cr variance in
+/// 8-bit units (already normalized across chroma formats by [`analyze_cell`]),
+/// so it can be folded directly against the luma term.
+#[inline]
+fn combined_activity(luma_var: u32, chroma_activity: u16) -> f32 {
+    let luma = ((1 + luma_var) as f32).log2();
+    let chroma = ((1 + chroma_activity as u32) as f32).log2();
+    luma + CHROMA_AQ_WEIGHT * chroma
+}
 
 /// Bidirectional, rate-neutral variance AQ QP offset (x265 `aq-mode`-style),
 /// the alternative to the one-directional perceptual [`aq_qp_offset`]. The
@@ -336,20 +459,61 @@ const VAR_AQ_CLAMP: f32 = 8.0;
 ///   Optimizes PSNR-at-equal-size.
 ///
 /// `strength` scales the deviation (x265's `--aq-strength`, ~1.0 nominal); the
-/// result is clamped to ±[`VAR_AQ_CLAMP`] QP steps. Caller adds this to the
-/// slice QP and clamps to the valid `[0, 51]` range.
+/// result is clamped to `±clamp` QP steps. Caller adds this to the slice QP and
+/// clamps to the valid `[0, 51]` range.
 pub fn aq_qp_offset_variance(
     variance: u32,
     frame_mean_log2var: f32,
     strength: f32,
     perceptual: bool,
+    clamp: f32,
 ) -> i32 {
     let log2var = ((1 + variance) as f32).log2();
     let mut adj = strength * (log2var - frame_mean_log2var);
     if !perceptual {
         adj = -adj;
     }
-    adj.round().clamp(-VAR_AQ_CLAMP, VAR_AQ_CLAMP) as i32
+    adj.round().clamp(-clamp, clamp) as i32
+}
+
+/// Chroma-aware perceptual variance AQ QP offset (Prangnell 2017 luma+chroma
+/// activity). Like [`aq_qp_offset_variance`]'s `perceptual` direction, but the
+/// per-cell activity folds in chroma log-activity ([`combined_activity`]) and is
+/// compared to the picture-mean *activity* (`frame_mean_activity`). High
+/// luma-or-chroma activity ⇒ higher QP (masking), flat-in-both ⇒ lower QP
+/// (anti-banding). `strength` scales the deviation, clamped to `±clamp`.
+pub fn aq_qp_offset_chroma(
+    luma_var: u32,
+    chroma_activity: u16,
+    frame_mean_activity: f32,
+    strength: f32,
+    clamp: f32,
+) -> i32 {
+    let activity = combined_activity(luma_var, chroma_activity);
+    let adj = strength * (activity - frame_mean_activity);
+    adj.round().clamp(-clamp, clamp) as i32
+}
+
+/// Rank-based positive-only shrink offset — the in-tree mirror of the
+/// experiment harness `positive` control. Every cell raises QP by `+1..+8`
+/// according to where its `log2(1 + variance)` ranks between the picture
+/// min/max, then clamped to `+clamp`. This is a deliberate size-bias control
+/// (effective higher QP), **not** a quality feature; it is exposed only as
+/// `AqMode::PositiveProbe` for parity with the experiment sweep.
+pub fn aq_qp_offset_positive(
+    luma_var: u32,
+    frame_min_log2var: f32,
+    frame_max_log2var: f32,
+    clamp: f32,
+) -> i32 {
+    let log2var = ((1 + luma_var) as f32).log2();
+    let span = frame_max_log2var - frame_min_log2var;
+    let rank = if span <= f32::EPSILON {
+        0.0
+    } else {
+        ((log2var - frame_min_log2var) / span).clamp(0.0, 1.0)
+    };
+    (1.0 + 7.0 * rank).round().clamp(1.0, clamp.max(1.0)) as i32
 }
 
 fn compute_importance(c: &CellAnalysis) -> u16 {
@@ -567,23 +731,21 @@ fn classify(
 }
 
 impl AnalysisMaps {
-    /// An empty map, for tiers that need neither AQ nor search steering
-    /// (`Best`/`Placebo`/`Reference`) — they early-return [`INERT`] from
-    /// [`Self::policy_at`] without indexing any cell, so the picture-wide
-    /// feature pass is skipped entirely.
+    /// An empty map, for tiers that need neither AQ nor search steering.
     pub fn empty() -> AnalysisMaps {
         AnalysisMaps {
             cells_x: 0,
             cells_y: 0,
             cells: Vec::new(),
             frame_mean_log2var: 0.0,
+            frame_min_log2var: 0.0,
+            frame_max_log2var: 0.0,
+            frame_mean_activity: 0.0,
         }
     }
 
     /// Resolve the steering policy for a coding block at `(x0, y0)` of size
-    /// `1 << log2_size`, given the encode effort. The byte-exact reference tiers
-    /// ([`crate::is_reference_tier`]) always get [`INERT`] so their output is
-    /// unchanged; every other tier is steered.
+    /// `1 << log2_size`, given the encode effort.
     pub fn policy_at(&self, x0: u32, y0: u32, log2_size: u8, effort: Effort) -> SearchPolicy {
         crate::effort::template(effort).resolve_policy(
             self.region_class_at(x0, y0, log2_size),
@@ -657,9 +819,37 @@ impl AnalysisMaps {
         self.cells[(cy * self.cells_x + cx) as usize].variance
     }
 
+    /// Combined Cb+Cr activity (8-bit-units variance) of the cell covering
+    /// `(x0, y0)` — the chroma signal the chroma-aware AQ
+    /// ([`aq_qp_offset_chroma`]) folds in. 0 when the map is empty.
+    pub fn chroma_activity_at(&self, x0: u32, y0: u32) -> u16 {
+        if self.cells.is_empty() {
+            return 0;
+        }
+        let cx = (x0 / CELL).min(self.cells_x - 1);
+        let cy = (y0 / CELL).min(self.cells_y - 1);
+        self.cells[(cy * self.cells_x + cx) as usize].chroma_activity
+    }
+
     /// Picture mean of `log2(1 + variance)` — the AQ reference point.
     pub fn frame_mean_log2var(&self) -> f32 {
         self.frame_mean_log2var
+    }
+
+    /// Picture mean chroma-aware activity — the [`aq_qp_offset_chroma`]
+    /// reference point.
+    pub fn frame_mean_log2activity(&self) -> f32 {
+        self.frame_mean_activity
+    }
+
+    /// Picture min/max `log2(1 + variance)` — the [`aq_qp_offset_positive`]
+    /// rank span.
+    pub fn frame_min_log2var(&self) -> f32 {
+        self.frame_min_log2var
+    }
+
+    pub fn frame_max_log2var(&self) -> f32 {
+        self.frame_max_log2var
     }
 
     /// Per-class cell counts, for `--debug-stats` (image-global; not per-worker).
@@ -669,6 +859,51 @@ impl AnalysisMaps {
             h[c.class.index()] += 1;
         }
         h
+    }
+}
+
+impl AqOffsetMap {
+    /// QP offset for the 32x32 quantization group containing `(x0, y0)`.
+    pub fn offset_at(&self, x0: u32, y0: u32) -> i32 {
+        let cx = (x0 >> CELL_LOG2).min(self.cells_x.saturating_sub(1));
+        let cy = (y0 >> CELL_LOG2).min(self.cells_y.saturating_sub(1));
+        self.offsets[(cy * self.cells_x + cx) as usize] as i32
+    }
+
+    /// Build an in-memory map from a per-QG **measured activity** signal — the
+    /// two-pass AQ path. `activity[cy*cells_x + cx]` is whatever pass-1 measured
+    /// for that quantization group (here: coded residual coefficient energy, an
+    /// actual CTU-search outcome rather than a source-variance prediction).
+    ///
+    /// The offset is the perceptual (x265 aq-mode-2) direction on log-activity:
+    /// high-activity QGs (genuinely complex/textured, where masking hides loss)
+    /// get **+QP**, low-activity QGs (flat, where banding shows) get **−QP**,
+    /// around the picture-mean log-activity so the redistribution is ~rate
+    /// neutral. `strength` scales the deviation; result clamped to `±clamp`.
+    pub fn from_qg_activity(
+        cells_x: u32,
+        cells_y: u32,
+        activity: &[f64],
+        strength: f32,
+        clamp: u8,
+    ) -> AqOffsetMap {
+        let n = activity.len();
+        let logs: Vec<f32> = activity.iter().map(|&a| (1.0 + a.max(0.0)).ln() as f32).collect();
+        let mean = if n == 0 {
+            0.0
+        } else {
+            logs.iter().sum::<f32>() / n as f32
+        };
+        let cl = clamp.max(1) as f32;
+        let offsets = logs
+            .iter()
+            .map(|&lv| (strength * (lv - mean)).round().clamp(-cl, cl) as i8)
+            .collect();
+        AqOffsetMap {
+            cells_x,
+            cells_y,
+            offsets,
+        }
     }
 }
 
@@ -781,7 +1016,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_tiers_get_inert_policy() {
+    fn placebo_gets_inert_policy() {
         let y = vec![128u16; 64 * 64];
         let src = Source {
             y: &y,
@@ -789,17 +1024,14 @@ mod tests {
             cr: &y,
         };
         let maps = analyze(64, 64, 8, 3, src);
-        // The byte-exact reference tiers are never steered.
-        for e in [Effort::Placebo, Effort::Reference] {
-            let p = maps.policy_at(0, 0, 5, e);
-            assert!(p.angular_prune.is_none() && p.allow_early_term);
-            assert_eq!((p.luma_rd_bias, p.chroma_rd_bias), (0, 0));
-            assert!(!p.force_leaf && p.rmd_prune_factor.is_none());
-        }
+        let p = maps.policy_at(0, 0, 5, Effort::Placebo);
+        assert!(p.angular_prune.is_none() && p.allow_early_term);
+        assert_eq!((p.luma_rd_bias, p.chroma_rd_bias), (0, 0));
+        assert!(!p.force_leaf && p.rmd_prune_factor.is_none());
         // A flat cell under a steered tier forces angular pruning.
         // Importance-based pruning factors and force-leaf depend on the
         // canonical template's PreanalysisTemplate settings.
-        let p = maps.policy_at(0, 0, 5, Effort::Balanced);
+        let p = maps.policy_at(0, 0, 5, Effort::Fast);
         assert_eq!(p.angular_prune, Some(true));
     }
 }

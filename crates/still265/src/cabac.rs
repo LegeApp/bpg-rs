@@ -41,7 +41,7 @@ static LPS_TABLE: [[u8; 4]; 64] = [
 
 /// MPS state transition, H.265 Table 9-43.
 #[rustfmt::skip]
-static STATE_TRANS_MPS: [u8; 64] = [
+const STATE_TRANS_MPS: [u8; 64] = [
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
     51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 62, 63,
@@ -49,7 +49,7 @@ static STATE_TRANS_MPS: [u8; 64] = [
 
 /// LPS state transition, H.265 Table 9-43.
 #[rustfmt::skip]
-static STATE_TRANS_LPS: [u8; 64] = [
+const STATE_TRANS_LPS: [u8; 64] = [
     0, 0, 1, 2, 2, 4, 4, 5, 6, 7, 8, 9, 9, 11, 11, 12, 13, 13, 15, 15, 16, 16, 18, 18, 19, 19, 21,
     21, 22, 22, 23, 24, 24, 25, 26, 26, 27, 27, 28, 29, 29, 30, 30, 30, 31, 32, 32, 33, 33, 33, 34,
     34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63,
@@ -76,11 +76,36 @@ static ENTROPY_BITS: [u32; 128] = [
     0x0041f, 0x2c0ad, 0x003e7, 0x2ca8d, 0x003ba, 0x2d323, 0x0010c, 0x3bfbb,
 ];
 
-/// A single CABAC context model: state index (0..=63) and most-probable-symbol.
+const fn build_next_state() -> [[u8; 2]; 128] {
+    let mut table = [[0u8; 2]; 128];
+    let mut packed = 0usize;
+    while packed < 128 {
+        let state = (packed >> 1) as u8;
+        let mps = (packed & 1) as u8;
+        let mut bin = 0usize;
+        while bin < 2 {
+            table[packed][bin] = if bin as u8 != mps {
+                let next_mps = if state == 0 { 1 - mps } else { mps };
+                (STATE_TRANS_LPS[state as usize] << 1) | next_mps
+            } else {
+                (STATE_TRANS_MPS[state as usize] << 1) | mps
+            };
+            bin += 1;
+        }
+        packed += 1;
+    }
+    table
+}
+
+/// Packed CABAC context transition table:
+/// `state_mps = (state << 1) | mps`, indexed by `[state_mps][bin]`.
+const NEXT_STATE: [[u8; 2]; 128] = build_next_state();
+
+/// A single CABAC context model: packed state index (0..=63) and
+/// most-probable-symbol (`state_mps = (state << 1) | mps`).
 #[derive(Clone, Copy, Debug)]
 pub struct ContextModel {
-    state: u8,
-    mps: u8,
+    state_mps: u8,
 }
 
 impl ContextModel {
@@ -96,40 +121,42 @@ impl ContextModel {
         let pre_ctx_state = (((m * qp) >> 4) + n).clamp(1, 126);
         if pre_ctx_state >= 64 {
             Self {
-                state: (pre_ctx_state - 64) as u8,
-                mps: 1,
+                state_mps: ((pre_ctx_state - 64) as u8) << 1 | 1,
             }
         } else {
             Self {
-                state: (63 - pre_ctx_state) as u8,
-                mps: 0,
+                state_mps: ((63 - pre_ctx_state) as u8) << 1,
             }
         }
+    }
+
+    #[inline]
+    fn state(self) -> u8 {
+        self.state_mps >> 1
+    }
+
+    #[inline]
+    fn mps(self) -> u8 {
+        self.state_mps & 1
     }
 
     /// Current (state, mps), exposed for cross-checking against the
     /// decoder-side `bpg_hevc_decode::hevc::cabac::ContextModel`.
     pub fn get_state(&self) -> (u8, u8) {
-        (self.state, self.mps)
+        (self.state(), self.mps())
     }
 
     /// Estimated cost for coding `bin_value`, in x265's 1/32768-bit units.
+    #[inline]
     pub fn entropy_bits(&self, bin_value: u8) -> u32 {
-        let packed = (self.state << 1) | self.mps;
-        ENTROPY_BITS[(packed ^ bin_value) as usize]
+        ENTROPY_BITS[(self.state_mps ^ bin_value) as usize]
     }
 
     /// Apply the same state transition as `encode_bin`, without arithmetic
     /// coding output.
+    #[inline]
     pub fn update(&mut self, bin_value: u8) {
-        if bin_value != self.mps {
-            if self.state == 0 {
-                self.mps = 1 - self.mps;
-            }
-            self.state = STATE_TRANS_LPS[self.state as usize];
-        } else {
-            self.state = STATE_TRANS_MPS[self.state as usize];
-        }
+        self.state_mps = NEXT_STATE[self.state_mps as usize][bin_value as usize];
     }
 }
 
@@ -199,24 +226,22 @@ impl CabacEncoder {
     /// `Entropy::encodeBin`.
     pub fn encode_bin(&mut self, w: &mut BitWriter, bin_value: u8, ctx: &mut ContextModel) {
         let q_range_idx = ((self.range >> 6) & 3) as usize;
-        let lps = LPS_TABLE[ctx.state as usize][q_range_idx] as u32;
+        let state = ctx.state();
+        let mps = ctx.mps();
+        let lps = LPS_TABLE[state as usize][q_range_idx] as u32;
         self.range -= lps;
 
         let num_bits: u32;
-        if bin_value != ctx.mps {
+        if bin_value != mps {
             // LPS path: CLZ(idx, lps) -> idx = bit index of lps's MSB (lps in 1..=255).
             let idx = 7 - (lps as u8).leading_zeros();
-            num_bits = if ctx.state >= 63 { 6 } else { 8 - idx };
+            num_bits = if state >= 63 { 6 } else { 8 - idx };
             self.low += self.range;
             self.range = lps;
-            if ctx.state == 0 {
-                ctx.mps = 1 - ctx.mps;
-            }
-            ctx.state = STATE_TRANS_LPS[ctx.state as usize];
         } else {
-            ctx.state = STATE_TRANS_MPS[ctx.state as usize];
             num_bits = self.range.wrapping_sub(256) >> 31;
         }
+        ctx.update(bin_value);
 
         self.low <<= num_bits;
         self.range <<= num_bits;

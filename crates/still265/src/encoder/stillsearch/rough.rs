@@ -181,16 +181,56 @@ where
                     .first()
                     .expect("x265shape cheap RDO must rank at least one candidate")
                     .mode;
-                let winner = self.materialize_x265_shape_winner(
-                    state,
-                    x0,
-                    y0,
-                    log2_cb_size,
-                    mpm_u8,
-                    lambda,
-                    scale,
-                    mode,
-                );
+                let exact_top = super::env::x265shape_exact_top();
+                let target_var = self.source_variance_8bit_scaled(state, x0, y0, log2_cb_size);
+                let winner = if exact_top > 1 && target_var >= super::env::x265shape_exact_var_min()
+                {
+                    let best_cost = simple_ranked[0].cost;
+                    let margin = super::env::x265shape_exact_margin();
+                    let mut exact_set: Vec<u8> = Vec::with_capacity(exact_top);
+                    for r in &simple_ranked {
+                        if exact_set.len() >= exact_top {
+                            break;
+                        }
+                        if r.cost <= best_cost * margin && !exact_set.contains(&r.mode) {
+                            exact_set.push(r.mode);
+                        }
+                    }
+                    if exact_set.len() > 1 {
+                        self.evaluate_exact_modes(
+                            state,
+                            x0,
+                            y0,
+                            log2_cb_size,
+                            mpm_u8,
+                            lambda,
+                            scale,
+                            &exact_set,
+                        )
+                    } else {
+                        self.materialize_x265_shape_winner(
+                            state,
+                            x0,
+                            y0,
+                            log2_cb_size,
+                            mpm_u8,
+                            lambda,
+                            scale,
+                            mode,
+                        )
+                    }
+                } else {
+                    self.materialize_x265_shape_winner(
+                        state,
+                        x0,
+                        y0,
+                        log2_cb_size,
+                        mpm_u8,
+                        lambda,
+                        scale,
+                        mode,
+                    )
+                };
                 if super::env::luma_oracle_enabled() {
                     let current_luma_cost = self.oracle_luma_exact_cost(
                         state,
@@ -660,7 +700,16 @@ where
         // per-mode source resample and border rebuild (the LumaCheap hot cost).
         let cheap_timer = StillSearchLedger::start_timer();
         let mut acc = std::mem::take(&mut self.workspace.block_scratch.simple_rdo_accum);
-        self.eval_simple_rdo_luma_modes(state, x0, y0, log2_cb_size, 0, shortlist, lambda, &mut acc);
+        self.eval_simple_rdo_luma_modes(
+            state,
+            x0,
+            y0,
+            log2_cb_size,
+            0,
+            shortlist,
+            lambda,
+            &mut acc,
+        );
         // Preserve the per-mode LumaCheap call accounting (one per candidate mode)
         // so the work ledger stays comparable across this refactor.
         for _ in 0..shortlist.len() {
@@ -697,6 +746,33 @@ where
                 .then_with(|| a.mode.cmp(&b.mode))
         });
         ranked
+    }
+
+    fn source_variance_8bit_scaled(
+        &self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+    ) -> f64 {
+        let size = 1usize << log2_size;
+        let shift = state.bit_depth.saturating_sub(8) as u32;
+        let mut sum = 0.0f64;
+        let mut sum2 = 0.0f64;
+        let mut n = 0.0f64;
+        for yy in 0..size {
+            for xx in 0..size {
+                let v = (self.source.sample(0, x0 + xx as u32, y0 + yy as u32) >> shift) as f64;
+                sum += v;
+                sum2 += v * v;
+                n += 1.0;
+            }
+        }
+        if n == 0.0 {
+            0.0
+        } else {
+            ((sum2 / n) - (sum / n) * (sum / n)).max(0.0)
+        }
     }
 
     /// Sum of SATD-based chroma costs for the full CU-area chroma
@@ -926,7 +1002,11 @@ where
         tu.split_mode = crate::effort::TuSplitMode::Disabled;
         tu.max_extra_depth = 0;
         let cfg = super::tu::ExactEvalConfig {
-            quant: super::eval::QuantMode::HardQuantSearch,
+            quant: if super::env::rdoq_search_enabled() {
+                super::eval::QuantMode::RdoqTrial { level: 2 }
+            } else {
+                super::eval::QuantMode::HardQuantSearch
+            },
             residual_pricing: super::eval::ResidualPricingMode::Exact,
             scope: super::tu::TtEvalScope::FullComponents,
             tu,
@@ -1282,8 +1362,14 @@ where
     ) -> ExactModeWinner<TtPlan, O::Saved> {
         let exact_timer = StillSearchLedger::start_timer();
         let mark = self.overlay.mark();
+        let use_rdoq = super::env::rdoq_search_enabled()
+            || state.effort_template.rdoq_trials.mode != TrialRdoqMode::Off;
         let cfg = super::tu::ExactEvalConfig {
-            quant: super::eval::QuantMode::HardQuantSearch,
+            quant: if use_rdoq {
+                super::eval::QuantMode::RdoqTrial { level: 2 }
+            } else {
+                super::eval::QuantMode::HardQuantSearch
+            },
             residual_pricing: super::eval::ResidualPricingMode::Exact,
             scope: super::tu::TtEvalScope::FullComponents,
             tu: state.effort_template.tu_exact,

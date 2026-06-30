@@ -34,107 +34,23 @@ pub mod tu_diag;
 
 pub use bpg_image::ChromaFormat;
 
-/// How much effort the mode-decision search spends, as a nine-step ladder
-/// (HandBrake/x265-style naming). Higher tiers run more RD trials — i.e. call
-/// the (already table-driven, already memoized) CABAC bit estimator more often,
-/// which is the dominant cost — in exchange for quality:
+/// How much search work the still encoder spends.
 ///
-/// - [`Effort::Floor`]: experimental speed-floor baseline. It deliberately
-///   under-searches CTUs by forcing leaf CUs where legal, disabling PartNxN,
-///   using one luma candidate, and forcing leaf TUs where legal. This is for
-///   timing diagnostics, not quality.
-/// - [`Effort::FloorPlus`]: photo-oriented floor-first repair preset. It starts
-///   from `Floor`, then selectively repairs failed 64x64 leaves with richer
-///   mode/TU search or one terminal 64->32 split.
-/// - [`Effort::FloorPlus2`]: FloorPlus with a tiny best-first CTU repair
-///   auction and odds-gated mode expansion. It keeps PartNxN disabled and avoids
-///   recursive CTU search.
-/// - [`Effort::FloorShallow`]: experimental shallow-CU preset. At each 64×64
-///   CTU chooses among three candidates by real RD cost: the plain floor leaf,
-///   an enhanced 64×64 leaf (same FloorPlus mode/TU budget), and a terminal
-///   64→32 split whose four 32×32 children each receive the same enhanced budget
-///   (not the bare MPM-only terminal-child budget used by FloorPlus). No
-///   recursive CU split below 32×32, no PartNxN. Tests the hypothesis that
-///   giving split children proper prediction+TU search recovers the remaining
-///   Floor→Best gap without the complexity of FloorPlus2.
-/// - [`Effort::SlowPlus`]: experimental Slow successor. It keeps Slow's shallow
-///   64→32-first architecture and reinvests budget into denser progressive RMD
-///   (coarse_step 3, top 3 regions), one extra luma/chroma RD candidate, and
-///   conservative/selective PartNxN islands (adaptive-fidelity, RDOQ on the top
-///   PUs) in structured 8×8 leaves. At QP28 this RD-beats `Slow` (smaller *and*
-///   higher PSNR) on native 12/50 MP photos. The x265-style "skip the root
-///   64×64 leaf at low QP" rule is wired but **off by default** — it regressed
-///   size on smooth high-res content (see `slowplus_skip_root_leaf`).
-/// - [`Effort::Fastest`]: sparsest rough-mode shortlist, one RD candidate, no
-///   chroma mode search beyond DM, no RDOQ refinement, approximate residual
-///   bits, fixed-leaf small TUs, and the most aggressive paper-driven search
-///   pruning (CU-split early termination + angular mode exclusion). The
-///   cheapest preset.
-/// - [`Effort::Fast`]: a second luma RD candidate only on the larger (16x16+)
-///   CUs, a sparser rough-mode sweep than `Balanced`, and moderate search
-///   pruning — a midpoint between `Fastest` and `Balanced`.
-/// - [`Effort::Balanced`] (default): the archival sweet spot — even-stepped
-///   rough modes, two luma RD candidates, single-scan RDOQ on small blocks,
-///   plus *light* (near-lossless) search pruning (zero-residual CU early
-///   termination + near-flat angular exclusion).
-/// - [`Effort::Good`]: denser rough modes, more luma/chroma RD candidates, and
-///   wider single-scan RDOQ coverage than `Balanced` — between `Balanced` and
-///   `Best`.
+/// The production model is intentionally small:
 ///
-/// `Fast`/`Balanced`/`Good` additionally apply **source-derived preanalysis
-/// steering** (see [`crate::preanalysis`]): a cheap per-32x32-cell structure map
-/// shifts search budget away from flat/smooth cells (prune angular) and toward
-/// edge/text cells (protect angular search; `Good` also spends extra RD
-/// candidates on text/colour-critical cells). `Fastest` is left unsteered (its
-/// local pruning is already maximal, so steering only adds overhead), as are the
-/// `Placebo`/`Reference` uniform/exact references.
-/// `Fastest`/`Fast`/`Balanced`/`Good` also trim search breadth as QP rises
-/// (narrower rough-mode sweeps, fewer RD candidates, fewer limited-RDOQ passes,
-/// and looser fast-tier early termination), because high quantization erases
-/// many fine mode/partition distinctions. `Best`/`Placebo`/`Reference` stay
-/// exhaustive.
-/// - [`Effort::Best`]: a practical max-quality tier: exhaustive rough-mode
-///   search, full-RD luma/chroma trials, full chroma candidate set, exact
-///   residual-bit pricing, exact final coding, and uniform QP, but with the
-///   non-reference luma-only candidate path and single-scan RDOQ. Its output is
-///   not bit-identical to [`Effort::Placebo`].
-/// - [`Effort::Placebo`]: the full exhaustive reference search (all 35 rough
-///   modes, full chroma RD during luma trials, exact greedy per-coefficient
-///   RDOQ, no pruning) run with CTU-wavefront-**parallel** analysis. RD is
-///   priced against a frozen slice-init CABAC context, which is what allows the
-///   parallelism.
-/// - [`Effort::Reference`]: identical exhaustive search to [`Effort::Placebo`]
-///   but **single-threaded** with exact running-context RD. The slowest,
-///   bit-reproducible regression-reference preset.
+/// - [`Effort::Fast`]: same pipeline shape as Slow, with cheaper search budgets.
+/// - [`Effort::Slow`]: the default archival-quality preset.
+/// - [`Effort::Placebo`]: expensive experimental/perceptual playground for
+///   tools that prove they beat Slow.
+///
+/// Older CLI names are accepted by the tools as aliases, but the crate API only
+/// exposes these three budgets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Effort {
-    Floor,
-    FloorPlus,
-    FloorPlus2,
-    FloorShallow,
-    /// Fuzzy shallow quality mode: progressive RMD, terminal 64→32 split,
-    /// final-winner RDOQ, QP-aware search. The experimental quality tier
-    /// between the floor family and Best — recovers most of the byte gap
-    /// without full recursive CTU search.
-    Slow,
-    /// Experimental Slow successor: denser progressive RMD, one extra
-    /// luma/chroma RD candidate, and conservative/selective PartNxN enabled by
-    /// default. RD-beats `Slow` at QP28. (The x265-style no-root-64-leaf rule
-    /// is wired but off by default — it regressed size on smooth high-res.)
-    SlowPlus,
-    Fastest,
-    /// QP-adaptive hybrid: uses [`FloorPlus`]'s search at low QP (< 32) and
-    /// [`Fastest`]'s search at high QP (>= 32). Intended as the new "Fast"
-    /// tier — combines thorough coding at low compression with speed at high
-    /// compression.
-    FastAdaptive,
     Fast,
     #[default]
-    Balanced,
-    Good,
-    Best,
+    Slow,
     Placebo,
-    Reference,
 }
 
 /// Sample Adaptive Offset mode (placeholder; Phase 3 emits `sao_enabled_flag
@@ -155,15 +71,10 @@ pub enum DeblockMode {
     On,
 }
 
-/// The byte-exact reference tiers ([`Effort::Placebo`]/[`Effort::Reference`]).
-/// They
-/// are immune to adaptive quantization and source-derived search steering, so
-/// their output stays bit-reproducible — the single choke point every
-/// quality-trading branch consults, so the "reference tiers never change"
-/// invariant holds structurally.
+/// Whether an effort is the inert high-quality comparison tier.
 #[inline]
 pub fn is_reference_tier(effort: Effort) -> bool {
-    matches!(effort, Effort::Placebo | Effort::Reference)
+    matches!(effort, Effort::Placebo)
 }
 
 /// Whether adaptive quantization (per-CU `cu_qp_delta`) is active for a config.
@@ -189,43 +100,130 @@ pub fn aq_active(config: &StillHevcConfig) -> bool {
     if config.chroma == ChromaFormat::Gray {
         return false;
     }
-    match config.effort {
-        // Byte-reproducible reference tiers never quantize adaptively.
-        Effort::Placebo | Effort::Reference => false,
-        // The whole ladder is now uniform-QP: each tier is a progressively
-        // pruned version of `Best` (same coding tools — PartNxN, SAO, uniform
-        // QP — with less search), so quality scales monotonically with effort.
-        // The previous per-CU variance AQ on the speed tiers diverged badly from
-        // `Best` (≈3 dB MS-SSIM and a scrambled quality ladder; see
-        // docs/effort-ladder-uniform-qp-2026-06-17.md), and the project's own
-        // measurements found the preanalysis AQ signal RD-neutral-to-negative.
-        // `Best` can still opt into the experimental variance AQ via
-        // [`best_aq_params`] (`BPG_BEST_AQ`).
-        Effort::Best => best_aq_params().is_some(),
-        // Speed tiers: opt-in via the config field (default off → uniform QP).
-        _ => config.adaptive_qp,
+    resolve_aq_mode(config) != AqMode::Off || preanalysis::external_aq_map_requested()
+}
+
+/// Adaptive-quantization map selection. The per-QG QP offset is derived from one
+/// of these strategies (see [`crate::preanalysis`] for the offset math). `Off` is
+/// uniform QP — the default for every tier; AQ is an explicit opt-in. The two
+/// `*Probe` variants are experiment/control modes, not user-quality features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AqMode {
+    /// Uniform QP (no `cu_qp_delta`). Default.
+    #[default]
+    Off,
+    /// Legacy one-directional importance shrink ([`preanalysis::aq_qp_offset`]):
+    /// always raises QP, most on flat/noisy regions. The old `adaptive_qp = true`
+    /// behaviour, kept as a compatibility mode.
+    LegacyShrink,
+    /// Bidirectional luma-variance perceptual AQ (x265 aq-mode-2 direction):
+    /// high-variance up, flat down. MS-SSIM-leaning.
+    Perceptual,
+    /// Perceptual AQ with chroma-aware activity (Prangnell 2017 luma+chroma).
+    PerceptualChroma,
+    /// Experiment control: PSNR/SSE-leaning bidirectional AQ (opposite sign of
+    /// `Perceptual`). Not RD-efficient at equal bytes — diagnostic only.
+    PsnrProbe,
+    /// Experiment control: rank-based positive-only shrinker (effective higher
+    /// QP). Not a quality feature — diagnostic/size-bias only.
+    PositiveProbe,
+    /// Two-pass measured AQ: pass-1 encodes uniformly and measures per-QG coded
+    /// complexity (an actual CTU-search outcome); pass-2 applies a perceptual
+    /// QP redistribution derived from it. The only AQ that reliably works (source
+    /// heuristics don't predict where AQ pays — see project history). Opt-in for
+    /// Slow and Placebo. Driven by [`crate::encoder::encode_two_pass`].
+    TwoPassMeasured,
+}
+
+impl AqMode {
+    /// Whether this mode requires the two-pass encode driver
+    /// ([`crate::encoder::encode_two_pass`]) rather than a single in-tree pass.
+    pub fn is_two_pass(self) -> bool {
+        matches!(self, AqMode::TwoPassMeasured)
     }
 }
 
-/// Experimental variance-AQ configuration for [`Effort::Best`], parsed from the
-/// environment. Returns `Some((perceptual, strength))` when enabled:
-/// `BPG_BEST_AQ=perceptual` (SSIM-leaning, x265 aq-mode-2 direction) or
-/// `BPG_BEST_AQ=psnr` (SSE-leaning, opposite sign; the default for any other
-/// non-empty value). `BPG_BEST_AQ_STRENGTH` scales the offset (default 1.0,
-/// x265 `--aq-strength`). Unset / `0` / empty ⇒ `None` (Best stays uniform-QP).
-pub fn best_aq_params() -> Option<(bool, f32)> {
-    let mode = std::env::var("BPG_BEST_AQ").ok()?;
+/// Resolve a named adaptive-quantization preset to `(mode, strength, clamp)` —
+/// the single source of truth shared by the CLI `--aq` flag and external library
+/// callers (so the API exposes exactly the same options as the command line).
+/// Returns `None` for an unknown name. Names use hyphens, e.g.
+/// `perceptual-chroma-mild`. `two-pass` is the recommended measured mode.
+pub fn aq_preset(name: &str) -> Option<(AqMode, f32, u8)> {
+    Some(match name.trim().to_ascii_lowercase().as_str() {
+        "off" => (AqMode::Off, 0.0, 2),
+        "legacy-shrink" | "legacy" => (AqMode::LegacyShrink, 0.0, 8),
+        "perceptual-mild" => (AqMode::Perceptual, 0.20, 2),
+        "perceptual" => (AqMode::Perceptual, 0.35, 2),
+        "perceptual-chroma-mild" => (AqMode::PerceptualChroma, 0.20, 2),
+        "perceptual-chroma" => (AqMode::PerceptualChroma, 0.35, 2),
+        "psnr-probe" | "psnr" => (AqMode::PsnrProbe, 0.35, 2),
+        "positive-probe" | "positive" => (AqMode::PositiveProbe, 0.35, 2),
+        "two-pass" | "twopass" => (AqMode::TwoPassMeasured, 0.60, 3),
+        _ => return None,
+    })
+}
+
+/// Resolve the effective [`AqMode`] for an encode. Resolution order:
+/// 1. `BPG_PLACEBO_AQ` env override (Placebo only) — back-compat experiment hook.
+/// 2. `config.aq_mode` (the `--aq` flag).
+/// 3. `config.adaptive_qp = true` ⇒ [`AqMode::LegacyShrink`] (deprecated alias).
+/// 4. Otherwise [`AqMode::Off`].
+pub fn resolve_aq_mode(config: &StillHevcConfig) -> AqMode {
+    if config.effort == Effort::Placebo {
+        if let Some((mode, _)) = placebo_aq_env() {
+            return mode;
+        }
+    }
+    if config.aq_mode != AqMode::Off {
+        return config.aq_mode;
+    }
+    if config.adaptive_qp {
+        return AqMode::LegacyShrink;
+    }
+    AqMode::Off
+}
+
+/// Resolve `(mode, strength, clamp)` for an encode, honouring the
+/// `BPG_PLACEBO_AQ` / `BPG_PLACEBO_AQ_STRENGTH` env override on Placebo and the
+/// `config.aq_*` fields otherwise.
+pub fn resolve_aq(config: &StillHevcConfig) -> (AqMode, f32, f32) {
+    if config.effort == Effort::Placebo {
+        if let Some((mode, strength)) = placebo_aq_env() {
+            // The legacy env path keeps the wider legacy clamp.
+            return (mode, strength, preanalysis::VAR_AQ_CLAMP);
+        }
+    }
+    let mode = resolve_aq_mode(config);
+    (mode, config.aq_strength, config.aq_clamp.max(1) as f32)
+}
+
+/// Parse the legacy `BPG_PLACEBO_AQ` / `BPG_PLACEBO_AQ_STRENGTH` experiment
+/// override into `(mode, strength)`. Recognised values: `perceptual`,
+/// `perceptual-chroma`, `psnr`, `positive`; any other non-empty value falls back
+/// to `psnr` (its historical default). Unset / `0` / empty ⇒ `None`.
+fn placebo_aq_env() -> Option<(AqMode, f32)> {
+    let mode = std::env::var("BPG_PLACEBO_AQ").ok()?;
     let mode = mode.trim();
     if mode.is_empty() || mode == "0" {
         return None;
     }
-    let perceptual = mode.eq_ignore_ascii_case("perceptual");
-    let strength = std::env::var("BPG_BEST_AQ_STRENGTH")
+    let aq_mode = if mode.eq_ignore_ascii_case("perceptual") {
+        AqMode::Perceptual
+    } else if mode.eq_ignore_ascii_case("perceptual-chroma")
+        || mode.eq_ignore_ascii_case("perceptual_chroma")
+    {
+        AqMode::PerceptualChroma
+    } else if mode.eq_ignore_ascii_case("positive") {
+        AqMode::PositiveProbe
+    } else {
+        AqMode::PsnrProbe
+    };
+    let strength = std::env::var("BPG_PLACEBO_AQ_STRENGTH")
         .ok()
         .and_then(|s| s.trim().parse::<f32>().ok())
         .filter(|s| s.is_finite() && *s >= 0.0)
         .unwrap_or(1.0);
-    Some((perceptual, strength))
+    Some((aq_mode, strength))
 }
 
 /// Whether HEVC sign-data-hiding is applied for a config. Single source of
@@ -234,16 +232,22 @@ pub fn best_aq_params() -> Option<(bool, f32)> {
 /// group's hidden sign parity-consistent), so the flag and the coded levels
 /// can never disagree.
 ///
-/// Scoped to [`Effort::Best`] (the x265-parity tier); the byte-reproducible
-/// reference tiers ([`Effort::Placebo`]/[`Effort::Reference`]) stay SDH-free so
-/// their output remains bit-stable. `BPG_BEST2_SDH=0` reverts for A/B testing.
+/// Enabled by default for every effort: `bpgenc -m9` (x265 placebo) always codes
+/// with `signhide`, and an A/B on the slow/x265shape parity tier showed SDH is a
+/// clean equal-bytes BD-rate win (~+0.04–0.055 dB on textured content) that is
+/// decode-safe (the `recon==decode` round-trip holds with it on). Previously this
+/// was scoped to the old Best tier only. `BPG_SDH=0` (or the legacy
+/// `BPG_BEST2_SDH=0`) disables it for A/B testing.
 #[inline]
 pub fn sdh_active(config: &StillHevcConfig) -> bool {
-    config.effort == Effort::Best
-        && std::env::var("BPG_BEST2_SDH")
-            .ok()
-            .map(|v| v.trim() != "0")
-            .unwrap_or(true)
+    let _ = config;
+    if let Ok(v) = std::env::var("BPG_SDH") {
+        return v.trim() != "0";
+    }
+    std::env::var("BPG_BEST2_SDH")
+        .ok()
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true)
 }
 
 /// Experimental PPS chroma QP offset for rate-allocation diagnostics. Defaults
@@ -268,12 +272,28 @@ pub struct StillHevcConfig {
     pub effort: Effort,
     pub sao: SaoMode,
     pub deblock: DeblockMode,
-    /// Per-CU adaptive quantization (`cu_qp_delta`) for the speed/size-oriented
-    /// tiers. **Off by default**: the effort ladder is uniform-QP (each tier a
-    /// pruned `Best`), which the project's measurements found beats the per-CU
-    /// variance AQ on photos. Opt in for size-at-equal-QP on flat content. No
-    /// effect on `Best` (use `BPG_BEST_AQ`) or the reference tiers.
+    /// **Deprecated** compatibility alias for `aq_mode = AqMode::LegacyShrink`.
+    /// When `aq_mode` is `Off` and this is `true`, the encoder uses the legacy
+    /// one-directional importance shrink. Prefer setting [`Self::aq_mode`].
     pub adaptive_qp: bool,
+    /// Adaptive-quantization strategy. **`Off` by default** (uniform QP): the
+    /// effort ladder is uniform-QP (each tier a pruned `Best`), which the
+    /// project's measurements found beats per-CU variance AQ on photos. AQ is an
+    /// explicit opt-in via the `--aq` flag for the Slow tier (single pass) and an
+    /// experiment hook on Placebo (`BPG_PLACEBO_AQ` env override).
+    pub aq_mode: AqMode,
+    /// AQ strength (x265 `--aq-strength`): scales the per-QG QP deviation from
+    /// the picture mean. Ignored when `aq_mode == AqMode::Off`.
+    pub aq_strength: f32,
+    /// Maximum magnitude (QP steps) the AQ offset is clamped to. The `--aq`
+    /// presets use `2`. Ignored when `aq_mode == AqMode::Off`.
+    pub aq_clamp: u8,
+    /// Two-pass AQ candidate-compare gate (default `true`). When the resolved AQ
+    /// mode is [`AqMode::TwoPassMeasured`], keep the AQ candidate only if it is a
+    /// perceptual rate-distortion win over the uniform pass; otherwise emit the
+    /// uniform encode. Makes two-pass AQ safe to enable by default — it can
+    /// improve a picture but never regress one. Ignored for non-two-pass modes.
+    pub two_pass_gate: bool,
 }
 
 /// Rust-native still-picture HEVC intra encoder.
@@ -295,16 +315,17 @@ impl StillHevcEncoder {
         let mut out = Vec::new();
         nal::write_annexb_nal(&mut out, nal::NalType::Vps, &params::write_vps());
         nal::write_annexb_nal(&mut out, nal::NalType::Sps, &params::write_sps(config));
+        let wpp = params::effective_wpp_enabled(config);
         let tiles = params::effective_tile_dims(config);
         nal::write_annexb_nal(
             &mut out,
             nal::NalType::Pps,
-            &params::write_pps(config, tiles),
+            &params::write_pps(config, tiles, wpp),
         );
         nal::write_annexb_nal(
             &mut out,
             nal::NalType::IdrWRadl,
-            &slice::write_slice_segment_header(config, tiles, &[]),
+            &slice::write_slice_segment_header(config, tiles, wpp, &[]),
         );
         out
     }

@@ -37,7 +37,7 @@ fn psnr_rgb(a: &[u8], b: &[u8]) -> f64 {
 fn round_trip_color_space(color_space: ColorSpace, expected_code: ColorSpaceCode) {
     let rgb = sample_rgb(41, 35);
     let image = Image::from_rgb8(&rgb, 41, 35, color_space, false, 8);
-    let backend = RustStillHevcEncoder::new(Effort::Balanced)
+    let backend = RustStillHevcEncoder::new(Effort::Slow)
         .with_deblock(DeblockMode::On)
         .with_sao(SaoMode::Off);
 

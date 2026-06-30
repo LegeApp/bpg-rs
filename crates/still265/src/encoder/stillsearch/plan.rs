@@ -17,6 +17,10 @@ pub(super) struct PlanBlock {
     pub(super) coeff: Option<CoeffId>,
     pub(super) cbf: bool,
     pub(super) frac_bits: u64,
+    /// Pixel-domain distortion term used by the search RD cost.
+    pub(super) dist: u64,
+    /// Fractional bits included in the search RD cost (CBF + residual syntax).
+    pub(super) rd_frac_bits: u64,
 }
 
 impl PlanBlock {
@@ -25,6 +29,8 @@ impl PlanBlock {
             coeff: None,
             cbf: false,
             frac_bits: 0,
+            dist: 0,
+            rd_frac_bits: 0,
         }
     }
 }

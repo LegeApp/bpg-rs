@@ -29,6 +29,10 @@ pub struct RustStillHevcEncoder {
     sao: SaoMode,
     deblock: DeblockMode,
     adaptive_qp: bool,
+    aq_mode: crate::AqMode,
+    aq_strength: f32,
+    aq_clamp: u8,
+    two_pass_gate: bool,
     last_stats: Mutex<Option<LastEncodeStats>>,
     last_recon: Mutex<Option<DecodedFrame>>,
 }
@@ -41,15 +45,37 @@ impl RustStillHevcEncoder {
             sao: SaoMode::Off,
             deblock: DeblockMode::On,
             adaptive_qp: false,
+            aq_mode: crate::AqMode::Off,
+            aq_strength: 0.35,
+            aq_clamp: 2,
+            two_pass_gate: true,
             last_stats: Mutex::new(None),
             last_recon: Mutex::new(None),
         }
     }
 
-    /// Enable per-CU adaptive quantization on the speed tiers (off by default;
-    /// the ladder is uniform-QP). No effect on `Best`/reference tiers.
+    /// Enable per-CU adaptive quantization on production tiers (off by default;
+    /// Fast/Slow stay uniform-QP unless explicitly opted in).
     pub fn with_adaptive_qp(mut self, adaptive_qp: bool) -> Self {
         self.adaptive_qp = adaptive_qp;
+        self
+    }
+
+    /// Select the adaptive-quantization strategy, strength, and clamp (the
+    /// `--aq` flag). `AqMode::Off` (the default) keeps uniform QP.
+    pub fn with_aq(mut self, mode: crate::AqMode, strength: f32, clamp: u8) -> Self {
+        self.aq_mode = mode;
+        self.aq_strength = strength;
+        self.aq_clamp = clamp;
+        self
+    }
+
+    /// Toggle the two-pass AQ candidate-compare gate (default on). When on,
+    /// [`crate::AqMode::TwoPassMeasured`] keeps its AQ candidate only if it is a
+    /// perceptual rate-distortion win over the uniform pass. Turning it off
+    /// always applies the AQ candidate (for A/B measurement).
+    pub fn with_two_pass_gate(mut self, enabled: bool) -> Self {
+        self.two_pass_gate = enabled;
         self
     }
 
@@ -147,6 +173,10 @@ impl HevcEncoder for RustStillHevcEncoder {
             sao: self.sao,
             deblock: self.deblock,
             adaptive_qp: self.adaptive_qp,
+            aq_mode: self.aq_mode,
+            aq_strength: self.aq_strength,
+            aq_clamp: self.aq_clamp,
+            two_pass_gate: self.two_pass_gate,
         };
 
         let src = Source {
@@ -183,19 +213,34 @@ impl HevcEncoder for RustStillHevcEncoder {
             let cuterm_at = |l: usize| stats.cu_early_term_by_log2[l] as f64 / ctus;
             eprintln!(
                 "  cu_trials/ctu by depth (64/32/16/8): {:.2} {:.2} {:.2} {:.2}",
-                cu_at(6), cu_at(5), cu_at(4), cu_at(3),
+                cu_at(6),
+                cu_at(5),
+                cu_at(4),
+                cu_at(3),
             );
             eprintln!(
                 "  cu_splits_taken/ctu  (64/32/16/8): {:.2} {:.2} {:.2} {:.2}   early_term/ctu: {:.2} {:.2} {:.2} {:.2}",
-                cusplit_at(6), cusplit_at(5), cusplit_at(4), cusplit_at(3),
-                cuterm_at(6), cuterm_at(5), cuterm_at(4), cuterm_at(3),
+                cusplit_at(6),
+                cusplit_at(5),
+                cusplit_at(4),
+                cusplit_at(3),
+                cuterm_at(6),
+                cuterm_at(5),
+                cuterm_at(4),
+                cuterm_at(3),
             );
             let tuleaf_at = |l: usize| stats.tu_leaf_by_log2[l] as f64 / ctus;
             let tusplit_at = |l: usize| stats.tu_split_by_log2[l] as f64 / ctus;
             eprintln!(
                 "  tu_leaf/ctu by depth (32/16/8/4): {:.2} {:.2} {:.2} {:.2}   tu_split/ctu: {:.2} {:.2} {:.2} {:.2}",
-                tuleaf_at(5), tuleaf_at(4), tuleaf_at(3), tuleaf_at(2),
-                tusplit_at(5), tusplit_at(4), tusplit_at(3), tusplit_at(2),
+                tuleaf_at(5),
+                tuleaf_at(4),
+                tuleaf_at(3),
+                tuleaf_at(2),
+                tusplit_at(5),
+                tusplit_at(4),
+                tusplit_at(3),
+                tusplit_at(2),
             );
             #[cfg(feature = "overlay-probe")]
             {
@@ -211,10 +256,14 @@ impl HevcEncoder for RustStillHevcEncoder {
             if dct_total > 0 {
                 eprintln!(
                     "  dct_size_histogram: 4x4={} ({:.1}%)  8x8={} ({:.1}%)  16x16={} ({:.1}%)  32x32={} ({:.1}%)",
-                    dct_hist[0], 100.0 * dct_hist[0] as f64 / dct_total as f64,
-                    dct_hist[1], 100.0 * dct_hist[1] as f64 / dct_total as f64,
-                    dct_hist[2], 100.0 * dct_hist[2] as f64 / dct_total as f64,
-                    dct_hist[3], 100.0 * dct_hist[3] as f64 / dct_total as f64,
+                    dct_hist[0],
+                    100.0 * dct_hist[0] as f64 / dct_total as f64,
+                    dct_hist[1],
+                    100.0 * dct_hist[1] as f64 / dct_total as f64,
+                    dct_hist[2],
+                    100.0 * dct_hist[2] as f64 / dct_total as f64,
+                    dct_hist[3],
+                    100.0 * dct_hist[3] as f64 / dct_total as f64,
                 );
             }
         }

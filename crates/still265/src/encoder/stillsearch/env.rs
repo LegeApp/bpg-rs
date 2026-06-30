@@ -20,11 +20,80 @@ pub(super) const PROFILE: &str = "BPG_STILLSEARCH_PROFILE";
 /// luma-only first pass followed by full TU search for one winner.
 pub(super) const LUMA_CHEAP: &str = "BPG_STILLSEARCH_LUMA_CHEAP";
 
+/// Diagnostic RD lambda multiplier. Values below 1.0 spend more bits for lower
+/// distortion; values above 1.0 save bits. Defaults to 1.0.
+pub(super) const LAMBDA_SCALE: &str = "BPG_STILLSEARCH_LAMBDA_SCALE";
+
+/// Experimental SSIM-RD-style candidate cost. This is deliberately separate
+/// from AQ: it only changes mode/TU/CBF ranking by adding a source-normalized
+/// residual-energy term to the normal SSE+rate cost. Off by default.
+pub(super) const SSIM_RD: &str = "BPG_STILLSEARCH_SSIM_RD";
+
+/// Diagnostic: use RDOQ, not hard quantization, during search/materialization
+/// trials. x265 placebo (`-m9`) has rdoq-level=2 enabled during RD search, while
+/// still265 normally runs RDOQ only as a final winner recode. Off by default
+/// because this is a speed/decision investigation knob.
+pub(super) const RDOQ_SEARCH: &str = "BPG_STILLSEARCH_RDOQ_SEARCH";
+
+/// Diagnostic: disable winner-final RDOQ recode and commit hard-quantized
+/// search coefficients. x265 rdoq-level=0 A/B is a useful quant/RDO parity
+/// reference; this isolates still265's final RDOQ contribution.
+pub(super) const FINAL_RDOQ: &str = "BPG_STILLSEARCH_FINAL_RDOQ";
+
+/// Diagnostic only: sample RDOQ-coded block residual pricing rows. Set
+/// `BPG_STILLSEARCH_RDOQ_AUDIT=1` and optionally
+/// `BPG_STILLSEARCH_RDOQ_AUDIT_MOD=N` (default 1024; 1 prints every block).
+pub(super) const RDOQ_AUDIT: &str = "BPG_STILLSEARCH_RDOQ_AUDIT";
+pub(super) const RDOQ_AUDIT_MOD: &str = "BPG_STILLSEARCH_RDOQ_AUDIT_MOD";
+
+/// Single-block forensic dump target. `BPG_STILL_DUMP=x,y,log2,c_idx` makes
+/// `eval_component_8_from_src_pred` print the full residual pipeline (source,
+/// prediction, residual, forward coeffs, quantised levels, dequant, inverse
+/// residual, recon, distortion) for every candidate mode whose block geometry
+/// matches, so it can be diffed coefficient-by-coefficient against x265. The
+/// fourth field (c_idx) is optional and defaults to 0 (luma).
+pub(super) const STILL_DUMP: &str = "BPG_STILL_DUMP";
+
+/// Diagnostic transform-tree split controls. These target the observed x265
+/// parity gap where C emits many more luma TUs, especially 4x4 TUs in textured
+/// regions. All are off by default.
+pub(super) const TU_MIN_SPLIT_LOG2: &str = "BPG_STILLSEARCH_TU_MIN_SPLIT_LOG2";
+pub(super) const TU_SPLIT_BIAS_PER_PX: &str = "BPG_STILLSEARCH_TU_SPLIT_BIAS_PER_PX";
+pub(super) const TU_4X4_BIAS_PER_PX: &str = "BPG_STILLSEARCH_TU_4X4_BIAS_PER_PX";
+pub(super) const TU_FORCE_SPLIT_LOG2: &str = "BPG_STILLSEARCH_TU_FORCE_SPLIT_LOG2";
+
+/// Targeted 8x8->4x4 TU split admission. Unlike the global min-split/bias
+/// probes, this only admits extra 4x4 split evaluation when local evidence says
+/// the 8x8 leaf is a poor fit.
+pub(super) const TU_TARGET_4X4: &str = "BPG_STILLSEARCH_TU_TARGET_4X4";
+pub(super) const TU_TARGET_VAR_MIN: &str = "BPG_STILLSEARCH_TU_TARGET_VAR_MIN";
+pub(super) const TU_TARGET_COST_MIN: &str = "BPG_STILLSEARCH_TU_TARGET_COST_MIN";
+pub(super) const TU_TARGET_MEAN_RANGE_MIN: &str = "BPG_STILLSEARCH_TU_TARGET_MEAN_RANGE_MIN";
+
+/// Diagnostic CU split controls. These increase the number of luma CUs/TUs to
+/// probe the x265 gap where bpgenc emits many more small partitions.
+pub(super) const CU_SPLIT_BIAS_PER_PX: &str = "BPG_STILLSEARCH_CU_SPLIT_BIAS_PER_PX";
+pub(super) const CU_FORCE_SPLIT_LOG2: &str = "BPG_STILLSEARCH_CU_FORCE_SPLIT_LOG2";
+
+/// Diagnostic PartNxN controls. PartNxN creates four 4x4 luma PUs/TUs inside
+/// an 8x8 CU, matching one path by which x265 emits many more 4x4 luma TUs.
+pub(super) const NXN_BIAS_PER_PX: &str = "BPG_STILLSEARCH_NXN_BIAS_PER_PX";
+pub(super) const NXN_FORCE: &str = "BPG_STILLSEARCH_NXN_FORCE";
+
+/// Multiplier for the experimental SSIM-RD residual-energy term.
+pub(super) const SSIM_RD_WEIGHT: &str = "BPG_STILLSEARCH_SSIM_RD_WEIGHT";
+
 /// Residual syntax pricing mode used only by the luma-cheap first pass.
 /// Defaults to `exact`. Set to `skip` or `0` to rank cheap luma candidates
 /// without exact residual syntax bits; the selected winner is still remeasured
 /// with exact pricing in the full pass.
 pub(super) const LUMA_CHEAP_RESIDUAL_PRICE: &str = "BPG_STILLSEARCH_LUMA_CHEAP_RESIDUAL_PRICE";
+
+/// Experimental: when set (`1`/`on`), the cheap-pass exact residual pricing uses
+/// the static-context (frozen-state, x265 `EstBitsSbac`-style) bit estimate
+/// instead of the evolving-CABAC re-encode. A/B knob for the residual-pricing
+/// speed/quality lever; off by default.
+pub(super) const CHEAP_BITS_STATIC: &str = "BPG_STILLSEARCH_CHEAP_BITS_STATIC";
 
 /// Diagnostic angular-mode prefilter for rough luma search:
 /// `off|game|iame|tsame`. Defaults to off. `BPG_BEST_ANGULAR_EXCLUSION` is
@@ -79,6 +148,13 @@ pub(super) const X265_RMD_AUDIT: &str = "BPG_STILLSEARCH_X265_RMD_AUDIT";
 /// x265's real `bitsCodeBin()` depends on the current fractional CABAC carry.
 pub(super) const X265_RMD_INTEGER_COST: &str = "BPG_STILLSEARCH_X265_RMD_INTEGER_COST";
 
+/// Diagnostic x265shape exact remeasure expansion. Default top=1 matches x265shape;
+/// higher values remeasure multiple simple-RDO-ranked modes with split-enabled
+/// exact search, optionally gated by variance and close-cost margin.
+pub(super) const X265SHAPE_EXACT_TOP: &str = "BPG_STILLSEARCH_X265SHAPE_EXACT_TOP";
+pub(super) const X265SHAPE_EXACT_MARGIN: &str = "BPG_STILLSEARCH_X265SHAPE_EXACT_MARGIN";
+pub(super) const X265SHAPE_EXACT_VAR_MIN: &str = "BPG_STILLSEARCH_X265SHAPE_EXACT_VAR_MIN";
+
 /// Diagnostic only: when set alongside the luma oracle, print one
 /// `MISS_AUDIT:` line per sampled oracle miss with RMD admission and
 /// simple-RDO ranking context.
@@ -112,6 +188,71 @@ pub(super) fn x265_rmd_integer_cost_enabled() -> bool {
 }
 
 #[inline]
+pub(super) fn rdoq_audit_sample(x0: u32, y0: u32, log2_size: u8, c_idx: u8, mode: u8) -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os(RDOQ_AUDIT).is_some()) {
+        return false;
+    }
+
+    static MOD: OnceLock<u64> = OnceLock::new();
+    let modulus = *MOD.get_or_init(|| {
+        std::env::var(RDOQ_AUDIT_MOD)
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1024)
+    });
+    if modulus <= 1 {
+        return true;
+    }
+
+    // Stable integer mix: enough to spread neighboring blocks/modes without
+    // pulling in a RNG or process-global state.
+    let mut h = u64::from(x0 / 4).wrapping_mul(0x9E37_79B1);
+    h ^= u64::from(y0 / 4).wrapping_mul(0x85EB_CA77);
+    h ^= u64::from(log2_size).wrapping_mul(0xC2B2_AE3D);
+    h ^= u64::from(c_idx).wrapping_mul(0x27D4_EB2F);
+    h ^= u64::from(mode).wrapping_mul(0x1656_67B1);
+    h % modulus == 0
+}
+
+#[inline]
+pub(super) fn x265shape_exact_top() -> usize {
+    static VALUE: OnceLock<usize> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(X265SHAPE_EXACT_TOP)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v >= 1)
+            .unwrap_or(1)
+    })
+}
+
+#[inline]
+pub(super) fn x265shape_exact_margin() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(X265SHAPE_EXACT_MARGIN)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 1.0)
+            .unwrap_or(f64::INFINITY)
+    })
+}
+
+#[inline]
+pub(super) fn x265shape_exact_var_min() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(X265SHAPE_EXACT_VAR_MIN)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+#[inline]
 pub(super) fn luma_miss_audit_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os(LUMA_MISS_AUDIT).is_some())
@@ -126,6 +267,278 @@ pub(super) fn luma_cheap_enabled(template_enabled: bool) -> bool {
     env_val.unwrap_or(template_enabled)
 }
 
+/// RD lambda multiplier used by [`super::price::rd_lambda`].
+#[inline]
+pub(super) fn lambda_scale() -> f64 {
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var(LAMBDA_SCALE)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+    })
+}
+
+/// Target CTU `(x,y)` pixel origin for candidate-cost dumps (`BPG_DUMP_CTU="x,y"`,
+/// same env as the patched x265 `BPGCAND` dump). `None` when unset/malformed.
+pub(super) fn dump_ctu_target() -> Option<(u32, u32)> {
+    static V: OnceLock<Option<(u32, u32)>> = OnceLock::new();
+    *V.get_or_init(|| {
+        let s = std::env::var("BPG_DUMP_CTU").ok()?;
+        let (a, b) = s.split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    })
+}
+
+/// Diagnostic scale on the SEARCH-side residual-bit estimate
+/// (`BPG_RESIDUAL_BITS_SCALE`, default 1.0). Applies only to trial RD pricing,
+/// never to emitted bits. <1 approximates the within-CTU CABAC context drift
+/// (mid-CTU blocks code ~12-37% cheaper than the frozen CTU-entry `price_base`
+/// estimates), to test whether pricing residual closer to its real evolving-
+/// context cost shifts textured leaf/split/CBF decisions toward more coding.
+pub(super) fn residual_bits_search_scale() -> f64 {
+    static SCALE: OnceLock<f64> = OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("BPG_RESIDUAL_BITS_SCALE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+    })
+}
+
+/// Parsed `BPG_STILL_DUMP` forensic target: `(x, y, log2_size, c_idx)`.
+/// Cached; `None` when unset or malformed (the hot path pays one branch).
+#[inline]
+pub(super) fn dump_target() -> Option<(u32, u32, u8, u8)> {
+    static VALUE: OnceLock<Option<(u32, u32, u8, u8)>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let raw = std::env::var(STILL_DUMP).ok()?;
+        let mut it = raw.split(',').map(|s| s.trim());
+        let x = it.next()?.parse::<u32>().ok()?;
+        let y = it.next()?.parse::<u32>().ok()?;
+        let log2 = it.next()?.parse::<u8>().ok()?;
+        let c_idx = it.next().and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+        Some((x, y, log2, c_idx))
+    })
+}
+
+/// Override the smallest TU log2 size that may be reached by optional splits.
+/// `2` enables 8x8 -> 4x4 split evaluation; default policy usually stops at 8x8.
+#[inline]
+pub(super) fn tu_min_split_log2_override() -> Option<u8> {
+    static VALUE: OnceLock<Option<u8>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(TU_MIN_SPLIT_LOG2)
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .filter(|&v| (2..=5).contains(&v))
+    })
+}
+
+/// Subtract this many RD-cost units per luma pixel from split candidates.
+#[inline]
+pub(super) fn tu_split_bias_per_px() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(TU_SPLIT_BIAS_PER_PX)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
+    })
+}
+
+/// Extra split bias for 8x8 -> 4x4 split decisions.
+#[inline]
+pub(super) fn tu_4x4_bias_per_px() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(TU_4X4_BIAS_PER_PX)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
+    })
+}
+
+/// Force optional TU splits at the given parent log2 size (for example `3`
+/// forces legal 8x8 -> 4x4 splits).
+#[inline]
+pub(super) fn tu_force_split_log2() -> Option<u8> {
+    static VALUE: OnceLock<Option<u8>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(TU_FORCE_SPLIT_LOG2)
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .filter(|&v| (3..=6).contains(&v))
+    })
+}
+
+/// Subtract this many RD-cost units per luma pixel from CU split candidates.
+#[inline]
+pub(super) fn cu_split_bias_per_px() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(CU_SPLIT_BIAS_PER_PX)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
+    })
+}
+
+/// Force CU splits at the given parent log2 size (for example `4` forces
+/// legal 16x16 -> 8x8 CU splits).
+#[inline]
+pub(super) fn cu_force_split_log2() -> Option<u8> {
+    static VALUE: OnceLock<Option<u8>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(CU_FORCE_SPLIT_LOG2)
+            .ok()
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .filter(|&v| (4..=6).contains(&v))
+    })
+}
+
+/// Subtract this many RD-cost units per luma pixel from legal PartNxN candidates.
+#[inline]
+pub(super) fn nxn_bias_per_px() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(NXN_BIAS_PER_PX)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.0)
+    })
+}
+
+/// Force legal PartNxN candidates to win after evaluation. Diagnostic only.
+#[inline]
+pub(super) fn nxn_force_enabled() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(NXN_FORCE)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "off" || v == "none" || v.is_empty())
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Enable targeted 8x8->4x4 TU split admission.
+#[inline]
+pub(super) fn tu_target_4x4_enabled() -> bool {
+    static VALUE: OnceLock<bool> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(TU_TARGET_4X4)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "off" || v == "none" || v.is_empty())
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[inline]
+pub(super) fn tu_target_var_min() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(TU_TARGET_VAR_MIN)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(200.0)
+    })
+}
+
+#[inline]
+pub(super) fn tu_target_cost_min() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(TU_TARGET_COST_MIN)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(50.0)
+    })
+}
+
+#[inline]
+pub(super) fn tu_target_mean_range_min() -> f64 {
+    static VALUE: OnceLock<f64> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var(TU_TARGET_MEAN_RANGE_MIN)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(16.0)
+    })
+}
+
+/// True unless `BPG_STILLSEARCH_FINAL_RDOQ=0/off/none` disables final RDOQ.
+#[inline]
+pub(super) fn final_rdoq_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(FINAL_RDOQ)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "off" || v == "none")
+            })
+            .unwrap_or(true)
+    })
+}
+
+/// True when RDOQ should participate in search decisions, not only final recode.
+#[inline]
+pub(super) fn rdoq_search_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(RDOQ_SEARCH)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "off" || v == "none" || v.is_empty())
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// True when experimental SSIM-RD-style candidate ranking is enabled.
+#[inline]
+pub(super) fn ssim_rd_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(SSIM_RD)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "off" || v == "none" || v.is_empty())
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Weight for the experimental SSIM-RD-style residual-energy term.
+#[inline]
+pub(super) fn ssim_rd_weight() -> f64 {
+    static WEIGHT: OnceLock<f64> = OnceLock::new();
+    *WEIGHT.get_or_init(|| {
+        std::env::var(SSIM_RD_WEIGHT)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(1.0 / 16384.0)
+    })
+}
+
 /// Residual syntax pricing mode used only by the luma-cheap first pass.
 /// Falls back to `template_exact` when env var is not set.
 #[inline]
@@ -138,6 +551,22 @@ pub(super) fn luma_cheap_residual_price_exact(template_exact: bool) -> bool {
         })
     });
     env_val.unwrap_or(template_exact)
+}
+
+/// True when the cheap pass should price residual bits with the static-context
+/// estimate (frozen-state x265 `EstBitsSbac` model) instead of the evolving
+/// CABAC re-encode. Off by default; see [`CHEAP_BITS_STATIC`].
+pub(super) fn cheap_bits_static() -> bool {
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| {
+        std::env::var(CHEAP_BITS_STATIC)
+            .ok()
+            .map(|v| {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "off" || v == "none" || v.is_empty())
+            })
+            .unwrap_or(false)
+    })
 }
 
 #[inline]

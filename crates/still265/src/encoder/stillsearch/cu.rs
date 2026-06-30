@@ -4,12 +4,13 @@ use crate::cabac::CabacEstimator;
 use crate::contexts::ctx;
 use crate::effort::{CuEarlyTerminateRule, SplitSearch};
 use crate::encoder::Encoder;
+use crate::encoder::types::QG_LOG2;
 use crate::plan::DecisionConfidence;
 
 use super::depth::StillSearchDepth;
 use super::emit;
 use super::overlay::OverlayCache;
-use super::plan::CuPlan;
+use super::plan::{CuPlan, PlanBlock, TtPlan};
 use super::price::{chroma_dm_bits, entropy_bits, part_mode_bits, rd_lambda};
 use super::source::CtuSourceCache;
 
@@ -18,6 +19,17 @@ where
     S: CtuSourceCache,
     O: OverlayCache,
 {
+    #[inline]
+    fn cu_split_cost_bias(&self, log2_cb_size: u8) -> f64 {
+        let pixels = 1u64 << (2 * log2_cb_size);
+        super::env::cu_split_bias_per_px() * pixels as f64
+    }
+
+    #[inline]
+    fn force_cu_split(&self, log2_cb_size: u8) -> bool {
+        super::env::cu_force_split_log2().is_some_and(|v| v == log2_cb_size)
+    }
+
     /// Decide one CU: code it as a single `Leaf2Nx2N`, legal `PartNxN`, or
     /// split into four sub-CUs. On return the overlay holds exactly the winner's
     /// recon for this region and `mode_map`/`ct_depth_map` reflect it.
@@ -35,6 +47,14 @@ where
         let can_split = log2_cb_size > 3;
 
         if !fully_inside && can_split {
+            return self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
+        }
+        // AQ targets are defined per 32x32 quantization group. Keeping larger
+        // leaf CUs would quantize the whole leaf with its top-left QG target,
+        // while the bitstream/decoder QP prediction can change at QG
+        // boundaries. For AQ-active experiments, force the CU tree down to QG
+        // size so analysis, writer, and decoder agree.
+        if state.aq.active && can_split && log2_cb_size > QG_LOG2 {
             return self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
         }
         if !can_split {
@@ -84,6 +104,8 @@ where
             }
         };
 
+        let should_skip_split = should_skip_split && !self.force_cu_split(log2_cb_size);
+
         if should_skip_split {
             state.stats.cu_early_term_by_log2[log2_cb_size as usize] += 1;
             self.overlay.reattach(leaf_saved);
@@ -103,7 +125,32 @@ where
         let leaf_total = leaf_cost + lambda * entropy_bits(model, 0) as f64 / scale;
         let split_total = split_cost + lambda * entropy_bits(model, 1) as f64 / scale;
 
-        if split_total < leaf_total {
+        if let Some((tx, ty)) = super::env::dump_ctu_target() {
+            if x0 & !63 == tx && y0 & !63 == ty {
+                let mode = match &leaf_plan {
+                    CuPlan::Leaf(l) => l.luma_mode as i32,
+                    _ => -1,
+                };
+                let leaf_dist = cu_plan_dist(&leaf_plan);
+                let split_dist = cu_plan_dist(&split_plan);
+                let leaf_frac_bits = cu_plan_rd_frac_bits(&leaf_plan);
+                let split_frac_bits = cu_plan_rd_frac_bits(&split_plan);
+                let leaf_bits = rd_real_bits(leaf_total, leaf_dist, lambda);
+                let split_bits = rd_real_bits(split_total, split_dist, lambda);
+                let n = 1u32 << log2_cb_size;
+                eprintln!(
+                    "STILLCAND cu={x0},{y0} {n}x{n} leaf_mode={mode} leaf_dist={leaf_dist} leaf_frac_bits={leaf_frac_bits} leaf_bits={leaf_bits:.1} leaf_total={leaf_total:.0} split_dist={split_dist} split_frac_bits={split_frac_bits} split_bits={split_bits:.1} split_total={split_total:.0} -> {}",
+                    if split_total < leaf_total {
+                        "SPLIT"
+                    } else {
+                        "LEAF"
+                    }
+                );
+            }
+        }
+
+        let split_cmp_total = split_total - self.cu_split_cost_bias(log2_cb_size);
+        if self.force_cu_split(log2_cb_size) || split_cmp_total < leaf_total {
             state.stats.cu_splits_taken_by_log2[log2_cb_size as usize] += 1;
             #[cfg(test)]
             super::api::CU_SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -159,7 +206,10 @@ where
         if !nxn_policy.enabled {
             return false;
         }
-        if !state.part_nxn_enabled || log2_cb_size != 3 || !matches!(state.cat, 0 | 1 | 2 | 3) {
+        // 4:2:2 PartNxN parent chroma has a known second-stacked-CBF/replay
+        // edge at very low QP. Keep PartNxN enabled for 4:2:0 and 4:4:4, but
+        // gate 4:2:2 until that syntax/recon path is fixed.
+        if !state.part_nxn_enabled || log2_cb_size != 3 || !matches!(state.cat, 0 | 1 | 3) {
             return false;
         }
         true
@@ -237,8 +287,32 @@ where
         };
         let leaf_total = leaf_cost + lambda * (part_leaf + chroma_bits) as f64 / scale;
         let nxn_total = nxn_cost + lambda * (part_nxn + nxn_chroma_bits) as f64 / scale;
+        let nxn_cmp_total = nxn_total - super::env::nxn_bias_per_px() * 64.0;
 
-        if nxn_total < leaf_total {
+        if let Some((tx, ty)) = super::env::dump_ctu_target() {
+            if x0 & !63 == tx && y0 & !63 == ty {
+                let mode = match &leaf_plan {
+                    CuPlan::Leaf(l) => l.luma_mode as i32,
+                    _ => -1,
+                };
+                let leaf_dist = cu_plan_dist(&leaf_plan);
+                let nxn_dist = cu_plan_dist(&nxn_plan);
+                let leaf_frac_bits = cu_plan_rd_frac_bits(&leaf_plan);
+                let nxn_frac_bits = cu_plan_rd_frac_bits(&nxn_plan);
+                let leaf_bits = rd_real_bits(leaf_total, leaf_dist, lambda);
+                let nxn_bits = rd_real_bits(nxn_total, nxn_dist, lambda);
+                eprintln!(
+                    "STILLNXN cu={x0},{y0} 8x8 leaf_mode={mode} leaf_dist={leaf_dist} leaf_frac_bits={leaf_frac_bits} leaf_bits={leaf_bits:.1} leaf_total={leaf_total:.0} nxn_dist={nxn_dist} nxn_frac_bits={nxn_frac_bits} nxn_bits={nxn_bits:.1} nxn_total={nxn_total:.0} -> {}",
+                    if nxn_cmp_total < leaf_total {
+                        "NXN"
+                    } else {
+                        "LEAF"
+                    }
+                );
+            }
+        }
+
+        if super::env::nxn_force_enabled() || nxn_cmp_total < leaf_total {
             state.stats.partnxn_wins += 1;
             if state.cat == 2 && nxn_plan.has_parent_second_chroma_cbf() {
                 state.stats.partnxn_422_parent_chroma_second_cbf += 1;
@@ -320,5 +394,85 @@ where
         let mut leaf = emit::cu_leaf(mpm, winner.mode, winner.tt);
         leaf.confidence = DecisionConfidence::Clear;
         (CuPlan::Leaf(leaf), winner.cost)
+    }
+}
+
+fn rd_real_bits(cost: f64, dist: u64, lambda: f64) -> f64 {
+    if lambda <= 0.0 {
+        0.0
+    } else {
+        ((cost - dist as f64) / lambda).max(0.0)
+    }
+}
+
+fn plan_block_dist(block: &PlanBlock) -> u64 {
+    block.dist
+}
+
+fn plan_block_rd_frac_bits(block: &PlanBlock) -> u64 {
+    block.rd_frac_bits
+}
+
+fn tt_plan_dist(tt: &TtPlan) -> u64 {
+    match tt {
+        TtPlan::Leaf(l) => {
+            plan_block_dist(&l.luma)
+                + plan_block_dist(&l.cb)
+                + plan_block_dist(&l.cr)
+                + plan_block_dist(&l.cb1)
+                + plan_block_dist(&l.cr1)
+        }
+        TtPlan::Split {
+            parent_chroma,
+            kids,
+            ..
+        } => {
+            let parent = parent_chroma.as_ref().map_or(0, |p| {
+                plan_block_dist(&p.cb)
+                    + plan_block_dist(&p.cb1)
+                    + plan_block_dist(&p.cr)
+                    + plan_block_dist(&p.cr1)
+            });
+            parent + kids.iter().map(tt_plan_dist).sum::<u64>()
+        }
+    }
+}
+
+fn tt_plan_rd_frac_bits(tt: &TtPlan) -> u64 {
+    match tt {
+        TtPlan::Leaf(l) => {
+            plan_block_rd_frac_bits(&l.luma)
+                + plan_block_rd_frac_bits(&l.cb)
+                + plan_block_rd_frac_bits(&l.cr)
+                + plan_block_rd_frac_bits(&l.cb1)
+                + plan_block_rd_frac_bits(&l.cr1)
+        }
+        TtPlan::Split {
+            parent_chroma,
+            kids,
+            ..
+        } => {
+            let parent = parent_chroma.as_ref().map_or(0, |p| {
+                plan_block_rd_frac_bits(&p.cb)
+                    + plan_block_rd_frac_bits(&p.cb1)
+                    + plan_block_rd_frac_bits(&p.cr)
+                    + plan_block_rd_frac_bits(&p.cr1)
+            });
+            parent + kids.iter().map(tt_plan_rd_frac_bits).sum::<u64>()
+        }
+    }
+}
+
+fn cu_plan_dist(plan: &CuPlan) -> u64 {
+    match plan {
+        CuPlan::Leaf(leaf) => tt_plan_dist(&leaf.tt),
+        CuPlan::Split { kids } => kids.iter().map(cu_plan_dist).sum(),
+    }
+}
+
+fn cu_plan_rd_frac_bits(plan: &CuPlan) -> u64 {
+    match plan {
+        CuPlan::Leaf(leaf) => tt_plan_rd_frac_bits(&leaf.tt),
+        CuPlan::Split { kids } => kids.iter().map(cu_plan_rd_frac_bits).sum(),
     }
 }
