@@ -17,6 +17,9 @@ use bpg_hevc_decode::DecodedFrame;
 
 #[derive(Clone, Debug)]
 pub(super) struct ReconPatch8 {
+    /// Identity of the push event that created this patch (see
+    /// [`OverlayCache::push_id_at`]). Preserved across detach/reattach.
+    pub(super) push_id: u64,
     pub(super) c_idx: u8,
     pub(super) x: u32,
     pub(super) y: u32,
@@ -27,6 +30,7 @@ pub(super) struct ReconPatch8 {
 
 #[derive(Clone, Debug)]
 pub(super) struct ReconPatch16 {
+    pub(super) push_id: u64,
     pub(super) c_idx: u8,
     pub(super) x: u32,
     pub(super) y: u32,
@@ -38,11 +42,21 @@ pub(super) struct ReconPatch16 {
 #[derive(Default, Debug)]
 pub(super) struct ReconOverlay8 {
     patches: Vec<ReconPatch8>,
+    /// Monotone id assigned to each pushed patch. Together with the patch
+    /// stack's length and top-of-prefix id this identifies the stack content
+    /// exactly (patches below the top only ever change by being popped and
+    /// re-pushed, which mints a fresh id).
+    next_push_id: u64,
+    /// Bumped only by [`drain_range`](Self::drain_range), the one mutation
+    /// that removes mid-stack elements and breaks the stack-identity model.
+    drain_epoch: u64,
 }
 
 #[derive(Default, Debug)]
 pub(super) struct ReconOverlay16 {
     patches: Vec<ReconPatch16>,
+    next_push_id: u64,
+    drain_epoch: u64,
 }
 
 impl ReconOverlay8 {
@@ -50,8 +64,14 @@ impl ReconOverlay8 {
         self.patches.clear();
     }
 
-    pub(super) fn push(&mut self, patch: ReconPatch8) {
+    pub(super) fn push(&mut self, mut patch: ReconPatch8) {
+        patch.push_id = self.mint_push_id();
         self.patches.push(patch);
+    }
+
+    fn mint_push_id(&mut self) -> u64 {
+        self.next_push_id += 1;
+        self.next_push_id
     }
 
     /// Record the `width * height` reconstructed `samples` (row-major, given as
@@ -66,7 +86,9 @@ impl ReconOverlay8 {
         height: u32,
         samples: &[u16],
     ) {
+        let push_id = self.mint_push_id();
         self.patches.push(ReconPatch8 {
+            push_id,
             c_idx,
             x,
             y,
@@ -88,7 +110,9 @@ impl ReconOverlay8 {
         height: u32,
         samples: &[u8],
     ) {
+        let push_id = self.mint_push_id();
         self.patches.push(ReconPatch8 {
+            push_id,
             c_idx,
             x,
             y,
@@ -110,6 +134,7 @@ impl ReconOverlay8 {
         let end = end.min(self.patches.len());
         if start < end {
             self.patches.drain(start..end);
+            self.drain_epoch += 1;
         }
     }
 
@@ -174,8 +199,14 @@ impl ReconOverlay16 {
         self.patches.clear();
     }
 
-    pub(super) fn push(&mut self, patch: ReconPatch16) {
+    pub(super) fn push(&mut self, mut patch: ReconPatch16) {
+        patch.push_id = self.mint_push_id();
         self.patches.push(patch);
+    }
+
+    fn mint_push_id(&mut self) -> u64 {
+        self.next_push_id += 1;
+        self.next_push_id
     }
 
     pub(super) fn push_block(
@@ -187,7 +218,9 @@ impl ReconOverlay16 {
         height: u32,
         samples: &[u16],
     ) {
+        let push_id = self.mint_push_id();
         self.patches.push(ReconPatch16 {
+            push_id,
             c_idx,
             x,
             y,
@@ -209,6 +242,7 @@ impl ReconOverlay16 {
         let end = end.min(self.patches.len());
         if start < end {
             self.patches.drain(start..end);
+            self.drain_epoch += 1;
         }
     }
 
@@ -254,6 +288,26 @@ pub(super) trait OverlayCache {
     type Saved;
     fn clear(&mut self);
     fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16>;
+    /// Overlay `dst.len()` samples from row `y`, starting at `x0`, onto an
+    /// already frame-initialized destination buffer. Later patches win, matching
+    /// [`sample`](Self::sample)'s reverse-stack lookup, but this scans the patch
+    /// stack once instead of once per reference sample.
+    fn overlay_row_samples(&self, c_idx: u8, y: u32, x0: u32, dst: &mut [u16]) {
+        for (i, sample) in dst.iter_mut().enumerate() {
+            if let Some(v) = self.sample(c_idx, x0 + i as u32, y) {
+                *sample = v;
+            }
+        }
+    }
+    /// Overlay `dst.len()` samples from column `x`, starting at `y0`, onto an
+    /// already frame-initialized destination buffer.
+    fn overlay_col_samples(&self, c_idx: u8, x: u32, y0: u32, dst: &mut [u16]) {
+        for (i, sample) in dst.iter_mut().enumerate() {
+            if let Some(v) = self.sample(c_idx, x, y0 + i as u32) {
+                *sample = v;
+            }
+        }
+    }
     fn push_block(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32, samples: &[u16]);
     fn push_block_u8(
         &mut self,
@@ -273,6 +327,45 @@ pub(super) trait OverlayCache {
     fn detach_from(&mut self, mark: usize) -> Self::Saved;
     fn reattach(&mut self, saved: Self::Saved);
     fn commit_to_frame(&self, frame: &mut bpg_hevc_decode::DecodedFrame);
+    /// Bumped whenever mid-stack patches were removed ([`drain_range`]
+    /// invalidates the push-id stack-identity model).
+    fn drain_epoch(&self) -> u64;
+    /// Push id of the patch at stack index `idx`, or `None` when out of range.
+    /// `(drain_epoch, len, push_id_at(len-1))` identifies the stack content
+    /// exactly: an element below the top can only change by first popping
+    /// everything above it, and any re-push mints a fresh id.
+    fn push_id_at(&self, idx: usize) -> Option<u64>;
+    /// Whether any patch at stack index `from` or above intersects the intra
+    /// reference-border read region of the `size`-wide block at `(x0, y0)` in
+    /// component `c_idx`: row `y0-1` over `x ∈ [x0-1, x0+2*size-1]` and column
+    /// `x0-1` over `y ∈ [y0-1, y0+2*size-1]` (matching
+    /// `fill_border_samples_with_reader`'s reads).
+    fn any_border_overlap_since(&self, from: usize, c_idx: u8, x0: u32, y0: u32, size: u32)
+    -> bool;
+}
+
+/// Shared rectangle-vs-border-strips intersection test for
+/// [`OverlayCache::any_border_overlap_since`], in i64 to sidestep edge
+/// underflow. Conservative only in never under-reporting overlap.
+#[inline]
+fn patch_overlaps_border(
+    (px, py, pw, ph): (u32, u32, u32, u32),
+    x0: u32,
+    y0: u32,
+    size: u32,
+) -> bool {
+    let (px, py) = (px as i64, py as i64);
+    let (pw, ph) = (pw as i64, ph as i64);
+    let (x0, y0, size) = (x0 as i64, y0 as i64, size as i64);
+    // Top strip: y == y0-1, x in [x0-1, x0+2*size-1].
+    if y0 > 0 && py <= y0 - 1 && y0 - 1 < py + ph && px <= x0 + 2 * size - 1 && px + pw > x0 - 1 {
+        return true;
+    }
+    // Left strip: x == x0-1, y in [y0-1, y0+2*size-1].
+    if x0 > 0 && px <= x0 - 1 && x0 - 1 < px + pw && py <= y0 + 2 * size - 1 && py + ph > y0 - 1 {
+        return true;
+    }
+    false
 }
 
 impl OverlayCache for ReconOverlay8 {
@@ -282,6 +375,46 @@ impl OverlayCache for ReconOverlay8 {
     }
     fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16> {
         ReconOverlay8::sample(self, c_idx, x, y).map(u16::from)
+    }
+    fn overlay_row_samples(&self, c_idx: u8, y: u32, x0: u32, dst: &mut [u16]) {
+        let x1 = x0.saturating_add(dst.len() as u32);
+        for p in &self.patches {
+            if p.c_idx != c_idx || y < p.y || y >= p.y.saturating_add(p.height) {
+                continue;
+            }
+            let ix0 = x0.max(p.x);
+            let ix1 = x1.min(p.x.saturating_add(p.width));
+            if ix0 >= ix1 {
+                continue;
+            }
+            let src_y = (y - p.y) as usize * p.width as usize;
+            let src_x = (ix0 - p.x) as usize;
+            let dst_x = (ix0 - x0) as usize;
+            let n = (ix1 - ix0) as usize;
+            for i in 0..n {
+                dst[dst_x + i] = u16::from(p.samples[src_y + src_x + i]);
+            }
+        }
+    }
+    fn overlay_col_samples(&self, c_idx: u8, x: u32, y0: u32, dst: &mut [u16]) {
+        let y1 = y0.saturating_add(dst.len() as u32);
+        for p in &self.patches {
+            if p.c_idx != c_idx || x < p.x || x >= p.x.saturating_add(p.width) {
+                continue;
+            }
+            let iy0 = y0.max(p.y);
+            let iy1 = y1.min(p.y.saturating_add(p.height));
+            if iy0 >= iy1 {
+                continue;
+            }
+            let src_x = (x - p.x) as usize;
+            let dst_y = (iy0 - y0) as usize;
+            let n = (iy1 - iy0) as usize;
+            for i in 0..n {
+                let src_y = (iy0 - p.y) as usize + i;
+                dst[dst_y + i] = u16::from(p.samples[src_y * p.width as usize + src_x]);
+            }
+        }
     }
     fn push_block(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32, samples: &[u16]) {
         ReconOverlay8::push_block(self, c_idx, x, y, width, height, samples);
@@ -315,6 +448,27 @@ impl OverlayCache for ReconOverlay8 {
     fn commit_to_frame(&self, frame: &mut bpg_hevc_decode::DecodedFrame) {
         ReconOverlay8::commit_to_frame(self, frame);
     }
+    fn drain_epoch(&self) -> u64 {
+        self.drain_epoch
+    }
+    fn push_id_at(&self, idx: usize) -> Option<u64> {
+        self.patches.get(idx).map(|p| p.push_id)
+    }
+    fn any_border_overlap_since(
+        &self,
+        from: usize,
+        c_idx: u8,
+        x0: u32,
+        y0: u32,
+        size: u32,
+    ) -> bool {
+        self.patches[from.min(self.patches.len())..]
+            .iter()
+            .any(|p| {
+                p.c_idx == c_idx
+                    && patch_overlaps_border((p.x, p.y, p.width, p.height), x0, y0, size)
+            })
+    }
 }
 
 impl OverlayCache for ReconOverlay16 {
@@ -324,6 +478,44 @@ impl OverlayCache for ReconOverlay16 {
     }
     fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16> {
         ReconOverlay16::sample(self, c_idx, x, y)
+    }
+    fn overlay_row_samples(&self, c_idx: u8, y: u32, x0: u32, dst: &mut [u16]) {
+        let x1 = x0.saturating_add(dst.len() as u32);
+        for p in &self.patches {
+            if p.c_idx != c_idx || y < p.y || y >= p.y.saturating_add(p.height) {
+                continue;
+            }
+            let ix0 = x0.max(p.x);
+            let ix1 = x1.min(p.x.saturating_add(p.width));
+            if ix0 >= ix1 {
+                continue;
+            }
+            let src_y = (y - p.y) as usize * p.width as usize;
+            let src_x = (ix0 - p.x) as usize;
+            let dst_x = (ix0 - x0) as usize;
+            let n = (ix1 - ix0) as usize;
+            dst[dst_x..dst_x + n].copy_from_slice(&p.samples[src_y + src_x..src_y + src_x + n]);
+        }
+    }
+    fn overlay_col_samples(&self, c_idx: u8, x: u32, y0: u32, dst: &mut [u16]) {
+        let y1 = y0.saturating_add(dst.len() as u32);
+        for p in &self.patches {
+            if p.c_idx != c_idx || x < p.x || x >= p.x.saturating_add(p.width) {
+                continue;
+            }
+            let iy0 = y0.max(p.y);
+            let iy1 = y1.min(p.y.saturating_add(p.height));
+            if iy0 >= iy1 {
+                continue;
+            }
+            let src_x = (x - p.x) as usize;
+            let dst_y = (iy0 - y0) as usize;
+            let n = (iy1 - iy0) as usize;
+            for i in 0..n {
+                let src_y = (iy0 - p.y) as usize + i;
+                dst[dst_y + i] = p.samples[src_y * p.width as usize + src_x];
+            }
+        }
     }
     fn push_block(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32, samples: &[u16]) {
         ReconOverlay16::push_block(self, c_idx, x, y, width, height, samples);
@@ -345,5 +537,26 @@ impl OverlayCache for ReconOverlay16 {
     }
     fn commit_to_frame(&self, frame: &mut bpg_hevc_decode::DecodedFrame) {
         ReconOverlay16::commit_to_frame(self, frame);
+    }
+    fn drain_epoch(&self) -> u64 {
+        self.drain_epoch
+    }
+    fn push_id_at(&self, idx: usize) -> Option<u64> {
+        self.patches.get(idx).map(|p| p.push_id)
+    }
+    fn any_border_overlap_since(
+        &self,
+        from: usize,
+        c_idx: u8,
+        x0: u32,
+        y0: u32,
+        size: u32,
+    ) -> bool {
+        self.patches[from.min(self.patches.len())..]
+            .iter()
+            .any(|p| {
+                p.c_idx == c_idx
+                    && patch_overlaps_border((p.x, p.y, p.width, p.height), x0, y0, size)
+            })
     }
 }

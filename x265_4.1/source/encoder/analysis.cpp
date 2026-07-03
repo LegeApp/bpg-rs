@@ -524,6 +524,32 @@ void Analysis::qprdRefine(const CUData& parentCTU, const CUGeom& cuGeom, int32_t
     md.bestMode->reconYuv.copyToPicYuv(*m_frame->m_reconPic[0], parentCTU.m_cuAddr, cuGeom.absPartIdx);
 }
 
+// BPG diagnostic (env BPG_DUMP_CTU="x,y"): dump each evaluated intra candidate's
+// RD cost terms for the 64x64 CTU at pixel (x,y), to compare candidate costs
+// against still265 for the same block. Prints to stderr, prefix "BPGCAND".
+static void bpgDumpCand(const Mode& m, const char* part)
+{
+    static int s_tx = -2, s_ty = -2;
+    if (s_tx == -2)
+    {
+        const char* e = getenv("BPG_DUMP_CTU");
+        if (!(e && sscanf(e, "%d,%d", &s_tx, &s_ty) == 2)) { s_tx = -1; s_ty = -1; }
+    }
+    if (s_tx < 0)
+        return;
+    const CUData& cu = m.cu;
+    uint32_t px = cu.m_cuPelX, py = cu.m_cuPelY;
+    uint32_t ctx = px & ~63u, cty = py & ~63u;
+    if ((int)ctx != s_tx || (int)cty != s_ty)
+        return;
+    int sz = 1 << cu.m_log2CUSize[0];
+    fprintf(stderr,
+            "BPGCAND cu=%u,%u %dx%d %-5s mode=%2u dist=%llu bits=%u sa8d=%llu rdcost=%llu\n",
+            px, py, sz, sz, part, (unsigned)cu.m_lumaIntraDir[0],
+            (unsigned long long)m.distortion, (unsigned)m.totalBits,
+            (unsigned long long)m.sa8dCost, (unsigned long long)m.rdCost);
+}
+
 #if ENABLE_SCC_EXT
 uint64_t Analysis::compressIntraCU(const CUData& parentCTU, const CUGeom& cuGeom, int32_t qp, IBC* ibc)
 #else
@@ -578,12 +604,14 @@ uint64_t Analysis::compressIntraCU(const CUData& parentCTU, const CUGeom& cuGeom
     {
         md.pred[PRED_INTRA].cu.initSubCU(parentCTU, cuGeom, qp);
         checkIntra(md.pred[PRED_INTRA], cuGeom, SIZE_2Nx2N);
+        bpgDumpCand(md.pred[PRED_INTRA], "2Nx2N");
         checkBestMode(md.pred[PRED_INTRA], depth);
 
         if (cuGeom.log2CUSize == 3 && m_slice->m_sps->quadtreeTULog2MinSize < 3)
         {
             md.pred[PRED_INTRA_NxN].cu.initSubCU(parentCTU, cuGeom, qp);
             checkIntra(md.pred[PRED_INTRA_NxN], cuGeom, SIZE_NxN);
+            bpgDumpCand(md.pred[PRED_INTRA_NxN], "NxN");
             checkBestMode(md.pred[PRED_INTRA_NxN], depth);
         }
 

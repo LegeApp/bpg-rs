@@ -534,6 +534,12 @@ pub struct ChromaSearchPolicy {
     pub max_candidates: u8,
     pub residual_price: ResidualPriceLevel,
     pub quant: TrialQuant,
+    /// Number of non-DM chroma modes promoted from the SATD rough pass to exact
+    /// RD. 4 preserves exhaustive x265-parity search.
+    pub rough_k: u8,
+    /// Per-chroma-sample rough SATD threshold below which chroma mode search
+    /// keeps DM without exact non-DM trials. 0 disables the skip.
+    pub skip_satd_per_sample: f64,
 }
 
 /// Pre-analysis steering for per-block decision making.
@@ -733,6 +739,8 @@ pub(crate) static FAST: EffortTemplate = EffortTemplate {
         max_candidates: 1,
         residual_price: ResidualPriceLevel::Approx,
         quant: TrialQuant::HardQuant,
+        rough_k: 1,
+        skip_satd_per_sample: 0.0,
     },
 
     final_pass: FinalSearchPolicy {
@@ -790,14 +798,14 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
             scope: ComponentScope::LumaOnly,
             allow_optional_tu_split: false,
             residual_price: ResidualPriceLevel::Exact,
-            quant: TrialQuant::HardQuant,
+            quant: TrialQuant::Rdoq,
             chroma_satd_in_cheap: false,
         },
         exact: ExactLumaPolicy {
             max_modes: 4,
             scope: ComponentScope::LumaOnly,
             residual_price: ResidualPriceLevel::Exact,
-            quant: TrialQuant::HardQuant,
+            quant: TrialQuant::Rdoq,
             promote: ExactPromotionPolicy {
                 max_exact_modes: 1,
                 include_cheap_winner: true,
@@ -851,7 +859,9 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
         timing: ChromaTiming::WinnerOnly,
         max_candidates: 2,
         residual_price: ResidualPriceLevel::Exact,
-        quant: TrialQuant::HardQuant,
+        quant: TrialQuant::Rdoq,
+        rough_k: 1,
+        skip_satd_per_sample: 0.0,
     },
 
     final_pass: FinalSearchPolicy {
@@ -922,14 +932,14 @@ pub(crate) static PLACEBO: EffortTemplate = EffortTemplate {
             scope: ComponentScope::LumaOnly,
             allow_optional_tu_split: false,
             residual_price: ResidualPriceLevel::Approx,
-            quant: TrialQuant::HardQuant,
+            quant: TrialQuant::Rdoq,
             chroma_satd_in_cheap: false,
         },
         exact: ExactLumaPolicy {
             max_modes: 12,
             scope: ComponentScope::FullComponents,
             residual_price: ResidualPriceLevel::Exact,
-            quant: TrialQuant::HardQuant,
+            quant: TrialQuant::Rdoq,
             promote: ExactPromotionPolicy::all_shortlist(),
             exact_usage: ExactUsage::AllShortlist,
         },
@@ -977,7 +987,9 @@ pub(crate) static PLACEBO: EffortTemplate = EffortTemplate {
         timing: ChromaTiming::DuringExactTrials,
         max_candidates: 3,
         residual_price: ResidualPriceLevel::Exact,
-        quant: TrialQuant::HardQuant,
+        quant: TrialQuant::Rdoq,
+        rough_k: 4,
+        skip_satd_per_sample: 0.0,
     },
 
     final_pass: FinalSearchPolicy {

@@ -583,15 +583,16 @@ pub(super) fn parallel_thread_count() -> usize {
 }
 
 /// Build CTU trees with WPP row-wavefront dependencies. Workers keep private
-/// encoder state and publish deterministic CTU snapshots; AQ-active configs do
-/// not enter this path until QP targets/syntax commits are split.
+/// encoder state and publish deterministic CTU snapshots. AQ uses this only as
+/// a tree-build acceleration path; final syntax is replayed serially.
 pub(super) fn build_slice_trees_parallel(
     state: &mut Encoder<'_>,
     slice_qp_y: i32,
+    allow_aq: bool,
 ) -> Vec<Option<CuNode>> {
     debug_assert!(
-        !state.aq.active,
-        "WPP v1 keeps AQ serial until QP targets and syntax prediction are split"
+        !state.aq.active || allow_aq,
+        "AQ WPP requires explicit tree-build-only opt-in"
     );
     debug_assert!(
         state.tile_grid.is_single(),
@@ -1410,6 +1411,44 @@ pub(super) fn build_slice_trees_serial(
     let ctbs_x = state.display_width.div_ceil(ctb);
     let ctbs_y = state.display_height.div_ceil(ctb);
     let mut trees: Vec<Option<CuNode>> = (0..(ctbs_x * ctbs_y) as usize).map(|_| None).collect();
-    let _ = encode_slice_data_capture(state, None, slice_qp_y, Some(&mut trees));
+    if state.tile_grid.is_single() {
+        let _ = encode_slice_data_capture(state, None, slice_qp_y, Some(&mut trees));
+    } else {
+        build_slice_trees_serial_tiled(state, slice_qp_y, &mut trees, ctbs_x, ctb);
+    }
     trees
+}
+
+fn build_slice_trees_serial_tiled(
+    state: &mut Encoder<'_>,
+    slice_qp_y: i32,
+    trees: &mut [Option<CuNode>],
+    ctbs_x: u32,
+    ctb: u32,
+) {
+    let num_tiles = state.tile_grid.num_tiles();
+    let bounds: Vec<(u32, u32, u32, u32)> = (0..num_tiles)
+        .map(|t| state.tile_grid.tile_ctb_bounds(t))
+        .collect();
+
+    for &(cx0, cy0, cx1, cy1) in &bounds {
+        if state.aq.active {
+            state.aq.reset_for_slice();
+        }
+        let mut w = BitWriter::new();
+        let mut enc = CabacEncoder::new();
+        let mut ctxs = Contexts::new(slice_qp_y);
+
+        for cy in cy0..cy1 {
+            for cx in cx0..cx1 {
+                let x0 = cx * ctb;
+                let y0 = cy * ctb;
+                state.stats.ctu_count += 1;
+                let cu =
+                    write_coding_quadtree(state, &mut enc, &mut w, &mut ctxs, x0, y0, CTB_LOG2, 0);
+                trees[(cy * ctbs_x + cx) as usize] = Some(cu);
+                enc.encode_bin_trm(&mut w, 0);
+            }
+        }
+    }
 }

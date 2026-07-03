@@ -10,6 +10,7 @@
 use std::sync::OnceLock;
 
 use super::angular::{AngularExclusionConfig, AngularExclusionMode};
+use crate::rdoq::RdoqPricingMode;
 
 /// Set to any value to collect `EncodeStats::stillsearch_ledger_ns` bucket
 /// timings in addition to call counts.
@@ -29,11 +30,31 @@ pub(super) const LAMBDA_SCALE: &str = "BPG_STILLSEARCH_LAMBDA_SCALE";
 /// residual-energy term to the normal SSE+rate cost. Off by default.
 pub(super) const SSIM_RD: &str = "BPG_STILLSEARCH_SSIM_RD";
 
-/// Diagnostic: use RDOQ, not hard quantization, during search/materialization
-/// trials. x265 placebo (`-m9`) has rdoq-level=2 enabled during RD search, while
-/// still265 normally runs RDOQ only as a final winner recode. Off by default
-/// because this is a speed/decision investigation knob.
+/// Use RDOQ, not hard quantization, during search/materialization trials.
+/// x265 placebo (`-m9`) has rdoq-level=2 enabled during RD search, while
+/// still265 historically ran RDOQ only as a final winner recode. `1` forces
+/// RDOQ trials everywhere, `0` forces hard quant everywhere; unset (or
+/// `effort`) defers to the effort template's per-stage `TrialQuant` policy
+/// (Rdoq on slow/placebo, HardQuant on fast). Measured 2026-07-02:
+/// −2.8% Y / −2.7% RGB BD-rate on the small native set at +46% encode time.
 pub(super) const RDOQ_SEARCH: &str = "BPG_STILLSEARCH_RDOQ_SEARCH";
+
+/// One-pass exact evaluation: `decide_tt` (Phase 1) quantizes with the effort
+/// policy's trial quant (RDOQ on slow/placebo), and the Phase-2 RDOQ re-run of
+/// exact candidates is skipped as redundant. This halves exact-stage work and
+/// explores TU splits under RDOQ (closer to x265 rdoq-level 2, which never
+/// evaluates a candidate twice). `0` restores the two-phase hard-quant→RDOQ
+/// flow. On by default.
+pub(super) const RDOQ_ONE_PASS: &str = "BPG_STILLSEARCH_RDOQ_ONE_PASS";
+
+/// Experimental post-RDOQ residual-pricing model:
+/// `frozen|running|hybrid|exact-cleanup|bounded-trellis`, or `0|1|2|3|4`.
+/// Defaults to `frozen`, preserving the current single-scan RDOQ output.
+pub(super) const RDOQ_PRICING: &str = "BPG_RDOQ_PRICING";
+
+/// Beam width for `BPG_RDOQ_PRICING=bounded-trellis` (default 4, clamped
+/// internally by the optimizer).
+pub(super) const RDOQ_TRELLIS_BEAM: &str = "BPG_RDOQ_TRELLIS_BEAM";
 
 /// Diagnostic: disable winner-final RDOQ recode and commit hard-quantized
 /// search coefficients. x265 rdoq-level=0 A/B is a useful quant/RDO parity
@@ -112,6 +133,49 @@ pub(super) const ANGULAR_IAME_FACTOR: &str = "BPG_ANGULAR_IAME_FACTOR";
 pub(super) const ANGULAR_MIN_KEEP: &str = "BPG_ANGULAR_MIN_KEEP";
 pub(super) const ANGULAR_MIN_LOG2: &str = "BPG_ANGULAR_MIN_LOG2";
 
+/// x265-parity CABAC context evolution during StillSearch RD pricing.
+///
+/// x265 chains entropy contexts through the coding tree during analysis: each
+/// child CU is priced from the previous sibling's post-coding contexts
+/// (`compressIntraCU`'s `nextContext`), `codeIntraLumaQT` evolves the coder
+/// TU-to-TU with per-depth save/restore, and the RDOQ rate model reads those
+/// evolved states. still265 historically priced every trial from a context
+/// frozen at CTU entry (`price_base`), overestimating residual bits mid-CTU by
+/// a measured 12–37%.
+///
+/// Values: `1`/unset = full (search + finalize), `0`/`off` = disabled
+/// (byte-identical to the frozen-context behavior), `search` = search-time
+/// chaining only, `finalize` = decoder-order final-RDOQ contexts only.
+pub(super) const CTX_EVOLVE: &str = "BPG_STILLSEARCH_CTX_EVOLVE";
+
+/// x265-parity CU-header bit pricing: include `intra_chroma_pred_mode` bits
+/// for every CU leaf and `part_mode` bits for every 8x8 CU in the leaf RD
+/// cost, matching x265 `checkIntra`'s full-syntax `totalBits`. Historically
+/// these were only priced inside the 8x8 2Nx2N-vs-NxN comparison, so CU
+/// splits (4 headers vs 1) were under-priced. `0` restores the old pricing.
+pub(super) const CU_HEADER_BITS: &str = "BPG_STILLSEARCH_CU_HEADER_BITS";
+
+/// x265-parity CU-level chroma intra mode search (`estIntraPredChromaQT`):
+/// full-RD evaluation of the five allowed chroma modes
+/// {planar, vertical, horizontal, DC, DM} for each CU leaf, instead of
+/// always signalling DM. `0` disables (DM-only, the historical behavior).
+pub(super) const CHROMA_MODE_SEARCH: &str = "BPG_STILLSEARCH_CHROMA_MODES";
+
+/// Chroma-mode search optimizer knobs. The mode search gate above still
+/// controls whether chroma modes are searched at all.
+///
+/// `CHROMA_ROUGH=0` restores exhaustive exact RD over all non-DM modes.
+/// `CHROMA_ROUGH_K` is the number of non-DM modes promoted from the rough SATD
+/// pass to exact RD (1..=4; default from the effort template).
+/// `CHROMA_SKIP_SATD` is a per-chroma-sample rough-SATD threshold below which
+/// DM is kept immediately (0 disables; default from the effort template).
+/// `CHROMA_REUSE_DM=0` restores the old behavior of rebuilding DM winners
+/// instead of replaying the already-materialized DM residual contexts.
+pub(super) const CHROMA_ROUGH: &str = "BPG_STILLSEARCH_CHROMA_ROUGH";
+pub(super) const CHROMA_ROUGH_K: &str = "BPG_STILLSEARCH_CHROMA_ROUGH_K";
+pub(super) const CHROMA_SKIP_SATD: &str = "BPG_STILLSEARCH_CHROMA_SKIP_SATD";
+pub(super) const CHROMA_REUSE_DM: &str = "BPG_STILLSEARCH_CHROMA_REUSE_DM";
+
 /// Rough-pass audit: when set, logs per-CU statistics about rough vs exact
 /// ranking and angular-mode inclusion to stderr.  Sampled to avoid flooding
 /// large images; the sampling stride is controlled by `ROUGH_AUDIT_MOD`.
@@ -173,6 +237,123 @@ pub(super) const LUMA_ORACLE_MOD: &str = "BPG_STILLSEARCH_LUMA_ORACLE_MOD";
 pub(super) fn profile_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os(PROFILE).is_some())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CtxEvolve {
+    search: bool,
+    finalize: bool,
+}
+
+#[inline]
+fn ctx_evolve() -> CtxEvolve {
+    static VALUE: OnceLock<CtxEvolve> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let raw = std::env::var(CTX_EVOLVE).unwrap_or_default();
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "0" | "off" | "none" => CtxEvolve {
+                search: false,
+                finalize: false,
+            },
+            "search" => CtxEvolve {
+                search: true,
+                finalize: false,
+            },
+            "finalize" => CtxEvolve {
+                search: false,
+                finalize: true,
+            },
+            _ => CtxEvolve {
+                search: true,
+                finalize: true,
+            },
+        }
+    })
+}
+
+/// Search-time CABAC context chaining (CU/TU sibling-to-sibling pricing).
+#[inline]
+pub(super) fn ctx_evolve_search() -> bool {
+    ctx_evolve().search
+}
+
+/// Decoder-order evolving contexts for the winner-only RDOQ finalize pass.
+#[inline]
+pub(super) fn ctx_evolve_finalize() -> bool {
+    ctx_evolve().finalize
+}
+
+/// Full CU-header (`part_mode` + `intra_chroma_pred_mode`) bit pricing in CU
+/// leaf RD costs (x265 `checkIntra` parity). Default on.
+#[inline]
+pub(super) fn cu_header_bits_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(CU_HEADER_BITS)
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// CU-level full-RD chroma intra mode search (x265 `estIntraPredChromaQT`
+/// parity). Default on.
+#[inline]
+pub(super) fn chroma_mode_search_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(CHROMA_MODE_SEARCH)
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Enable SATD rough pre-selection for chroma mode search. Default on.
+#[inline]
+pub(super) fn chroma_rough_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(CHROMA_ROUGH)
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Number of non-DM chroma modes to exact-evaluate after rough ranking.
+#[inline]
+pub(super) fn chroma_rough_k(template_k: u8) -> usize {
+    static VALUE: OnceLock<Option<usize>> = OnceLock::new();
+    let env_val = *VALUE.get_or_init(|| {
+        std::env::var(CHROMA_ROUGH_K)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|v| v.clamp(1, 4))
+    });
+    env_val.unwrap_or(usize::from(template_k.clamp(1, 4)))
+}
+
+/// Per-sample SATD threshold below which chroma search keeps DM immediately.
+#[inline]
+pub(super) fn chroma_skip_satd(template_threshold: f64) -> f64 {
+    static VALUE: OnceLock<Option<f64>> = OnceLock::new();
+    let env_val = *VALUE.get_or_init(|| {
+        std::env::var(CHROMA_SKIP_SATD)
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    });
+    env_val.unwrap_or(template_threshold.max(0.0))
+}
+
+/// Reuse the already-materialized DM chroma blocks for the baseline cost and
+/// avoid a full DM rebuild when DM wins. Default on.
+#[inline]
+pub(super) fn chroma_reuse_dm_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(CHROMA_REUSE_DM)
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
 }
 
 #[inline]
@@ -496,18 +677,71 @@ pub(super) fn final_rdoq_enabled() -> bool {
     })
 }
 
-/// True when RDOQ should participate in search decisions, not only final recode.
+/// True unless `BPG_STILLSEARCH_RDOQ_ONE_PASS=0/off/none` restores the
+/// two-phase (hard-quant Phase 1 + RDOQ Phase 2) exact evaluation.
 #[inline]
-pub(super) fn rdoq_search_enabled() -> bool {
+pub(super) fn rdoq_one_pass_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        std::env::var(RDOQ_SEARCH)
+        std::env::var(RDOQ_ONE_PASS)
             .ok()
             .map(|v| {
                 let v = v.trim().to_ascii_lowercase();
-                !(v == "0" || v == "off" || v == "none" || v.is_empty())
+                !(v == "0" || v == "off" || v == "none")
             })
-            .unwrap_or(false)
+            .unwrap_or(true)
+    })
+}
+
+/// RDOQ-in-search override: `Some(true)` forces RDOQ trials at every search
+/// decision site, `Some(false)` forces hard quant, `None` (unset or `effort`)
+/// defers to the effort template's per-stage [`crate::effort::TrialQuant`].
+#[inline]
+pub(super) fn rdoq_search_override() -> Option<bool> {
+    static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        let v = std::env::var(RDOQ_SEARCH).ok()?;
+        let v = v.trim().to_ascii_lowercase();
+        if v.is_empty() || v == "effort" {
+            return None;
+        }
+        Some(!(v == "0" || v == "off" || v == "none"))
+    })
+}
+
+/// Post-RDOQ pricing experiment mode. See [`RDOQ_PRICING`].
+#[inline]
+pub(super) fn rdoq_pricing_mode() -> RdoqPricingMode {
+    static MODE: OnceLock<RdoqPricingMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let raw = std::env::var(RDOQ_PRICING).ok();
+        match raw
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("1" | "running" | "run") => RdoqPricingMode::Running,
+            Some("2" | "hybrid") => RdoqPricingMode::Hybrid,
+            Some("3" | "exact" | "exact-cleanup" | "cleanup") => RdoqPricingMode::ExactCleanup,
+            Some("4" | "trellis" | "bounded-trellis" | "bounded_trellis") => {
+                RdoqPricingMode::BoundedTrellis
+            }
+            _ => RdoqPricingMode::Frozen,
+        }
+    })
+}
+
+/// Beam width for `BPG_RDOQ_PRICING=bounded-trellis`.
+#[inline]
+pub(super) fn rdoq_trellis_beam() -> usize {
+    static BEAM: OnceLock<usize> = OnceLock::new();
+    *BEAM.get_or_init(|| {
+        std::env::var(RDOQ_TRELLIS_BEAM)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(4)
     })
 }
 

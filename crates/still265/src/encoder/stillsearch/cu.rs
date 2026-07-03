@@ -30,6 +30,47 @@ where
         super::env::cu_force_split_log2().is_some_and(|v| v == log2_cb_size)
     }
 
+    /// Update the `split_cu_flag` context in the evolving trial context for
+    /// the branch being explored (the writer codes it before the CU content).
+    #[inline]
+    fn commit_cu_split_flag_ctx(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        ct_depth: u8,
+        is_split: bool,
+    ) {
+        let ci = ctx::SPLIT_CU_FLAG + state.split_ctx_inc(x0, y0, ct_depth);
+        self.workspace.price_cur.models[ci].update(is_split as u8);
+    }
+
+    /// Commit a 2Nx2N CU leaf's header syntax (`part_mode` at min CU size,
+    /// `prev_intra_luma_pred_flag`, `intra_chroma_pred_mode`) into the
+    /// evolving trial context. Content (CBF/residual) contexts were already
+    /// committed by the winner's materialization; header models are disjoint
+    /// from content models, so applying them here yields the same final
+    /// per-model state as the writer's coding order.
+    fn commit_cu_leaf_header_ctx(
+        &mut self,
+        state: &Encoder<'_>,
+        mpm: [bpg_hevc_decode::hevc::slice::IntraPredMode; 3],
+        mode: u8,
+        log2_cb_size: u8,
+        chroma_mode_idx: u8,
+    ) {
+        let ctxs = &mut self.workspace.price_cur;
+        if log2_cb_size == 3 {
+            ctxs.models[ctx::PART_MODE].update(1);
+        }
+        let in_mpm = mpm.iter().any(|m| m.as_u8() == mode);
+        ctxs.models[ctx::PREV_INTRA_LUMA_PRED_FLAG].update(in_mpm as u8);
+        if state.cat != 0 {
+            ctxs.models[ctx::INTRA_CHROMA_PRED_MODE]
+                .update((chroma_mode_idx != crate::encoder::types::CHROMA_DM_IDX) as u8);
+        }
+    }
+
     /// Decide one CU: code it as a single `Leaf2Nx2N`, legal `PartNxN`, or
     /// split into four sub-CUs. On return the overlay holds exactly the winner's
     /// recon for this region and `mode_map`/`ct_depth_map` reflect it.
@@ -55,6 +96,9 @@ where
         // boundaries. For AQ-active experiments, force the CU tree down to QG
         // size so analysis, writer, and decoder agree.
         if state.aq.active && can_split && log2_cb_size > QG_LOG2 {
+            if super::env::ctx_evolve_search() {
+                self.commit_cu_split_flag_ctx(state, x0, y0, ct_depth, true);
+            }
             return self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
         }
         if !can_split {
@@ -62,6 +106,18 @@ where
                 return self.decide_cu_min_leaf_or_nxn(state, x0, y0, ct_depth);
             }
             return self.decide_cu_leaf(state, x0, y0, log2_cb_size, ct_depth);
+        }
+
+        // Snapshot the split-flag pricing model and (with evolving contexts)
+        // the CU-entry context before the alternatives touch either. Neighbor
+        // ct-depths feeding `split_ctx_inc` come from CUs decided before this
+        // one, so computing the index up front matches the writer.
+        let evolve = super::env::ctx_evolve_search();
+        let ci = ctx::SPLIT_CU_FLAG + state.split_ctx_inc(x0, y0, ct_depth);
+        let flag_model = self.workspace.price_cur.models[ci];
+        let ctx_entry = evolve.then(|| self.workspace.price_cur.clone());
+        if evolve {
+            self.commit_cu_split_flag_ctx(state, x0, y0, ct_depth, false);
         }
 
         let mark0 = self.overlay.mark();
@@ -116,14 +172,19 @@ where
             return (leaf_plan, leaf_cost);
         }
 
+        let ctx_leaf = ctx_entry.as_ref().map(|entry| {
+            let leaf_state = self.workspace.price_cur.clone();
+            self.workspace.price_cur = entry.clone();
+            self.commit_cu_split_flag_ctx(state, x0, y0, ct_depth, true);
+            leaf_state
+        });
+
         let (split_plan, split_cost) = self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
 
         let lambda = rd_lambda(state.cur_qp_y);
         let scale = CabacEstimator::SCALE as f64;
-        let ci = ctx::SPLIT_CU_FLAG + state.split_ctx_inc(x0, y0, ct_depth);
-        let model = &self.workspace.price_base.models[ci];
-        let leaf_total = leaf_cost + lambda * entropy_bits(model, 0) as f64 / scale;
-        let split_total = split_cost + lambda * entropy_bits(model, 1) as f64 / scale;
+        let leaf_total = leaf_cost + lambda * entropy_bits(&flag_model, 0) as f64 / scale;
+        let split_total = split_cost + lambda * entropy_bits(&flag_model, 1) as f64 / scale;
 
         if let Some((tx, ty)) = super::env::dump_ctu_target() {
             if x0 & !63 == tx && y0 & !63 == ty {
@@ -156,6 +217,9 @@ where
             super::api::CU_SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (split_plan, split_total)
         } else {
+            if let Some(leaf_state) = ctx_leaf {
+                self.workspace.price_cur = leaf_state;
+            }
             self.overlay.truncate(mark0);
             self.overlay.reattach(leaf_saved);
             if let CuPlan::Leaf(ref leaf) = leaf_plan {
@@ -247,8 +311,23 @@ where
         let incoming_modes = self.save_8x8_modes(state, x0, y0);
         let mark0 = self.overlay.mark();
 
+        // Header-bit models snapshotted before either alternative can evolve
+        // them. With `cu_header_bits` on, `decide_cu_leaf` prices the leaf's
+        // own part_mode/chroma header, so only the NxN side adds them here.
+        let header_bits_in_leaf = super::env::cu_header_bits_enabled();
+        let part_leaf = part_mode_bits(&self.workspace.price_cur, false);
+        let part_nxn = part_mode_bits(&self.workspace.price_cur, true);
+        let chroma_bits = chroma_dm_bits(&self.workspace.price_cur, state.cat);
+        let evolve = super::env::ctx_evolve_search();
+        let ctx_entry = evolve.then(|| self.workspace.price_cur.clone());
+
         let (leaf_plan, leaf_cost) = self.decide_cu_leaf(state, x0, y0, 3, ct_depth);
         let leaf_saved = self.overlay.detach_from(mark0);
+        let leaf_header_extra = if header_bits_in_leaf {
+            0.0
+        } else {
+            lambda * (part_leaf + chroma_bits) as f64 / scale
+        };
 
         // Rough SATD below the env threshold means the block is too smooth for
         // PartNxN to improve over the 2Nx2N leaf — skip it.
@@ -266,26 +345,22 @@ where
                 state.store_mode(x0, y0, 3, leaf.luma_mode);
                 state.set_ct_depth(x0, y0, 3, ct_depth);
             }
-            let part_leaf = part_mode_bits(&self.workspace.price_base, false);
-            let chroma_bits = chroma_dm_bits(&self.workspace.price_base, state.cat);
-            return (
-                leaf_plan,
-                leaf_cost + lambda * (part_leaf + chroma_bits) as f64 / scale,
-            );
+            return (leaf_plan, leaf_cost + leaf_header_extra);
         }
+
+        let ctx_leaf = ctx_entry
+            .as_ref()
+            .map(|entry| std::mem::replace(&mut self.workspace.price_cur, entry.clone()));
 
         self.restore_8x8_modes(state, x0, y0, incoming_modes);
         let (nxn_plan, nxn_cost) = self.decide_cu_part_nxn(state, x0, y0, ct_depth, lambda);
 
-        let part_leaf = part_mode_bits(&self.workspace.price_base, false);
-        let part_nxn = part_mode_bits(&self.workspace.price_base, true);
-        let chroma_bits = chroma_dm_bits(&self.workspace.price_base, state.cat);
         let nxn_chroma_bits = if state.cat == 3 {
             4 * chroma_bits
         } else {
             chroma_bits
         };
-        let leaf_total = leaf_cost + lambda * (part_leaf + chroma_bits) as f64 / scale;
+        let leaf_total = leaf_cost + leaf_header_extra;
         let nxn_total = nxn_cost + lambda * (part_nxn + nxn_chroma_bits) as f64 / scale;
         let nxn_cmp_total = nxn_total - super::env::nxn_bias_per_px() * 64.0;
 
@@ -320,6 +395,9 @@ where
             (nxn_plan, nxn_total)
         } else {
             state.stats.partnxn_losses += 1;
+            if let Some(leaf_state) = ctx_leaf {
+                self.workspace.price_cur = leaf_state;
+            }
             self.overlay.truncate(mark0);
             self.overlay.reattach(leaf_saved);
             if let CuPlan::Leaf(ref leaf) = leaf_plan {
@@ -393,7 +471,34 @@ where
         state.stats.final_coded_blocks += 1;
         let mut leaf = emit::cu_leaf(mpm, winner.mode, winner.tt);
         leaf.confidence = DecisionConfidence::Clear;
-        (CuPlan::Leaf(leaf), winner.cost)
+
+        let mut cost = winner.cost;
+        // x265 `checkIntra` prices the complete CU syntax (part_mode, pred
+        // info incl. the chroma mode) into every mode's rdcost, so CU splits
+        // pay for their extra per-CU headers. Price them here for parity;
+        // the 8x8 2Nx2N-vs-NxN comparison skips its own copy when this is on.
+        if super::env::cu_header_bits_enabled() {
+            let scale = CabacEstimator::SCALE as f64;
+            let mut hbits = chroma_dm_bits(&self.workspace.price_cur, state.cat);
+            if log2_cb_size == 3 {
+                hbits += part_mode_bits(&self.workspace.price_cur, false);
+            }
+            cost += lambda * hbits as f64 / scale;
+        }
+
+        // CU-level chroma mode search (x265 estIntraPredChromaQT parity):
+        // re-decide the winner's chroma blocks across the five allowed chroma
+        // modes, updating plan blocks, overlay recon, and the leaf cost.
+        if super::env::chroma_mode_search_enabled() {
+            cost += self.select_cu_chroma_mode(state, &mut leaf, x0, y0, log2_cb_size, lambda);
+        }
+
+        if super::env::ctx_evolve_search() {
+            let chroma_idx = leaf.chroma_mode_idx;
+            self.commit_cu_leaf_header_ctx(state, mpm, winner.mode, log2_cb_size, chroma_idx);
+        }
+
+        (CuPlan::Leaf(leaf), cost)
     }
 }
 

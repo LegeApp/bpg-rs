@@ -10,8 +10,8 @@ use crate::contexts::ctx;
 use crate::encoder::Encoder;
 use crate::primitives::{add_clip_u8, add_clip_u16, ssd_u8, ssd_u16, sub_residual_u8};
 use crate::residual::{
-    apply_sign_data_hiding, estimate_residual_bits_into_nnz, estimate_residual_bits_static,
-    get_scan_order,
+    ScanOrder, apply_sign_data_hiding, estimate_residual_bits, estimate_residual_bits_into_nnz,
+    estimate_residual_bits_static, get_scan_order,
 };
 use crate::transform;
 
@@ -41,6 +41,21 @@ pub(super) enum QuantMode {
 pub(super) enum ResidualPricingMode {
     Exact,
     Skip,
+}
+
+/// Quantization for search-stage RD decision sites (NxN PU modes, chroma mode
+/// search, cheap luma ranking): x265 rdoq-level-2 applies RDOQ in every RD
+/// evaluation. Follows the effort template's per-stage [`TrialQuant`] policy
+/// unless `BPG_STILLSEARCH_RDOQ_SEARCH` overrides it globally.
+#[inline]
+pub(super) fn search_trial_quant(policy: crate::effort::TrialQuant) -> QuantMode {
+    let rdoq =
+        super::env::rdoq_search_override().unwrap_or(policy == crate::effort::TrialQuant::Rdoq);
+    if rdoq {
+        QuantMode::RdoqTrial { level: 2 }
+    } else {
+        QuantMode::HardQuantSearch
+    }
 }
 
 /// Result of evaluating one transform block (luma or one chroma component).
@@ -117,6 +132,57 @@ where
             .ledger
             .finish_timer(WorkBucket::ChromaTrial, chroma_timer);
         out
+    }
+
+    /// Commit one selected block outcome's context updates into `price_cur`
+    /// (x265 parity: the winning candidate's coded syntax evolves the trial
+    /// contexts that later siblings price from). Updates the CBF bin and,
+    /// for coded blocks, evolves the residual-syntax context range exactly as
+    /// real coding would. Callers roll back via `price_cur` save/restore when
+    /// the surrounding alternative loses.
+    pub(super) fn commit_component_ctx(
+        &mut self,
+        cbf: bool,
+        levels: &[i16],
+        log2_size: u8,
+        c_idx: u8,
+        trafo_depth: u8,
+        scan: ScanOrder,
+        sdh_enabled: bool,
+    ) {
+        let cbf_ci = if c_idx == 0 {
+            ctx::CBF_LUMA + if trafo_depth == 0 { 1 } else { 0 }
+        } else {
+            ctx::CBF_CBCR + trafo_depth as usize
+        };
+        let ctxs = &mut self.workspace.price_cur;
+        ctxs.models[cbf_ci].update(cbf as u8);
+        if cbf {
+            debug_assert!(
+                !levels.is_empty(),
+                "committed coded block must retain levels"
+            );
+            let _ = estimate_residual_bits(ctxs, levels, log2_size, c_idx, scan, sdh_enabled);
+        }
+    }
+
+    /// Enter a committed-winner evaluation scope: subsequent `eval_component*`
+    /// calls write their selected outcome's context updates into `price_cur`
+    /// (with chroma deferred to the CU-level chroma-mode search when that is
+    /// enabled). Returns the previous flags for [`Self::end_winner_commit_scope`].
+    pub(super) fn begin_winner_commit_scope(&mut self) -> (bool, bool) {
+        let prev = (
+            self.workspace.commit_ctx,
+            self.workspace.commit_ctx_skip_chroma,
+        );
+        self.workspace.commit_ctx = super::env::ctx_evolve_search();
+        self.workspace.commit_ctx_skip_chroma = super::env::chroma_mode_search_enabled();
+        prev
+    }
+
+    pub(super) fn end_winner_commit_scope(&mut self, prev: (bool, bool)) {
+        self.workspace.commit_ctx = prev.0;
+        self.workspace.commit_ctx_skip_chroma = prev.1;
     }
 
     /// Like [`eval_component`] but skips overlay push. Useful for cheap
@@ -199,6 +265,8 @@ where
         let cat = state.cat;
         let sdh_enabled = state.sign_data_hiding;
         let is_dst4 = c_idx == 0 && log2_size == 2;
+        let commit_ctx =
+            self.workspace.commit_ctx && (c_idx == 0 || !self.workspace.commit_ctx_skip_chroma);
 
         let mut src = vec![0u16; n];
         for y in 0..size {
@@ -219,7 +287,7 @@ where
         } else {
             ctx::CBF_CBCR + trafo_depth as usize
         };
-        let cbf0_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 0);
+        let cbf0_bits = entropy_bits(&self.workspace.price_cur.models[cbf_ci], 0);
         let scale = CabacEstimator::SCALE as f64;
         let ssim_rd = super::env::ssim_rd_enabled();
         let ssim_weight = super::env::ssim_rd_weight();
@@ -235,6 +303,18 @@ where
             if push_overlay {
                 self.overlay
                     .push_block(c_idx, x0, y0, size as u32, size as u32, &pred);
+            }
+            if commit_ctx {
+                let scan = get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
+                self.commit_component_ctx(
+                    false,
+                    &[],
+                    log2_size,
+                    c_idx,
+                    trafo_depth,
+                    scan,
+                    sdh_enabled,
+                );
             }
             return BlockTrial {
                 coeff: None,
@@ -266,7 +346,7 @@ where
                 QuantMode::RdoqFinal => {
                     let timer = StillSearchLedger::start_timer();
                     let rdoq = crate::rdoq::rdoq_single_scan_into(
-                        &self.workspace.price_base,
+                        &self.workspace.price_cur,
                         coeff,
                         log2_size,
                         c_idx,
@@ -279,12 +359,31 @@ where
                     );
                     levels.clear();
                     levels.extend_from_slice(rdoq.levels);
+                    let mut nnz = rdoq.nnz;
                     self.workspace.ledger.bump(WorkBucket::Rdoq);
                     self.workspace.ledger.finish_timer(WorkBucket::Rdoq, timer);
-                    let mut nnz = rdoq.nnz;
+                    let pricing_mode = super::env::rdoq_pricing_mode();
+                    if pricing_mode != crate::rdoq::RdoqPricingMode::Frozen {
+                        nnz = crate::rdoq::apply_rdoq_pricing_mode(
+                            &self.workspace.price_cur,
+                            coeff,
+                            residual,
+                            levels,
+                            log2_size,
+                            c_idx,
+                            qp,
+                            bit_depth,
+                            is_dst4,
+                            scan,
+                            lambda,
+                            pricing_mode,
+                            super::env::rdoq_trellis_beam(),
+                            &mut self.workspace.rdoq_scratch,
+                        );
+                    }
                     if crate::rdoq::rdoq_refine_enabled() {
                         nnz = crate::rdoq::refine_rdoq_levels(
-                            &self.workspace.price_base,
+                            &self.workspace.price_cur,
                             coeff,
                             residual,
                             levels,
@@ -302,7 +401,7 @@ where
                 QuantMode::RdoqTrial { level: _ } => {
                     let timer = StillSearchLedger::start_timer();
                     let rdoq = crate::rdoq::rdoq_single_scan_into(
-                        &self.workspace.price_base,
+                        &self.workspace.price_cur,
                         coeff,
                         log2_size,
                         c_idx,
@@ -315,11 +414,31 @@ where
                     );
                     levels.clear();
                     levels.extend_from_slice(rdoq.levels);
+                    let mut nnz = rdoq.nnz;
                     self.workspace.ledger.bump(WorkBucket::RdoqTrial);
                     self.workspace
                         .ledger
                         .finish_timer(WorkBucket::RdoqTrial, timer);
-                    rdoq.nnz
+                    let pricing_mode = super::env::rdoq_pricing_mode();
+                    if pricing_mode != crate::rdoq::RdoqPricingMode::Frozen {
+                        nnz = crate::rdoq::apply_rdoq_pricing_mode(
+                            &self.workspace.price_cur,
+                            coeff,
+                            residual,
+                            levels,
+                            log2_size,
+                            c_idx,
+                            qp,
+                            bit_depth,
+                            is_dst4,
+                            scan,
+                            lambda,
+                            pricing_mode,
+                            super::env::rdoq_trellis_beam(),
+                            &mut self.workspace.rdoq_scratch,
+                        );
+                    }
+                    nnz
                 }
             };
             if sdh_enabled && nnz > 0 {
@@ -356,7 +475,7 @@ where
             }
         }
 
-        let cbf1_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 1);
+        let cbf1_bits = entropy_bits(&self.workspace.price_cur.models[cbf_ci], 1);
 
         let coded_min_cost = component_rd_cost(
             dist_coded,
@@ -371,7 +490,7 @@ where
         } else if nnz > 0 && coded_min_cost < cost_zero {
             let timer = StillSearchLedger::start_timer();
             let residual_bits = estimate_residual_bits_into_nnz(
-                &self.workspace.price_base,
+                &self.workspace.price_cur,
                 &levels_vec,
                 nnz,
                 log2_size,
@@ -393,7 +512,7 @@ where
                 ssim_weight,
             );
             maybe_dump_rdoq_audit(
-                &self.workspace.price_base,
+                &self.workspace.price_cur,
                 &levels_vec,
                 quant_mode,
                 x0,
@@ -425,6 +544,17 @@ where
                         .push_block(c_idx, x0, y0, size as u32, size as u32, &recon);
                 }
                 let coeff = retain_coeff.then(|| self.workspace.coeffs.push(&levels_vec));
+                if commit_ctx {
+                    self.commit_component_ctx(
+                        true,
+                        &levels_vec,
+                        log2_size,
+                        c_idx,
+                        trafo_depth,
+                        scan,
+                        sdh_enabled,
+                    );
+                }
                 BlockTrial {
                     coeff,
                     cbf: true,
@@ -435,6 +565,18 @@ where
                 }
             }
             _ => {
+                if commit_ctx {
+                    let scan = get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
+                    self.commit_component_ctx(
+                        false,
+                        &[],
+                        log2_size,
+                        c_idx,
+                        trafo_depth,
+                        scan,
+                        sdh_enabled,
+                    );
+                }
                 if push_overlay {
                     self.overlay
                         .push_block(c_idx, x0, y0, size as u32, size as u32, &pred);
@@ -479,8 +621,15 @@ where
 
         let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
         pred.resize(n, 0);
+        let t_border = profile.then(Instant::now);
+        let refs = self.cached_intra_refs_for_block(state, x0, y0, log2_size, c_idx);
+        if let Some(t) = t_border {
+            let ns = t.elapsed().as_nanos() as u64;
+            self.workspace.substage.border_ns =
+                self.workspace.substage.border_ns.saturating_add(ns);
+        }
         let t_predict = profile.then(Instant::now);
-        self.predict_exact_into_u8(state, x0, y0, log2_size, c_idx, mode, &mut pred);
+        self.predict_exact_from_refs_u8(&refs, log2_size, c_idx, mode, &mut pred);
         if let Some(t) = t_predict {
             let ns = t.elapsed().as_nanos() as u64;
             self.workspace.substage.predict_ns =
@@ -542,6 +691,8 @@ where
         let cat = state.cat;
         let sdh_enabled = state.sign_data_hiding;
         let is_dst4 = c_idx == 0 && log2_size == 2;
+        let commit_ctx =
+            self.workspace.commit_ctx && (c_idx == 0 || !self.workspace.commit_ctx_skip_chroma);
         debug_assert!(src.len() >= n && pred.len() >= n);
 
         let mut levels_vec = Vec::new();
@@ -559,8 +710,8 @@ where
         } else {
             ctx::CBF_CBCR + trafo_depth as usize
         };
-        let cbf0_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 0);
-        let cbf1_bits = entropy_bits(&self.workspace.price_base.models[cbf_ci], 1);
+        let cbf0_bits = entropy_bits(&self.workspace.price_cur.models[cbf_ci], 0);
+        let cbf1_bits = entropy_bits(&self.workspace.price_cur.models[cbf_ci], 1);
         let scale = CabacEstimator::SCALE as f64;
         let ssim_rd = super::env::ssim_rd_enabled();
         let ssim_weight = super::env::ssim_rd_weight();
@@ -578,6 +729,18 @@ where
                     .push_block_u8(c_idx, x0, y0, size as u32, size as u32, pred);
             }
             self.workspace.block_scratch.component_recon_u8 = recon;
+            if commit_ctx {
+                let scan = get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
+                self.commit_component_ctx(
+                    false,
+                    &[],
+                    log2_size,
+                    c_idx,
+                    trafo_depth,
+                    scan,
+                    sdh_enabled,
+                );
+            }
             return BlockTrial {
                 coeff: None,
                 cbf: false,
@@ -616,7 +779,7 @@ where
                 QuantMode::RdoqFinal => {
                     let timer = StillSearchLedger::start_timer();
                     let rdoq = crate::rdoq::rdoq_single_scan_into(
-                        &self.workspace.price_base,
+                        &self.workspace.price_cur,
                         coeff,
                         log2_size,
                         c_idx,
@@ -629,12 +792,31 @@ where
                     );
                     levels.clear();
                     levels.extend_from_slice(rdoq.levels);
+                    let mut nnz = rdoq.nnz;
                     self.workspace.ledger.bump(WorkBucket::Rdoq);
                     self.workspace.ledger.finish_timer(WorkBucket::Rdoq, timer);
-                    let mut nnz = rdoq.nnz;
+                    let pricing_mode = super::env::rdoq_pricing_mode();
+                    if pricing_mode != crate::rdoq::RdoqPricingMode::Frozen {
+                        nnz = crate::rdoq::apply_rdoq_pricing_mode(
+                            &self.workspace.price_cur,
+                            coeff,
+                            residual,
+                            levels,
+                            log2_size,
+                            c_idx,
+                            qp,
+                            8,
+                            is_dst4,
+                            scan,
+                            lambda,
+                            pricing_mode,
+                            super::env::rdoq_trellis_beam(),
+                            &mut self.workspace.rdoq_scratch,
+                        );
+                    }
                     if crate::rdoq::rdoq_refine_enabled() {
                         nnz = crate::rdoq::refine_rdoq_levels(
-                            &self.workspace.price_base,
+                            &self.workspace.price_cur,
                             coeff,
                             residual,
                             levels,
@@ -652,7 +834,7 @@ where
                 QuantMode::RdoqTrial { level: _ } => {
                     let timer = StillSearchLedger::start_timer();
                     let rdoq = crate::rdoq::rdoq_single_scan_into(
-                        &self.workspace.price_base,
+                        &self.workspace.price_cur,
                         coeff,
                         log2_size,
                         c_idx,
@@ -665,11 +847,31 @@ where
                     );
                     levels.clear();
                     levels.extend_from_slice(rdoq.levels);
+                    let mut nnz = rdoq.nnz;
                     self.workspace.ledger.bump(WorkBucket::RdoqTrial);
                     self.workspace
                         .ledger
                         .finish_timer(WorkBucket::RdoqTrial, timer);
-                    rdoq.nnz
+                    let pricing_mode = super::env::rdoq_pricing_mode();
+                    if pricing_mode != crate::rdoq::RdoqPricingMode::Frozen {
+                        nnz = crate::rdoq::apply_rdoq_pricing_mode(
+                            &self.workspace.price_cur,
+                            coeff,
+                            residual,
+                            levels,
+                            log2_size,
+                            c_idx,
+                            qp,
+                            8,
+                            is_dst4,
+                            scan,
+                            lambda,
+                            pricing_mode,
+                            super::env::rdoq_trellis_beam(),
+                            &mut self.workspace.rdoq_scratch,
+                        );
+                    }
+                    nnz
                 }
             };
             if sdh_enabled && nnz > 0 {
@@ -742,7 +944,7 @@ where
                     let t_price = profile.then(Instant::now);
                     let residual_bits = if super::env::cheap_bits_static() {
                         crate::residual::estimate_residual_bits_static(
-                            &self.workspace.price_base,
+                            &self.workspace.price_cur,
                             levels,
                             log2_size,
                             c_idx,
@@ -751,7 +953,7 @@ where
                         )
                     } else {
                         estimate_residual_bits_into_nnz(
-                            &self.workspace.price_base,
+                            &self.workspace.price_cur,
                             levels,
                             nnz,
                             log2_size,
@@ -775,7 +977,7 @@ where
                     };
                     priced_residual_bits = Some(residual_bits);
                 }
-                if (retain_coeff || rdoq_audit) && coded_min_cost < cost_zero {
+                if (retain_coeff || rdoq_audit || commit_ctx) && coded_min_cost < cost_zero {
                     levels_vec = levels.clone();
                 }
                 recon_coded = true;
@@ -803,7 +1005,7 @@ where
                 ssim_weight,
             );
             maybe_dump_rdoq_audit(
-                &self.workspace.price_base,
+                &self.workspace.price_cur,
                 &levels_vec,
                 quant_mode,
                 x0,
@@ -835,6 +1037,17 @@ where
                         .push_block_u8(c_idx, x0, y0, size as u32, size as u32, &recon);
                 }
                 let coeff = retain_coeff.then(|| self.workspace.coeffs.push(&levels_vec));
+                if commit_ctx {
+                    self.commit_component_ctx(
+                        true,
+                        &levels_vec,
+                        log2_size,
+                        c_idx,
+                        trafo_depth,
+                        scan,
+                        sdh_enabled,
+                    );
+                }
                 BlockTrial {
                     coeff,
                     cbf: true,
@@ -848,6 +1061,17 @@ where
                 if push_overlay {
                     self.overlay
                         .push_block_u8(c_idx, x0, y0, size as u32, size as u32, pred);
+                }
+                if commit_ctx {
+                    self.commit_component_ctx(
+                        false,
+                        &[],
+                        log2_size,
+                        c_idx,
+                        trafo_depth,
+                        scan,
+                        sdh_enabled,
+                    );
                 }
                 BlockTrial {
                     coeff: None,

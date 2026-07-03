@@ -672,6 +672,8 @@ fn select_primitives() -> Primitives {
         p.transform.fwd_dct32 = wide::fwd_dct32;
         p.intra.pred_allangs = wide::intra_pred_allangs;
         p.intra.pred_allangs_u8 = wide::pred_allangs_u8;
+        p.intra.pred_planar_u8 = intra::exact::pred_planar_u8_wide;
+        p.intra.pred_angular_u8 = intra::exact::pred_angular_u8_wide;
         p.backend = "wide";
 
         // ISA-specific layers overwrite individual entries as detected.

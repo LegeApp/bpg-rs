@@ -642,7 +642,8 @@ fn encode_inner(
         frame.qp_map.fill(qp_y as i8);
     }
 
-    let wpp = params::effective_wpp_enabled(config);
+    let stream_wpp = params::effective_wpp_enabled(config);
+    let build_wpp = params::effective_wpp_build_enabled(config);
     let tiles = params::effective_tile_dims(config);
     let tile_grid = {
         let ctb = 1u32 << CTB_LOG2;
@@ -726,11 +727,13 @@ fn encode_inner(
     let mut qg_energy_bits: Option<(u32, u32, Vec<f64>, Vec<f64>)> = None;
     let (slice_data, entry_sizes) = if config.sao == SaoMode::On
         || !state.tile_grid.is_single()
-        || wpp
+        || stream_wpp
+        || build_wpp
         || collect_activity
     {
-        let trees = if wpp {
-            build_slice_trees_parallel(&mut state, slice_qp_y)
+        let trees = if build_wpp {
+            let allow_aq_build = state.aq.active;
+            build_slice_trees_parallel(&mut state, slice_qp_y, allow_aq_build)
         } else {
             build_slice_trees_serial(&mut state, slice_qp_y)
         };
@@ -757,7 +760,7 @@ fn encode_inner(
         };
         let phase_start = std::time::Instant::now();
         let (bytes, entries) =
-            write_slice_from_trees(&mut state, &trees, sao_map.as_ref(), slice_qp_y, wpp);
+            write_slice_from_trees(&mut state, &trees, sao_map.as_ref(), slice_qp_y, stream_wpp);
         state.stats.phase_write_us += phase_start.elapsed().as_micros() as u64;
         if let Some(map) = &sao_map {
             let phase_start = std::time::Instant::now();
@@ -799,7 +802,7 @@ fn encode_inner(
         }
     });
 
-    let mut payload = slice::write_slice_segment_header(config, tiles, wpp, &entry_sizes);
+    let mut payload = slice::write_slice_segment_header(config, tiles, stream_wpp, &entry_sizes);
     payload.extend_from_slice(&slice_data);
 
     let mut out = Vec::new();
@@ -808,7 +811,7 @@ fn encode_inner(
     nal::write_annexb_nal(
         &mut out,
         nal::NalType::Pps,
-        &params::write_pps(config, tiles, wpp),
+        &params::write_pps(config, tiles, stream_wpp),
     );
     nal::write_annexb_nal(&mut out, nal::NalType::IdrWRadl, &payload);
 
@@ -929,7 +932,9 @@ pub fn encode_two_pass(
             eprintln!(
                 "2PASS-GATE w={ssim_w} rv={rate_value} q_a={q_a:.4} uniform@aq_rate={uniform_q_at_aq_rate:.4} credit={credit:.4} thresh={:.4} (q_u={q_u:.4}@{} q_u3={q_u3:.4}@{} bytes_a={}) -> {}",
                 uniform_q_at_aq_rate - credit,
-                bytes_u.len(), bytes_u3.len(), bytes_a.len(),
+                bytes_u.len(),
+                bytes_u3.len(),
+                bytes_a.len(),
                 if keep { "KEEP-AQ" } else { "REVERT-UNIFORM" }
             );
         }
@@ -956,13 +961,7 @@ fn two_pass_gate_enabled(config: &StillHevcConfig) -> bool {
 /// measured (bytes, quality) points — the rate axis BD-rate uses. Clamps to the
 /// endpoints when `target` falls outside the bracket (AQ saved/grew more than a
 /// QP step).
-fn interp_log_rate(
-    bytes0: usize,
-    q0: f64,
-    bytes1: usize,
-    q1: f64,
-    target_bytes: usize,
-) -> f64 {
+fn interp_log_rate(bytes0: usize, q0: f64, bytes1: usize, q1: f64, target_bytes: usize) -> f64 {
     let (l0, l1, lt) = (
         (bytes0.max(1) as f64).ln(),
         (bytes1.max(1) as f64).ln(),
@@ -1034,7 +1033,11 @@ fn luma_fidelity(
         }
         by += 8;
     }
-    let ssim = if blocks == 0 { 1.0 } else { ssim_acc / blocks as f64 };
+    let ssim = if blocks == 0 {
+        1.0
+    } else {
+        ssim_acc / blocks as f64
+    };
     let mse = if total == 0.0 { 0.0 } else { sse / total };
     (ssim, mse)
 }
@@ -1121,7 +1124,10 @@ fn collect_qg_activity(
             .map(|&c| (c as i64).abs())
             .sum();
         let fb: u64 = blocks.iter().map(|b| b.frac_bits).sum();
-        (e as f64, fb as f64 / crate::cabac::CabacEstimator::SCALE as f64)
+        (
+            e as f64,
+            fb as f64 / crate::cabac::CabacEstimator::SCALE as f64,
+        )
     };
 
     // Recurse a transform tree, attributing each leaf TU to its QG.
@@ -1139,7 +1145,9 @@ fn collect_qg_activity(
                 let (e, b) = leaf_stats(l);
                 add(energy, bits, x, y, e, b);
             }
-            Tt::Split { log2_size, kids, .. } => {
+            Tt::Split {
+                log2_size, kids, ..
+            } => {
                 let half = 1u32 << (log2_size - 1);
                 for (i, kid) in kids.iter().enumerate() {
                     let kx = x + (i as u32 & 1) * half;
@@ -1189,7 +1197,16 @@ fn collect_qg_activity(
         if let Some(node) = tree {
             let cx = (idx as u32 % ctbs_x) * ctb;
             let cy = (idx as u32 / ctbs_x) * ctb;
-            cu_walk(node, cx, cy, CTB_LOG2, &mut energy, &mut bits, &add, &leaf_stats);
+            cu_walk(
+                node,
+                cx,
+                cy,
+                CTB_LOG2,
+                &mut energy,
+                &mut bits,
+                &add,
+                &leaf_stats,
+            );
         }
     }
     (cells_x, cells_y, energy, bits)

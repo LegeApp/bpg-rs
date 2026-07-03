@@ -96,6 +96,30 @@ where
         super::env::tu_force_split_log2().is_some_and(|v| v == log2_size)
     }
 
+    /// Update the `split_transform_flag` context in the evolving trial context
+    /// for the branch currently being explored (x265 codes the flag before the
+    /// node's content, so its context evolution precedes the children's).
+    #[inline]
+    fn commit_tt_split_flag_ctx(&mut self, log2_size: u8, is_split: bool) {
+        let ci = crate::contexts::ctx::SPLIT_TRANSFORM_FLAG
+            + (5usize.saturating_sub(log2_size as usize)).min(2);
+        self.workspace.price_cur.models[ci].update(is_split as u8);
+    }
+
+    /// Quantization for the plain `decide_tt` exact pass. With one-pass RDOQ
+    /// (default) this follows the exact-stage `TrialQuant` policy so candidates
+    /// and TU splits are evaluated under RDOQ directly and the Phase-2 re-run
+    /// is skipped; with `BPG_STILLSEARCH_RDOQ_ONE_PASS=0` it stays hard-quant
+    /// (the legacy two-phase flow).
+    #[inline]
+    fn tt_search_quant(&self, state: &Encoder<'_>) -> QuantMode {
+        if super::env::rdoq_one_pass_enabled() {
+            super::eval::search_trial_quant(state.effort_template.luma.exact.quant)
+        } else {
+            QuantMode::HardQuantSearch
+        }
+    }
+
     #[inline]
     fn target_4x4_possible(&self, log2_size: u8, syntax_can_split: bool) -> bool {
         syntax_can_split && log2_size == 3 && super::env::tu_target_4x4_enabled()
@@ -186,6 +210,7 @@ where
             crate::effort::ResidualPriceLevel::Exact => ResidualPricingMode::Exact,
             _ => ResidualPricingMode::Skip,
         };
+        let tt_quant = self.tt_search_quant(state);
 
         if must_split {
             return self.eval_tt_split(
@@ -207,9 +232,10 @@ where
                 log2_size,
                 trafo_depth,
                 luma_mode,
+                luma_mode,
                 false,
                 lambda,
-                QuantMode::HardQuantSearch,
+                tt_quant,
                 residual_pricing,
                 true,
                 scope,
@@ -217,6 +243,17 @@ where
         }
 
         // Leaf-first evaluation: evaluate the leaf candidate before the split.
+        // With evolving trial contexts, each alternative's coded syntax
+        // evolves `price_cur` from the same node-entry snapshot; the winner's
+        // exit state survives (x265 `codeIntraLumaQT` save/restore parity).
+        let flag_priced = can_split || target_4x4_possible;
+        let ctx_entry = self
+            .workspace
+            .commit_ctx
+            .then(|| self.workspace.price_cur.clone());
+        if self.workspace.commit_ctx && flag_priced {
+            self.commit_tt_split_flag_ctx(log2_size, false);
+        }
         let mark0 = self.overlay.mark();
         let (leaf_tt, leaf_cost) = self.eval_tt_leaf(
             state,
@@ -225,9 +262,10 @@ where
             log2_size,
             trafo_depth,
             luma_mode,
+            luma_mode,
             can_split || target_4x4_possible,
             lambda,
-            QuantMode::HardQuantSearch,
+            tt_quant,
             residual_pricing,
             true,
             scope,
@@ -266,6 +304,15 @@ where
             }
         }
 
+        let ctx_leaf = ctx_entry.as_ref().map(|entry| {
+            let leaf_state = self.workspace.price_cur.clone();
+            self.workspace.price_cur = entry.clone();
+            if flag_priced {
+                self.commit_tt_split_flag_ctx(log2_size, true);
+            }
+            leaf_state
+        });
+
         let (split_tt, split_cost) = self.eval_tt_split(
             state,
             x0,
@@ -285,6 +332,9 @@ where
         } else {
             #[cfg(test)]
             super::api::LEAF_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(leaf_state) = ctx_leaf {
+                self.workspace.price_cur = leaf_state;
+            }
             self.overlay.truncate(mark0);
             self.overlay.reattach(leaf_saved);
             (leaf_tt, leaf_cost)
@@ -294,6 +344,7 @@ where
     /// Evaluate this node as a leaf TU (luma + chroma), returning its internal
     /// plan and RD cost and pushing its recon to the overlay.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn eval_tt_leaf(
         &mut self,
         state: &Encoder<'_>,
@@ -302,6 +353,7 @@ where
         log2_size: u8,
         trafo_depth: u8,
         luma_mode: u8,
+        chroma_mode: u8,
         code_split_flag: bool,
         lambda: f64,
         quant_mode: QuantMode,
@@ -336,7 +388,7 @@ where
         let mut cb1 = emit::empty_block();
         let mut cr1 = emit::empty_block();
         let mut chroma_log2 = 0;
-        let chroma_mode_for_syntax = luma_mode;
+        let chroma_mode_for_syntax = chroma_mode;
 
         if scope == TtEvalScope::FullComponents && has_chroma_tb(cat, log2_size) {
             if let Some((cx, cy, clog2, count)) = chroma_tb_geom(cat, x0, y0, log2_size) {
@@ -420,7 +472,7 @@ where
         }
 
         if code_split_flag {
-            let bits = split_flag_bits(&self.workspace.price_base, log2_size, false);
+            let bits = split_flag_bits(&self.workspace.price_cur, log2_size, false);
             cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
         }
 
@@ -509,7 +561,7 @@ where
             state.cur_qp_y,
             trafo_depth,
             lambda,
-            QuantMode::HardQuantSearch,
+            super::eval::search_trial_quant(state.effort_template.luma.cheap.quant),
             if super::env::luma_cheap_residual_price_exact(
                 state.effort_template.luma.cheap.residual_price
                     == crate::effort::ResidualPriceLevel::Exact,
@@ -523,7 +575,7 @@ where
         let mut cost = luma.cost;
 
         if code_split_flag {
-            let bits = split_flag_bits(&self.workspace.price_base, log2_size, false);
+            let bits = split_flag_bits(&self.workspace.price_cur, log2_size, false);
             cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
         }
         let tt = emit::leaf_tu(
@@ -567,7 +619,7 @@ where
             state.cur_qp_y,
             trafo_depth,
             lambda,
-            QuantMode::HardQuantSearch,
+            super::eval::search_trial_quant(state.effort_template.luma.cheap.quant),
             if super::env::luma_cheap_residual_price_exact(
                 state.effort_template.luma.cheap.residual_price
                     == crate::effort::ResidualPriceLevel::Exact,
@@ -580,7 +632,7 @@ where
         );
         let mut cost = luma.cost;
         if code_split_flag {
-            let bits = split_flag_bits(&self.workspace.price_base, log2_size, false);
+            let bits = split_flag_bits(&self.workspace.price_cur, log2_size, false);
             cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
         }
         (cost, luma.cbf)
@@ -728,7 +780,7 @@ where
             && log2_size > state.effort_template.tu.min_split_log2
             && trafo_depth < MAX_INTRA_TT_DEPTH;
         let split_false_cost = if split_flag_coded {
-            let bits = split_flag_bits(&self.workspace.price_base, log2_size, false);
+            let bits = split_flag_bits(&self.workspace.price_cur, log2_size, false);
             lambda * bits as f64 / CabacEstimator::SCALE as f64
         } else {
             0.0
@@ -812,7 +864,7 @@ where
         let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
         src.resize(n, 0);
         self.source.sample_block_u8(0, x0, y0, size, &mut src);
-        let refs = self.build_intra_refs_for_block(state, x0, y0, log2_size, 0);
+        let refs = self.cached_intra_refs_for_block(state, x0, y0, log2_size, 0);
 
         let residual_pricing = if super::env::luma_cheap_residual_price_exact(
             state.effort_template.luma.cheap.residual_price
@@ -839,11 +891,7 @@ where
                 state.cur_qp_y,
                 trafo_depth,
                 lambda,
-                if super::env::rdoq_search_enabled() {
-                    QuantMode::RdoqTrial { level: 2 }
-                } else {
-                    QuantMode::HardQuantSearch
-                },
+                super::eval::search_trial_quant(state.effort_template.luma.cheap.quant),
                 residual_pricing,
                 false,
                 false,
@@ -1077,14 +1125,14 @@ where
             trafo_depth,
             luma_mode,
             lambda,
-            QuantMode::HardQuantSearch,
+            self.tt_search_quant(state),
             true,
         ) {
             cost += pc_cost;
             parent_chroma = Some(pc);
         }
         if code_split_flag {
-            let bits = split_flag_bits(&self.workspace.price_base, log2_size, true);
+            let bits = split_flag_bits(&self.workspace.price_cur, log2_size, true);
             cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
         }
 
@@ -1154,6 +1202,7 @@ where
                 log2_size,
                 trafo_depth,
                 luma_mode,
+                luma_mode,
                 false,
                 lambda,
                 cfg.quant,
@@ -1163,7 +1212,15 @@ where
             );
         }
 
-        // Leaf-first evaluation.
+        // Leaf-first evaluation. Trial-context save/restore mirrors decide_tt.
+        let flag_priced = can_split || target_4x4_possible;
+        let ctx_entry = self
+            .workspace
+            .commit_ctx
+            .then(|| self.workspace.price_cur.clone());
+        if self.workspace.commit_ctx && flag_priced {
+            self.commit_tt_split_flag_ctx(log2_size, false);
+        }
         let mark0 = self.overlay.mark();
         let (leaf_tt, leaf_cost) = self.eval_tt_leaf(
             state,
@@ -1171,6 +1228,7 @@ where
             y0,
             log2_size,
             trafo_depth,
+            luma_mode,
             luma_mode,
             can_split || target_4x4_possible,
             lambda,
@@ -1203,6 +1261,15 @@ where
             }
         }
 
+        let ctx_leaf = ctx_entry.as_ref().map(|entry| {
+            let leaf_state = self.workspace.price_cur.clone();
+            self.workspace.price_cur = entry.clone();
+            if flag_priced {
+                self.commit_tt_split_flag_ctx(log2_size, true);
+            }
+            leaf_state
+        });
+
         let (split_tt, split_cost) = self.eval_tt_split_with_config(
             state,
             x0,
@@ -1223,6 +1290,9 @@ where
         } else {
             #[cfg(test)]
             super::api::LEAF_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(leaf_state) = ctx_leaf {
+                self.workspace.price_cur = leaf_state;
+            }
             self.overlay.truncate(mark0);
             self.overlay.reattach(leaf_saved);
             (leaf_tt, leaf_cost)
@@ -1308,7 +1378,7 @@ where
             }
         }
         if code_split_flag {
-            let bits = split_flag_bits(&self.workspace.price_base, log2_size, true);
+            let bits = split_flag_bits(&self.workspace.price_cur, log2_size, true);
             cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
         }
 

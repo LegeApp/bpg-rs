@@ -449,11 +449,18 @@ fn wpp_env_allows_auto() -> bool {
         .unwrap_or(true)
 }
 
-/// Resolved encoder WPP mode. WPP v1 is intentionally uniform-QP only: mutable
-/// AQ predictor state remains serial until QP targets and syntax prediction are
-/// split cleanly.
-pub fn effective_wpp_enabled(config: &StillHevcConfig) -> bool {
-    if !wpp_env_allows_auto() || explicit_tile_request() || crate::aq_active(config) {
+fn aq_wpp_build_env_allows_auto() -> bool {
+    std::env::var("BPG_AQ_WPP")
+        .ok()
+        .map(|v| {
+            let s = v.trim();
+            !(s == "0" || s.eq_ignore_ascii_case("off") || s.eq_ignore_ascii_case("none"))
+        })
+        .unwrap_or(true)
+}
+
+fn wpp_shape_enabled(config: &StillHevcConfig) -> bool {
+    if !wpp_env_allows_auto() || explicit_tile_request() {
         return false;
     }
     if !crate::effort::template(config.effort).parallel_analysis {
@@ -464,6 +471,25 @@ pub fn effective_wpp_enabled(config: &StillHevcConfig) -> bool {
     }
     let ctb = 1u32 << 6;
     config.width.div_ceil(ctb) > 1 && config.height.div_ceil(ctb) > 1
+}
+
+/// Resolved encoder WPP mode for emitted bitstreams. AQ streams intentionally
+/// keep serial slice syntax because HEVC QP prediction is not reset at WPP row
+/// boundaries.
+pub fn effective_wpp_enabled(config: &StillHevcConfig) -> bool {
+    if crate::aq_active(config) {
+        return false;
+    }
+    wpp_shape_enabled(config)
+}
+
+/// Resolved WPP row-worker mode for CU tree construction. AQ can use this as a
+/// build-only acceleration path while the final syntax writer remains serial.
+pub fn effective_wpp_build_enabled(config: &StillHevcConfig) -> bool {
+    if crate::aq_active(config) && !aq_wpp_build_env_allows_auto() {
+        return false;
+    }
+    wpp_shape_enabled(config)
 }
 
 /// Uniform auto-grid (Phase 5a): choose `cols x rows` so the tile count is as
@@ -538,7 +564,7 @@ fn auto_tile_effort(effort: crate::Effort) -> bool {
 /// the single source of truth shared by [`write_pps`], the slice header, and the
 /// encoder, so they always agree on the partition.
 pub fn effective_tile_dims(config: &StillHevcConfig) -> Option<(u32, u32)> {
-    if effective_wpp_enabled(config) {
+    if effective_wpp_enabled(config) || effective_wpp_build_enabled(config) {
         return None;
     }
     if !tile_capable(config) {

@@ -94,7 +94,19 @@ where
         // re-code the chosen plan in decoder order with RDOQ, rebuilding coeffs/
         // recon/CBFs. Search decided the structure; this only refines coding.
         self.overlay.clear();
+        // Re-seed the evolving trial context from the CTU-entry writer state
+        // for the decoder-order walk. With `ctx_evolve_finalize`, each
+        // finalized block commits its syntax so the final RDOQ rate model
+        // prices from per-block contexts close to the real writer's (x265
+        // parity) instead of frozen CTU-entry states.
+        let prev_commit = self.workspace.commit_ctx;
+        let prev_skip = self.workspace.commit_ctx_skip_chroma;
+        self.workspace.price_cur = self.workspace.price_base.clone();
+        self.workspace.commit_ctx = super::env::ctx_evolve_finalize();
+        self.workspace.commit_ctx_skip_chroma = false;
         let plan = self.finalize_cu(state, plan, x0, y0, log2_cb_size);
+        self.workspace.commit_ctx = prev_commit;
+        self.workspace.commit_ctx_skip_chroma = prev_skip;
 
         let final_commit_timer = StillSearchLedger::start_timer();
         self.overlay.commit_to_frame(&mut state.frame);
@@ -117,6 +129,10 @@ where
         self.workspace
             .ledger
             .merge_wall_ns_into(&mut state.stats.stillsearch_ledger_ns);
+        state.stats.substage_border_ns = state
+            .stats
+            .substage_border_ns
+            .saturating_add(self.workspace.substage.border_ns);
         state.stats.substage_predict_ns = state
             .stats
             .substage_predict_ns
@@ -233,24 +249,8 @@ where
         c_idx: u8,
     ) -> IntraRefs {
         let tile_bounds = state.tile_clamp_bounds(x0, y0, c_idx);
-        let overlay = &self.overlay;
         let (uf, ft, center, bit_depth) =
-            bpg_hevc_decode::hevc::intra::build_reference_borders_with_reader(
-                &state.frame,
-                x0,
-                y0,
-                log2_size,
-                c_idx,
-                true,
-                |c, rx, ry| {
-                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
-                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
-                            return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
-                        }
-                    }
-                    overlay.sample(c, rx, ry)
-                },
-            );
+            self.build_intra_refs_bulk_overlay(&state.frame, x0, y0, log2_size, c_idx, tile_bounds);
         IntraRefs {
             uf,
             ft,
@@ -308,22 +308,320 @@ where
         }
     }
 
-    /// Exact 8-bit prediction through the Still265 primitive table. Builds the
-    /// border then predicts; the [`build_intra_refs_for_block`] /
-    /// [`predict_exact_from_refs_u8`] split lets hot loops amortize the build.
-    pub(super) fn predict_exact_into_u8(
-        &self,
+    /// [`build_intra_refs_for_block`] through the per-component workspace cache.
+    ///
+    /// A cached entry is reused only when it provably reads the same samples a
+    /// fresh build would: the overlay patch stack still contains the exact
+    /// prefix present at build time (same length-`build_len` prefix, verified
+    /// by the top element's push id and the drain epoch), and no patch pushed
+    /// since intersects this block's border read region. Both checks are exact,
+    /// so a hit is byte-identical to rebuilding.
+    pub(super) fn cached_intra_refs_for_block(
+        &mut self,
         state: &Encoder<'_>,
         x0: u32,
         y0: u32,
         log2_size: u8,
         c_idx: u8,
-        mode: bpg_hevc_decode::hevc::slice::IntraPredMode,
-        dst: &mut [u8],
-    ) {
+    ) -> IntraRefs {
+        let len = self.overlay.mark();
+        let epoch = self.overlay.drain_epoch();
+        let slot = (c_idx as usize).min(2);
+        for way in self.workspace.intra_refs_cache[slot].iter().flatten() {
+            if way.x0 == x0
+                && way.y0 == y0
+                && way.log2_size == log2_size
+                && way.drain_epoch == epoch
+                && len >= way.build_len
+                && len - way.build_len <= 64
+                && (way.build_len == 0
+                    || self.overlay.push_id_at(way.build_len - 1) == Some(way.build_top_id))
+                && !self.overlay.any_border_overlap_since(
+                    way.build_len,
+                    c_idx,
+                    x0,
+                    y0,
+                    1u32 << log2_size,
+                )
+            {
+                return way.refs;
+            }
+        }
         let refs = self.build_intra_refs_for_block(state, x0, y0, log2_size, c_idx);
-        self.predict_exact_from_refs_u8(&refs, log2_size, c_idx, mode, dst);
+        let build_top_id = if len == 0 {
+            0
+        } else {
+            self.overlay.push_id_at(len - 1).unwrap_or(0)
+        };
+        let ways = &mut self.workspace.intra_refs_cache[slot];
+        let victim = self.workspace.intra_refs_cache_rr[slot] as usize % ways.len();
+        self.workspace.intra_refs_cache_rr[slot] =
+            self.workspace.intra_refs_cache_rr[slot].wrapping_add(1);
+        ways[victim] = Some(IntraRefsCacheEntry {
+            x0,
+            y0,
+            log2_size,
+            build_len: len,
+            build_top_id,
+            drain_epoch: epoch,
+            refs,
+        });
+        refs
     }
+
+    #[allow(clippy::type_complexity)]
+    pub(super) fn build_intra_refs_bulk_overlay(
+        &self,
+        frame: &bpg_hevc_decode::DecodedFrame,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        c_idx: u8,
+        tile_bounds: Option<(u32, u32, u32, u32)>,
+    ) -> (
+        [i32; bpg_hevc_decode::hevc::intra::INTRA_BORDER_LEN],
+        [i32; bpg_hevc_decode::hevc::intra::INTRA_BORDER_LEN],
+        usize,
+        u8,
+    ) {
+        use bpg_hevc_decode::hevc::UNINIT_SAMPLE;
+        use bpg_hevc_decode::hevc::intra::{
+            INTRA_BORDER_CENTER, INTRA_BORDER_LEN, MAX_INTRA_PRED_BLOCK_SIZE,
+            apply_reference_filter,
+        };
+
+        let size = 1u32 << log2_size;
+        let bit_depth = frame.bit_depth;
+        let center = INTRA_BORDER_CENTER;
+        let default_val = 1i32 << (bit_depth - 1);
+        let (plane, stride) = frame.plane(c_idx);
+        let (frame_w, frame_h) = frame.component_dims(c_idx);
+        let avail_left = x0 > 0;
+        let avail_top = y0 > 0;
+        let mut unfiltered = [0i32; INTRA_BORDER_LEN];
+        let mut avail = [false; 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1];
+        let mut avail_count = 0u32;
+        let total_samples = 4 * size + 1;
+
+        #[inline]
+        fn in_tile(tile: Option<(u32, u32, u32, u32)>, x: u32, y: u32) -> bool {
+            tile.is_none_or(|(tx0, ty0, tx1, ty1)| x >= tx0 && x < tx1 && y >= ty0 && y < ty1)
+        }
+
+        #[inline]
+        fn read_plane_sample(plane: &[u16], stride: usize, x: u32, y: u32) -> u16 {
+            plane
+                .get(y as usize * stride + x as usize)
+                .copied()
+                .unwrap_or(0)
+        }
+
+        #[inline]
+        fn maybe_set(
+            border: &mut [i32],
+            avail: &mut [bool],
+            avail_count: &mut u32,
+            idx: usize,
+            raw: u16,
+        ) -> bool {
+            if raw != UNINIT_SAMPLE {
+                border[idx] = raw as i32;
+                avail[idx] = true;
+                *avail_count += 1;
+                true
+            } else {
+                false
+            }
+        }
+
+        let read_one = |rx: u32, ry: u32| -> u16 {
+            if !in_tile(tile_bounds, rx, ry) {
+                return UNINIT_SAMPLE;
+            }
+            self.overlay
+                .sample(c_idx, rx, ry)
+                .unwrap_or_else(|| read_plane_sample(plane, stride, rx, ry))
+        };
+
+        // Top-left corner, with the same top/left fallback order as the decoder
+        // helper. Tile-clamped samples are treated as unavailable.
+        let mut corner_avail = false;
+        if avail_left && avail_top {
+            corner_avail = maybe_set(
+                &mut unfiltered,
+                &mut avail,
+                &mut avail_count,
+                center,
+                read_one(x0 - 1, y0 - 1),
+            );
+        }
+        if !corner_avail && avail_top {
+            corner_avail = maybe_set(
+                &mut unfiltered,
+                &mut avail,
+                &mut avail_count,
+                center,
+                read_one(x0, y0 - 1),
+            );
+        }
+        if !corner_avail && avail_left {
+            corner_avail = maybe_set(
+                &mut unfiltered,
+                &mut avail,
+                &mut avail_count,
+                center,
+                read_one(x0 - 1, y0),
+            );
+        }
+        if !corner_avail {
+            unfiltered[center] = default_val;
+        }
+
+        // Top + above-right: start from the committed frame row in one pass,
+        // then overlay all intersecting patches with a single patch-stack scan.
+        if avail_top {
+            let top_count = (2 * size).min(frame_w.saturating_sub(x0)) as usize;
+            let mut row = [UNINIT_SAMPLE; 2 * MAX_INTRA_PRED_BLOCK_SIZE];
+            if top_count > 0 {
+                let row_base = (y0 - 1) as usize * stride + x0 as usize;
+                for (i, dst) in row[..top_count].iter_mut().enumerate() {
+                    *dst = plane.get(row_base + i).copied().unwrap_or(0);
+                }
+                self.overlay
+                    .overlay_row_samples(c_idx, y0 - 1, x0, &mut row[..top_count]);
+                for (i, &raw) in row[..top_count].iter().enumerate() {
+                    let rx = x0 + i as u32;
+                    if in_tile(tile_bounds, rx, y0 - 1) {
+                        maybe_set(
+                            &mut unfiltered,
+                            &mut avail,
+                            &mut avail_count,
+                            center + 1 + i,
+                            raw,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Left + below-left: same bulk-overlay path for the reference column.
+        if avail_left {
+            let left_count = (2 * size).min(frame_h.saturating_sub(y0)) as usize;
+            let mut col = [UNINIT_SAMPLE; 2 * MAX_INTRA_PRED_BLOCK_SIZE];
+            if left_count > 0 {
+                let left_x = (x0 - 1) as usize;
+                for (i, dst) in col[..left_count].iter_mut().enumerate() {
+                    let plane_idx = (y0 as usize + i) * stride + left_x;
+                    *dst = plane.get(plane_idx).copied().unwrap_or(0);
+                }
+                self.overlay
+                    .overlay_col_samples(c_idx, x0 - 1, y0, &mut col[..left_count]);
+                for (i, &raw) in col[..left_count].iter().enumerate() {
+                    let ry = y0 + i as u32;
+                    if in_tile(tile_bounds, x0 - 1, ry) {
+                        maybe_set(
+                            &mut unfiltered,
+                            &mut avail,
+                            &mut avail_count,
+                            center - 1 - i,
+                            raw,
+                        );
+                    }
+                }
+            }
+        }
+
+        if avail_count < total_samples {
+            substitute_unavailable_refs(
+                &mut unfiltered,
+                &avail,
+                center,
+                size as usize,
+                default_val,
+            );
+        }
+
+        let mut filtered = unfiltered;
+        if (c_idx == 0 || frame.chroma_format == 3) && size > 4 {
+            apply_reference_filter(
+                &mut filtered,
+                center,
+                size as usize,
+                c_idx,
+                true,
+                bit_depth as usize,
+            );
+        }
+
+        (unfiltered, filtered, center, bit_depth)
+    }
+}
+
+fn substitute_unavailable_refs(
+    border: &mut [i32],
+    avail: &[bool],
+    center: usize,
+    size: usize,
+    default_val: i32,
+) {
+    let mut first_avail_val = None;
+    for i in (0..(2 * size)).rev() {
+        let idx = center - 1 - i;
+        if avail[idx] {
+            first_avail_val = Some(border[idx]);
+            break;
+        }
+    }
+    if first_avail_val.is_none() && avail[center] {
+        first_avail_val = Some(border[center]);
+    }
+    if first_avail_val.is_none() {
+        for i in 0..(2 * size) {
+            let idx = center + 1 + i;
+            if avail[idx] {
+                first_avail_val = Some(border[idx]);
+                break;
+            }
+        }
+    }
+
+    let mut current = first_avail_val.unwrap_or(default_val);
+    for i in (0..(2 * size)).rev() {
+        let idx = center - 1 - i;
+        if avail[idx] {
+            current = border[idx];
+        } else {
+            border[idx] = current;
+        }
+    }
+    if avail[center] {
+        current = border[center];
+    } else {
+        border[center] = current;
+    }
+    for i in 0..(2 * size) {
+        let idx = center + 1 + i;
+        if avail[idx] {
+            current = border[idx];
+        } else {
+            border[idx] = current;
+        }
+    }
+}
+
+/// One way of the per-component intra reference-border cache (see
+/// [`cached_intra_refs_for_block`](StillSearchDepth::cached_intra_refs_for_block)).
+#[derive(Clone, Copy)]
+pub(super) struct IntraRefsCacheEntry {
+    pub(super) x0: u32,
+    pub(super) y0: u32,
+    pub(super) log2_size: u8,
+    /// Overlay patch-stack length when the borders were built.
+    pub(super) build_len: usize,
+    /// Push id of the top stack element at build time (0 when empty).
+    pub(super) build_top_id: u64,
+    pub(super) drain_epoch: u64,
+    pub(super) refs: IntraRefs,
 }
 
 /// Prebuilt intra reference borders for one block, reusable across all candidate

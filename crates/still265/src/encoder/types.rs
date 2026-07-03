@@ -160,6 +160,8 @@ pub struct EncodeStats {
     pub luma_close_call_escalations: u64,
     pub luma_rough_predictions: u64,
     pub chroma_rough_predictions: u64,
+    pub chroma_mode_exact_candidates: u64,
+    pub chroma_mode_rough_skips: u64,
     pub code_block_calls: u64,
     pub forward_transforms: u64,
     pub inverse_transforms: u64,
@@ -228,6 +230,7 @@ pub struct EncodeStats {
     pub stillsearch_ledger_ns: [u64; 16],
     /// Per-CTU-substage accumulators for `eval_component_8` breakdown.
     /// Populated only when `BPG_STILLSEARCH_PROFILE=1`.
+    pub substage_border_ns: u64,
     pub substage_predict_ns: u64,
     pub substage_forward_xform_ns: u64,
     pub substage_quant_ns: u64,
@@ -274,6 +277,12 @@ impl EncodeStats {
         self.luma_oracle_cheap_rank_count += other.luma_oracle_cheap_rank_count;
         self.luma_oracle_delta_cost_x1000 += other.luma_oracle_delta_cost_x1000;
         self.luma_oracle_miss_delta_cost_x1000 += other.luma_oracle_miss_delta_cost_x1000;
+        self.chroma_rough_predictions += other.chroma_rough_predictions;
+        self.chroma_mode_exact_candidates += other.chroma_mode_exact_candidates;
+        self.chroma_mode_rough_skips += other.chroma_mode_rough_skips;
+        self.substage_border_ns = self
+            .substage_border_ns
+            .saturating_add(other.substage_border_ns);
         self.substage_predict_ns = self
             .substage_predict_ns
             .saturating_add(other.substage_predict_ns);
@@ -430,7 +439,8 @@ impl fmt::Display for EncodeStats {
                 }
             }
             // Substage breakdown (eval_component_8 internals).
-            let sub_ns = self.substage_predict_ns
+            let sub_ns = self.substage_border_ns
+                + self.substage_predict_ns
                 + self.substage_forward_xform_ns
                 + self.substage_quant_ns
                 + self.substage_recon_dist_ns
@@ -438,6 +448,7 @@ impl fmt::Display for EncodeStats {
             if self.substage_calls > 0 && sub_ns > 0 {
                 writeln!(f, "  substage_profile ({} calls):", self.substage_calls)?;
                 for (name, ns) in [
+                    ("BorderBuild", self.substage_border_ns),
                     ("Predict", self.substage_predict_ns),
                     ("ForwardXform", self.substage_forward_xform_ns),
                     ("Quant+SDH", self.substage_quant_ns),

@@ -9,7 +9,7 @@ use crate::primitives::{satd_u8, satd_u16};
 
 use super::depth::StillSearchDepth;
 use super::emit;
-use super::eval::{BlockTrial, QuantMode, ResidualPricingMode};
+use super::eval::{BlockTrial, ResidualPricingMode};
 use super::ledger::{StillSearchLedger, WorkBucket};
 use super::overlay::OverlayCache;
 use super::plan::{CuPlan, NxnInfoPlan, ParentChromaPlan, TtPlan};
@@ -77,6 +77,7 @@ where
         let mut cost = 0.0;
         let mut rough_set = NxnRoughSet::new();
 
+        let evolve = super::env::ctx_evolve_search();
         for (pu, &(px, py)) in pu_xy.iter().enumerate() {
             let mpm = super::intra_mpm(state, px, py);
             mpms[pu] = mpm;
@@ -87,11 +88,35 @@ where
             luma_modes[pu] = mode;
             state.store_mode(px, py, 2, mode);
             cost += pu_cost;
+            if evolve {
+                // Commit the winning PU's luma syntax (mode trials never
+                // commit): CBF bin + residual context evolution, so later
+                // PUs price from post-PU contexts like x265's coder does.
+                self.workspace.price_cur.models[crate::contexts::ctx::CBF_LUMA]
+                    .update(luma.cbf as u8);
+                if luma.cbf {
+                    if let Some(id) = luma.coeff {
+                        let scan = crate::residual::get_scan_order(2, mode, 0, state.cat);
+                        let _ = crate::residual::estimate_residual_bits(
+                            &mut self.workspace.price_cur,
+                            self.workspace.coeffs.get(id),
+                            2,
+                            0,
+                            scan,
+                            state.sign_data_hiding,
+                        );
+                    }
+                }
+            }
 
             let mut cb = emit::empty_block();
             let mut cr = emit::empty_block();
             let chroma_log2 = if state.cat == 3 { 2 } else { 0 };
             if state.cat == 3 {
+                let prev_commit = self.workspace.commit_ctx;
+                let prev_skip = self.workspace.commit_ctx_skip_chroma;
+                self.workspace.commit_ctx = evolve;
+                self.workspace.commit_ctx_skip_chroma = false;
                 let chroma_mode = IntraPredMode::from_u8(mode).unwrap_or(IntraPredMode::Dc);
                 let cb_e = self.eval_component(
                     state,
@@ -103,7 +128,7 @@ where
                     state.cur_qp_c,
                     1,
                     lambda,
-                    QuantMode::HardQuantSearch,
+                    super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
                     ResidualPricingMode::Exact,
                     true,
                 );
@@ -119,12 +144,14 @@ where
                     state.cur_qp_c,
                     1,
                     lambda,
-                    QuantMode::HardQuantSearch,
+                    super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
                     ResidualPricingMode::Exact,
                     true,
                 );
                 cost += cr_e.cost;
                 cr = cr_e.into_plan_block();
+                self.workspace.commit_ctx = prev_commit;
+                self.workspace.commit_ctx_skip_chroma = prev_skip;
             }
 
             let tt = emit::leaf_tu(
@@ -144,8 +171,14 @@ where
 
         let mut parent_chroma = None;
         if matches!(state.cat, 1 | 2) {
+            let prev_commit = self.workspace.commit_ctx;
+            let prev_skip = self.workspace.commit_ctx_skip_chroma;
+            self.workspace.commit_ctx = evolve;
+            self.workspace.commit_ctx_skip_chroma = false;
             let (pc, pc_cost) =
                 self.eval_part_nxn_parent_chroma_subsampled(state, x0, y0, luma_modes[0], lambda);
+            self.workspace.commit_ctx = prev_commit;
+            self.workspace.commit_ctx_skip_chroma = prev_skip;
             cost += pc_cost;
             parent_chroma = Some(pc);
         }
@@ -175,6 +208,25 @@ where
             parent_chroma,
             kids,
         };
+
+        if evolve {
+            // NxN CU header syntax: part_mode=NxN, four prev_intra flags,
+            // then the chroma mode(s). Header models are disjoint from
+            // content models, so applying them after content preserves the
+            // writer's per-model bin sequences.
+            let ctxs = &mut self.workspace.price_cur;
+            ctxs.models[crate::contexts::ctx::PART_MODE].update(0);
+            for pu in 0..4 {
+                let in_mpm = mpms[pu].iter().any(|m| m.as_u8() == luma_modes[pu]);
+                ctxs.models[crate::contexts::ctx::PREV_INTRA_LUMA_PRED_FLAG].update(in_mpm as u8);
+            }
+            if state.cat != 0 {
+                let n = if state.cat == 3 { 4 } else { 1 };
+                for _ in 0..n {
+                    ctxs.models[crate::contexts::ctx::INTRA_CHROMA_PRED_MODE].update(0);
+                }
+            }
+        }
 
         let mut leaf = emit::cu_leaf(mpms[0], luma_modes[0], tt);
         leaf.chroma_mode_idx = CHROMA_DM_IDX;
@@ -212,7 +264,7 @@ where
             state.cur_qp_c,
             0,
             lambda,
-            QuantMode::HardQuantSearch,
+            super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
             ResidualPricingMode::Exact,
             true,
         );
@@ -229,7 +281,7 @@ where
                 state.cur_qp_c,
                 0,
                 lambda,
-                QuantMode::HardQuantSearch,
+                super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
                 ResidualPricingMode::Exact,
                 true,
             );
@@ -247,7 +299,7 @@ where
             state.cur_qp_c,
             0,
             lambda,
-            QuantMode::HardQuantSearch,
+            super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
             ResidualPricingMode::Exact,
             true,
         );
@@ -264,7 +316,7 @@ where
                 state.cur_qp_c,
                 0,
                 lambda,
-                QuantMode::HardQuantSearch,
+                super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
                 ResidualPricingMode::Exact,
                 true,
             );
@@ -325,13 +377,13 @@ where
                 let mode = IntraPredMode::from_u8(m).expect("0..=1 are valid intra modes");
                 self.predict_into_u8(state, x0, y0, 2, 0, mode, &mut pred, &mut tmp_u16);
                 let satd = satd_u8(&src, size, &pred, size, size);
-                let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
+                let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, m);
                 rough[idx] = (satd as f64 + lambda_sad * mbits as f64 / scale, m);
             }
             for m in 2u8..=34 {
                 let off = intra_angs::slot_offset(m, 2);
                 let satd = satd_u8(&src, size, &batch_u8[off..off + n], size, size);
-                let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
+                let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, m);
                 rough[m as usize] = (satd as f64 + lambda_sad * mbits as f64 / scale, m);
             }
         } else {
@@ -354,14 +406,14 @@ where
                 let mode = IntraPredMode::from_u8(m).expect("0..=1 are valid intra modes");
                 self.predict_into(state, x0, y0, 2, 0, mode, &mut pred);
                 let satd = satd_u16(&src, size, &pred, size, size);
-                let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
+                let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, m);
                 rough[idx] = (satd as f64 + lambda_sad * mbits as f64 / scale, m);
             }
             for m in 2u8..=34 {
                 let off = intra_angs::slot_offset(m, 2);
                 let slot = &batch[off..off + n];
                 let satd = satd_u16(&src, size, slot, size, size);
-                let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, m);
+                let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, m);
                 rough[m as usize] = (satd as f64 + lambda_sad * mbits as f64 / scale, m);
             }
         }
@@ -432,11 +484,11 @@ where
                 state.cur_qp_y,
                 1,
                 lambda,
-                QuantMode::HardQuantSearch,
+                super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
                 ResidualPricingMode::Exact,
                 true,
             );
-            let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+            let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
             let total = trial.cost + lambda * mbits as f64 / scale;
             let recon = self.overlay.detach_from(mark);
             match &best {

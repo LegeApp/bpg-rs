@@ -122,6 +122,7 @@ where
                     l.log2_size,
                     l.trafo_depth,
                     l.luma_mode,
+                    l.chroma_mode,
                     false,
                     lambda,
                     if super::env::final_rdoq_enabled() {

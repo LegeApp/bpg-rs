@@ -12,6 +12,7 @@
 mod angular;
 mod api;
 mod arena;
+mod chroma;
 mod cost;
 mod cu;
 mod depth;

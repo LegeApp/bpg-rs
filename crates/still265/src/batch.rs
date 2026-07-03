@@ -13,7 +13,8 @@
 //! let cfg = StillHevcConfig {
 //!     width: 4096, height: 3072, bit_depth: 8, chroma: ChromaFormat::Yuv420,
 //!     qp: 28, effort: Effort::Slow, sao: SaoMode::On, deblock: DeblockMode::On,
-//!     adaptive_qp: false,
+//!     adaptive_qp: false, aq_mode: still265::AqMode::Off, aq_strength: 0.35,
+//!     aq_clamp: 2, two_pass_gate: true,
 //! };
 //! // How much RAM will one encode of this size take?
 //! let est = batch::estimate_memory(&cfg);
@@ -80,17 +81,17 @@ fn plane_samples(w: u32, h: u32, chroma: ChromaFormat) -> u64 {
 }
 
 /// Whether `config` runs the frame-cloning parallel wavefront path. Mirrors the
-/// encoder's wavefront gate for uniform-QP tiers (AQ off, not disabled by env).
+/// encoder's wavefront gate, including AQ's build-only WPP acceleration path.
 fn is_parallel(config: &StillHevcConfig) -> bool {
+    if crate::aq_active(config) {
+        return crate::params::effective_wpp_build_enabled(config);
+    }
     match config.effort {
         Effort::Placebo => true,
-        _ => {
-            !crate::aq_active(config)
-                && std::env::var("BPG_BEST2_PARALLEL")
-                    .ok()
-                    .map(|v| v.trim() != "0")
-                    .unwrap_or(true)
-        }
+        _ => std::env::var("BPG_BEST2_PARALLEL")
+            .ok()
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true),
     }
 }
 
@@ -266,11 +267,18 @@ mod tests {
     }
 
     #[test]
-    fn aq_configs_have_no_worker_frames() {
+    fn aq_configs_follow_build_only_wpp_gate() {
+        // AQ streams keep serial slice syntax, but CU-tree construction may
+        // still use WPP row workers (build-only acceleration, `BPG_AQ_WPP`).
+        // The memory estimate must mirror that gate.
         let mut fast_aq = cfg(1024, 768, Effort::Fast, ChromaFormat::Yuv420);
         fast_aq.adaptive_qp = true;
-        let fast_aq = estimate_memory(&fast_aq);
-        assert_eq!(fast_aq.worker_frames, 0);
+        let est = estimate_memory(&fast_aq);
+        if crate::params::effective_wpp_build_enabled(&fast_aq) {
+            assert!(est.worker_frames > 0);
+        } else {
+            assert_eq!(est.worker_frames, 0);
+        }
     }
 
     #[test]

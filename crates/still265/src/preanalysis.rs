@@ -888,7 +888,10 @@ impl AqOffsetMap {
         clamp: u8,
     ) -> AqOffsetMap {
         let n = activity.len();
-        let logs: Vec<f32> = activity.iter().map(|&a| (1.0 + a.max(0.0)).ln() as f32).collect();
+        let logs: Vec<f32> = activity
+            .iter()
+            .map(|&a| (1.0 + a.max(0.0)).ln() as f32)
+            .collect();
         let mean = if n == 0 {
             0.0
         } else {

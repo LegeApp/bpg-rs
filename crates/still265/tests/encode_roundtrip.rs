@@ -973,6 +973,245 @@ fn yuv422_adaptive_qp_round_trip() {
     );
 }
 
+#[test]
+fn two_pass_aq_wpp_tree_build_round_trip_420() {
+    let _guard = env_lock().lock().unwrap();
+    unsafe {
+        std::env::set_var("BPG_AQ_WPP", "1");
+        std::env::set_var("BPG_WPP", "1");
+        std::env::set_var("BPG_ENC_THREADS", "4");
+        std::env::set_var("BPG_TILE_MIN_CTBS", "1");
+    }
+
+    let w = 128u32;
+    let h = 128u32;
+    let bd = 8u8;
+    let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, bd);
+    let config = StillHevcConfig {
+        aq_mode: still265::AqMode::TwoPassMeasured,
+        two_pass_gate: false,
+        ..cfg(w, h, 32, bd)
+    };
+    assert!(still265::aq_active(&config));
+    assert!(still265::params::effective_wpp_build_enabled(&config));
+    assert!(!still265::params::effective_wpp_enabled(&config));
+    assert_eq!(still265::params::effective_tile_dims(&config), None);
+
+    let (bytes, recon, _stats) = encode_with_stats(
+        &config,
+        Source {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+        },
+    );
+    let decoded = decode(&bytes).expect("decoder must accept 4:2:0 two-pass AQ stream");
+
+    unsafe {
+        std::env::remove_var("BPG_AQ_WPP");
+        std::env::remove_var("BPG_WPP");
+        std::env::remove_var("BPG_ENC_THREADS");
+        std::env::remove_var("BPG_TILE_MIN_CTBS");
+    }
+
+    assert_plane_eq(
+        &decoded.y_plane,
+        &recon.y_plane,
+        decoded.width as usize,
+        "4:2:0 two-pass AQ WPP-build: luma recon",
+    );
+    assert_plane_eq(
+        &decoded.cb_plane,
+        &recon.cb_plane,
+        decoded.width.div_ceil(2) as usize,
+        "4:2:0 two-pass AQ WPP-build: cb recon",
+    );
+    assert_plane_eq(
+        &decoded.cr_plane,
+        &recon.cr_plane,
+        decoded.width.div_ceil(2) as usize,
+        "4:2:0 two-pass AQ WPP-build: cr recon",
+    );
+}
+
+#[test]
+fn two_pass_aq_explicit_tiles_round_trip_420() {
+    let _guard = env_lock().lock().unwrap();
+    unsafe {
+        std::env::set_var("BPG_AQ_WPP", "1");
+        std::env::set_var("BPG_WPP", "1");
+        std::env::set_var("BPG_TILES", "2x2");
+        std::env::set_var("BPG_ENC_THREADS", "4");
+    }
+
+    let w = 128u32;
+    let h = 128u32;
+    let bd = 8u8;
+    let (y, cb, cr) = make_textured_source_420(w as usize, h as usize, bd);
+    let config = StillHevcConfig {
+        aq_mode: still265::AqMode::TwoPassMeasured,
+        two_pass_gate: false,
+        ..cfg(w, h, 32, bd)
+    };
+    assert!(still265::aq_active(&config));
+    assert!(!still265::params::effective_wpp_build_enabled(&config));
+    assert!(!still265::params::effective_wpp_enabled(&config));
+    assert_eq!(still265::params::effective_tile_dims(&config), Some((2, 2)));
+
+    let (bytes, recon, _stats) = encode_with_stats(
+        &config,
+        Source {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+        },
+    );
+    let decoded = decode(&bytes).expect("decoder must accept 4:2:0 tiled two-pass AQ stream");
+
+    unsafe {
+        std::env::remove_var("BPG_AQ_WPP");
+        std::env::remove_var("BPG_WPP");
+        std::env::remove_var("BPG_TILES");
+        std::env::remove_var("BPG_ENC_THREADS");
+    }
+
+    assert_plane_eq(
+        &decoded.y_plane,
+        &recon.y_plane,
+        decoded.width as usize,
+        "4:2:0 explicit tiled two-pass AQ: luma recon",
+    );
+    assert_plane_eq(
+        &decoded.cb_plane,
+        &recon.cb_plane,
+        decoded.width.div_ceil(2) as usize,
+        "4:2:0 explicit tiled two-pass AQ: cb recon",
+    );
+    assert_plane_eq(
+        &decoded.cr_plane,
+        &recon.cr_plane,
+        decoded.width.div_ceil(2) as usize,
+        "4:2:0 explicit tiled two-pass AQ: cr recon",
+    );
+}
+
+#[test]
+fn two_pass_aq_wpp_tree_build_round_trip_422() {
+    let _guard = env_lock().lock().unwrap();
+    unsafe {
+        std::env::set_var("BPG_AQ_WPP", "1");
+        std::env::set_var("BPG_WPP", "1");
+        std::env::set_var("BPG_ENC_THREADS", "4");
+    }
+
+    let w = 128u32;
+    let h = 96u32;
+    let bd = 8u8;
+    let (y, cb, cr) = make_textured_source_422(w as usize, h as usize, bd);
+    let config = StillHevcConfig {
+        aq_mode: still265::AqMode::TwoPassMeasured,
+        two_pass_gate: false,
+        ..cfg_chroma(w, h, 32, bd, ChromaFormat::Yuv422)
+    };
+    assert!(still265::aq_active(&config));
+    assert!(still265::params::effective_wpp_build_enabled(&config));
+    assert!(!still265::params::effective_wpp_enabled(&config));
+
+    let (bytes, recon, _stats) = encode_with_stats(
+        &config,
+        Source {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+        },
+    );
+    let decoded = decode(&bytes).expect("decoder must accept 4:2:2 two-pass AQ stream");
+
+    unsafe {
+        std::env::remove_var("BPG_AQ_WPP");
+        std::env::remove_var("BPG_WPP");
+        std::env::remove_var("BPG_ENC_THREADS");
+    }
+
+    assert_plane_eq(
+        &decoded.y_plane,
+        &recon.y_plane,
+        decoded.width as usize,
+        "4:2:2 two-pass AQ WPP-build: luma recon",
+    );
+    assert_plane_eq(
+        &decoded.cb_plane,
+        &recon.cb_plane,
+        decoded.width.div_ceil(2) as usize,
+        "4:2:2 two-pass AQ WPP-build: cb recon",
+    );
+    assert_plane_eq(
+        &decoded.cr_plane,
+        &recon.cr_plane,
+        decoded.width.div_ceil(2) as usize,
+        "4:2:2 two-pass AQ WPP-build: cr recon",
+    );
+}
+
+#[test]
+fn perceptual_aq_wpp_tree_build_round_trip_444_10bit() {
+    let _guard = env_lock().lock().unwrap();
+    unsafe {
+        std::env::set_var("BPG_AQ_WPP", "1");
+        std::env::set_var("BPG_WPP", "1");
+        std::env::set_var("BPG_ENC_THREADS", "4");
+    }
+
+    let w = 128u32;
+    let h = 96u32;
+    let bd = 10u8;
+    let (y, cb, cr) = make_textured_source_444(w as usize, h as usize, bd);
+    let config = StillHevcConfig {
+        aq_mode: still265::AqMode::Perceptual,
+        aq_strength: 0.35,
+        aq_clamp: 2,
+        ..cfg_chroma(w, h, 30, bd, ChromaFormat::Yuv444)
+    };
+    assert!(still265::aq_active(&config));
+    assert!(still265::params::effective_wpp_build_enabled(&config));
+    assert!(!still265::params::effective_wpp_enabled(&config));
+
+    let (bytes, recon, _stats) = encode_with_stats(
+        &config,
+        Source {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+        },
+    );
+    let decoded = decode(&bytes).expect("decoder must accept 4:4:4 perceptual AQ stream");
+
+    unsafe {
+        std::env::remove_var("BPG_AQ_WPP");
+        std::env::remove_var("BPG_WPP");
+        std::env::remove_var("BPG_ENC_THREADS");
+    }
+
+    assert_plane_eq(
+        &decoded.y_plane,
+        &recon.y_plane,
+        decoded.width as usize,
+        "4:4:4 perceptual AQ WPP-build: luma recon",
+    );
+    assert_plane_eq(
+        &decoded.cb_plane,
+        &recon.cb_plane,
+        decoded.width as usize,
+        "4:4:4 perceptual AQ WPP-build: cb recon",
+    );
+    assert_plane_eq(
+        &decoded.cr_plane,
+        &recon.cr_plane,
+        decoded.width as usize,
+        "4:4:4 perceptual AQ WPP-build: cr recon",
+    );
+}
+
 fn run_external_aq_offset_map_round_trip(map_body: &str, label: &str) {
     let _guard = env_lock().lock().unwrap();
     let w = 96u32;

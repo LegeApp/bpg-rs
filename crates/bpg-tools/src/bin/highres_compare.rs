@@ -88,7 +88,7 @@ struct Args {
     qp: u8,
 
     /// bpgenc compression level.
-    #[arg(short = 'm', long = "compress-level", default_value_t = 8)]
+    #[arg(short = 'm', long = "compress-level", default_value_t = 9)]
     compress_level: u8,
 
     /// Rust RD-search effort(s). Comma-separated. NOTE: the StillSearch core
@@ -324,6 +324,9 @@ struct Row {
     angular_modes_before: u64,
     angular_modes_after: u64,
     angular_modes_removed: u64,
+    chroma_rough_predictions: u64,
+    chroma_mode_exact_candidates: u64,
+    chroma_mode_rough_skips: u64,
     stillsearch_ledger: [u64; 16],
     stillsearch_ledger_ns: [u64; 16],
 }
@@ -374,7 +377,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&csv_path)?;
     writeln!(
         csv,
-        "effort,source,width,height,pixels,run,c_total_s,c_bpg_bytes,rust_total_s,rust_prepare_s,rust_encode_s,rust_bpg_bytes,rust_annexb_bytes,psnr_y,psnr_cb,psnr_cr,psnr_rgb,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,code_block_calls,forward_transforms,trial_coded_blocks,final_coded_blocks,trial_rdoq_blocks,final_rdoq_blocks,phase_build_us,phase_write_us,bytes_restored,partnxn_attempts,partnxn_wins,angular_exclusions,angular_game_blocks,angular_iame_blocks,angular_modes_before,angular_modes_after,angular_modes_removed,c_rgb_psnr,rust_rgb_psnr,c_y_psnr,ss_rough_luma,ss_luma_cheap,ss_luma_exact,ss_tu_leaf,ss_tu_split,ss_nxn_rough,ss_nxn_batch,ss_chroma_rough,ss_chroma_trial,ss_rdoq,ss_residual_price,ss_final_commit,ss_writer,ss_deblock,ss_sao,ssns_rough_luma,ssns_luma_cheap,ssns_luma_exact,ssns_tu_leaf,ssns_tu_split,ssns_nxn_rough,ssns_nxn_batch,ssns_chroma_rough,ssns_chroma_trial,ssns_rdoq,ssns_residual_price,ssns_final_commit,ssns_writer,ssns_deblock,ssns_sao"
+        "effort,source,width,height,pixels,run,c_total_s,c_bpg_bytes,rust_total_s,rust_prepare_s,rust_encode_s,rust_bpg_bytes,rust_annexb_bytes,psnr_y,psnr_cb,psnr_cr,psnr_rgb,ctu_count,cu_trials,cu_early_terminations,cu_split_bound_aborts,cu_force_leaf,code_block_calls,forward_transforms,trial_coded_blocks,final_coded_blocks,trial_rdoq_blocks,final_rdoq_blocks,phase_build_us,phase_write_us,bytes_restored,partnxn_attempts,partnxn_wins,angular_exclusions,angular_game_blocks,angular_iame_blocks,angular_modes_before,angular_modes_after,angular_modes_removed,c_rgb_psnr,rust_rgb_psnr,c_y_psnr,chroma_rough_predictions,chroma_mode_exact_candidates,chroma_mode_rough_skips,ss_rough_luma,ss_luma_cheap,ss_luma_exact,ss_tu_leaf,ss_tu_split,ss_nxn_rough,ss_nxn_batch,ss_chroma_rough,ss_chroma_trial,ss_rdoq,ss_rdoq_trial,ss_residual_price,ss_final_commit,ss_writer,ss_deblock,ss_sao,ssns_rough_luma,ssns_luma_cheap,ssns_luma_exact,ssns_tu_leaf,ssns_tu_split,ssns_nxn_rough,ssns_nxn_batch,ssns_chroma_rough,ssns_chroma_trial,ssns_rdoq,ssns_rdoq_trial,ssns_residual_price,ssns_final_commit,ssns_writer,ssns_deblock,ssns_sao"
     )?;
 
     let mut rows: Vec<Row> = Vec::new();
@@ -474,6 +477,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         angular_modes_before: rust_result.angular_modes_before,
                         angular_modes_after: rust_result.angular_modes_after,
                         angular_modes_removed: rust_result.angular_modes_removed,
+                        chroma_rough_predictions: rust_result.chroma_rough_predictions,
+                        chroma_mode_exact_candidates: rust_result.chroma_mode_exact_candidates,
+                        chroma_mode_rough_skips: rust_result.chroma_mode_rough_skips,
                         stillsearch_ledger: rust_result.stillsearch_ledger,
                         stillsearch_ledger_ns: rust_result.stillsearch_ledger_ns,
                     };
@@ -852,6 +858,9 @@ struct RustResult {
     angular_modes_before: u64,
     angular_modes_after: u64,
     angular_modes_removed: u64,
+    chroma_rough_predictions: u64,
+    chroma_mode_exact_candidates: u64,
+    chroma_mode_rough_skips: u64,
     /// StillSearch per-CTU work-ledger bucket call counts (summed over the
     /// frame). Indexed by `WorkBucket` order: RoughLuma, LumaCheap, LumaExact,
     /// TuLeaf, TuSplit, NxnRough, NxnBatch, ChromaRough, ChromaTrial, Rdoq,
@@ -1010,6 +1019,9 @@ fn run_rust_encode_inner(
         angular_modes_before: last.stats.rdo2_angular_modes_before,
         angular_modes_after: last.stats.rdo2_angular_modes_after,
         angular_modes_removed: last.stats.rdo2_angular_modes_removed,
+        chroma_rough_predictions: last.stats.chroma_rough_predictions,
+        chroma_mode_exact_candidates: last.stats.chroma_mode_exact_candidates,
+        chroma_mode_rough_skips: last.stats.chroma_mode_rough_skips,
         stillsearch_ledger: last.stats.stillsearch_ledger,
         stillsearch_ledger_ns: last.stats.stillsearch_ledger_ns,
         rgb_psnr,
@@ -1093,7 +1105,7 @@ fn write_csv_row(out: &mut File, row: &Row) -> Result<(), Box<dyn std::error::Er
     let qrgb = q.map_or(String::new(), |q| format!("{:.4}", q.psnr_rgb));
     write!(
         out,
-        "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{:.6},{:.6},{:.6},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         csv_field(&row.effort),
         csv_field(&row.source),
         row.width,
@@ -1136,6 +1148,9 @@ fn write_csv_row(out: &mut File, row: &Row) -> Result<(), Box<dyn std::error::Er
         row.c_rgb_psnr.map_or(String::new(), |p| format!("{p:.4}")),
         row.rust_rgb_psnr.map_or(String::new(), |p| format!("{p:.4}")),
         row.c_y_psnr.map_or(String::new(), |p| format!("{p:.4}")),
+        row.chroma_rough_predictions,
+        row.chroma_mode_exact_candidates,
+        row.chroma_mode_rough_skips,
     )?;
     let ledger = row
         .stillsearch_ledger

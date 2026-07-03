@@ -29,7 +29,10 @@
 
 use crate::cabac::CabacEstimator;
 use crate::contexts::{Contexts, ctx};
-use crate::residual::{ScanOrder, calc_sig_coeff_flag_ctx, get_scan_4x4, get_scan_sub_block};
+use crate::residual::{
+    ResidualPricingScratch, ScanOrder, estimate_residual_bits_into, get_scan_4x4,
+    get_scan_sub_block,
+};
 use crate::transform::DequantParams;
 
 /// x265 `g_quantScales` (forward quant scale per `qp % 6`).
@@ -59,6 +62,38 @@ fn rdoq_lambda_scale() -> f64 {
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v > 0.0)
             .unwrap_or(1.0)
+    })
+}
+
+/// A/B gate for x265's coding-group carry shape. In x265 `rdoQuant`, the
+/// greater1 carry (`c1`) is reset to 1 at the start of every coefficient group;
+/// an empty group therefore clears any previous `c1 == 0` carry before the next
+/// lower-frequency group. The historical still265 single-scan path left the
+/// carry unchanged across empty groups.
+fn x265_empty_cg_carry_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BPG_RDOQ_X265_EMPTY_CG_CARRY")
+            .ok()
+            .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+            .unwrap_or(false)
+    })
+}
+
+/// A/B gate for x265's last-significant refinement envelope. x265 evaluates
+/// candidate last positions walking high-frequency -> low-frequency, but stops
+/// after the first coded coefficient whose selected absolute level is > 1
+/// (`rdoqLevel > 1`). The historical still265 path considered every non-zero
+/// coefficient as a possible last.
+fn x265_last_stop_enabled() -> bool {
+    use std::sync::OnceLock;
+    static V: OnceLock<bool> = OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("BPG_RDOQ_X265_LAST_STOP")
+            .ok()
+            .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+            .unwrap_or(false)
     })
 }
 
@@ -149,24 +184,6 @@ fn last_axis_bits(ctxs: &Contexts, value: u32, log2_size: u8, c_idx: u8, is_x: b
     bits
 }
 
-/// Total estimated `last_sig_coeff_x/y` bits for a last position at `(x, y)`.
-fn last_pos_bits(
-    ctxs: &Contexts,
-    x: u32,
-    y: u32,
-    log2_size: u8,
-    c_idx: u8,
-    scan: ScanOrder,
-) -> u64 {
-    let (raw_x, raw_y) = if scan == ScanOrder::Vertical {
-        (y, x)
-    } else {
-        (x, y)
-    };
-    last_axis_bits(ctxs, raw_x, log2_size, c_idx, true)
-        + last_axis_bits(ctxs, raw_y, log2_size, c_idx, false)
-}
-
 /// Per-coefficient state captured during the level-decision scan, indexed by
 /// forward (DC -> high-frequency) combined scan rank.
 #[derive(Clone, Copy, Default)]
@@ -176,7 +193,6 @@ struct CoeffRec {
     y: u32,
     level: i16,     // chosen signed level (0 if quantized away)
     dist0: f64,     // distortion if zeroed
-    dist_l: f64,    // distortion at chosen level
     rd_normal: f64, // RD cost coded as a normal coefficient (sig flag + level)
     rd_last: f64,   // RD cost coded as the last significant coeff (no sig flag)
 }
@@ -184,15 +200,30 @@ struct CoeffRec {
 #[derive(Default)]
 pub struct RdoqScratch {
     recs: Vec<CoeffRec>,
-    rank_of: Vec<usize>,
     suff_zero: Vec<f64>,
     pref_normal: Vec<f64>,
     levels: Vec<i16>,
+    price_scratch: ResidualPricingScratch,
+    dequant: Vec<i16>,
+    recon: Vec<i16>,
+    trial_levels: Vec<i16>,
 }
 
 pub struct RdoqResult<'a> {
     pub levels: &'a mut [i16],
     pub nnz: u32,
+}
+
+/// Experimental post-RDOQ residual-pricing models selected by
+/// `BPG_RDOQ_PRICING`. `Frozen` is the existing single-scan behavior.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RdoqPricingMode {
+    #[default]
+    Frozen,
+    Running,
+    Hybrid,
+    ExactCleanup,
+    BoundedTrellis,
 }
 
 /// `BPG_RDOQ_REFINE` gate (default off). Post-RDOQ coordinate-descent that
@@ -295,6 +326,494 @@ pub fn refine_rdoq_levels(
     levels.iter().filter(|&&l| l != 0).count() as u32
 }
 
+#[allow(clippy::too_many_arguments)]
+fn exact_rd_cost(
+    base_ctxs: &Contexts,
+    residual: &[i16],
+    levels: &[i16],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+    scratch: &mut RdoqScratch,
+) -> f64 {
+    crate::transform::reconstruct_residual_into(
+        levels,
+        log2_size,
+        qp,
+        bit_depth,
+        is_dst4,
+        &mut scratch.dequant,
+        &mut scratch.recon,
+    );
+    let dist: f64 = residual
+        .iter()
+        .zip(&scratch.recon)
+        .map(|(&r, &c)| {
+            let d = r as i64 - c as i64;
+            (d * d) as f64
+        })
+        .sum();
+    let bits = estimate_residual_bits_into(
+        base_ctxs,
+        levels,
+        log2_size,
+        c_idx,
+        scan,
+        false,
+        &mut scratch.price_scratch,
+    );
+    dist + lambda * bits as f64 / CabacEstimator::SCALE as f64
+}
+
+fn level_sign(coeff: i16, level: i16) -> Option<i32> {
+    if level != 0 {
+        Some(level.signum() as i32)
+    } else if coeff != 0 {
+        Some(coeff.signum() as i32)
+    } else {
+        None
+    }
+}
+
+fn signed_level(sign: i32, mag: i32) -> i16 {
+    let mag = mag.clamp(0, i16::MAX as i32);
+    (sign * mag) as i16
+}
+
+fn nnz(levels: &[i16]) -> u32 {
+    levels.iter().filter(|&&l| l != 0).count() as u32
+}
+
+fn scan_indices(log2_size: u8, scan: ScanOrder) -> Vec<usize> {
+    let size = 1usize << log2_size;
+    let mut out = Vec::with_capacity(size * size);
+    for &(sbx, sby) in get_scan_sub_block(log2_size, scan).iter() {
+        for &(px, py) in get_scan_4x4(scan).iter() {
+            let x = sbx as usize * 4 + px as usize;
+            let y = sby as usize * 4 + py as usize;
+            if x < size && y < size {
+                out.push(y * size + x);
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keep_if_better(
+    base_ctxs: &Contexts,
+    residual: &[i16],
+    levels: &mut [i16],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+    scratch: &mut RdoqScratch,
+    best: &mut f64,
+) -> bool {
+    let cost = exact_rd_cost(
+        base_ctxs, residual, levels, log2_size, c_idx, qp, bit_depth, is_dst4, scan, lambda,
+        scratch,
+    );
+    if cost + 1e-6 < *best {
+        *best = cost;
+        true
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_set_level(
+    base_ctxs: &Contexts,
+    residual: &[i16],
+    levels: &mut [i16],
+    idx: usize,
+    cand: i16,
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+    scratch: &mut RdoqScratch,
+    best: &mut f64,
+) -> bool {
+    if levels[idx] == cand {
+        return false;
+    }
+    let save = levels[idx];
+    levels[idx] = cand;
+    if keep_if_better(
+        base_ctxs, residual, levels, log2_size, c_idx, qp, bit_depth, is_dst4, scan, lambda,
+        scratch, best,
+    ) {
+        true
+    } else {
+        levels[idx] = save;
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_drop_sweep(
+    base_ctxs: &Contexts,
+    coeffs: &[i16],
+    residual: &[i16],
+    levels: &mut [i16],
+    order: &[usize],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+    scratch: &mut RdoqScratch,
+    best: &mut f64,
+) -> bool {
+    let mut improved = false;
+    for &idx in order.iter().rev() {
+        let cur = levels[idx];
+        if cur == 0 {
+            continue;
+        }
+        let sign = level_sign(coeffs[idx], cur).unwrap_or(1);
+        let mag = cur.unsigned_abs() as i32;
+        let down = signed_level(sign, mag - 1);
+        if try_set_level(
+            base_ctxs, residual, levels, idx, down, log2_size, c_idx, qp, bit_depth, is_dst4, scan,
+            lambda, scratch, best,
+        ) {
+            improved = true;
+        }
+        if levels[idx] != 0
+            && try_set_level(
+                base_ctxs, residual, levels, idx, 0, log2_size, c_idx, qp, bit_depth, is_dst4,
+                scan, lambda, scratch, best,
+            )
+        {
+            improved = true;
+        }
+    }
+    improved
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_tail_cleanup(
+    base_ctxs: &Contexts,
+    residual: &[i16],
+    levels: &mut [i16],
+    order: &[usize],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+    scratch: &mut RdoqScratch,
+    best: &mut f64,
+) -> bool {
+    let mut improved = false;
+    scratch.trial_levels.clear();
+    scratch.trial_levels.extend_from_slice(levels);
+    if scratch.trial_levels.iter().any(|&l| l != 0) {
+        for v in &mut scratch.trial_levels {
+            *v = 0;
+        }
+        let trial = scratch.trial_levels.clone();
+        let cost = exact_rd_cost(
+            base_ctxs, residual, &trial, log2_size, c_idx, qp, bit_depth, is_dst4, scan, lambda,
+            scratch,
+        );
+        if cost + 1e-6 < *best {
+            *best = cost;
+            levels.copy_from_slice(&trial);
+            improved = true;
+        }
+    }
+
+    scratch.trial_levels.clear();
+    scratch.trial_levels.extend_from_slice(levels);
+    for last_rank in (0..order.len()).rev() {
+        let last_idx = order[last_rank];
+        if levels[last_idx] == 0 {
+            continue;
+        }
+        scratch.trial_levels.copy_from_slice(levels);
+        for &idx in order.iter().skip(last_rank + 1) {
+            scratch.trial_levels[idx] = 0;
+        }
+        let trial = scratch.trial_levels.clone();
+        let cost = exact_rd_cost(
+            base_ctxs, residual, &trial, log2_size, c_idx, qp, bit_depth, is_dst4, scan, lambda,
+            scratch,
+        );
+        if cost + 1e-6 < *best {
+            *best = cost;
+            levels.copy_from_slice(&trial);
+            improved = true;
+        }
+    }
+    improved
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_subblock_cleanup(
+    base_ctxs: &Contexts,
+    residual: &[i16],
+    levels: &mut [i16],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+    scratch: &mut RdoqScratch,
+    best: &mut f64,
+) -> bool {
+    let size = 1usize << log2_size;
+    let sb_width = size / 4;
+    let mut improved = false;
+    for &(sbx, sby) in get_scan_sub_block(log2_size, scan).iter().rev() {
+        let (sbx, sby) = (sbx as usize, sby as usize);
+        if sbx >= sb_width || sby >= sb_width {
+            continue;
+        }
+        let mut has_nz = false;
+        scratch.trial_levels.clear();
+        scratch.trial_levels.extend_from_slice(levels);
+        for y in sby * 4..((sby + 1) * 4).min(size) {
+            for x in sbx * 4..((sbx + 1) * 4).min(size) {
+                let idx = y * size + x;
+                has_nz |= scratch.trial_levels[idx] != 0;
+                scratch.trial_levels[idx] = 0;
+            }
+        }
+        if !has_nz {
+            continue;
+        }
+        let trial = scratch.trial_levels.clone();
+        let cost = exact_rd_cost(
+            base_ctxs, residual, &trial, log2_size, c_idx, qp, bit_depth, is_dst4, scan, lambda,
+            scratch,
+        );
+        if cost + 1e-6 < *best {
+            *best = cost;
+            levels.copy_from_slice(&trial);
+            improved = true;
+        }
+    }
+    improved
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_coordinate_descent(
+    base_ctxs: &Contexts,
+    coeffs: &[i16],
+    residual: &[i16],
+    levels: &mut [i16],
+    order: &[usize],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+    scratch: &mut RdoqScratch,
+    best: &mut f64,
+) {
+    loop {
+        let mut improved = false;
+        for &idx in order.iter().rev() {
+            let Some(sign) = level_sign(coeffs[idx], levels[idx]) else {
+                continue;
+            };
+            let mag = levels[idx].unsigned_abs() as i32;
+            let cands = [0, signed_level(sign, mag - 1), signed_level(sign, mag + 1)];
+            for cand in cands {
+                if try_set_level(
+                    base_ctxs, residual, levels, idx, cand, log2_size, c_idx, qp, bit_depth,
+                    is_dst4, scan, lambda, scratch, best,
+                ) {
+                    improved = true;
+                }
+            }
+        }
+        if !improved {
+            break;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_trellis(
+    base_ctxs: &Contexts,
+    coeffs: &[i16],
+    residual: &[i16],
+    levels: &mut [i16],
+    order: &[usize],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+    beam_width: usize,
+    scratch: &mut RdoqScratch,
+    best: &mut f64,
+) {
+    const MAX_TRELLIS_POSITIONS: usize = 32;
+    let beam_width = beam_width.clamp(1, 16);
+    let mut positions: Vec<usize> = order
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&idx| levels[idx] != 0 || coeffs[idx] != 0)
+        .take(MAX_TRELLIS_POSITIONS)
+        .collect();
+    if positions.is_empty() {
+        return;
+    }
+    positions.reverse();
+
+    let mut beam = vec![(levels.to_vec(), *best)];
+    for idx in positions {
+        let mut next: Vec<(Vec<i16>, f64)> = Vec::new();
+        for (state, _) in beam.iter() {
+            let Some(sign) = level_sign(coeffs[idx], state[idx]) else {
+                continue;
+            };
+            let mag = state[idx].unsigned_abs() as i32;
+            let cands = [
+                state[idx],
+                0,
+                signed_level(sign, mag - 1),
+                signed_level(sign, mag + 1),
+            ];
+            for cand in cands {
+                let mut candidate = state.clone();
+                candidate[idx] = cand;
+                if next.iter().any(|(seen, _)| seen == &candidate) {
+                    continue;
+                }
+                let cost = exact_rd_cost(
+                    base_ctxs, residual, &candidate, log2_size, c_idx, qp, bit_depth, is_dst4,
+                    scan, lambda, scratch,
+                );
+                next.push((candidate, cost));
+            }
+        }
+        next.sort_by(|a, b| a.1.total_cmp(&b.1));
+        next.truncate(beam_width);
+        if next.is_empty() {
+            break;
+        }
+        beam = next;
+    }
+    if let Some((state, cost)) = beam.first() {
+        if *cost + 1e-6 < *best {
+            *best = *cost;
+            levels.copy_from_slice(state);
+        }
+    }
+}
+
+/// Applies opt-in residual-pricing experiments after the normal frozen
+/// single-scan RDOQ decision. Returns the resulting non-zero coefficient count.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_rdoq_pricing_mode(
+    base_ctxs: &Contexts,
+    coeffs: &[i16],
+    residual: &[i16],
+    levels: &mut [i16],
+    log2_size: u8,
+    c_idx: u8,
+    qp: i32,
+    bit_depth: u8,
+    is_dst4: bool,
+    scan: ScanOrder,
+    lambda: f64,
+    mode: RdoqPricingMode,
+    trellis_beam: usize,
+    scratch: &mut RdoqScratch,
+) -> u32 {
+    if mode == RdoqPricingMode::Frozen {
+        return nnz(levels);
+    }
+
+    let order = scan_indices(log2_size, scan);
+    let mut best = exact_rd_cost(
+        base_ctxs, residual, levels, log2_size, c_idx, qp, bit_depth, is_dst4, scan, lambda,
+        scratch,
+    );
+
+    match mode {
+        RdoqPricingMode::Frozen => {}
+        RdoqPricingMode::Running => exact_coordinate_descent(
+            base_ctxs, coeffs, residual, levels, &order, log2_size, c_idx, qp, bit_depth, is_dst4,
+            scan, lambda, scratch, &mut best,
+        ),
+        RdoqPricingMode::Hybrid => {
+            exact_tail_cleanup(
+                base_ctxs, residual, levels, &order, log2_size, c_idx, qp, bit_depth, is_dst4,
+                scan, lambda, scratch, &mut best,
+            );
+            exact_drop_sweep(
+                base_ctxs, coeffs, residual, levels, &order, log2_size, c_idx, qp, bit_depth,
+                is_dst4, scan, lambda, scratch, &mut best,
+            );
+        }
+        RdoqPricingMode::ExactCleanup => loop {
+            let changed_tail = exact_tail_cleanup(
+                base_ctxs, residual, levels, &order, log2_size, c_idx, qp, bit_depth, is_dst4,
+                scan, lambda, scratch, &mut best,
+            );
+            let changed_sb = exact_subblock_cleanup(
+                base_ctxs, residual, levels, log2_size, c_idx, qp, bit_depth, is_dst4, scan,
+                lambda, scratch, &mut best,
+            );
+            let changed_drop = exact_drop_sweep(
+                base_ctxs, coeffs, residual, levels, &order, log2_size, c_idx, qp, bit_depth,
+                is_dst4, scan, lambda, scratch, &mut best,
+            );
+            if !(changed_tail || changed_sb || changed_drop) {
+                break;
+            }
+        },
+        RdoqPricingMode::BoundedTrellis => bounded_trellis(
+            base_ctxs,
+            coeffs,
+            residual,
+            levels,
+            &order,
+            log2_size,
+            c_idx,
+            qp,
+            bit_depth,
+            is_dst4,
+            scan,
+            lambda,
+            trellis_beam,
+            scratch,
+            &mut best,
+        ),
+    }
+    nnz(levels)
+}
+
 /// Single-scan RDOQ: choose quantized levels for `coeffs` directly from the
 /// transform coefficients. Returns `(levels, nnz)` with the same layout as
 /// `transform::quantize`.
@@ -392,40 +911,82 @@ pub fn rdoq_single_scan_into<'scratch>(
     let gt1_base = ctx::COEFF_ABS_LEVEL_GREATER1_FLAG + if c_idx > 0 { 16 } else { 0 };
     let gt2_base = ctx::COEFF_ABS_LEVEL_GREATER2_FLAG + if c_idx > 0 { 4 } else { 0 };
 
-    // Forward combined scan rank for every in-bounds position.
+    // Pre-pass: reverse-scan for the last significant coefficient under
+    // round-to-nearest quant.
+    // `q >= 1  ⟺  abs*scale + round >= 1<<qbits  ⟺  abs >= ceil(round/scale)`
+    // (since `round` is exactly half of `1<<qbits`). Positions after the last
+    // significant rank can never be coded (stage (b) only considers significant
+    // `last` candidates and never prices ranks beyond it), so all work past it
+    // is trimmed to a pure zeroing-distortion suffix, and an all-insignificant
+    // block returns immediately. Scanning high->low frequency stops at the
+    // first significant coefficient instead of touching the whole block.
+    debug_assert_eq!(scan_sub.len() * 16, size * size);
+    let sig_threshold = ((round + scale - 1) / scale) as u32;
+    let mut last_sig_rank: isize = -1;
+    'find_last: for (sb_i, &(sbx, sby)) in scan_sub.iter().enumerate().rev() {
+        let row0 = sby as usize * 4 * size + sbx as usize * 4;
+        for pos in (0..16).rev() {
+            let (px, py) = scan_pos[pos];
+            let abs = coeffs[row0 + py as usize * size + px as usize].unsigned_abs() as u32;
+            if abs >= sig_threshold {
+                last_sig_rank = (sb_i * 16 + pos) as isize;
+                break 'find_last;
+            }
+        }
+    }
+    if last_sig_rank < 0 {
+        scratch.levels.clear();
+        scratch.levels.resize(size * size, 0);
+        return RdoqResult {
+            levels: &mut scratch.levels,
+            nnz: 0,
+        };
+    }
+    let last_cg = last_sig_rank as usize / 16;
+    let last_cg_top = last_sig_rank as usize % 16;
+    let kept_cgs = last_cg + 1;
+    let kept = last_sig_rank as usize + 1;
+
+    // Records are indexed by forward combined scan rank (rank = sb*16 + pos;
+    // the scan tables cover the block exactly, so ranks are arithmetic).
+    // Fields are filled during the stage-(a) scan.
     let recs = &mut scratch.recs;
     recs.clear();
-    recs.reserve(size * size);
-    let rank_of = &mut scratch.rank_of;
-    rank_of.clear();
-    rank_of.resize(size * size, usize::MAX);
-    for &(sbx, sby) in scan_sub.iter() {
-        for &(px, py) in scan_pos.iter() {
-            let x = sbx as usize * 4 + px as usize;
-            let y = sby as usize * 4 + py as usize;
-            if x < size && y < size {
-                rank_of[y * size + x] = recs.len();
-                recs.push(CoeffRec {
-                    idx: y * size + x,
-                    x: x as u32,
-                    y: y as u32,
-                    ..Default::default()
-                });
-            }
+    recs.resize(kept, CoeffRec::default());
+
+    // Zeroing distortion of the trimmed tail (ranks kept..size*size), summed in
+    // reverse scan order — the identical float accumulation the full suffix
+    // pass used, so downstream costs stay bit-exact. Full coding groups beyond
+    // the last significant one first, then the last group's tail positions.
+    let mut tail_zero_dist = 0.0f64;
+    for &(sbx, sby) in scan_sub[kept_cgs..].iter().rev() {
+        let row0 = sby as usize * 4 * size + sbx as usize * 4;
+        for &(px, py) in scan_pos.iter().rev() {
+            let abs = coeffs[row0 + py as usize * size + px as usize].unsigned_abs() as i64;
+            tail_zero_dist += (abs * abs) as f64;
+        }
+    }
+    {
+        let (sbx, sby) = scan_sub[last_cg];
+        let row0 = sby as usize * 4 * size + sbx as usize * 4;
+        for pos in (last_cg_top + 1..16).rev() {
+            let (px, py) = scan_pos[pos];
+            let abs = coeffs[row0 + py as usize * size + px as usize].unsigned_abs() as i64;
+            tail_zero_dist += (abs * abs) as f64;
         }
     }
 
     // --- Stage (a): per-coefficient level decision, reverse sub-block scan. ---
-    let mut coded_sb_flags = [[false; 8]; 8];
+    let mut coded_sb_flags = [0u8; 8];
     // `level2` coding-group state carried across groups (x265 `rdoqQuant`):
     // `prev_cg_c1` is the previous coded group's final greater1 context, used to
     // bump `ctxSet` for the next group.
     let mut prev_cg_c1 = 1u32;
-    for &(sbx, sby) in scan_sub.iter().rev() {
+    for (sb_i, &(sbx, sby)) in scan_sub[..kept_cgs].iter().enumerate().rev() {
         let sbx = sbx as usize;
         let sby = sby as usize;
-        let right = sbx + 1 < sb_width && coded_sb_flags[sby][sbx + 1];
-        let below = sby + 1 < sb_width && coded_sb_flags[sby + 1][sbx];
+        let right = sbx + 1 < sb_width && (coded_sb_flags[sby] & (1u8 << (sbx + 1))) != 0;
+        let below = sby + 1 < sb_width && (coded_sb_flags[sby + 1] & (1u8 << sbx)) != 0;
         let prev_csbf = (right as u8) | ((below as u8) << 1);
 
         // Per-group greater1/greater2 state (x265 quant.cpp:778-866). `ctx_set`
@@ -444,26 +1005,56 @@ pub fn rdoq_single_scan_into<'scratch>(
         let mut c1_idx = 0u32;
         let mut c2_idx = 0u32;
 
+        // The greater2 context index only depends on `ctx_set2`, fixed for the
+        // whole group — hoist its entropy bits out of the position loop.
+        let gt2 = if level2 {
+            let gt2_ci = gt2_base + ctx_set2 as usize;
+            [bits(gt2_ci, 0), bits(gt2_ci, 1)]
+        } else {
+            [0, 0]
+        };
+
+        let sig_row =
+            crate::residual::sig_ctx_row(log2_size, c_idx, scan_idx, !cg_is_not_dc, prev_csbf);
         let mut sb_has_sig = false;
-        for pos in (0..16).rev() {
+        // Positions above the last significant rank in the last group carry no
+        // record (their zeroing distortion lives in `tail_zero_dist`).
+        let top = if sb_i == last_cg { last_cg_top } else { 15 };
+        for pos in (0..=top).rev() {
             let (px, py) = scan_pos[pos];
             let x = sbx * 4 + px as usize;
             let y = sby * 4 + py as usize;
-            if x >= size || y >= size {
-                continue;
-            }
-            let rank = rank_of[y * size + x];
+            let rank = sb_i * 16 + pos;
             let coeff = coeffs[y * size + x];
             let abs = coeff.unsigned_abs() as i64;
             let q = ((abs * scale + round) >> qbits).min(32767) as i32;
 
-            let sig_ci =
-                calc_sig_coeff_flag_ctx(x as u8, y as u8, log2_size, c_idx, scan_idx, prev_csbf);
+            let sig_ci = sig_row[pos] as usize;
             let sig0 = bits(sig_ci, 0);
-            let sig1 = bits(sig_ci, 1);
+            let dist0 = (abs * abs) as f64;
 
-            // Per-coefficient `level2` rate parameters from the tracked state.
-            let (base_level, gt1, gt2, c1c2idx) = if level2 {
+            let rec = &mut recs[rank];
+            rec.idx = y * size + x;
+            rec.x = x as u32;
+            rec.y = y as u32;
+            rec.dist0 = dist0;
+
+            // Match x265's RDOQ refinement boundary: start from the
+            // round-to-nearest quantized level, never resurrect an initial
+            // zero, and only compare the kept level with one step down. An
+            // initial zero needs no level-rate parameters and no state advance,
+            // so it exits before the greater1/greater2 lookups.
+            if q == 0 {
+                rec.level = 0;
+                rec.rd_normal = dist0 + lam * sig0 as f64;
+                rec.rd_last = f64::INFINITY;
+                continue;
+            }
+
+            let sig1 = bits(sig_ci, 1);
+            // Per-coefficient `level2` rate parameters from the tracked state
+            // (`gt2` was hoisted per group above).
+            let (base_level, gt1, c1c2idx) = if level2 {
                 let c1c2idx =
                     (if c1_idx < 8 { 1u32 } else { 0 }) + (if c2_idx == 0 { 2 } else { 0 });
                 let base_level = if c1_idx < 8 {
@@ -472,34 +1063,15 @@ pub fn rdoq_single_scan_into<'scratch>(
                     1
                 };
                 let gt1_ci = gt1_base + 4 * ctx_set2 as usize + c1 as usize;
-                let gt2_ci = gt2_base + ctx_set2 as usize;
-                (
-                    base_level,
-                    [bits(gt1_ci, 0), bits(gt1_ci, 1)],
-                    [bits(gt2_ci, 0), bits(gt2_ci, 1)],
-                    c1c2idx,
-                )
+                (base_level, [bits(gt1_ci, 0), bits(gt1_ci, 1)], c1c2idx)
             } else {
-                (0, [0, 0], [0, 0], 0)
+                (0, [0, 0], 0)
             };
 
-            let dist0 = (abs * abs) as f64;
             let mut best_l = 0i64;
             let mut best_levbits = 0u64;
             let mut best_distl = dist0;
             let mut best_cost = dist0 + lam * sig0 as f64;
-            // Match x265's RDOQ refinement boundary: start from the
-            // round-to-nearest quantized level, never resurrect an initial
-            // zero, and only compare the kept level with one step down.
-            if q == 0 {
-                let rec = &mut recs[rank];
-                rec.dist0 = dist0;
-                rec.dist_l = dist0;
-                rec.level = 0;
-                rec.rd_normal = best_cost;
-                rec.rd_last = f64::INFINITY;
-                continue;
-            }
             for l in (q - 1).max(1)..=q {
                 let dl = abs - dq.apply(l as i16) as i64;
                 let dist = (dl * dl) as f64;
@@ -519,7 +1091,6 @@ pub fn rdoq_single_scan_into<'scratch>(
 
             let rec = &mut recs[rank];
             rec.dist0 = dist0;
-            rec.dist_l = best_distl;
             if best_l != 0 {
                 rec.level = if coeff < 0 { -best_l } else { best_l } as i16;
                 rec.rd_normal = best_distl + lam * (sig1 + best_levbits) as f64;
@@ -555,11 +1126,13 @@ pub fn rdoq_single_scan_into<'scratch>(
         // Carry this group's final greater1 context only when it coded a
         // coefficient (empty groups leave c1 == 1 and don't shift the next
         // group's ctxSet), matching x265 skipping all-zero groups.
-        if level2 && sb_has_sig {
-            prev_cg_c1 = c1;
+        if level2 {
+            if sb_has_sig || x265_empty_cg_carry_enabled() {
+                prev_cg_c1 = c1;
+            }
         }
         if sb_has_sig {
-            coded_sb_flags[sby][sbx] = true;
+            coded_sb_flags[sby] |= 1u8 << sbx;
         }
     }
 
@@ -569,34 +1142,75 @@ pub fn rdoq_single_scan_into<'scratch>(
     // (its sig flag inferred), ranks > p are zeroed (distortion only). Also
     // consider zeroing the whole block (cbf = 0).
     let total = recs.len();
-    // Suffix distortion of zeroing rank..end.
+    // Suffix distortion of zeroing rank..end. `suff_zero[total]` seeds the
+    // trimmed tail's zeroing distortion so costs match the untrimmed pass.
     let suff_zero = &mut scratch.suff_zero;
     suff_zero.clear();
     suff_zero.resize(total + 1, 0.0);
+    suff_zero[total] = tail_zero_dist;
     for k in (0..total).rev() {
         suff_zero[k] = suff_zero[k + 1] + recs[k].dist0;
     }
-    // Prefix RD of coding ranks 0..k as normal coefficients.
-    let pref_normal = &mut scratch.pref_normal;
-    pref_normal.clear();
-    pref_normal.resize(total + 1, 0.0);
-    for k in 0..total {
-        pref_normal[k + 1] = pref_normal[k] + recs[k].rd_normal;
-    }
-
     // Baseline: all-zero block (cbf = 0), no residual bits.
     let mut best_cost = suff_zero[0];
     let mut best_last: isize = -1;
-    for p in 0..total {
-        if recs[p].level == 0 {
-            continue;
+
+    // `last_sig_coeff_x/y` prices depend only on the axis value for this block.
+    // Cache the two tiny axis tables once per RDOQ call instead of walking the
+    // truncated-unary contexts for every non-zero last-position candidate.
+    let mut last_x_bits_by_val = [0u64; 32];
+    let mut last_y_bits_by_val = [0u64; 32];
+    for v in 0..size {
+        last_x_bits_by_val[v] = last_axis_bits(ctxs, v as u32, log2_size, c_idx, true);
+        last_y_bits_by_val[v] = last_axis_bits(ctxs, v as u32, log2_size, c_idx, false);
+    }
+    let last_bits_for_rec = |rec: &CoeffRec| -> u64 {
+        let (raw_x, raw_y) = if scan_order == ScanOrder::Vertical {
+            (rec.y as usize, rec.x as usize)
+        } else {
+            (rec.x as usize, rec.y as usize)
+        };
+        last_x_bits_by_val[raw_x] + last_y_bits_by_val[raw_y]
+    };
+
+    let last_stop = x265_last_stop_enabled();
+    if last_stop {
+        // Prefix RD of coding ranks 0..k as normal coefficients. Only the
+        // diagnostic reverse-scan envelope needs random prefix lookup; the
+        // default forward scan below carries the prefix in a scalar and avoids
+        // one Vec fill per RDOQ call.
+        let pref_normal = &mut scratch.pref_normal;
+        pref_normal.clear();
+        pref_normal.resize(total + 1, 0.0);
+        for k in 0..total {
+            pref_normal[k + 1] = pref_normal[k] + recs[k].rd_normal;
         }
-        let lp =
-            lam * last_pos_bits(ctxs, recs[p].x, recs[p].y, log2_size, c_idx, scan_order) as f64;
-        let cost = pref_normal[p] + recs[p].rd_last + suff_zero[p + 1] + lp;
-        if cost < best_cost {
-            best_cost = cost;
-            best_last = p as isize;
+        for p in (0..total).rev() {
+            if recs[p].level == 0 {
+                continue;
+            }
+            let lp = lam * last_bits_for_rec(&recs[p]) as f64;
+            let cost = pref_normal[p] + recs[p].rd_last + suff_zero[p + 1] + lp;
+            if cost < best_cost {
+                best_cost = cost;
+                best_last = p as isize;
+            }
+            if recs[p].level.unsigned_abs() > 1 {
+                break;
+            }
+        }
+    } else {
+        let mut pref_normal = 0.0f64;
+        for p in 0..total {
+            if recs[p].level != 0 {
+                let lp = lam * last_bits_for_rec(&recs[p]) as f64;
+                let cost = pref_normal + recs[p].rd_last + suff_zero[p + 1] + lp;
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_last = p as isize;
+                }
+            }
+            pref_normal += recs[p].rd_normal;
         }
     }
 
@@ -609,31 +1223,33 @@ pub fn rdoq_single_scan_into<'scratch>(
     // residual encoder re-derives CSBF from the levels — so this can only change
     // RD, never validity. Sub-blocks are visited high->low frequency so a
     // neighbour's final coded state is known when its CSBF context is priced.
-    if best_last >= 0 {
+    // Ranks are arithmetic, so the last coefficient's sub-block scan index is
+    // `last / 16`; with fewer than two groups before it the loop below is
+    // empty, so skip the coded-state build entirely.
+    let last_sb_scan = if best_last >= 0 {
+        best_last as usize / 16
+    } else {
+        0
+    };
+    if last_sb_scan > 1 {
         let last = best_last as usize;
-        let last_sbx = recs[last].x as usize / 4;
-        let last_sby = recs[last].y as usize / 4;
-        let last_sb_scan = scan_sub
-            .iter()
-            .position(|&(sx, sy)| sx as usize == last_sbx && sy as usize == last_sby)
-            .unwrap_or(0);
 
         // Final coded-sub-block state from the post-stage-(b) levels.
-        let mut coded = [[false; 8]; 8];
+        let mut coded = [0u8; 8];
         for rec in recs.iter().take(last + 1) {
             if rec.level != 0 {
-                coded[rec.y as usize / 4][rec.x as usize / 4] = true;
+                coded[rec.y as usize / 4] |= 1u8 << (rec.x as usize / 4);
             }
         }
 
         for sb_scan in (1..last_sb_scan).rev() {
             let (sbx, sby) = scan_sub[sb_scan];
             let (sbx, sby) = (sbx as usize, sby as usize);
-            if !coded[sby][sbx] {
+            if (coded[sby] & (1u8 << sbx)) == 0 {
                 continue; // already empty: CSBF=0 either way
             }
-            let right = sbx + 1 < sb_width && coded[sby][sbx + 1];
-            let below = sby + 1 < sb_width && coded[sby + 1][sbx];
+            let right = sbx + 1 < sb_width && (coded[sby] & (1u8 << (sbx + 1))) != 0;
+            let below = sby + 1 < sb_width && (coded[sby + 1] & (1u8 << sbx)) != 0;
             let csbf_neighbors = (right as u8) | ((below as u8) << 1);
             let csbf_ci = ctx::CODED_SUB_BLOCK_FLAG
                 + (csbf_neighbors != 0) as usize
@@ -641,16 +1257,7 @@ pub fn rdoq_single_scan_into<'scratch>(
 
             let mut keep = lam * bits(csbf_ci, 1) as f64;
             let mut zero = lam * bits(csbf_ci, 0) as f64;
-            for &(px, py) in scan_pos.iter() {
-                let x = sbx * 4 + px as usize;
-                let y = sby * 4 + py as usize;
-                if x >= size || y >= size {
-                    continue;
-                }
-                let rank = rank_of[y * size + x];
-                if rank == usize::MAX || rank > last {
-                    continue;
-                }
+            for rank in sb_scan * 16..(sb_scan + 1) * 16 {
                 keep += recs[rank].rd_normal;
                 zero += recs[rank].dist0;
             }
@@ -662,17 +1269,10 @@ pub fn rdoq_single_scan_into<'scratch>(
             // margin was tried and made it worse (it blocked genuine wins
             // without fixing the directional misestimates), so decide bare.
             if zero < keep {
-                for &(px, py) in scan_pos.iter() {
-                    let x = sbx * 4 + px as usize;
-                    let y = sby * 4 + py as usize;
-                    if x < size && y < size {
-                        let rank = rank_of[y * size + x];
-                        if rank != usize::MAX && rank <= last {
-                            recs[rank].level = 0;
-                        }
-                    }
+                for rank in sb_scan * 16..(sb_scan + 1) * 16 {
+                    recs[rank].level = 0;
                 }
-                coded[sby][sbx] = false;
+                coded[sby] &= !(1u8 << sbx);
             }
         }
     }
@@ -684,12 +1284,11 @@ pub fn rdoq_single_scan_into<'scratch>(
     let mut nnz = 0u32;
     if best_last >= 0 {
         let last = best_last as usize;
-        for (rank, rec) in recs.iter().enumerate().take(last + 1) {
+        for rec in recs.iter().take(last + 1) {
             if rec.level != 0 {
                 levels[rec.idx] = rec.level;
                 nnz += 1;
             }
-            let _ = rank;
         }
     }
 
@@ -710,7 +1309,7 @@ mod rdoq_optimality_tests {
     //! consistently beats RDOQ on TRUE RD, the trellis is leaving bits on the
     //! table; if not, RDOQ selection is near-optimal and the still265-vs-x265
     //! gap is NOT in coefficient selection.
-    use super::rdoq_single_scan;
+    use super::{RdoqPricingMode, RdoqScratch, apply_rdoq_pricing_mode, rdoq_single_scan};
     use crate::cabac::CabacEstimator;
     use crate::contexts::Contexts;
     use crate::residual::{ScanOrder, estimate_residual_bits};
@@ -745,6 +1344,61 @@ mod rdoq_optimality_tests {
             dist,
             bits,
         )
+    }
+
+    #[test]
+    fn pricing_modes_do_not_worsen_exact_rd_objective() {
+        let log2 = 3;
+        let qp = 28;
+        let bd = 8;
+        let scan = ScanOrder::Diagonal;
+        let lam = lambda(qp);
+        let residual: Vec<i16> = (0..64)
+            .map(|i| {
+                let x = (i & 7) as i16;
+                let y = (i >> 3) as i16;
+                (x * 9 - y * 5 + ((i % 5) as i16 - 2) * 7).clamp(-127, 127)
+            })
+            .collect();
+        let coeffs = forward_transform(&residual, log2, false, bd);
+        let ctx = Contexts::new(qp);
+        let (start, _) = rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true);
+
+        for mode in [
+            RdoqPricingMode::Running,
+            RdoqPricingMode::Hybrid,
+            RdoqPricingMode::ExactCleanup,
+            RdoqPricingMode::BoundedTrellis,
+        ] {
+            let mut levels = start.clone();
+            let before = true_rd(&levels, &residual, log2, qp, bd, scan, lam).0;
+            let mut scratch = RdoqScratch::default();
+            let returned_nnz = apply_rdoq_pricing_mode(
+                &ctx,
+                &coeffs,
+                &residual,
+                &mut levels,
+                log2,
+                0,
+                qp,
+                bd,
+                false,
+                scan,
+                lam,
+                mode,
+                4,
+                &mut scratch,
+            );
+            let after = true_rd(&levels, &residual, log2, qp, bd, scan, lam).0;
+            assert!(
+                after <= before + 1e-6,
+                "{mode:?} worsened exact RD: before={before}, after={after}"
+            );
+            assert_eq!(
+                returned_nnz,
+                levels.iter().filter(|&&l| l != 0).count() as u32
+            );
+        }
     }
 
     /// Coordinate-descent over the per-coefficient RD-relevant candidate set,

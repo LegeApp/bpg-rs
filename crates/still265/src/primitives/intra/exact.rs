@@ -265,6 +265,143 @@ pub fn pred_angular_u8_scalar(
     }
 }
 
+/// `wide` i32x8 planar prediction; bit-identical to [`pred_planar_u8_scalar`]
+/// (same i32 arithmetic, vectorized 8 pixels per step).
+pub fn pred_planar_u8_wide(
+    dst: &mut [u8],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    bit_depth: u8,
+) {
+    let size = 1usize << log2_size;
+    if size < 8 {
+        return pred_planar_u8_scalar(dst, border, center, log2_size, c_idx, bit_depth);
+    }
+    debug_assert_eq!(bit_depth, 8, "pred_planar_u8 is only for 8-bit content");
+    debug_assert!(dst.len() >= size * size);
+    use wide::i32x8;
+    let n_i = size as i32;
+    let right = i32x8::splat(border[center + 1 + size]);
+    let bottom = border[center - 1 - size];
+    let round = i32x8::splat(n_i);
+    let shift = log2_size as i32 + 1;
+    let zero = i32x8::splat(0);
+    let maxv = i32x8::splat(255);
+    let iota = i32x8::new([0, 1, 2, 3, 4, 5, 6, 7]);
+    for py in 0..size {
+        let py_i = py as i32;
+        let left = i32x8::splat(border[center - 1 - py]);
+        let wy_top = i32x8::splat(n_i - 1 - py_i);
+        let y_bottom = i32x8::splat((py_i + 1) * bottom);
+        let row = &mut dst[py * size..py * size + size];
+        for px in (0..size).step_by(8) {
+            let px_v = i32x8::splat(px as i32) + iota;
+            let wx_left = i32x8::splat(n_i - 1) - px_v;
+            let wx_right = px_v + i32x8::splat(1);
+            let top = i32x8::new(
+                <[i32; 8]>::try_from(&border[center + 1 + px..center + 9 + px]).unwrap(),
+            );
+            let pred =
+                (wx_left * left + wx_right * right + wy_top * top + y_bottom + round) >> shift;
+            let arr = pred.max(zero).min(maxv).to_array();
+            for k in 0..8 {
+                row[px + k] = arr[k] as u8;
+            }
+        }
+    }
+}
+
+/// `wide` i32x8 angular prediction for the vertical family (mode >= 18);
+/// bit-identical to [`pred_angular_u8_scalar`]. The horizontal family and
+/// sub-8 sizes fall back to the scalar kernel.
+pub fn pred_angular_u8_wide(
+    dst: &mut [u8],
+    border: &[i32],
+    center: usize,
+    log2_size: u8,
+    c_idx: u8,
+    mode: u8,
+    bit_depth: u8,
+) {
+    let size = 1usize << log2_size;
+    if size < 8 || mode < 18 {
+        return pred_angular_u8_scalar(dst, border, center, log2_size, c_idx, mode, bit_depth);
+    }
+    debug_assert_eq!(bit_depth, 8, "pred_angular_u8 is only for 8-bit content");
+    debug_assert!(dst.len() >= size * size);
+    use wide::i32x8;
+    let n = size as i32;
+    let intra_pred_angle = INTRA_PRED_ANGLE[mode as usize] as i32;
+
+    let mut ref_arr = [0i32; 4 * MAX_INTRA_PRED_BLOCK_SIZE + 1];
+    let ref_center = 2 * MAX_INTRA_PRED_BLOCK_SIZE;
+    ref_arr[ref_center..ref_center + size + 1].copy_from_slice(&border[center..center + size + 1]);
+    if intra_pred_angle < 0 {
+        let inv_angle = inv_angle(mode);
+        let ext = (n * intra_pred_angle) >> 5;
+        if ext < -1 {
+            for xx in ext..=-1 {
+                let idx = (xx * inv_angle + 128) >> 8;
+                if idx >= 0 && idx <= 2 * n {
+                    ref_arr[(ref_center as i32 + xx) as usize] =
+                        border[(center as i32 - idx) as usize];
+                }
+            }
+        }
+    } else {
+        let src_start = center + size + 1;
+        let dst_start = ref_center + size + 1;
+        ref_arr[dst_start..dst_start + size].copy_from_slice(&border[src_start..src_start + size]);
+    }
+
+    let zero = i32x8::splat(0);
+    let maxv = i32x8::splat(255);
+    for py in 0..n {
+        let i_idx = ((py + 1) * intra_pred_angle) >> 5;
+        let i_fact = ((py + 1) * intra_pred_angle) & 31;
+        let base_idx = (ref_center as i32 + i_idx + 1) as usize;
+        let row = &mut dst[py as usize * size..py as usize * size + size];
+        if i_fact != 0 {
+            let w0 = i32x8::splat(32 - i_fact);
+            let w1 = i32x8::splat(i_fact);
+            let rnd = i32x8::splat(16);
+            for px in (0..size).step_by(8) {
+                let a = i32x8::new(
+                    <[i32; 8]>::try_from(&ref_arr[base_idx + px..base_idx + px + 8]).unwrap(),
+                );
+                let b = i32x8::new(
+                    <[i32; 8]>::try_from(&ref_arr[base_idx + px + 1..base_idx + px + 9]).unwrap(),
+                );
+                let v: i32x8 = (w0 * a + w1 * b + rnd) >> 5;
+                let arr = v.max(zero).min(maxv).to_array();
+                for k in 0..8 {
+                    row[px + k] = arr[k] as u8;
+                }
+            }
+        } else {
+            for px in (0..size).step_by(8) {
+                let a = i32x8::new(
+                    <[i32; 8]>::try_from(&ref_arr[base_idx + px..base_idx + px + 8]).unwrap(),
+                );
+                let arr = a.max(zero).min(maxv).to_array();
+                for k in 0..8 {
+                    row[px + k] = arr[k] as u8;
+                }
+            }
+        }
+    }
+
+    if mode == 26 && c_idx == 0 && size < 32 {
+        for py in 0..n {
+            let pred =
+                border[center + 1] + ((border[center - 1 - py as usize] - border[center]) >> 1);
+            dst[py as usize * size] = clip_u8(pred);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::primitives::{

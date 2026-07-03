@@ -161,7 +161,7 @@ where
             (true, ExactUsage::X265Shape) => {
                 let shortlist = build_x265_shape_shortlist(
                     state,
-                    &self.workspace.price_base,
+                    &self.workspace.price_cur,
                     &evidence.rough_costs,
                     mpm_u8,
                     log2_cb_size,
@@ -382,7 +382,7 @@ where
                     satd_u8(&src, size, &pred, size, size)
                 };
                 let bit_cost = lambda_sad
-                    * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                    * luma_mode_bits(&self.workspace.price_cur, mpm_u8, m) as f64
                     / scale;
                 let cost = satd as f64 + mbits_weight * bit_cost;
                 let (class, family) = classify_mode(m);
@@ -409,7 +409,7 @@ where
                         satd_u8(&src, size, &batch8[off..off + n], size, size)
                     };
                     let bit_cost = lambda_sad
-                        * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                        * luma_mode_bits(&self.workspace.price_cur, mpm_u8, m) as f64
                         / scale;
                     let cost = satd as f64 + mbits_weight * bit_cost;
                     let (class, family) = classify_mode(m);
@@ -441,7 +441,7 @@ where
                         satd_u8(&src, size, &pred, size, size)
                     };
                     let bit_cost = lambda_sad
-                        * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                        * luma_mode_bits(&self.workspace.price_cur, mpm_u8, m) as f64
                         / scale;
                     let cost = satd as f64 + mbits_weight * bit_cost;
                     let (class, family) = classify_mode(m);
@@ -475,7 +475,7 @@ where
                     satd_u16(&src, size, &pred, size, size)
                 };
                 let bit_cost = lambda_sad
-                    * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                    * luma_mode_bits(&self.workspace.price_cur, mpm_u8, m) as f64
                     / scale;
                 let cost = satd as f64 + mbits_weight * bit_cost;
                 let (class, family) = classify_mode(m);
@@ -504,7 +504,7 @@ where
                         satd_u16(&src, size, slot, size, size)
                     };
                     let bit_cost = lambda_sad
-                        * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                        * luma_mode_bits(&self.workspace.price_cur, mpm_u8, m) as f64
                         / scale;
                     let cost = satd as f64 + mbits_weight * bit_cost;
                     let (class, family) = classify_mode(m);
@@ -527,7 +527,7 @@ where
                         satd_u16(&src, size, &pred, size, size)
                     };
                     let bit_cost = lambda_sad
-                        * luma_mode_bits(&self.workspace.price_base, mpm_u8, m) as f64
+                        * luma_mode_bits(&self.workspace.price_cur, mpm_u8, m) as f64
                         / scale;
                     let cost = satd as f64 + mbits_weight * bit_cost;
                     let (class, family) = classify_mode(m);
@@ -623,7 +623,7 @@ where
             let mark = self.overlay.mark();
             let (tt, tt_cost) =
                 self.decide_tt_luma_no_optional_split(state, x0, y0, log2_cb_size, 0, mode, lambda);
-            let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+            let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
             let mut total = tt_cost + lambda * mbits as f64 / scale;
 
             // Approximate chroma RD cost via SATD.
@@ -720,7 +720,7 @@ where
             .finish_timer(WorkBucket::LumaCheap, cheap_timer);
 
         for a in &acc {
-            let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, a.mode);
+            let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, a.mode);
             let total = a.cost + lambda * mbits as f64 / scale;
             let rough_rank = evidence
                 .rough_costs
@@ -895,13 +895,27 @@ where
         scale: f64,
         modes: &[u8],
     ) -> ExactModeWinner<TtPlan, O::Saved> {
-        // Phase 1: Hard-quant evaluation of every candidate mode.
+        // Phase 1: Hard-quant evaluation of every candidate mode. With
+        // evolving trial contexts, every candidate starts from the same
+        // CU-entry context (x265 loads `m_rqt[depth].cur` per candidate);
+        // each trial's exit context is captured so the winner's can survive.
+        let evolve = super::env::ctx_evolve_search();
+        let ctx_entry = evolve.then(|| self.workspace.price_cur.clone());
+        // Keyed by mode: Phase 2 sorts/replaces trials in place, so parallel
+        // indexing would desync. Candidate mode lists are deduplicated.
+        let mut trial_ctxs: Vec<(u8, crate::contexts::Contexts)> = Vec::new();
         let mut trials: Vec<ExactModeWinner<TtPlan, O::Saved>> = Vec::with_capacity(modes.len());
         for &mode in modes {
             let exact_timer = StillSearchLedger::start_timer();
             let mark = self.overlay.mark();
+            let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
+            let commit_scope = self.begin_winner_commit_scope();
             let (tt, tt_cost) = self.decide_tt(state, x0, y0, log2_cb_size, 0, mode, lambda);
-            let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+            self.end_winner_commit_scope(commit_scope);
+            if let Some(entry) = ctx_entry.as_ref() {
+                let exit = std::mem::replace(&mut self.workspace.price_cur, entry.clone());
+                upsert_trial_ctx(&mut trial_ctxs, mode, exit);
+            }
             let cost = tt_cost + lambda * mbits as f64 / scale;
             record_exact_stats(state, mode, tt_cost);
             let recon = self.overlay.detach_from(mark);
@@ -918,8 +932,17 @@ where
         }
 
         // Phase 2: Selective RDOQ trial for close candidates (Slow/Placebo).
+        // Redundant when Phase 1 already quantized with RDOQ (one-pass mode):
+        // every candidate was evaluated under the same quant Phase 2 would
+        // apply, with a fuller TU-split search than Phase 2's restricted one.
+        let phase1_rdoq = super::env::rdoq_one_pass_enabled()
+            && matches!(
+                super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
+                super::eval::QuantMode::RdoqTrial { .. }
+            );
         let rdoq_policy = state.effort_template.rdoq_trials;
-        if rdoq_policy.mode != TrialRdoqMode::Off && rdoq_policy.max_rdoq_modes > 0 {
+        if !phase1_rdoq && rdoq_policy.mode != TrialRdoqMode::Off && rdoq_policy.max_rdoq_modes > 0
+        {
             trials.sort_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap());
             let best_cost = trials[0].cost;
             let n = trials.len().min(rdoq_policy.max_rdoq_modes as usize);
@@ -956,9 +979,15 @@ where
                     tu,
                     retain_coeff: true,
                 };
+                let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
+                let commit_scope = self.begin_winner_commit_scope();
                 let (tt, tt_cost) =
                     self.decide_tt_with_config(state, x0, y0, log2_cb_size, 0, mode, lambda, cfg);
-                let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+                self.end_winner_commit_scope(commit_scope);
+                if let Some(entry) = ctx_entry.as_ref() {
+                    let exit = std::mem::replace(&mut self.workspace.price_cur, entry.clone());
+                    upsert_trial_ctx(&mut trial_ctxs, mode, exit);
+                }
                 let cost = tt_cost + lambda * mbits as f64 / scale;
                 record_exact_stats(state, mode, tt_cost);
                 let recon = self.overlay.detach_from(mark);
@@ -975,10 +1004,16 @@ where
             }
         }
 
-        trials
+        let winner = trials
             .into_iter()
             .min_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap())
-            .unwrap()
+            .unwrap();
+        if evolve {
+            if let Some((_, exit)) = trial_ctxs.into_iter().find(|(m, _)| *m == winner.mode) {
+                self.workspace.price_cur = exit;
+            }
+        }
+        winner
     }
 
     /// Re-evaluate the cheap winner once with full components and retained
@@ -1002,19 +1037,17 @@ where
         tu.split_mode = crate::effort::TuSplitMode::Disabled;
         tu.max_extra_depth = 0;
         let cfg = super::tu::ExactEvalConfig {
-            quant: if super::env::rdoq_search_enabled() {
-                super::eval::QuantMode::RdoqTrial { level: 2 }
-            } else {
-                super::eval::QuantMode::HardQuantSearch
-            },
+            quant: super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
             residual_pricing: super::eval::ResidualPricingMode::Exact,
             scope: super::tu::TtEvalScope::FullComponents,
             tu,
             retain_coeff: true,
         };
+        let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
+        let commit_scope = self.begin_winner_commit_scope();
         let (tt, tt_cost) =
             self.decide_tt_with_config(state, x0, y0, log2_cb_size, 0, mode, lambda, cfg);
-        let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+        self.end_winner_commit_scope(commit_scope);
         let cost = tt_cost + lambda * mbits as f64 / scale;
         record_exact_stats(state, mode, tt_cost);
         let recon = self.overlay.detach_from(mark);
@@ -1070,7 +1103,7 @@ where
         for &mode in shortlist {
             let m = self.overlay.mark();
             let (_, tt_cost) = self.decide_tt(state, x0, y0, log2_cb_size, 0, mode, lambda);
-            let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+            let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
             let total = tt_cost + lambda * mbits as f64 / scale;
             if total < best_sl_cost {
                 best_sl_cost = total;
@@ -1085,7 +1118,7 @@ where
         for &mode in &ALL_MODES {
             let m = self.overlay.mark();
             let (_, tt_cost) = self.decide_tt(state, x0, y0, log2_cb_size, 0, mode, lambda);
-            let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+            let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
             let total = tt_cost + lambda * mbits as f64 / scale;
             if total < best_all_cost {
                 best_all_cost = total;
@@ -1155,7 +1188,7 @@ where
         if super::env::x265_rmd_audit_enabled() {
             emit_x265_rmd_audit(
                 state,
-                &self.workspace.price_base,
+                &self.workspace.price_cur,
                 x0,
                 y0,
                 log2_cb_size,
@@ -1168,7 +1201,7 @@ where
         if current_mode != best_all_mode && super::env::luma_miss_audit_enabled() {
             emit_luma_miss_audit(
                 state,
-                &self.workspace.price_base,
+                &self.workspace.price_cur,
                 x0,
                 y0,
                 log2_cb_size,
@@ -1210,7 +1243,7 @@ where
         let (_, tt_cost) =
             self.decide_tt_with_config(state, x0, y0, log2_cb_size, 0, mode, lambda, cfg);
         self.overlay.truncate(mark);
-        let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+        let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
         tt_cost + lambda * mbits as f64 / scale
     }
 
@@ -1222,25 +1255,14 @@ where
         log2_size: u8,
         dst: &mut [u8],
     ) {
-        let tile_bounds = state.tile_clamp_bounds(x0, y0, 0);
-        let overlay = &self.overlay;
-        let (uf, ft, center, bit_depth) =
-            bpg_hevc_decode::hevc::intra::build_reference_borders_with_reader(
-                &state.frame,
-                x0,
-                y0,
-                log2_size,
-                0,
-                true,
-                |c, rx, ry| {
-                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
-                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
-                            return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
-                        }
-                    }
-                    overlay.sample(c, rx, ry)
-                },
-            );
+        let (uf, ft, center, bit_depth) = self.build_intra_refs_bulk_overlay(
+            &state.frame,
+            x0,
+            y0,
+            log2_size,
+            0,
+            state.tile_clamp_bounds(x0, y0, 0),
+        );
         let size = 1usize << log2_size;
         let border = if matches!(size, 8 | 16 | 32) {
             &ft
@@ -1258,25 +1280,14 @@ where
         log2_size: u8,
         dst: &mut [u16],
     ) {
-        let tile_bounds = state.tile_clamp_bounds(x0, y0, 0);
-        let overlay = &self.overlay;
-        let (uf, ft, center, bit_depth) =
-            bpg_hevc_decode::hevc::intra::build_reference_borders_with_reader(
-                &state.frame,
-                x0,
-                y0,
-                log2_size,
-                0,
-                true,
-                |c, rx, ry| {
-                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
-                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
-                            return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
-                        }
-                    }
-                    overlay.sample(c, rx, ry)
-                },
-            );
+        let (uf, ft, center, bit_depth) = self.build_intra_refs_bulk_overlay(
+            &state.frame,
+            x0,
+            y0,
+            log2_size,
+            0,
+            state.tile_clamp_bounds(x0, y0, 0),
+        );
         let size = 1usize << log2_size;
         let border = if matches!(size, 8 | 16 | 32) {
             &ft
@@ -1294,25 +1305,14 @@ where
         log2_size: u8,
         dst: &mut [u8],
     ) {
-        let tile_bounds = state.tile_clamp_bounds(x0, y0, 0);
-        let overlay = &self.overlay;
-        let (uf, ft, center, bit_depth) =
-            bpg_hevc_decode::hevc::intra::build_reference_borders_with_reader(
-                &state.frame,
-                x0,
-                y0,
-                log2_size,
-                0,
-                true,
-                |c, rx, ry| {
-                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
-                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
-                            return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
-                        }
-                    }
-                    overlay.sample(c, rx, ry)
-                },
-            );
+        let (uf, ft, center, bit_depth) = self.build_intra_refs_bulk_overlay(
+            &state.frame,
+            x0,
+            y0,
+            log2_size,
+            0,
+            state.tile_clamp_bounds(x0, y0, 0),
+        );
         primitives::pred_allangs_u8(dst, &uf, &ft, center, log2_size, 0, bit_depth);
     }
 
@@ -1324,25 +1324,14 @@ where
         log2_size: u8,
         dst: &mut [u16],
     ) {
-        let tile_bounds = state.tile_clamp_bounds(x0, y0, 0);
-        let overlay = &self.overlay;
-        let (uf, ft, center, bit_depth) =
-            bpg_hevc_decode::hevc::intra::build_reference_borders_with_reader(
-                &state.frame,
-                x0,
-                y0,
-                log2_size,
-                0,
-                true,
-                |c, rx, ry| {
-                    if let Some((tx0, ty0, tx1, ty1)) = tile_bounds {
-                        if rx < tx0 || rx >= tx1 || ry < ty0 || ry >= ty1 {
-                            return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
-                        }
-                    }
-                    overlay.sample(c, rx, ry)
-                },
-            );
+        let (uf, ft, center, bit_depth) = self.build_intra_refs_bulk_overlay(
+            &state.frame,
+            x0,
+            y0,
+            log2_size,
+            0,
+            state.tile_clamp_bounds(x0, y0, 0),
+        );
         primitives::intra_pred_allangs(dst, &uf, &ft, center, log2_size, 0, bit_depth);
     }
 
@@ -1362,8 +1351,10 @@ where
     ) -> ExactModeWinner<TtPlan, O::Saved> {
         let exact_timer = StillSearchLedger::start_timer();
         let mark = self.overlay.mark();
-        let use_rdoq = super::env::rdoq_search_enabled()
-            || state.effort_template.rdoq_trials.mode != TrialRdoqMode::Off;
+        let use_rdoq = matches!(
+            super::eval::search_trial_quant(state.effort_template.luma.exact.quant),
+            super::eval::QuantMode::RdoqTrial { .. }
+        ) || state.effort_template.rdoq_trials.mode != TrialRdoqMode::Off;
         let cfg = super::tu::ExactEvalConfig {
             quant: if use_rdoq {
                 super::eval::QuantMode::RdoqTrial { level: 2 }
@@ -1375,9 +1366,11 @@ where
             tu: state.effort_template.tu_exact,
             retain_coeff: true,
         };
+        let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
+        let commit_scope = self.begin_winner_commit_scope();
         let (tt, tt_cost) =
             self.decide_tt_with_config(state, x0, y0, log2_cb_size, 0, mode, lambda, cfg);
-        let mbits = luma_mode_bits(&self.workspace.price_base, mpm_u8, mode);
+        self.end_winner_commit_scope(commit_scope);
         let cost = tt_cost + lambda * mbits as f64 / scale;
         record_exact_stats(state, mode, tt_cost);
         let recon = self.overlay.detach_from(mark);
@@ -1391,6 +1384,16 @@ where
             recon,
             cost,
         }
+    }
+}
+
+/// Replace-or-insert a per-mode trial exit context (modes are unique within
+/// one `evaluate_exact_modes` call; Phase 2 re-measures replace Phase 1's).
+fn upsert_trial_ctx(list: &mut Vec<(u8, crate::contexts::Contexts)>, mode: u8, exit: Contexts) {
+    if let Some(slot) = list.iter_mut().find(|(m, _)| *m == mode) {
+        slot.1 = exit;
+    } else {
+        list.push((mode, exit));
     }
 }
 

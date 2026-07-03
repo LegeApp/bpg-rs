@@ -364,7 +364,7 @@ fn build_sig_ctx_table() -> Box<SigCtxTable> {
 /// scan positions (index 0 = DC). Replaces the per-bin `calc_sig_coeff_flag_ctx`
 /// in the residual traversal hot loop.
 #[inline]
-fn sig_ctx_row(
+pub(crate) fn sig_ctx_row(
     log2_size: u8,
     c_idx: u8,
     scan_idx: u8,

@@ -1,7 +1,5 @@
 //! CTU-local workspace and scratch buffers.
 
-use std::time::Instant;
-
 use super::arena::CoeffArena;
 use super::ledger::StillSearchLedger;
 use crate::contexts::Contexts;
@@ -20,6 +18,7 @@ pub(super) struct SsimRdNorm {
 /// Populated only when `BPG_STILLSEARCH_PROFILE=1`.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct SubstageProfile {
+    pub border_ns: u64,
     pub predict_ns: u64,
     pub forward_xform_ns: u64,
     pub quant_ns: u64,
@@ -32,10 +31,28 @@ pub(super) struct CtuWorkspace {
     pub(super) coeffs: CoeffArena,
     pub(super) ledger: StillSearchLedger,
     pub(super) block_scratch: BlockScratch,
-    /// Frozen CTU-entry context for trial residual/flag pricing (the standard
-    /// HM/x265 RDO approximation: contexts are not re-coded across candidates).
-    /// Re-seeded per CTU from the live writer context at coding-tree entry.
+    /// Frozen CTU-entry context, re-seeded per CTU from the live writer
+    /// context at coding-tree entry. Kept as the stable reference state:
+    /// `price_cur` is re-seeded from it for the finalize pass, and it is the
+    /// exact pre-CTU writer state either way.
     pub(super) price_base: Contexts,
+    /// Evolving trial-pricing context (x265 `m_rqt[depth].cur` parity). All
+    /// pricing reads go through this. When `BPG_STILLSEARCH_CTX_EVOLVE` is
+    /// enabled, committed winner syntax evolves it sibling-to-sibling through
+    /// the coding tree (with save/restore around alternatives); when disabled
+    /// it stays equal to `price_base`, reproducing the frozen behavior.
+    pub(super) price_cur: Contexts,
+    /// When true, `eval_component*` write their selected outcome's context
+    /// updates (CBF bin + residual syntax) back into `price_cur`. Set only
+    /// around committed-winner evaluation scopes (materialize/finalize), never
+    /// during candidate ranking.
+    pub(super) commit_ctx: bool,
+    /// When true alongside `commit_ctx`, chroma (`c_idx != 0`) evaluations do
+    /// not commit context updates. Used by search-time materialization while
+    /// the CU-level chroma mode search is enabled: the chroma blocks coded
+    /// there are provisional DM blocks; the chroma-mode rebuild pass commits
+    /// the final chroma syntax instead.
+    pub(super) commit_ctx_skip_chroma: bool,
     pub(super) price_scratch: ResidualPricingScratch,
     /// Reusable scratch for the retained-block single-scan RDOQ refinement.
     pub(super) rdoq_scratch: RdoqScratch,
@@ -55,6 +72,13 @@ pub(super) struct CtuWorkspace {
     /// `eval_tt_split` calls. Merged into `EncodeStats` in `build_ctu`.
     pub(super) tu_leaf_by_log2: [u64; 7],
     pub(super) tu_split_by_log2: [u64; 7],
+    /// Small per-component associative cache of built intra reference borders
+    /// (4 ways per component). Validity is checked exactly against the overlay
+    /// patch stack (see `cached_intra_refs_for_block`), so hits are
+    /// byte-identical to rebuilding.
+    pub(super) intra_refs_cache: [[Option<super::depth::IntraRefsCacheEntry>; 4]; 3],
+    /// Round-robin replacement cursors for `intra_refs_cache`.
+    pub(super) intra_refs_cache_rr: [u8; 3],
 }
 
 impl Default for CtuWorkspace {
@@ -64,6 +88,9 @@ impl Default for CtuWorkspace {
             ledger: StillSearchLedger::default(),
             block_scratch: BlockScratch::default(),
             price_base: Contexts::new(0),
+            price_cur: Contexts::new(0),
+            commit_ctx: false,
+            commit_ctx_skip_chroma: false,
             price_scratch: ResidualPricingScratch::default(),
             rdoq_scratch: RdoqScratch::default(),
             last_8x8_rough_satd: f64::INFINITY,
@@ -72,6 +99,8 @@ impl Default for CtuWorkspace {
             tu_split_early_terminations: 0,
             tu_leaf_by_log2: [0; 7],
             tu_split_by_log2: [0; 7],
+            intra_refs_cache: [[None; 4]; 3],
+            intra_refs_cache_rr: [0; 3],
         }
     }
 }
@@ -86,11 +115,16 @@ impl CtuWorkspace {
         self.tu_split_early_terminations = 0;
         self.tu_leaf_by_log2 = [0; 7];
         self.tu_split_by_log2 = [0; 7];
+        self.intra_refs_cache = [[None; 4]; 3];
+        self.intra_refs_cache_rr = [0; 3];
     }
 
     /// Seed the trial-pricing entry context with the live CTU-entry context.
     pub(super) fn set_price_context(&mut self, ctxs: &Contexts) {
         self.price_base = ctxs.clone();
+        self.price_cur = ctxs.clone();
+        self.commit_ctx = false;
+        self.commit_ctx_skip_chroma = false;
     }
 }
 
