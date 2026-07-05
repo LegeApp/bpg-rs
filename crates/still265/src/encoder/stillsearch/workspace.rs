@@ -67,6 +67,9 @@ pub(super) struct CtuWorkspace {
     /// Number of TU split evaluations skipped due to zero-residual early
     /// termination in this CTU.
     pub(super) tu_split_early_terminations: u64,
+    /// TU split evaluations aborted by the leaf-first branch-and-bound
+    /// (decision-identical; see `TuSplitBound`).
+    pub(super) tu_split_bound_aborts: u64,
     /// Per-TU-depth evaluation work for this CTU, indexed by `log2_size`
     /// (TU sizes 4/8/16/32 = log2 2/3/4/5). Counts `eval_tt_leaf` /
     /// `eval_tt_split` calls. Merged into `EncodeStats` in `build_ctu`.
@@ -97,6 +100,7 @@ impl Default for CtuWorkspace {
             substage: SubstageProfile::default(),
             ssim_rd_norm: [SsimRdNorm::default(); 3],
             tu_split_early_terminations: 0,
+            tu_split_bound_aborts: 0,
             tu_leaf_by_log2: [0; 7],
             tu_split_by_log2: [0; 7],
             intra_refs_cache: [[None; 4]; 3],
@@ -113,6 +117,7 @@ impl CtuWorkspace {
         self.substage = SubstageProfile::default();
         self.ssim_rd_norm = [SsimRdNorm::default(); 3];
         self.tu_split_early_terminations = 0;
+        self.tu_split_bound_aborts = 0;
         self.tu_leaf_by_log2 = [0; 7];
         self.tu_split_by_log2 = [0; 7];
         self.intra_refs_cache = [[None; 4]; 3];

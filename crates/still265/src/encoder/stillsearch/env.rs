@@ -96,6 +96,15 @@ pub(super) const TU_TARGET_MEAN_RANGE_MIN: &str = "BPG_STILLSEARCH_TU_TARGET_MEA
 pub(super) const CU_SPLIT_BIAS_PER_PX: &str = "BPG_STILLSEARCH_CU_SPLIT_BIAS_PER_PX";
 pub(super) const CU_FORCE_SPLIT_LOG2: &str = "BPG_STILLSEARCH_CU_FORCE_SPLIT_LOG2";
 
+/// Decision-identical CU split branch-and-bound: abort remaining split
+/// children once the partial split cost already exceeds the leaf-first bound
+/// (the split can no longer win the leaf-vs-split compare). `0` disables.
+pub(super) const CU_SPLIT_BOUND: &str = "BPG_STILLSEARCH_CU_SPLIT_BOUND";
+
+/// Same branch-and-bound at the transform-tree level (`decide_tt` leaf-first
+/// split evaluation). `0` disables.
+pub(super) const TU_SPLIT_BOUND: &str = "BPG_STILLSEARCH_TU_SPLIT_BOUND";
+
 /// Diagnostic PartNxN controls. PartNxN creates four 4x4 luma PUs/TUs inside
 /// an 8x8 CU, matching one path by which x265 emits many more 4x4 luma TUs.
 pub(super) const NXN_BIAS_PER_PX: &str = "BPG_STILLSEARCH_NXN_BIAS_PER_PX";
@@ -567,6 +576,32 @@ pub(super) fn cu_split_bias_per_px() -> f64 {
             .and_then(|v| v.trim().parse::<f64>().ok())
             .filter(|v| v.is_finite())
             .unwrap_or(0.0)
+    })
+}
+
+/// Leaf-first CU split branch-and-bound abort. Default on; decision- and
+/// byte-identical to full evaluation (only skips children that cannot change
+/// the leaf-vs-split winner).
+#[inline]
+pub(super) fn cu_split_bound_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(CU_SPLIT_BOUND)
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Leaf-first TU split branch-and-bound abort. Default on; decision- and
+/// byte-identical to full evaluation (only skips TU children that cannot
+/// change the leaf-vs-split winner).
+#[inline]
+pub(super) fn tu_split_bound_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(TU_SPLIT_BOUND)
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
     })
 }
 

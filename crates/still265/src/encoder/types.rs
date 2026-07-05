@@ -86,6 +86,9 @@ pub struct EncodeStats {
     pub cu_trials: u64,
     pub cu_early_terminations: u64,
     pub cu_split_bound_aborts: u64,
+    /// Split-bound aborts by how many children were fully evaluated before
+    /// the abort fired (index 1..=3; 0 and 4 are impossible).
+    pub cu_split_bound_abort_by_child: [u64; 5],
     /// Per-CU-depth evaluation work, indexed directly by `log2_cb_size`
     /// (CU sizes 8/16/32/64 = log2 3/4/5/6; TU sizes 4/8/16/32 = log2 2/3/4/5).
     /// These mirror x265's `DETAILED_CU_STATS` "Intra RDO calls per depth" so the
@@ -134,6 +137,7 @@ pub struct EncodeStats {
     pub floorshallow_bytes_saved_estimate: u64,
     pub cu_force_leaf: u64,
     pub tu_split_early_terminations: u64,
+    pub tu_split_bound_aborts: u64,
     pub rmd_prunes: u64,
     pub luma_candidate_expansions: u64,
     pub chroma_candidate_expansions: u64,
@@ -242,6 +246,52 @@ pub struct EncodeStats {
 impl EncodeStats {
     pub fn merge(&mut self, other: &Self) {
         self.ctu_count += other.ctu_count;
+        self.cu_trials += other.cu_trials;
+        self.cu_early_terminations += other.cu_early_terminations;
+        self.cu_split_bound_aborts += other.cu_split_bound_aborts;
+        self.tu_split_bound_aborts += other.tu_split_bound_aborts;
+        for (dst, src) in self
+            .cu_split_bound_abort_by_child
+            .iter_mut()
+            .zip(other.cu_split_bound_abort_by_child.iter())
+        {
+            *dst += *src;
+        }
+        for (dst, src) in self
+            .cu_trials_by_log2
+            .iter_mut()
+            .zip(other.cu_trials_by_log2.iter())
+        {
+            *dst += *src;
+        }
+        for (dst, src) in self
+            .cu_splits_taken_by_log2
+            .iter_mut()
+            .zip(other.cu_splits_taken_by_log2.iter())
+        {
+            *dst += *src;
+        }
+        for (dst, src) in self
+            .cu_early_term_by_log2
+            .iter_mut()
+            .zip(other.cu_early_term_by_log2.iter())
+        {
+            *dst += *src;
+        }
+        for (dst, src) in self
+            .tu_leaf_by_log2
+            .iter_mut()
+            .zip(other.tu_leaf_by_log2.iter())
+        {
+            *dst += *src;
+        }
+        for (dst, src) in self
+            .tu_split_by_log2
+            .iter_mut()
+            .zip(other.tu_split_by_log2.iter())
+        {
+            *dst += *src;
+        }
         self.phase_total_us += other.phase_total_us;
         self.phase_build_us += other.phase_build_us;
         self.phase_deblock_us += other.phase_deblock_us;

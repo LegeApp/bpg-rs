@@ -46,6 +46,29 @@ impl SimpleRdoAccum {
     }
 }
 
+/// Leaf-first TU split abort bound. `split_loses` evaluates the exact float
+/// expression of `decide_tt`'s final leaf-vs-split compare on the partial
+/// child-cost sum; because `fl(p - bias)` is monotone nondecreasing in `p`
+/// and the remaining terms (children, parent chroma, split-flag bits) are
+/// non-negative, a `true` here proves the fully-evaluated split would lose.
+#[derive(Clone, Copy)]
+pub(super) struct TuSplitBound {
+    bias: f64,
+    leaf_cost: f64,
+}
+
+impl TuSplitBound {
+    #[inline]
+    pub(super) fn new(bias: f64, leaf_cost: f64) -> Self {
+        Self { bias, leaf_cost }
+    }
+
+    #[inline]
+    fn split_loses(&self, partial_split_cost: f64) -> bool {
+        partial_split_cost - self.bias >= self.leaf_cost
+    }
+}
+
 /// Scope of transform-tree evaluation: luma-only (for fast mode/TU search)
 /// or full luma+chroma (for winner re-evaluation and finalize).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -222,6 +245,7 @@ where
                 luma_mode,
                 false,
                 lambda,
+                None,
             );
         }
         if !can_split && !target_4x4_possible {
@@ -313,6 +337,9 @@ where
             leaf_state
         });
 
+        let bias = self.tu_split_cost_bias(log2_size);
+        let bound = (super::env::tu_split_bound_enabled() && !self.force_tu_split(log2_size))
+            .then_some(TuSplitBound::new(bias, leaf_cost));
         let (split_tt, split_cost) = self.eval_tt_split(
             state,
             x0,
@@ -322,9 +349,10 @@ where
             luma_mode,
             true,
             lambda,
+            bound,
         );
 
-        let split_cmp_cost = split_cost - self.tu_split_cost_bias(log2_size);
+        let split_cmp_cost = split_cost - bias;
         if self.force_tu_split(log2_size) || split_cmp_cost < leaf_cost {
             #[cfg(test)]
             super::api::SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1079,6 +1107,7 @@ where
 
     /// Evaluate this node as a split into four child transform trees.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn eval_tt_split(
         &mut self,
         state: &Encoder<'_>,
@@ -1089,6 +1118,7 @@ where
         luma_mode: u8,
         code_split_flag: bool,
         lambda: f64,
+        bound: Option<TuSplitBound>,
     ) -> (TtPlan, f64) {
         self.workspace.ledger.bump(WorkBucket::TuSplit);
         self.workspace.tu_split_by_log2[log2_size as usize] += 1;
@@ -1096,26 +1126,28 @@ where
         let half = 1u32 << (log2_size - 1);
         let kid_log2 = log2_size - 1;
         let kid_depth = trafo_depth + 1;
-        let (k0, c0) = self.decide_tt(state, x0, y0, kid_log2, kid_depth, luma_mode, lambda);
-        let (k1, c1) = self.decide_tt(state, x0 + half, y0, kid_log2, kid_depth, luma_mode, lambda);
-        let (k2, c2) = self.decide_tt(state, x0, y0 + half, kid_log2, kid_depth, luma_mode, lambda);
-        let (k3, c3) = self.decide_tt(
-            state,
-            x0 + half,
-            y0 + half,
-            kid_log2,
-            kid_depth,
-            luma_mode,
-            lambda,
-        );
+        let mut kids = Vec::with_capacity(4);
+        let mut cost = 0.0;
+        for (kx, ky) in [
+            (x0, y0),
+            (x0 + half, y0),
+            (x0, y0 + half),
+            (x0 + half, y0 + half),
+        ] {
+            let (k, c) = self.decide_tt(state, kx, ky, kid_log2, kid_depth, luma_mode, lambda);
+            kids.push(k);
+            cost += c;
+            if let Some(b) = &bound
+                && b.split_loses(cost)
+            {
+                self.workspace.tu_split_bound_aborts += 1;
+                return (
+                    self.tt_split_plan(log2_size, trafo_depth, None, kids),
+                    f64::INFINITY,
+                );
+            }
+        }
 
-        let kids = vec![k0, k1, k2, k3];
-        let cbf_cb = kids.iter().any(TtPlan::cbf_cb);
-        let cbf_cr = kids.iter().any(TtPlan::cbf_cr);
-        let cbf_cb1 = kids.iter().any(TtPlan::cbf_cb1);
-        let cbf_cr1 = kids.iter().any(TtPlan::cbf_cr1);
-
-        let mut cost = c0 + c1 + c2 + c3;
         let mut parent_chroma = None;
         if let Some((pc, pc_cost)) = self.eval_tt_split_parent_chroma(
             state,
@@ -1136,17 +1168,29 @@ where
             cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
         }
 
-        let tt = TtPlan::Split {
+        (
+            self.tt_split_plan(log2_size, trafo_depth, parent_chroma, kids),
+            cost,
+        )
+    }
+
+    fn tt_split_plan(
+        &self,
+        log2_size: u8,
+        trafo_depth: u8,
+        parent_chroma: Option<ParentChromaPlan>,
+        kids: Vec<TtPlan>,
+    ) -> TtPlan {
+        TtPlan::Split {
             log2_size,
             trafo_depth,
-            cbf_cb,
-            cbf_cr,
-            cbf_cb1,
-            cbf_cr1,
+            cbf_cb: kids.iter().any(TtPlan::cbf_cb),
+            cbf_cr: kids.iter().any(TtPlan::cbf_cr),
+            cbf_cb1: kids.iter().any(TtPlan::cbf_cb1),
+            cbf_cr1: kids.iter().any(TtPlan::cbf_cr1),
             parent_chroma,
             kids,
-        };
-        (tt, cost)
+        }
     }
 
     // ── Config-aware variants ──────────────────────────────────────
@@ -1190,6 +1234,7 @@ where
                 false,
                 lambda,
                 cfg,
+                None,
             );
         }
         if (!can_split && !target_4x4_possible)
@@ -1270,6 +1315,9 @@ where
             leaf_state
         });
 
+        let bias = self.tu_split_cost_bias(log2_size);
+        let bound =
+            super::env::tu_split_bound_enabled().then_some(TuSplitBound::new(bias, leaf_cost));
         let (split_tt, split_cost) = self.eval_tt_split_with_config(
             state,
             x0,
@@ -1280,9 +1328,10 @@ where
             true,
             lambda,
             cfg,
+            bound,
         );
 
-        let split_cmp_cost = split_cost - self.tu_split_cost_bias(log2_size);
+        let split_cmp_cost = split_cost - bias;
         if split_cmp_cost < leaf_cost {
             #[cfg(test)]
             super::api::SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1302,6 +1351,7 @@ where
     /// Evaluate a split node using an explicit config, recursing via
     /// [`decide_tt_with_config`].
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn eval_tt_split_with_config(
         &mut self,
         state: &Encoder<'_>,
@@ -1313,6 +1363,7 @@ where
         code_split_flag: bool,
         lambda: f64,
         cfg: ExactEvalConfig,
+        bound: Option<TuSplitBound>,
     ) -> (TtPlan, f64) {
         self.workspace.ledger.bump(WorkBucket::TuSplit);
         self.workspace.tu_split_by_log2[log2_size as usize] += 1;
@@ -1320,46 +1371,29 @@ where
         let half = 1u32 << (log2_size - 1);
         let kid_log2 = log2_size - 1;
         let kid_depth = trafo_depth + 1;
-        let (k0, c0) =
-            self.decide_tt_with_config(state, x0, y0, kid_log2, kid_depth, luma_mode, lambda, cfg);
-        let (k1, c1) = self.decide_tt_with_config(
-            state,
-            x0 + half,
-            y0,
-            kid_log2,
-            kid_depth,
-            luma_mode,
-            lambda,
-            cfg,
-        );
-        let (k2, c2) = self.decide_tt_with_config(
-            state,
-            x0,
-            y0 + half,
-            kid_log2,
-            kid_depth,
-            luma_mode,
-            lambda,
-            cfg,
-        );
-        let (k3, c3) = self.decide_tt_with_config(
-            state,
-            x0 + half,
-            y0 + half,
-            kid_log2,
-            kid_depth,
-            luma_mode,
-            lambda,
-            cfg,
-        );
+        let mut kids = Vec::with_capacity(4);
+        let mut cost = 0.0;
+        for (kx, ky) in [
+            (x0, y0),
+            (x0 + half, y0),
+            (x0, y0 + half),
+            (x0 + half, y0 + half),
+        ] {
+            let (k, c) = self
+                .decide_tt_with_config(state, kx, ky, kid_log2, kid_depth, luma_mode, lambda, cfg);
+            kids.push(k);
+            cost += c;
+            if let Some(b) = &bound
+                && b.split_loses(cost)
+            {
+                self.workspace.tu_split_bound_aborts += 1;
+                return (
+                    self.tt_split_plan(log2_size, trafo_depth, None, kids),
+                    f64::INFINITY,
+                );
+            }
+        }
 
-        let kids = vec![k0, k1, k2, k3];
-        let cbf_cb = kids.iter().any(TtPlan::cbf_cb);
-        let cbf_cr = kids.iter().any(TtPlan::cbf_cr);
-        let cbf_cb1 = kids.iter().any(TtPlan::cbf_cb1);
-        let cbf_cr1 = kids.iter().any(TtPlan::cbf_cr1);
-
-        let mut cost = c0 + c1 + c2 + c3;
         let mut parent_chroma = None;
         if cfg.scope == TtEvalScope::FullComponents {
             if let Some((pc, pc_cost)) = self.eval_tt_split_parent_chroma(
@@ -1382,17 +1416,10 @@ where
             cost += lambda * bits as f64 / CabacEstimator::SCALE as f64;
         }
 
-        let tt = TtPlan::Split {
-            log2_size,
-            trafo_depth,
-            cbf_cb,
-            cbf_cr,
-            cbf_cb1,
-            cbf_cr1,
-            parent_chroma,
-            kids,
-        };
-        (tt, cost)
+        (
+            self.tt_split_plan(log2_size, trafo_depth, parent_chroma, kids),
+            cost,
+        )
     }
 }
 

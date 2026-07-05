@@ -14,6 +14,25 @@ use super::plan::{CuPlan, PlanBlock, TtPlan};
 use super::price::{chroma_dm_bits, entropy_bits, part_mode_bits, rd_lambda};
 use super::source::CtuSourceCache;
 
+/// Leaf-first CU split abort bound. `split_loses` evaluates the exact float
+/// expression of the caller's final leaf-vs-split compare on the partial
+/// child-cost sum; because `fl((p + flag1) - bias)` is monotone nondecreasing
+/// in `p` and remaining child costs are non-negative, a `true` here proves the
+/// fully-evaluated split would lose that compare.
+#[derive(Clone, Copy)]
+struct SplitBound {
+    flag1_term: f64,
+    bias: f64,
+    leaf_total: f64,
+}
+
+impl SplitBound {
+    #[inline]
+    fn split_loses(&self, partial_split_cost: f64) -> bool {
+        (partial_split_cost + self.flag1_term) - self.bias >= self.leaf_total
+    }
+}
+
 impl<S, O> StillSearchDepth<S, O>
 where
     S: CtuSourceCache,
@@ -179,12 +198,30 @@ where
             leaf_state
         });
 
-        let (split_plan, split_cost) = self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
-
+        // Leaf-first branch-and-bound: child costs are non-negative, so once
+        // the partial child sum makes `split_cmp_total >= leaf_total` the
+        // split cannot win and the remaining children need not be evaluated.
+        // The bound check applies the exact same float expression as the
+        // final compare below (monotone in the partial sum), so the decision
+        // — and, via the losing-split cleanup, the output — is identical.
         let lambda = rd_lambda(state.cur_qp_y);
         let scale = CabacEstimator::SCALE as f64;
-        let leaf_total = leaf_cost + lambda * entropy_bits(&flag_model, 0) as f64 / scale;
-        let split_total = split_cost + lambda * entropy_bits(&flag_model, 1) as f64 / scale;
+        let flag0_term = lambda * entropy_bits(&flag_model, 0) as f64 / scale;
+        let flag1_term = lambda * entropy_bits(&flag_model, 1) as f64 / scale;
+        let leaf_total = leaf_cost + flag0_term;
+        let bound = (super::env::cu_split_bound_enabled()
+            && !self.force_cu_split(log2_cb_size)
+            && super::env::dump_ctu_target().is_none())
+        .then_some(SplitBound {
+            flag1_term,
+            bias: self.cu_split_cost_bias(log2_cb_size),
+            leaf_total,
+        });
+
+        let (split_plan, split_cost) =
+            self.decide_cu_split_bounded(state, x0, y0, log2_cb_size, ct_depth, bound);
+
+        let split_total = split_cost + flag1_term;
 
         if let Some((tx, ty)) = super::env::dump_ctu_target() {
             if x0 & !63 == tx && y0 & !63 == ty {
@@ -416,6 +453,18 @@ where
         log2_cb_size: u8,
         ct_depth: u8,
     ) -> (CuPlan, f64) {
+        self.decide_cu_split_bounded(state, x0, y0, log2_cb_size, ct_depth, None)
+    }
+
+    fn decide_cu_split_bounded(
+        &mut self,
+        state: &mut Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_cb_size: u8,
+        ct_depth: u8,
+        bound: Option<SplitBound>,
+    ) -> (CuPlan, f64) {
         let half = (1u32 << log2_cb_size) / 2;
         let x1 = x0 + half;
         let y1 = y0 + half;
@@ -424,23 +473,26 @@ where
         let mut kids = Vec::with_capacity(4);
         let mut cost = 0.0;
 
-        let (k, c) = self.decide_cu(state, x0, y0, kid_log2, kd);
-        kids.push(k);
-        cost += c;
-        if x1 < state.display_width {
-            let (k, c) = self.decide_cu(state, x1, y0, kid_log2, kd);
+        let child_positions = [
+            Some((x0, y0)),
+            (x1 < state.display_width).then_some((x1, y0)),
+            (y1 < state.display_height).then_some((x0, y1)),
+            (x1 < state.display_width && y1 < state.display_height).then_some((x1, y1)),
+        ];
+        let last = child_positions.iter().rposition(|p| p.is_some()).unwrap();
+        for (i, &pos) in child_positions.iter().enumerate() {
+            let Some((cx, cy)) = pos else { continue };
+            let (k, c) = self.decide_cu(state, cx, cy, kid_log2, kd);
             kids.push(k);
             cost += c;
-        }
-        if y1 < state.display_height {
-            let (k, c) = self.decide_cu(state, x0, y1, kid_log2, kd);
-            kids.push(k);
-            cost += c;
-        }
-        if x1 < state.display_width && y1 < state.display_height {
-            let (k, c) = self.decide_cu(state, x1, y1, kid_log2, kd);
-            kids.push(k);
-            cost += c;
+            if i < last
+                && let Some(b) = &bound
+                && b.split_loses(cost)
+            {
+                state.stats.cu_split_bound_aborts += 1;
+                state.stats.cu_split_bound_abort_by_child[kids.len().min(4)] += 1;
+                return (CuPlan::Split { kids }, f64::INFINITY);
+            }
         }
         (CuPlan::Split { kids }, cost)
     }

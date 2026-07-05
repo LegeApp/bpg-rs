@@ -155,6 +155,7 @@ where
             .saturating_add(self.workspace.substage.residual_price_ns);
         state.stats.substage_calls += self.workspace.substage.calls;
         state.stats.tu_split_early_terminations += self.workspace.tu_split_early_terminations;
+        state.stats.tu_split_bound_aborts += self.workspace.tu_split_bound_aborts;
         for i in 0..7 {
             state.stats.tu_leaf_by_log2[i] += self.workspace.tu_leaf_by_log2[i];
             state.stats.tu_split_by_log2[i] += self.workspace.tu_split_by_log2[i];
