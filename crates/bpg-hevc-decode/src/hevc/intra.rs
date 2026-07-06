@@ -683,17 +683,20 @@ fn fill_border_samples_with_reader<F>(
                 }
             }
         } else {
+            // Slow path: consult the reader first — it may cover positions
+            // the backing plane does not (encoder-side canvas readers over
+            // planeless worker frames); an out-of-bounds plane fallback is
+            // unavailable (UNINIT), exactly like the old skip.
             for i in 0..top_count {
                 let plane_idx = top_row_start + x as usize + i;
-                if plane_idx < plane.len() {
-                    let rx = x + i as u32;
-                    let raw = sample_reader(c_idx, rx, y - 1).unwrap_or(plane[plane_idx]);
-                    if raw != UNINIT_SAMPLE {
-                        let idx = center + 1 + i;
-                        border[idx] = raw as i32;
-                        avail[idx] = true;
-                        avail_count += 1;
-                    }
+                let rx = x + i as u32;
+                let raw = sample_reader(c_idx, rx, y - 1)
+                    .unwrap_or_else(|| plane.get(plane_idx).copied().unwrap_or(UNINIT_SAMPLE));
+                if raw != UNINIT_SAMPLE {
+                    let idx = center + 1 + i;
+                    border[idx] = raw as i32;
+                    avail[idx] = true;
+                    avail_count += 1;
                 }
             }
         }
@@ -720,17 +723,18 @@ fn fill_border_samples_with_reader<F>(
                 }
             }
         } else {
+            // Slow path: reader-first, bounded plane fallback (see the top
+            // branch above).
             for i in 0..left_count {
                 let plane_idx = (y as usize + i) * stride + left_x;
-                if plane_idx < plane.len() {
-                    let ry = y + i as u32;
-                    let raw = sample_reader(c_idx, x - 1, ry).unwrap_or(plane[plane_idx]);
-                    if raw != UNINIT_SAMPLE {
-                        let idx = center - 1 - i;
-                        border[idx] = raw as i32;
-                        avail[idx] = true;
-                        avail_count += 1;
-                    }
+                let ry = y + i as u32;
+                let raw = sample_reader(c_idx, x - 1, ry)
+                    .unwrap_or_else(|| plane.get(plane_idx).copied().unwrap_or(UNINIT_SAMPLE));
+                if raw != UNINIT_SAMPLE {
+                    let idx = center - 1 - i;
+                    border[idx] = raw as i32;
+                    avail[idx] = true;
+                    avail_count += 1;
                 }
             }
         }

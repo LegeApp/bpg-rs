@@ -4,7 +4,7 @@ use crate::contexts::Contexts;
 use crate::encoder::Encoder;
 use crate::encoder::syntax::CuNode;
 
-use super::canvas::CanvasOverlay;
+use super::canvas::{CanvasOverlay, ReconBackground};
 use super::emit;
 use super::ledger::{StillSearchLedger, WorkBucket};
 use super::source::{CtuSource8, CtuSource16, CtuSourceCache};
@@ -23,6 +23,12 @@ pub(super) struct StillSearchDepth<S> {
     pub(super) workspace: CtuWorkspace,
     pub(super) source: S,
     pub(super) overlay: CanvasOverlay,
+    /// True while building from [`ReconBackground::Strips`]: the worker owns
+    /// no reconstruction frame, so out-of-canvas reference reads must resolve
+    /// to UNINIT (they cannot happen for in-CTU blocks — debug-asserted)
+    /// and the final canvas content is published by the caller instead of
+    /// committed to `state.frame`.
+    pub(super) frameless: bool,
 }
 
 impl StillSearch {
@@ -43,14 +49,25 @@ impl StillSearch {
         y0: u32,
         log2_cb_size: u8,
         ct_depth: u8,
+        background: ReconBackground<'_>,
     ) -> CuNode {
         match &mut self.imp {
             StillSearchImpl::EightBit(search) => {
-                search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth)
+                search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth, background)
             }
             StillSearchImpl::HighBit(search) => {
-                search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth)
+                search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth, background)
             }
+        }
+    }
+
+    /// The finalize-generation canvas content of the last
+    /// [`build_ctu`](Self::build_ctu) under [`ReconBackground::Strips`] —
+    /// what the frameless WPP worker publishes to the master sink.
+    pub(in crate::encoder) fn canvas(&self) -> &CanvasOverlay {
+        match &self.imp {
+            StillSearchImpl::EightBit(search) => &search.overlay,
+            StillSearchImpl::HighBit(search) => &search.overlay,
         }
     }
 }
@@ -64,6 +81,7 @@ where
             workspace: CtuWorkspace::default(),
             source: S::default(),
             overlay: CanvasOverlay::default(),
+            frameless: false,
         }
     }
 }
@@ -80,11 +98,19 @@ where
         y0: u32,
         log2_cb_size: u8,
         ct_depth: u8,
+        background: ReconBackground<'_>,
     ) -> CuNode {
         self.workspace.reset();
         self.workspace.set_price_context(price_ctx);
         self.source.reset_from_ctu(state, x0, y0, log2_cb_size);
-        self.overlay.reset_from_ctu(&state.frame, x0, y0);
+        self.frameless = matches!(background, ReconBackground::Strips(_));
+        match background {
+            ReconBackground::Frame => self.overlay.reset_from_ctu(&state.frame, x0, y0),
+            ReconBackground::Strips(strips) => {
+                self.overlay
+                    .reset_from_strips(strips, state.frame.chroma_format, x0, y0)
+            }
+        }
 
         let (plan, _cost) = self.decide_cu(state, x0, y0, log2_cb_size, ct_depth);
 
@@ -107,11 +133,19 @@ where
         self.workspace.commit_ctx_skip_chroma = prev_skip;
 
         let final_commit_timer = StillSearchLedger::start_timer();
-        self.overlay.commit_to_frame(&mut state.frame);
+        if !self.frameless {
+            self.overlay.commit_to_frame(&mut state.frame);
+        }
         self.workspace
             .ledger
             .finish_timer(WorkBucket::FinalCommit, final_commit_timer);
-        self.overlay.clear();
+        if !self.frameless {
+            // Frameless builds keep the finalize-generation canvas resident:
+            // the caller publishes it to the master sink, and the next
+            // `reset_from_strips` self-captures its right edge as the left
+            // border column.
+            self.overlay.clear();
+        }
         self.workspace.ledger.bump(WorkBucket::FinalCommit);
         // One plan->syntax materialization per CTU (emit::cu_node below).
         self.workspace.ledger.bump(WorkBucket::Writer);
@@ -182,6 +216,7 @@ where
         let size = 1usize << log2_size;
         let tile_bounds = state.tile_clamp_bounds(x0, y0, c_idx);
         let overlay = &self.overlay;
+        let frameless = self.frameless;
         bpg_hevc_decode::hevc::intra::predict_intra_into_with_reader(
             &state.frame,
             x0,
@@ -198,7 +233,17 @@ where
                         return Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE);
                     }
                 }
-                overlay.sample(c, rx, ry)
+                match overlay.sample(c, rx, ry) {
+                    Some(v) => Some(v),
+                    // In-CTU reference reads always land in the canvas; a
+                    // frameless worker has no frame to fall back to, so an
+                    // out-of-canvas read resolves to UNINIT (= unavailable).
+                    None if frameless => {
+                        debug_assert!(false, "frameless out-of-canvas read c={c} ({rx},{ry})");
+                        Some(bpg_hevc_decode::hevc::UNINIT_SAMPLE)
+                    }
+                    None => None,
+                }
             },
         );
     }
@@ -370,13 +415,18 @@ where
             }
         }
 
+        let frameless = self.frameless;
         let read_one = |rx: u32, ry: u32| -> u16 {
             if !in_tile(tile_bounds, rx, ry) {
                 return UNINIT_SAMPLE;
             }
-            self.overlay
-                .sample(c_idx, rx, ry)
-                .unwrap_or_else(|| read_plane_sample(plane, stride, rx, ry))
+            self.overlay.sample(c_idx, rx, ry).unwrap_or_else(|| {
+                debug_assert!(
+                    !frameless,
+                    "frameless out-of-canvas read c={c_idx} ({rx},{ry})"
+                );
+                read_plane_sample(plane, stride, rx, ry)
+            })
         };
 
         // Top-left corner, with the same top/left fallback order as the decoder
@@ -425,6 +475,7 @@ where
                     .overlay
                     .read_row_merged(c_idx, y0 - 1, x0, &mut row[..top_count])
                 {
+                    debug_assert!(!frameless, "frameless out-of-canvas top-row read");
                     let row_base = (y0 - 1) as usize * stride + x0 as usize;
                     for (i, dst) in row[..top_count].iter_mut().enumerate() {
                         *dst = plane.get(row_base + i).copied().unwrap_or(0);
@@ -456,6 +507,7 @@ where
                     .overlay
                     .read_col_merged(c_idx, x0 - 1, y0, &mut col[..left_count])
                 {
+                    debug_assert!(!frameless, "frameless out-of-canvas left-col read");
                     let left_x = (x0 - 1) as usize;
                     for (i, dst) in col[..left_count].iter_mut().enumerate() {
                         let plane_idx = (y0 as usize + i) * stride + left_x;

@@ -462,6 +462,7 @@ pub(super) fn write_coding_quadtree(
         y0,
         log2_cb_size,
         ct_depth,
+        super::stillsearch::ReconBackground::Frame,
     );
     state.record_analysis_cache_cu_node(&cu, x0, y0, log2_cb_size, ct_depth);
     if state.deblock {
@@ -636,6 +637,13 @@ pub(super) fn build_slice_trees_parallel(
     // the master's serial end-of-build replay are all gone.
     let seed = WppWorkerSeed::capture(state);
     let sink = MasterFrameSink::new(state);
+    // Frameless workers (canvas-design.md phase 3): no per-worker
+    // reconstruction frame at all — the canvas loads its committed context
+    // from a row-above strip buffer + its own previous content, and publishes
+    // straight from the canvas. Requires the default 1-row strip imports
+    // (`BPG_WPP_IMPORT_ROWS` unset); `BPG_WPP_FRAMELESS=0` restores worker
+    // frames for A/B.
+    let frameless = wpp_frameless_enabled() && wpp_import_strip_rows() == Some(1);
     std::thread::scope(|scope| {
         for _ in 0..worker_limit {
             let shared = Arc::clone(&shared);
@@ -643,7 +651,9 @@ pub(super) fn build_slice_trees_parallel(
             let sink = &sink;
             scope.spawn(move || {
                 let setup_start = std::time::Instant::now();
-                let mut worker_state = seed.make_encoder();
+                let mut worker_state = seed.make_encoder(frameless);
+                let mut strips =
+                    frameless.then(|| super::stillsearch::RowStrips::new(&worker_state.frame));
                 {
                     let (lock, _) = &*shared;
                     let mut guard = lock.lock().expect("WPP build mutex poisoned");
@@ -666,6 +676,7 @@ pub(super) fn build_slice_trees_parallel(
                         ctbs_x,
                         ctbs_y,
                         ctb,
+                        strips.as_mut(),
                     );
                 }
             });
@@ -760,7 +771,7 @@ impl<'a> WppWorkerSeed<'a> {
         }
     }
 
-    fn make_encoder(&self) -> Encoder<'a> {
+    fn make_encoder(&self, frameless: bool) -> Encoder<'a> {
         // Same geometry as the master frame's construction in `encode_inner`;
         // the seed's map templates restore the slice-start fills, and the
         // alpha_plane stays `None` (the tree build never reads it). Worker
@@ -768,12 +779,33 @@ impl<'a> WppWorkerSeed<'a> {
         // builder (`depth.rs::maybe_set`) uses the sample value itself as the
         // reference-availability sentinel, so any other fill would make
         // unwritten neighbours look like available samples.
-        let mut frame = DecodedFrame::with_params(
-            self.frame_width,
-            self.frame_height,
-            self.bit_depth,
-            self.cat,
-        );
+        //
+        // Frameless workers own no reconstruction pixels at all: the planes
+        // are emptied (dropping lazily-zeroed, never-touched allocations),
+        // which removes the per-worker UNINIT fill (~2 bytes/pixel) and the
+        // frame-mediated publish traffic. Only the maps below remain live;
+        // the search reads recon exclusively through its canvas
+        // (`ReconBackground::Strips`).
+        let mut frame = if frameless {
+            let mut frame = DecodedFrame::with_params_filled(
+                self.frame_width,
+                self.frame_height,
+                self.bit_depth,
+                self.cat,
+                0,
+            );
+            frame.y_plane = Vec::new();
+            frame.cb_plane = Vec::new();
+            frame.cr_plane = Vec::new();
+            frame
+        } else {
+            DecodedFrame::with_params(
+                self.frame_width,
+                self.frame_height,
+                self.bit_depth,
+                self.cat,
+            )
+        };
         frame.full_range = self.frame_full_range;
         frame.matrix_coeffs = self.frame_matrix_coeffs;
         frame.deblock_flags.copy_from_slice(&self.deblock_flags);
@@ -933,6 +965,46 @@ impl MasterFrameSink {
             let (x0, y0, x1, y1) = plane_rect(sink, sx, sy, cx, cy, ctb);
             bytes += unsafe { sink.publish_rect(plane, x0, y0, x1, y1) };
         }
+        bytes + unsafe { self.publish_ctu_maps(state, cx, cy) }
+    }
+
+    /// Frameless variant of [`publish_ctu`](Self::publish_ctu): the pixel
+    /// rectangles come straight from the worker's finalize-generation canvas
+    /// (`StillSearch::canvas`), the maps from the worker state as before.
+    ///
+    /// # Safety
+    /// Same contract as [`publish_ctu`](Self::publish_ctu); the canvas must
+    /// hold the finalized CTU at `(cx, cy)`.
+    unsafe fn publish_ctu_from_canvas(
+        &self,
+        canvas: &super::stillsearch::CanvasOverlay,
+        state: &Encoder<'_>,
+        cx: u32,
+        cy: u32,
+    ) -> u64 {
+        let mut bytes = 0u64;
+        let plane_count = if state.cat == 0 { 1 } else { 3 };
+        for c_idx in 0..plane_count {
+            let sink = &self.planes[c_idx as usize];
+            canvas.for_each_ctu_row(c_idx, sink.stride, sink.rows(), |py, px0, src| {
+                let off = py * sink.stride + px0;
+                debug_assert!(off + src.len() <= sink.len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src.as_ptr(), sink.ptr.add(off), src.len());
+                }
+                bytes += (src.len() * std::mem::size_of::<u16>()) as u64;
+            });
+        }
+        bytes + unsafe { self.publish_ctu_maps(state, cx, cy) }
+    }
+
+    /// The per-block map rectangles of one CTU publish (shared by the frame
+    /// and canvas pixel paths).
+    ///
+    /// # Safety
+    /// Same contract as [`publish_ctu`](Self::publish_ctu).
+    unsafe fn publish_ctu_maps(&self, state: &Encoder<'_>, cx: u32, cy: u32) -> u64 {
+        let mut bytes = 0u64;
         let (x0, y0, x1, y1) = map_rect(&self.mode, cx, cy, 16);
         bytes += unsafe { self.mode.publish_rect(&state.mode_map, x0, y0, x1, y1) };
         let (x0, y0, x1, y1) = map_rect(&self.ct_depth, cx, cy, 8);
@@ -1000,6 +1072,60 @@ impl MasterFrameSink {
         }
         bytes
     }
+
+    /// Frameless variant of [`import_ctu_border`](Self::import_ctu_border):
+    /// the published CTU's last pixel row lands in the worker's [`RowStrips`]
+    /// buffer instead of a worker frame band; the last ct-depth row imports
+    /// into the worker map exactly as before.
+    ///
+    /// # Safety
+    /// Same contract as [`import_ctu_border`](Self::import_ctu_border).
+    unsafe fn import_ctu_border_strip(
+        &self,
+        state: &mut Encoder<'_>,
+        strips: &mut super::stillsearch::RowStrips,
+        cx: u32,
+        cy: u32,
+        ctb: u32,
+    ) -> u64 {
+        let mut bytes = 0u64;
+        let plane_count = if state.cat == 0 { 1 } else { 3 };
+        for c_idx in 0..plane_count {
+            let (sx, sy) = state.plane_shifts(c_idx);
+            let sink = &self.planes[c_idx as usize];
+            let (x0, y0, x1, y1) = plane_rect(sink, sx, sy, cx, cy, ctb);
+            if x0 < x1 && y0 < y1 {
+                let y = y1 - 1;
+                let dst = &mut strips.row_mut(c_idx as usize)[x0..x1];
+                let off = y * sink.stride + x0;
+                debug_assert!(off + dst.len() <= sink.len);
+                unsafe {
+                    std::ptr::copy_nonoverlapping(sink.ptr.add(off), dst.as_mut_ptr(), dst.len());
+                }
+                bytes += (dst.len() * std::mem::size_of::<u16>()) as u64;
+            }
+        }
+        let (x0, y0, x1, y1) = map_rect(&self.ct_depth, cx, cy, 8);
+        let ys = y0.max(y1.saturating_sub(1));
+        bytes += unsafe {
+            self.ct_depth
+                .import_rect(&mut state.ct_depth_map, x0, ys, x1, y1)
+        };
+        bytes
+    }
+}
+
+/// Frameless WPP workers (canvas-design.md phase 3): default on; `0`
+/// restores per-worker reconstruction frames for A/B. Only effective with
+/// the default 1-row strip imports (see `wpp_import_strip_rows`) — wider
+/// imports need a worker frame to land in.
+fn wpp_frameless_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("BPG_WPP_FRAMELESS")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
 }
 
 /// Bisect helper for the WPP import width: `BPG_WPP_IMPORT_ROWS` unset uses
@@ -1083,10 +1209,16 @@ fn build_wpp_row(
     ctbs_x: u32,
     ctbs_y: u32,
     ctb: u32,
+    mut strips: Option<&mut super::stillsearch::RowStrips>,
 ) {
     let (lock, cvar) = &*shared;
     let mut search = super::stillsearch::StillSearch::new(state.bit_depth);
     let mut prev_applied = 0u32;
+    if let Some(strips) = strips.as_deref_mut() {
+        // The strip buffer holds plane row `cy_prev*ctb - 1` content from
+        // this worker's previous row; this row reads `cy*ctb - 1`.
+        strips.clear();
+    }
 
     let mut ctxs = {
         let wait_start = std::time::Instant::now();
@@ -1134,7 +1266,14 @@ fn build_wpp_row(
                 // Safety: `row_progress[cy - 1] >= need_prev` was observed
                 // under the mutex, so these rectangles are published and
                 // final.
-                bytes += unsafe { sink.import_ctu_border(state, px, cy - 1, ctb) };
+                bytes += unsafe {
+                    match strips.as_deref_mut() {
+                        Some(strips) => {
+                            sink.import_ctu_border_strip(state, strips, px, cy - 1, ctb)
+                        }
+                        None => sink.import_ctu_border(state, px, cy - 1, ctb),
+                    }
+                };
             }
             let imported = (need_prev - import_from) as u64;
             let plane_count = if state.cat == 0 { 1u64 } else { 3 };
@@ -1153,7 +1292,11 @@ fn build_wpp_row(
         let x0 = cx * ctb;
         let y0 = cy * ctb;
         let price_ctx = ctxs.clone();
-        let cu = search.build_ctu(state, &price_ctx, x0, y0, CTB_LOG2, 0);
+        let background = match strips.as_deref() {
+            Some(strips) => super::stillsearch::ReconBackground::Strips(strips),
+            None => super::stillsearch::ReconBackground::Frame,
+        };
+        let cu = search.build_ctu(state, &price_ctx, x0, y0, CTB_LOG2, 0, background);
         state.record_analysis_cache_cu_node(&cu, x0, y0, CTB_LOG2, 0);
         if state.deblock {
             let (display_width, display_height) = (state.display_width, state.display_height);
@@ -1174,7 +1317,13 @@ fn build_wpp_row(
         let publish_start = std::time::Instant::now();
         // Safety: this worker built the CTU and its `row_progress` advance
         // has not happened yet, so no other thread can touch the rectangles.
-        let bytes = unsafe { sink.publish_ctu(state, cx, cy, ctb) };
+        let bytes = unsafe {
+            if strips.is_some() {
+                sink.publish_ctu_from_canvas(search.canvas(), state, cx, cy)
+            } else {
+                sink.publish_ctu(state, cx, cy, ctb)
+            }
+        };
         let plane_count = if state.cat == 0 { 1u64 } else { 3 };
         state.stats.frame_snapshots = state.stats.frame_snapshots.saturating_add(plane_count);
         state.stats.map_snapshots = state.stats.map_snapshots.saturating_add(4);

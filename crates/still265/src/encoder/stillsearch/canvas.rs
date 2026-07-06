@@ -111,6 +111,77 @@ impl CanvasPlane {
             .extend((0..rows).map(|cy| self.buf[cy * stride]));
     }
 
+    /// Frameless-worker variant of [`reset`](Self::reset) (canvas-design.md
+    /// phase 3): the committed background comes from the row-above border
+    /// `strip` (plane row `y0c-1`, full plane width, UNINIT where not yet
+    /// published) instead of a frame, and the left border column
+    /// self-captures from this canvas's previous content — the previous CTU
+    /// in the row is the left neighbor, and its resident finalize-generation
+    /// recon holds plane column `x0c-1` (its own last sample column).
+    fn reset_from_strip(
+        &mut self,
+        strip: &[u16],
+        plane_h: usize,
+        chroma_format: u8,
+        c_idx: u8,
+        ctu_x: u32,
+        ctu_y: u32,
+    ) {
+        let (sx, sy) = bpg_hevc_decode::hevc::tile::plane_shifts(c_idx, chroma_format);
+        let cw = CTB >> sx;
+        let ch = CTB >> sy;
+        let stride = 1 + 2 * cw;
+        let rows = 1 + 2 * ch;
+        let new_ox = ((ctu_x >> sx) as i64) - 1;
+        let new_oy = ((ctu_y >> sy) as i64) - 1;
+
+        // Capture the left border column before wiping. Valid only when this
+        // canvas currently sits on the left neighbor (same CTB row, one CTU
+        // step left); at a row start (or a fresh canvas) the column stays
+        // UNINIT, exactly like the frame path at `x0c-1 < 0` / uncoded left.
+        let capture = self.stride == stride
+            && self.rows == rows
+            && self.origin_y == new_oy
+            && self.origin_x + cw as i64 == new_ox
+            && !self.buf.is_empty();
+        let mut left_col = [UNINIT_SAMPLE; CTB];
+        if capture {
+            for (i, v) in left_col[..ch].iter_mut().enumerate() {
+                *v = self.buf[(1 + i) * stride + cw];
+            }
+        }
+
+        self.stride = stride;
+        self.rows = rows;
+        self.origin_x = new_ox;
+        self.origin_y = new_oy;
+        self.buf.clear();
+        self.buf.resize(stride * rows, UNINIT_SAMPLE);
+
+        // Top border row from the strip (canvas row 0 = plane row y0c-1),
+        // clamped to the plane width; UNINIT strip content stays UNINIT.
+        let plane_w = strip.len();
+        if new_oy >= 0 && (new_oy as usize) < plane_h {
+            let px0 = new_ox.max(0) as usize;
+            let px1 = ((new_ox + stride as i64).min(plane_w as i64)).max(0) as usize;
+            if px0 < px1 {
+                let dst0 = (px0 as i64 - new_ox) as usize;
+                self.buf[dst0..dst0 + (px1 - px0)].copy_from_slice(&strip[px0..px1]);
+            }
+        }
+        if capture {
+            for (i, &v) in left_col[..ch].iter().enumerate() {
+                self.buf[(1 + i) * stride] = v;
+            }
+        }
+
+        self.bg_top.clear();
+        self.bg_top.extend_from_slice(&self.buf[..stride]);
+        self.bg_left.clear();
+        self.bg_left
+            .extend((0..rows).map(|cy| self.buf[cy * stride]));
+    }
+
     /// Restore the background state (UNINIT + saved border strips) without
     /// touching the frame. No-op geometry until the first `reset`.
     fn clear_to_background(&mut self) {
@@ -154,7 +225,7 @@ pub(super) struct RedoPatch {
 }
 
 #[derive(Default)]
-pub(super) struct CanvasOverlay {
+pub(in crate::encoder) struct CanvasOverlay {
     planes: [CanvasPlane; 3],
     n_comp: usize,
     journal: Vec<JournalEntry>,
@@ -217,6 +288,31 @@ impl CanvasOverlay {
         self.n_comp = if frame.chroma_format == 0 { 1 } else { 3 };
         for c_idx in 0..self.n_comp {
             self.planes[c_idx].reset(frame, c_idx as u8, x0, y0);
+        }
+        self.journal.clear();
+    }
+
+    /// Frameless rebase (canvas-design.md phase 3): the committed background
+    /// comes from the worker's row-above [`RowStrips`] plus this canvas's own
+    /// previous content (see [`CanvasPlane::reset_from_strip`]); no
+    /// reconstruction frame is read.
+    pub(super) fn reset_from_strips(
+        &mut self,
+        strips: &RowStrips,
+        chroma_format: u8,
+        x0: u32,
+        y0: u32,
+    ) {
+        self.n_comp = strips.n_comp;
+        for c_idx in 0..self.n_comp {
+            self.planes[c_idx].reset_from_strip(
+                &strips.rows[c_idx],
+                strips.heights[c_idx],
+                chroma_format,
+                c_idx as u8,
+                x0,
+                y0,
+            );
         }
         self.journal.clear();
     }
@@ -442,6 +538,37 @@ impl CanvasOverlay {
         }
     }
 
+    /// Walk the coded CTU rectangle rows (the exact [`commit_to_frame`]
+    /// geometry, clamped to `plane_w`/`plane_h`), handing each to `f` as
+    /// `(plane_row, plane_x0, samples)`. The frameless publish path: the WPP
+    /// sink copies these rows straight into the master planes, replacing the
+    /// worker-frame middleman.
+    pub(in crate::encoder) fn for_each_ctu_row(
+        &self,
+        c_idx: u8,
+        plane_w: usize,
+        plane_h: usize,
+        mut f: impl FnMut(usize, usize, &[u16]),
+    ) {
+        let plane = &self.planes[c_idx as usize];
+        if plane.stride == 0 {
+            return;
+        }
+        let ctu_w = (plane.stride - 1) / 2;
+        let ctu_h = (plane.rows - 1) / 2;
+        let px0 = plane.origin_x + 1;
+        let py0 = plane.origin_y + 1;
+        let px1 = (px0 + ctu_w as i64).min(plane_w as i64);
+        let py1 = (py0 + ctu_h as i64).min(plane_h as i64);
+        for py in py0..py1 {
+            let cy = (py - plane.origin_y) as usize;
+            let cx0 = (px0 - plane.origin_x) as usize;
+            let n = (px1 - px0) as usize;
+            let off = cy * plane.stride + cx0;
+            f(py as usize, px0 as usize, &plane.buf[off..off + n]);
+        }
+    }
+
     /// Copy the coded CTU rectangle into the committed frame — the single
     /// point where trial reconstruction reaches shared state.
     pub(super) fn commit_to_frame(&self, frame: &mut DecodedFrame) {
@@ -468,4 +595,65 @@ impl CanvasOverlay {
             }
         }
     }
+}
+
+/// Per-worker committed-context buffer for frameless WPP builds
+/// (canvas-design.md phase 3): one full-plane-width pixel row per component,
+/// holding plane row `y0c-1` — the last row of the CTU row above, imported
+/// from the master sink as CTUs above publish. UNINIT where not yet
+/// published, exactly the values the retired per-worker frame held there.
+pub(in crate::encoder) struct RowStrips {
+    rows: [Vec<u16>; 3],
+    heights: [usize; 3],
+    n_comp: usize,
+}
+
+impl RowStrips {
+    /// Size the strips from the (metadata of the) worker frame; the frame's
+    /// pixel planes may be empty.
+    pub(in crate::encoder) fn new(frame: &DecodedFrame) -> Self {
+        let n_comp = if frame.chroma_format == 0 { 1 } else { 3 };
+        let mut rows: [Vec<u16>; 3] = Default::default();
+        let mut heights = [0usize; 3];
+        for (c, (row, height)) in rows
+            .iter_mut()
+            .zip(heights.iter_mut())
+            .enumerate()
+            .take(n_comp)
+        {
+            let (w, h) = frame.component_dims(c as u8);
+            *row = vec![UNINIT_SAMPLE; w as usize];
+            *height = h as usize;
+        }
+        Self {
+            rows,
+            heights,
+            n_comp,
+        }
+    }
+
+    /// Reset to UNINIT for a newly claimed CTB row (the previous row's
+    /// strip content belongs to a different `y0c-1`).
+    pub(in crate::encoder) fn clear(&mut self) {
+        for row in self.rows[..self.n_comp].iter_mut() {
+            row.fill(UNINIT_SAMPLE);
+        }
+    }
+
+    /// Mutable access for the sink import (columns `x0..x1` of the newly
+    /// published row-above rectangle land here).
+    pub(in crate::encoder) fn row_mut(&mut self, c_idx: usize) -> &mut [u16] {
+        &mut self.rows[c_idx]
+    }
+}
+
+/// Where a CTU build loads the canvas's committed background from.
+pub(in crate::encoder) enum ReconBackground<'a> {
+    /// The committed reconstruction frame (serial, tile, and master builds):
+    /// the canvas reads its top-row/left-column strips from `state.frame`.
+    Frame,
+    /// Frameless WPP worker: the row-above strip buffer; the left column
+    /// self-captures from the previous CTU's canvas content. The worker
+    /// frame's pixel planes are empty and must never be read.
+    Strips(&'a RowStrips),
 }
