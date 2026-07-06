@@ -360,9 +360,7 @@ impl<'a> Encoder<'a> {
         let ctbs_y = self.display_height.div_ceil(ctb_size);
         let mut map = SaoMap::new(ctbs_x, ctbs_y);
 
-        let workers = write::parallel_thread_count()
-            .min(ctbs_y as usize)
-            .max(1);
+        let workers = write::parallel_thread_count().min(ctbs_y as usize).max(1);
         if workers <= 1 {
             for (ctb_y, row) in map.data.chunks_mut(ctbs_x as usize).enumerate() {
                 self.decide_sao_row(ctb_size, ctb_y as u32, row);

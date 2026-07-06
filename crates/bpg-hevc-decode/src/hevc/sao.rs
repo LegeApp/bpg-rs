@@ -74,7 +74,12 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
 /// rectangle (rows of CTBs own disjoint plane bands), band offsets are
 /// per-pixel in-place, and edge offsets read from the immutable pre-SAO
 /// plane clones.
-pub fn apply_sao_threads(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32, threads: usize) {
+pub fn apply_sao_threads(
+    frame: &mut DecodedFrame,
+    sao_map: &SaoMap,
+    ctb_size: u32,
+    threads: usize,
+) {
     let width = frame.width;
     let height = frame.height;
     let bit_depth = frame.bit_depth;

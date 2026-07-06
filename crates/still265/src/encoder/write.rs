@@ -1007,12 +1007,10 @@ impl MasterFrameSink {
 /// an integer imports that many bottom pixel rows per plane rectangle.
 fn wpp_import_strip_rows() -> Option<usize> {
     static VALUE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *VALUE.get_or_init(|| {
-        match std::env::var("BPG_WPP_IMPORT_ROWS") {
-            Ok(v) if v.trim() == "full" => None,
-            Ok(v) => v.trim().parse::<usize>().ok().filter(|&n| n > 0),
-            Err(_) => Some(1),
-        }
+    *VALUE.get_or_init(|| match std::env::var("BPG_WPP_IMPORT_ROWS") {
+        Ok(v) if v.trim() == "full" => None,
+        Ok(v) => v.trim().parse::<usize>().ok().filter(|&n| n > 0),
+        Err(_) => Some(1),
     })
 }
 
@@ -1037,7 +1035,12 @@ fn plane_rect<T: Copy>(
 
 /// CTU rectangle in a per-block map with `unit` cells per CTU side (clamped),
 /// mirroring the old snapshot rectangle math.
-fn map_rect<T: Copy>(map: &RawPlane<T>, cx: u32, cy: u32, unit: usize) -> (usize, usize, usize, usize) {
+fn map_rect<T: Copy>(
+    map: &RawPlane<T>,
+    cx: u32,
+    cy: u32,
+    unit: usize,
+) -> (usize, usize, usize, usize) {
     let x0 = (cx as usize * unit).min(map.stride);
     let x1 = ((cx as usize + 1) * unit).min(map.stride);
     let y0 = (cy as usize * unit).min(map.rows());
