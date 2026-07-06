@@ -97,6 +97,9 @@ pub struct EncodeStats {
     pub cu_trials_by_log2: [u64; 7],
     pub cu_splits_taken_by_log2: [u64; 7],
     pub cu_early_term_by_log2: [u64; 7],
+    /// CU descent-termination gate skips (leaf accepted, split branch never
+    /// evaluated), per parent log2 size. See `CuSearchPolicy::descent_gate_*`.
+    pub cu_descent_gate_by_log2: [u64; 7],
     pub tu_leaf_by_log2: [u64; 7],
     pub tu_split_by_log2: [u64; 7],
     pub floorplus_ctus: u64,
@@ -275,6 +278,13 @@ impl EncodeStats {
             .cu_early_term_by_log2
             .iter_mut()
             .zip(other.cu_early_term_by_log2.iter())
+        {
+            *dst += *src;
+        }
+        for (dst, src) in self
+            .cu_descent_gate_by_log2
+            .iter_mut()
+            .zip(other.cu_descent_gate_by_log2.iter())
         {
             *dst += *src;
         }

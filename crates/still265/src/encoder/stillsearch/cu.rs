@@ -122,10 +122,16 @@ where
             return self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
         }
         if !can_split {
-            if fully_inside && self.part_nxn_legal(state, log2_cb_size) {
-                return self.decide_cu_min_leaf_or_nxn(state, x0, y0, ct_depth);
+            let (plan, cost) = if fully_inside && self.part_nxn_legal(state, log2_cb_size) {
+                self.decide_cu_min_leaf_or_nxn(state, x0, y0, ct_depth)
+            } else {
+                self.decide_cu_leaf(state, x0, y0, log2_cb_size, ct_depth)
+            };
+            if super::env::descent_log_enabled() {
+                let rough = self.workspace.last_rough_best_cost;
+                eprintln!("DSC {x0} {y0} {log2_cb_size} {rough:.1} {cost:.1} nan min");
             }
-            return self.decide_cu_leaf(state, x0, y0, log2_cb_size, ct_depth);
+            return (plan, cost);
         }
 
         // Snapshot the split-flag pricing model and (with evolving contexts)
@@ -158,6 +164,7 @@ where
 
         let mark0 = self.overlay.mark();
         let (leaf_plan, leaf_cost) = self.decide_cu_leaf(state, x0, y0, log2_cb_size, ct_depth);
+        let leaf_rough = self.workspace.last_rough_best_cost;
         let leaf_saved = self.overlay.detach_from(mark0);
 
         // CU early termination: skip split evaluation when the leaf is
@@ -205,7 +212,47 @@ where
                 state.store_mode(x0, y0, log2_cb_size, leaf.luma_mode);
                 state.set_ct_depth(x0, y0, log2_cb_size, ct_depth);
             }
+            if super::env::descent_log_enabled() {
+                eprintln!("DSC {x0} {y0} {log2_cb_size} {leaf_rough:.1} {leaf_cost:.1} nan early");
+            }
             return (leaf_plan, leaf_cost);
+        }
+
+        // Descent-termination gate (speed-parity audit §7/§10.5): accept the
+        // leaf without evaluating the split branch when the leaf's RD total is
+        // small per lambda-scaled pixel — offline calibration shows split wins
+        // below the shipped thresholds are <~1% of split wins and their
+        // forgone RD is <~0.01% of node RD. Unlike the leaf-first
+        // branch-and-bound below (which is decision-identical but still pays
+        // for 1-3 children before aborting), this skips the whole subtree.
+        let flag0_term = lambda * entropy_bits(&flag_model, 0) as f64 / scale;
+        let leaf_total = leaf_cost + flag0_term;
+        let gate_t = {
+            let (t16, t32) = super::env::descent_gate_override()
+                .unwrap_or((cu_policy.descent_gate_t16, cu_policy.descent_gate_t32));
+            match log2_cb_size {
+                4 => t16,
+                5 => t32,
+                _ => 0.0,
+            }
+        };
+        if gate_t > 0.0 && super::env::dump_ctu_target().is_none() {
+            let pixels = (1u64 << (2 * log2_cb_size)) as f64;
+            let lambda_ref = rd_lambda(28 + state.aq.qp_bd_offset);
+            if leaf_total <= gate_t * (lambda / lambda_ref) * pixels {
+                state.stats.cu_descent_gate_by_log2[log2_cb_size as usize] += 1;
+                self.overlay.reattach(leaf_saved);
+                if let CuPlan::Leaf(ref leaf) = leaf_plan {
+                    state.store_mode(x0, y0, log2_cb_size, leaf.luma_mode);
+                    state.set_ct_depth(x0, y0, log2_cb_size, ct_depth);
+                }
+                if super::env::descent_log_enabled() {
+                    eprintln!(
+                        "DSC {x0} {y0} {log2_cb_size} {leaf_rough:.1} {leaf_total:.1} nan gate"
+                    );
+                }
+                return (leaf_plan, leaf_total);
+            }
         }
 
         let ctx_leaf = ctx_entry.as_ref().map(|entry| {
@@ -221,8 +268,6 @@ where
         // The bound check applies the exact same float expression as the
         // final compare below (monotone in the partial sum), so the decision
         // — and, via the losing-split cleanup, the output — is identical.
-        let flag0_term = lambda * entropy_bits(&flag_model, 0) as f64 / scale;
-        let leaf_total = leaf_cost + flag0_term;
         let bound = (super::env::cu_split_bound_enabled()
             && !self.force_cu_split(state, log2_cb_size)
             && super::env::dump_ctu_target().is_none())
@@ -259,6 +304,19 @@ where
                     }
                 );
             }
+        }
+
+        if super::env::descent_log_enabled() {
+            let tag = if split_cost.is_infinite() {
+                "abort"
+            } else if split_total - self.cu_split_cost_bias(log2_cb_size) < leaf_total {
+                "split"
+            } else {
+                "leaf"
+            };
+            eprintln!(
+                "DSC {x0} {y0} {log2_cb_size} {leaf_rough:.1} {leaf_total:.1} {split_total:.1} {tag}"
+            );
         }
 
         let split_cmp_total = split_total - self.cu_split_cost_bias(log2_cb_size);

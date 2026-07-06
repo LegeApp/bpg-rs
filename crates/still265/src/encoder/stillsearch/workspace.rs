@@ -59,6 +59,10 @@ pub(super) struct CtuWorkspace {
     /// Best rough SATD score for the current 8×8 CU (set by decide_cu_luma_mode
     /// when log2_cb_size==3, consumed by decide_cu_min_leaf_or_nxn).
     pub(super) last_8x8_rough_satd: f64,
+    /// Best rough (SATD + mode bits) score of the most recent
+    /// `decide_cu_luma_mode` call at any size — the per-CU rough evidence the
+    /// descent-termination instrumentation/gate reads (see `cu.rs`).
+    pub(super) last_rough_best_cost: f64,
     /// Per-CTU substage profile (eval_component_8 breakdown). Zero when
     /// profiling is disabled.
     pub(super) substage: SubstageProfile,
@@ -97,6 +101,7 @@ impl Default for CtuWorkspace {
             price_scratch: ResidualPricingScratch::default(),
             rdoq_scratch: RdoqScratch::default(),
             last_8x8_rough_satd: f64::INFINITY,
+            last_rough_best_cost: f64::INFINITY,
             substage: SubstageProfile::default(),
             ssim_rd_norm: [SsimRdNorm::default(); 3],
             tu_split_early_terminations: 0,

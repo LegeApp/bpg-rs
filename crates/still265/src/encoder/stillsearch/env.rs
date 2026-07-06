@@ -592,6 +592,34 @@ pub(super) fn cu_split_bound_enabled() -> bool {
     })
 }
 
+/// Descent-termination instrumentation: when set, `decide_cu` logs one
+/// `DSC` line per decided CU (rough score, leaf total, split total, outcome)
+/// to stderr for offline bound calibration. Diagnostic only.
+#[inline]
+pub(super) fn descent_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BPG_STILLSEARCH_DESCENT_LOG").is_some())
+}
+
+/// Override for the effort template's CU descent gate thresholds
+/// (`CuSearchPolicy::descent_gate_t16/t32`). `BPG_STILLSEARCH_DESCENT_GATE`
+/// accepts `t16,t32` (floats), or `off`/`0` to disable the gate.
+#[inline]
+pub(super) fn descent_gate_override() -> Option<(f64, f64)> {
+    static VALUE: OnceLock<Option<(f64, f64)>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let raw = std::env::var("BPG_STILLSEARCH_DESCENT_GATE").ok()?;
+        let v = raw.trim();
+        if matches!(v, "0" | "off" | "false" | "none" | "disable" | "disabled") {
+            return Some((0.0, 0.0));
+        }
+        let (a, b) = v.split_once(',')?;
+        let t16 = a.trim().parse::<f64>().ok().filter(|t| t.is_finite())?;
+        let t32 = b.trim().parse::<f64>().ok().filter(|t| t.is_finite())?;
+        Some((t16, t32))
+    })
+}
+
 /// Leaf-first TU split branch-and-bound abort. Default on; decision- and
 /// byte-identical to full evaluation (only skips TU children that cannot
 /// change the leaf-vs-split winner).

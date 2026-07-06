@@ -61,7 +61,9 @@ where
         let evidence = self.compute_rough_scores(state, x0, y0, log2_cb_size, mpm, lambda, scale);
 
         // Store the best rough score for the NxN skip heuristic (consumed by
-        // decide_cu_min_leaf_or_nxn for 8x8 CUs).
+        // decide_cu_min_leaf_or_nxn for 8x8 CUs) and for the CU descent
+        // instrumentation/gate (consumed by decide_cu at every size).
+        self.workspace.last_rough_best_cost = evidence.best_satd;
         if log2_cb_size == 3 {
             self.workspace.last_8x8_rough_satd = evidence.best_satd;
         }
