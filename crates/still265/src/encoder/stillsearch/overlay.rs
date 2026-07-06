@@ -286,6 +286,12 @@ impl ReconOverlay16 {
 pub(super) trait OverlayCache {
     /// Owned patch buffer detached by [`detach_from`](Self::detach_from).
     type Saved;
+    /// Rebase the overlay onto a new CTU: patch overlays just clear; the
+    /// canvas additionally reloads its committed background strips from the
+    /// frame (see `canvas.rs`).
+    fn reset_from_ctu(&mut self, _frame: &DecodedFrame, _x0: u32, _y0: u32) {
+        self.clear();
+    }
     fn clear(&mut self);
     fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16>;
     /// Overlay `dst.len()` samples from row `y`, starting at `x0`, onto an
@@ -307,6 +313,18 @@ pub(super) trait OverlayCache {
                 *sample = v;
             }
         }
+    }
+    /// Fast path: read `dst.len()` frame+overlay *merged* samples from row
+    /// `y` starting at `x0`. Returns `false` when the implementation cannot
+    /// (patch overlays: the caller then frame-initializes `dst` and runs
+    /// [`overlay_row_samples`](Self::overlay_row_samples)); the canvas copies
+    /// directly and returns `true`.
+    fn read_row_merged(&self, _c_idx: u8, _y: u32, _x0: u32, _dst: &mut [u16]) -> bool {
+        false
+    }
+    /// Column variant of [`read_row_merged`](Self::read_row_merged).
+    fn read_col_merged(&self, _c_idx: u8, _x: u32, _y0: u32, _dst: &mut [u16]) -> bool {
+        false
     }
     fn push_block(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32, samples: &[u16]);
     fn push_block_u8(
@@ -348,7 +366,7 @@ pub(super) trait OverlayCache {
 /// [`OverlayCache::any_border_overlap_since`], in i64 to sidestep edge
 /// underflow. Conservative only in never under-reporting overlap.
 #[inline]
-fn patch_overlaps_border(
+pub(super) fn patch_overlaps_border(
     (px, py, pw, ph): (u32, u32, u32, u32),
     x0: u32,
     y0: u32,

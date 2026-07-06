@@ -12,6 +12,7 @@
 mod angular;
 mod api;
 mod arena;
+mod canvas;
 mod chroma;
 mod cost;
 mod cu;

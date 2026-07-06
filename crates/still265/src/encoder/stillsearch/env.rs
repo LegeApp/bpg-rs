@@ -592,6 +592,20 @@ pub(super) fn cu_split_bound_enabled() -> bool {
     })
 }
 
+/// Select the trial-reconstruction storage. Default is the contiguous
+/// per-CTU canvas (`canvas.rs`, audit #6 phases 1+1.5, byte-identical and
+/// ~10% faster single-thread); `BPG_STILLSEARCH_OVERLAY=patches` restores
+/// the reference patch-stack overlays for A/B.
+#[inline]
+pub(super) fn canvas_overlay_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BPG_STILLSEARCH_OVERLAY")
+            .map(|v| !v.trim().eq_ignore_ascii_case("patches"))
+            .unwrap_or(true)
+    })
+}
+
 /// Descent-termination instrumentation: when set, `decide_cu` logs one
 /// `DSC` line per decided CU (rough score, leaf total, split total, outcome)
 /// to stderr for offline bound calibration. Diagnostic only.
