@@ -294,10 +294,17 @@ impl EncodeStats {
         }
         self.phase_total_us += other.phase_total_us;
         self.phase_build_us += other.phase_build_us;
+        self.phase_parallel_restore_us += other.phase_parallel_restore_us;
         self.phase_deblock_us += other.phase_deblock_us;
         self.phase_sao_decide_us += other.phase_sao_decide_us;
         self.phase_sao_apply_us += other.phase_sao_apply_us;
         self.phase_write_us += other.phase_write_us;
+        self.frame_snapshots += other.frame_snapshots;
+        self.frame_restores += other.frame_restores;
+        self.map_snapshots += other.map_snapshots;
+        self.map_restores += other.map_restores;
+        self.bytes_snapshotted += other.bytes_snapshotted;
+        self.bytes_restored += other.bytes_restored;
         for (dst, src) in self
             .stillsearch_ledger
             .iter_mut()
@@ -359,6 +366,11 @@ impl fmt::Display for EncodeStats {
         writeln!(f, "  final_coded_blocks: {}", self.final_coded_blocks)?;
         writeln!(f, "  phase_total_us: {}", self.phase_total_us)?;
         writeln!(f, "  phase_build_us: {}", self.phase_build_us)?;
+        writeln!(
+            f,
+            "  phase_parallel_restore_us: {}",
+            self.phase_parallel_restore_us
+        )?;
         writeln!(f, "  phase_write_us: {}", self.phase_write_us)?;
         writeln!(f, "  phase_deblock_us: {}", self.phase_deblock_us)?;
         writeln!(f, "  phase_sao_decide_us: {}", self.phase_sao_decide_us)?;

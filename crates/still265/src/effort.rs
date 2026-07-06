@@ -514,6 +514,10 @@ pub struct CuSearchPolicy {
     pub early_terminate: CuEarlyTerminateRule,
     pub use_preanalysis_force_leaf: bool,
     pub use_preanalysis_force_split: bool,
+    /// Force legal CUs at this parent log2 size to split without evaluating
+    /// the 2Nx2N leaf. `Some(6)` mirrors x265's still-image intra path, which
+    /// never tests a 64x64 CU leaf at the CTU root.
+    pub force_split_log2: Option<u8>,
     pub leaf_first: bool,
 }
 
@@ -723,6 +727,7 @@ pub(crate) static FAST: EffortTemplate = EffortTemplate {
         early_terminate: CuEarlyTerminateRule::Fast,
         use_preanalysis_force_leaf: true,
         use_preanalysis_force_split: false,
+        force_split_log2: None,
         leaf_first: true,
     },
 
@@ -844,6 +849,11 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
         early_terminate: CuEarlyTerminateRule::Balanced,
         use_preanalysis_force_leaf: true,
         use_preanalysis_force_split: true,
+        // x265 placebo/`bpgenc -m9` always splits the CTU root: its intra
+        // analysis never evaluates a 64x64 2Nx2N leaf. Slow is the production
+        // x265-shaped preset, so skip that extra depth by default. Set
+        // `BPG_STILLSEARCH_CU_FORCE_SPLIT_LOG2=0` to restore the old search.
+        force_split_log2: Some(6),
         leaf_first: true,
     },
 
@@ -972,6 +982,7 @@ pub(crate) static PLACEBO: EffortTemplate = EffortTemplate {
         early_terminate: CuEarlyTerminateRule::Disabled,
         use_preanalysis_force_leaf: false,
         use_preanalysis_force_split: false,
+        force_split_log2: None,
         leaf_first: true,
     },
 

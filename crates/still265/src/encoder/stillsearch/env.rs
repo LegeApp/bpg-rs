@@ -606,16 +606,27 @@ pub(super) fn tu_split_bound_enabled() -> bool {
 }
 
 /// Force CU splits at the given parent log2 size (for example `4` forces
-/// legal 16x16 -> 8x8 CU splits).
+/// legal 16x16 -> 8x8 CU splits). When unset, use the effort template's
+/// default. Set to `0`/`off`/`false`/`none` to disable a template default.
 #[inline]
-pub(super) fn cu_force_split_log2() -> Option<u8> {
-    static VALUE: OnceLock<Option<u8>> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var(CU_FORCE_SPLIT_LOG2)
+pub(super) fn cu_force_split_log2(default: Option<u8>) -> Option<u8> {
+    static OVERRIDE: OnceLock<Option<Option<u8>>> = OnceLock::new();
+    match *OVERRIDE.get_or_init(|| {
+        let Ok(raw) = std::env::var(CU_FORCE_SPLIT_LOG2) else {
+            return None;
+        };
+        let v = raw.trim();
+        if matches!(v, "0" | "off" | "false" | "none" | "disable" | "disabled") {
+            return Some(None);
+        }
+        v.parse::<u8>()
             .ok()
-            .and_then(|v| v.trim().parse::<u8>().ok())
             .filter(|&v| (4..=6).contains(&v))
-    })
+            .map(Some)
+    }) {
+        Some(v) => v,
+        None => default,
+    }
 }
 
 /// Subtract this many RD-cost units per luma pixel from legal PartNxN candidates.

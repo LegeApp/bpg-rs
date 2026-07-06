@@ -45,8 +45,9 @@ where
     }
 
     #[inline]
-    fn force_cu_split(&self, log2_cb_size: u8) -> bool {
-        super::env::cu_force_split_log2().is_some_and(|v| v == log2_cb_size)
+    fn force_cu_split(&self, state: &Encoder<'_>, log2_cb_size: u8) -> bool {
+        super::env::cu_force_split_log2(state.effort_template.cu.force_split_log2)
+            .is_some_and(|v| v == log2_cb_size)
     }
 
     /// Update the `split_cu_flag` context in the evolving trial context for
@@ -134,6 +135,22 @@ where
         let evolve = super::env::ctx_evolve_search();
         let ci = ctx::SPLIT_CU_FLAG + state.split_ctx_inc(x0, y0, ct_depth);
         let flag_model = self.workspace.price_cur.models[ci];
+        let lambda = rd_lambda(state.cur_qp_y);
+        let scale = CabacEstimator::SCALE as f64;
+        let flag1_term = lambda * entropy_bits(&flag_model, 1) as f64 / scale;
+
+        if self.force_cu_split(state, log2_cb_size) {
+            if evolve {
+                self.commit_cu_split_flag_ctx(state, x0, y0, ct_depth, true);
+            }
+            let (split_plan, split_cost) =
+                self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
+            state.stats.cu_splits_taken_by_log2[log2_cb_size as usize] += 1;
+            #[cfg(test)]
+            super::api::CU_SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return (split_plan, split_cost + flag1_term);
+        }
+
         let ctx_entry = evolve.then(|| self.workspace.price_cur.clone());
         if evolve {
             self.commit_cu_split_flag_ctx(state, x0, y0, ct_depth, false);
@@ -179,7 +196,7 @@ where
             }
         };
 
-        let should_skip_split = should_skip_split && !self.force_cu_split(log2_cb_size);
+        let should_skip_split = should_skip_split && !self.force_cu_split(state, log2_cb_size);
 
         if should_skip_split {
             state.stats.cu_early_term_by_log2[log2_cb_size as usize] += 1;
@@ -204,13 +221,10 @@ where
         // The bound check applies the exact same float expression as the
         // final compare below (monotone in the partial sum), so the decision
         // — and, via the losing-split cleanup, the output — is identical.
-        let lambda = rd_lambda(state.cur_qp_y);
-        let scale = CabacEstimator::SCALE as f64;
         let flag0_term = lambda * entropy_bits(&flag_model, 0) as f64 / scale;
-        let flag1_term = lambda * entropy_bits(&flag_model, 1) as f64 / scale;
         let leaf_total = leaf_cost + flag0_term;
         let bound = (super::env::cu_split_bound_enabled()
-            && !self.force_cu_split(log2_cb_size)
+            && !self.force_cu_split(state, log2_cb_size)
             && super::env::dump_ctu_target().is_none())
         .then_some(SplitBound {
             flag1_term,
@@ -248,7 +262,7 @@ where
         }
 
         let split_cmp_total = split_total - self.cu_split_cost_bias(log2_cb_size);
-        if self.force_cu_split(log2_cb_size) || split_cmp_total < leaf_total {
+        if self.force_cu_split(state, log2_cb_size) || split_cmp_total < leaf_total {
             state.stats.cu_splits_taken_by_log2[log2_cb_size as usize] += 1;
             #[cfg(test)]
             super::api::CU_SPLIT_WINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
