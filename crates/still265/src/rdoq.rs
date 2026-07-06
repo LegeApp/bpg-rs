@@ -186,22 +186,33 @@ fn last_axis_bits(ctxs: &Contexts, value: u32, log2_size: u8, c_idx: u8, is_x: b
 
 /// Per-coefficient state captured during the level-decision scan, indexed by
 /// forward (DC -> high-frequency) combined scan rank.
+///
+/// RD costs are in the x265 `rdoQuant` int64 fixed-point domain:
+/// `(d*d << scale_bits) + ((lambda_q8 * frac_bits) >> 8)` with `frac_bits` in
+/// 1/32768-bit units. All sums stay well below 2^63, so the arithmetic is
+/// exact (the earlier f64 domain rounded above 2^53) and the per-coefficient
+/// loop runs integer-only.
 #[derive(Clone, Copy, Default)]
 struct CoeffRec {
     idx: usize, // row-major coefficient index
     x: u32,
     y: u32,
     level: i16,     // chosen signed level (0 if quantized away)
-    dist0: f64,     // distortion if zeroed
-    rd_normal: f64, // RD cost coded as a normal coefficient (sig flag + level)
-    rd_last: f64,   // RD cost coded as the last significant coeff (no sig flag)
+    dist0: i64,     // distortion if zeroed (scaled by << scale_bits)
+    rd_normal: i64, // RD cost coded as a normal coefficient (sig flag + level)
+    rd_last: i64,   // RD cost coded as the last significant coeff (no sig flag)
 }
+
+/// `rd_last` sentinel for "this coefficient cannot be the last" (level == 0).
+/// Stage (b) never reads `rd_last` for zero levels, so the sentinel is never
+/// added into a cost sum.
+const RD_NEVER: i64 = i64::MAX;
 
 #[derive(Default)]
 pub struct RdoqScratch {
     recs: Vec<CoeffRec>,
-    suff_zero: Vec<f64>,
-    pref_normal: Vec<f64>,
+    suff_zero: Vec<i64>,
+    pref_normal: Vec<i64>,
     levels: Vec<i16>,
     price_scratch: ResidualPricingScratch,
     dequant: Vec<i16>,
@@ -875,17 +886,18 @@ pub fn rdoq_single_scan_into<'scratch>(
     let round = 1i64 << (qbits - 1); // round-to-nearest center for the candidate level
 
     let dq = DequantParams::new(log2_size, qp, bit_depth);
-    // Scale lambda from pixel-domain SSE to coefficient-domain SSE.
-    //
-    // x265 computes RDOQ as:
-    //   ((coeff - dequant(level))^2 << scaleBits) + lambda2 * cabac_frac_bits
-    // where `cabac_frac_bits` is already in 1/32768-bit units. Since this code
-    // keeps the coefficient squared error unshifted, the equivalent multiplier
-    // for those same fractional-bit units is `lambda / 2^scaleBits`. Do not
-    // divide by CabacEstimator::SCALE here; that conversion is only for costs
-    // expressed as `lambda * real_bits` against pixel-domain SSE.
-    let scale_bits = SCALE_BITS - 2 * transform_shift;
-    let lam = rdoq_lambda_scale() * lambda / (1u64 << scale_bits as u32) as f64;
+    // x265 `rdoQuant` int64 fixed-point cost domain:
+    //   RDCOST(d, bits) = ((d*d) << scaleBits) + ((lambda2_q8 * bits) >> 8)
+    // with `bits` in 1/32768-bit units and `lambda2_q8` the SSE-domain lambda
+    // in Q8. `scaleBits` lifts coefficient-domain squared error to pixel-domain
+    // SSE (see `transform.rs`); it is always positive here
+    // (`SCALE_BITS - 2*transform_shift`, transform_shift <= 5). Costs stay
+    // below ~2^56 for a 32x32 block, so i64 sums are exact — the earlier f64
+    // domain rounded above 2^53 — and the hot loop runs integer-only.
+    let scale_bits = (SCALE_BITS - 2 * transform_shift) as u32;
+    debug_assert!((SCALE_BITS - 2 * transform_shift) > 0);
+    let lam = (rdoq_lambda_scale() * lambda * 256.0).round() as i64;
+    let rate = |bits: u64| -> i64 { (lam * bits as i64) >> 8 };
     let bits = |ci: usize, bin: u8| -> u64 { ctxs.models[ci].entropy_bits(bin) as u64 };
 
     // Frozen representative greater1/greater2 contexts (greater1_ctx = 1, first
@@ -954,25 +966,24 @@ pub fn rdoq_single_scan_into<'scratch>(
     recs.clear();
     recs.resize(kept, CoeffRec::default());
 
-    // Zeroing distortion of the trimmed tail (ranks kept..size*size), summed in
-    // reverse scan order — the identical float accumulation the full suffix
-    // pass used, so downstream costs stay bit-exact. Full coding groups beyond
-    // the last significant one first, then the last group's tail positions.
-    let mut tail_zero_dist = 0.0f64;
-    for &(sbx, sby) in scan_sub[kept_cgs..].iter().rev() {
+    // Zeroing distortion of the trimmed tail (ranks kept..size*size). Full
+    // coding groups beyond the last significant one first, then the last
+    // group's tail positions. i64 sums are order-independent and exact.
+    let mut tail_zero_dist = 0i64;
+    for &(sbx, sby) in scan_sub[kept_cgs..].iter() {
         let row0 = sby as usize * 4 * size + sbx as usize * 4;
-        for &(px, py) in scan_pos.iter().rev() {
+        for &(px, py) in scan_pos.iter() {
             let abs = coeffs[row0 + py as usize * size + px as usize].unsigned_abs() as i64;
-            tail_zero_dist += (abs * abs) as f64;
+            tail_zero_dist += (abs * abs) << scale_bits;
         }
     }
     {
         let (sbx, sby) = scan_sub[last_cg];
         let row0 = sby as usize * 4 * size + sbx as usize * 4;
-        for pos in (last_cg_top + 1..16).rev() {
+        for pos in last_cg_top + 1..16 {
             let (px, py) = scan_pos[pos];
             let abs = coeffs[row0 + py as usize * size + px as usize].unsigned_abs() as i64;
-            tail_zero_dist += (abs * abs) as f64;
+            tail_zero_dist += (abs * abs) << scale_bits;
         }
     }
 
@@ -1031,7 +1042,7 @@ pub fn rdoq_single_scan_into<'scratch>(
 
             let sig_ci = sig_row[pos] as usize;
             let sig0 = bits(sig_ci, 0);
-            let dist0 = (abs * abs) as f64;
+            let dist0 = (abs * abs) << scale_bits;
 
             let rec = &mut recs[rank];
             rec.idx = y * size + x;
@@ -1046,8 +1057,8 @@ pub fn rdoq_single_scan_into<'scratch>(
             // so it exits before the greater1/greater2 lookups.
             if q == 0 {
                 rec.level = 0;
-                rec.rd_normal = dist0 + lam * sig0 as f64;
-                rec.rd_last = f64::INFINITY;
+                rec.rd_normal = dist0 + rate(sig0);
+                rec.rd_last = RD_NEVER;
                 continue;
             }
 
@@ -1071,16 +1082,16 @@ pub fn rdoq_single_scan_into<'scratch>(
             let mut best_l = 0i64;
             let mut best_levbits = 0u64;
             let mut best_distl = dist0;
-            let mut best_cost = dist0 + lam * sig0 as f64;
+            let mut best_cost = dist0 + rate(sig0);
             for l in (q - 1).max(1)..=q {
                 let dl = abs - dq.apply(l as i16) as i64;
-                let dist = (dl * dl) as f64;
+                let dist = (dl * dl) << scale_bits;
                 let mb = if level2 {
                     ic_level_bits(l as u32, base_level, gt1, gt2, c1c2idx, go_rice) + BYPASS_BITS
                 } else {
                     magnitude_bits(l as u32)
                 };
-                let cost = dist + lam * (sig1 + mb) as f64;
+                let cost = dist + rate(sig1 + mb);
                 if cost < best_cost {
                     best_cost = cost;
                     best_l = l as i64;
@@ -1093,13 +1104,13 @@ pub fn rdoq_single_scan_into<'scratch>(
             rec.dist0 = dist0;
             if best_l != 0 {
                 rec.level = if coeff < 0 { -best_l } else { best_l } as i16;
-                rec.rd_normal = best_distl + lam * (sig1 + best_levbits) as f64;
-                rec.rd_last = best_distl + lam * best_levbits as f64;
+                rec.rd_normal = best_distl + rate(sig1 + best_levbits);
+                rec.rd_last = best_distl + rate(best_levbits);
                 sb_has_sig = true;
             } else {
                 rec.level = 0;
-                rec.rd_normal = dist0 + lam * sig0 as f64;
-                rec.rd_last = f64::INFINITY; // a zero coeff can never be the last
+                rec.rd_normal = dist0 + rate(sig0);
+                rec.rd_last = RD_NEVER; // a zero coeff can never be the last
             }
 
             // Advance the `level2` greater1/greater2/Rice state (x265 quant.cpp:1074-1091).
@@ -1146,7 +1157,7 @@ pub fn rdoq_single_scan_into<'scratch>(
     // trimmed tail's zeroing distortion so costs match the untrimmed pass.
     let suff_zero = &mut scratch.suff_zero;
     suff_zero.clear();
-    suff_zero.resize(total + 1, 0.0);
+    suff_zero.resize(total + 1, 0);
     suff_zero[total] = tail_zero_dist;
     for k in (0..total).rev() {
         suff_zero[k] = suff_zero[k + 1] + recs[k].dist0;
@@ -1181,7 +1192,7 @@ pub fn rdoq_single_scan_into<'scratch>(
         // one Vec fill per RDOQ call.
         let pref_normal = &mut scratch.pref_normal;
         pref_normal.clear();
-        pref_normal.resize(total + 1, 0.0);
+        pref_normal.resize(total + 1, 0);
         for k in 0..total {
             pref_normal[k + 1] = pref_normal[k] + recs[k].rd_normal;
         }
@@ -1189,7 +1200,7 @@ pub fn rdoq_single_scan_into<'scratch>(
             if recs[p].level == 0 {
                 continue;
             }
-            let lp = lam * last_bits_for_rec(&recs[p]) as f64;
+            let lp = rate(last_bits_for_rec(&recs[p]));
             let cost = pref_normal[p] + recs[p].rd_last + suff_zero[p + 1] + lp;
             if cost < best_cost {
                 best_cost = cost;
@@ -1200,10 +1211,10 @@ pub fn rdoq_single_scan_into<'scratch>(
             }
         }
     } else {
-        let mut pref_normal = 0.0f64;
+        let mut pref_normal = 0i64;
         for p in 0..total {
             if recs[p].level != 0 {
-                let lp = lam * last_bits_for_rec(&recs[p]) as f64;
+                let lp = rate(last_bits_for_rec(&recs[p]));
                 let cost = pref_normal + recs[p].rd_last + suff_zero[p + 1] + lp;
                 if cost < best_cost {
                     best_cost = cost;
@@ -1255,8 +1266,8 @@ pub fn rdoq_single_scan_into<'scratch>(
                 + (csbf_neighbors != 0) as usize
                 + if c_idx > 0 { 2 } else { 0 };
 
-            let mut keep = lam * bits(csbf_ci, 1) as f64;
-            let mut zero = lam * bits(csbf_ci, 0) as f64;
+            let mut keep = rate(bits(csbf_ci, 1));
+            let mut zero = rate(bits(csbf_ci, 0));
             for rank in sb_scan * 16..(sb_scan + 1) * 16 {
                 keep += recs[rank].rd_normal;
                 zero += recs[rank].dist0;
