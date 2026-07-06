@@ -776,7 +776,14 @@ fn encode_inner(
         }
         if state.deblock {
             let phase_start = std::time::Instant::now();
-            bpg_hevc_decode::hevc::deblock::apply_deblocking_filter(&mut state.frame, 0, 0, 0, 0);
+            bpg_hevc_decode::hevc::deblock::apply_deblocking_filter_threads(
+                &mut state.frame,
+                0,
+                0,
+                0,
+                0,
+                write::parallel_thread_count(),
+            );
             state.stats.phase_deblock_us += phase_start.elapsed().as_micros() as u64;
         }
         let sao_map = if config.sao == SaoMode::On {
@@ -803,7 +810,14 @@ fn encode_inner(
         state.stats.phase_write_us += phase_start.elapsed().as_micros() as u64;
         if state.deblock {
             let phase_start = std::time::Instant::now();
-            bpg_hevc_decode::hevc::deblock::apply_deblocking_filter(&mut state.frame, 0, 0, 0, 0);
+            bpg_hevc_decode::hevc::deblock::apply_deblocking_filter_threads(
+                &mut state.frame,
+                0,
+                0,
+                0,
+                0,
+                write::parallel_thread_count(),
+            );
             state.stats.phase_deblock_us += phase_start.elapsed().as_micros() as u64;
         }
         (bytes, Vec::new())
