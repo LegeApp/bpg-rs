@@ -21,15 +21,13 @@ use crate::encoder::types::chroma_pred_mode;
 use super::depth::StillSearchDepth;
 use super::emit;
 use super::eval::{QuantMode, ResidualPricingMode};
-use super::overlay::OverlayCache;
 use super::plan::{CuLeafPlan, CuPlan, ParentChromaPlan, TtPlan};
 use super::price::rd_lambda;
 use super::source::CtuSourceCache;
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     /// Re-code the selected `plan` with RDOQ in decoder order, returning the
     /// finalized plan (RDOQ coeffs/CBFs) and leaving RDOQ recon in the overlay.

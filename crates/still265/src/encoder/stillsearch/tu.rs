@@ -10,7 +10,6 @@ use super::depth::StillSearchDepth;
 use super::emit;
 use super::eval::{QuantMode, ResidualPricingMode};
 use super::ledger::WorkBucket;
-use super::overlay::OverlayCache;
 use super::plan::{ParentChromaPlan, TtPlan};
 use super::price::split_flag_bits;
 use super::source::CtuSourceCache;
@@ -92,10 +91,9 @@ pub(super) struct ExactEvalConfig {
     pub retain_coeff: bool,
 }
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     #[inline]
     fn effective_tu_min_split_log2(&self, base: u8) -> u8 {
@@ -892,7 +890,7 @@ where
         let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
         src.resize(n, 0);
         self.source.sample_block_u8(0, x0, y0, size, &mut src);
-        let refs = self.cached_intra_refs_for_block(state, x0, y0, log2_size, 0);
+        let refs = self.build_intra_refs_for_block(state, x0, y0, log2_size, 0);
 
         let residual_pricing = if super::env::luma_cheap_residual_price_exact(
             state.effort_template.luma.cheap.residual_price

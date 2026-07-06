@@ -11,9 +11,9 @@ use crate::primitives;
 use crate::primitives::intra_angs;
 use crate::primitives::{sa8d_u8, sa8d_u16, satd_u8, satd_u16};
 
+use super::canvas::CanvasSaved;
 use super::depth::StillSearchDepth;
 use super::ledger::{StillSearchLedger, WorkBucket};
-use super::overlay::OverlayCache;
 use super::plan::TtPlan;
 use super::price::{
     luma_mode_bits, x265_rd_sad_cost, x265_rmd_luma_mode_bits_no_carry,
@@ -29,10 +29,9 @@ use crate::effort::{
     SimpleRdoResult, TrialRdoqMode,
 };
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     /// Choose the CU's luma intra mode through a four-stage pipeline:
     ///
@@ -51,7 +50,7 @@ where
         log2_cb_size: u8,
         mpm: [IntraPredMode; 3],
         lambda: f64,
-    ) -> ExactModeWinner<TtPlan, O::Saved> {
+    ) -> ExactModeWinner<TtPlan, CanvasSaved> {
         let mpm_u8 = [mpm[0].as_u8(), mpm[1].as_u8(), mpm[2].as_u8()];
         let scale = CabacEstimator::SCALE as f64;
         let rough_log2 = log2_cb_size.min(MAX_TB_LOG2);
@@ -601,7 +600,7 @@ where
         scale: f64,
         shortlist: &[u8],
         evidence: &RoughBlockEvidence,
-    ) -> (Vec<CheapMode>, Option<ExactModeWinner<TtPlan, O::Saved>>) {
+    ) -> (Vec<CheapMode>, Option<ExactModeWinner<TtPlan, CanvasSaved>>) {
         let cheap_tpl = &state.effort_template.luma.cheap;
         let chroma_satd_enabled =
             cheap_tpl.chroma_satd_in_cheap && has_chroma_tb(state.cat, log2_cb_size);
@@ -611,7 +610,7 @@ where
         let lambda_sad = lambda.sqrt();
 
         let mut best_cost = f64::MAX;
-        let mut best_plan: Option<(TtPlan, O::Saved)> = None;
+        let mut best_plan: Option<(TtPlan, CanvasSaved)> = None;
         let cheap_limit = if cheap_tpl.max_ranked_modes == 0 {
             shortlist.len()
         } else {
@@ -896,7 +895,7 @@ where
         lambda: f64,
         scale: f64,
         modes: &[u8],
-    ) -> ExactModeWinner<TtPlan, O::Saved> {
+    ) -> ExactModeWinner<TtPlan, CanvasSaved> {
         // Phase 1: Hard-quant evaluation of every candidate mode. With
         // evolving trial contexts, every candidate starts from the same
         // CU-entry context (x265 loads `m_rqt[depth].cur` per candidate);
@@ -906,7 +905,7 @@ where
         // Keyed by mode: Phase 2 sorts/replaces trials in place, so parallel
         // indexing would desync. Candidate mode lists are deduplicated.
         let mut trial_ctxs: Vec<(u8, crate::contexts::Contexts)> = Vec::new();
-        let mut trials: Vec<ExactModeWinner<TtPlan, O::Saved>> = Vec::with_capacity(modes.len());
+        let mut trials: Vec<ExactModeWinner<TtPlan, CanvasSaved>> = Vec::with_capacity(modes.len());
         for &mode in modes {
             let exact_timer = StillSearchLedger::start_timer();
             let mark = self.overlay.mark();
@@ -1032,7 +1031,7 @@ where
         lambda: f64,
         scale: f64,
         mode: u8,
-    ) -> ExactModeWinner<TtPlan, O::Saved> {
+    ) -> ExactModeWinner<TtPlan, CanvasSaved> {
         let exact_timer = StillSearchLedger::start_timer();
         let mark = self.overlay.mark();
         let mut tu = state.effort_template.tu_exact;
@@ -1350,7 +1349,7 @@ where
         lambda: f64,
         scale: f64,
         mode: u8,
-    ) -> ExactModeWinner<TtPlan, O::Saved> {
+    ) -> ExactModeWinner<TtPlan, CanvasSaved> {
         let exact_timer = StillSearchLedger::start_timer();
         let mark = self.overlay.mark();
         let use_rdoq = matches!(

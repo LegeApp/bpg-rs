@@ -9,7 +9,6 @@ use crate::plan::DecisionConfidence;
 
 use super::depth::StillSearchDepth;
 use super::emit;
-use super::overlay::OverlayCache;
 use super::plan::{CuPlan, PlanBlock, TtPlan};
 use super::price::{chroma_dm_bits, entropy_bits, part_mode_bits, rd_lambda};
 use super::source::CtuSourceCache;
@@ -33,10 +32,9 @@ impl SplitBound {
     }
 }
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     #[inline]
     fn cu_split_cost_bias(&self, log2_cb_size: u8) -> f64 {

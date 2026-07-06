@@ -18,7 +18,6 @@ use crate::transform;
 use super::arena::CoeffId;
 use super::depth::StillSearchDepth;
 use super::ledger::{StillSearchLedger, WorkBucket};
-use super::overlay::OverlayCache;
 use super::plan::PlanBlock;
 use super::price::entropy_bits;
 use super::source::CtuSourceCache;
@@ -82,10 +81,9 @@ impl BlockTrial {
     }
 }
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     /// Evaluate a single transform block (one component) without mutating the
     /// shared frame. Predicts into local scratch (overlay-first reference
@@ -622,7 +620,7 @@ where
         let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
         pred.resize(n, 0);
         let t_border = profile.then(Instant::now);
-        let refs = self.cached_intra_refs_for_block(state, x0, y0, log2_size, c_idx);
+        let refs = self.build_intra_refs_for_block(state, x0, y0, log2_size, c_idx);
         if let Some(t) = t_border {
             let ns = t.elapsed().as_nanos() as u64;
             self.workspace.substage.border_ns =

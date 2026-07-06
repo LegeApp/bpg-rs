@@ -1,36 +1,34 @@
 //! Contiguous per-CTU reconstruction canvas (speed-parity audit #6,
-//! `canvas-design.md` phase 1).
+//! `canvas-design.md` phases 1+2).
 //!
-//! A drop-in [`OverlayCache`] implementation that replaces the patch stack
-//! with one contiguous `u16` working buffer per component covering
+//! The trial-reconstruction store for the CTU search: one contiguous `u16`
+//! working buffer per component covering
 //! `[x0c-1, x0c+2*CTB) × [y0c-1, y0c+2*CTB)` (chroma scaled by subsampling).
-//! On [`reset_from_ctu`](OverlayCache::reset_from_ctu) the canvas is filled
+//! On [`reset_from_ctu`](CanvasOverlay::reset_from_ctu) the canvas is filled
 //! with `UNINIT_SAMPLE` — which **is** the reference-availability sentinel
 //! (see `depth.rs::maybe_set`) — and the committed background actually
 //! reachable by intra reads is loaded: the top border row (`y0c-1`, full
 //! canvas width) and the left border column (`x0c-1`, CTU height).
 //!
-//! Patch-stack semantics are emulated with an undo journal so the trait
-//! contract (mark/truncate/detach/reattach, push-id stack identity for the
-//! border cache) is reproduced exactly:
+//! Trials push candidate recon rectangles; the winning branch commits once
+//! to `state.frame`. Loser rollback uses an undo journal (this replaced the
+//! retired patch-stack overlays, whose contract it reproduces exactly):
 //!
 //! - `push_block` journals the rectangle's previous canvas content, then
 //!   writes the new samples;
 //! - `truncate(mark)` walks the journal backwards restoring `old`;
 //! - `detach_from(mark)` additionally captures each rectangle's current
-//!   content (redo) into `Saved`, preserving push ids;
-//! - `reattach(saved)` re-applies the redo rectangles with their ids.
+//!   content (redo) into [`CanvasSaved`];
+//! - `reattach(saved)` re-applies the redo rectangles.
 //!
-//! Equivalence: the canvas state after any call sequence equals the
-//! frame-plus-patch-stack merge at every in-canvas coordinate, and
-//! `sample()` returning `Some(background)` where the patch stack returns
-//! `None` is value-identical because callers fall back to the very frame
-//! content the background was loaded from (including `UNINIT`).
+//! Equivalence to the committed frame: the canvas state after any call
+//! sequence equals the frame-plus-journal merge at every in-canvas
+//! coordinate, and `sample()` returning `Some(background)` for never-pushed
+//! positions is value-identical to a frame read because the background was
+//! loaded from that very frame content (including `UNINIT`).
 
 use bpg_hevc_decode::DecodedFrame;
 use bpg_hevc_decode::hevc::UNINIT_SAMPLE;
-
-use super::overlay::{OverlayCache, patch_overlaps_border};
 
 const CTB: usize = 64;
 
@@ -130,7 +128,6 @@ impl CanvasPlane {
 }
 
 struct JournalEntry {
-    push_id: u64,
     c_idx: u8,
     x: u32,
     y: u32,
@@ -140,10 +137,14 @@ struct JournalEntry {
     old: Vec<u16>,
 }
 
+/// Owned buffer detached by [`CanvasOverlay::detach_from`]: the losing/
+/// kept-aside branch's redo rectangles, re-applied by
+/// [`CanvasOverlay::reattach`]. May be dropped without reattaching.
+pub(super) type CanvasSaved = Vec<RedoPatch>;
+
 /// A detached (kept-aside) rectangle: the content the push had written,
-/// re-applied by `reattach` with its original push id.
+/// re-applied by `reattach`.
 pub(super) struct RedoPatch {
-    push_id: u64,
     c_idx: u8,
     x: u32,
     y: u32,
@@ -157,16 +158,9 @@ pub(super) struct CanvasOverlay {
     planes: [CanvasPlane; 3],
     n_comp: usize,
     journal: Vec<JournalEntry>,
-    next_push_id: u64,
-    drain_epoch: u64,
 }
 
 impl CanvasOverlay {
-    fn mint_push_id(&mut self) -> u64 {
-        self.next_push_id += 1;
-        self.next_push_id
-    }
-
     /// Copy a journal/redo rectangle between the canvas and a side buffer.
     /// `to_canvas`: write `data` into the canvas; else fill `data` from it.
     fn rect_copy(
@@ -194,7 +188,6 @@ impl CanvasOverlay {
     }
 
     fn push_rect(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32) -> usize {
-        let push_id = self.mint_push_id();
         let mut old = vec![0u16; (width * height) as usize];
         Self::rect_copy(
             &mut self.planes[c_idx as usize],
@@ -206,7 +199,6 @@ impl CanvasOverlay {
             false,
         );
         self.journal.push(JournalEntry {
-            push_id,
             c_idx,
             x,
             y,
@@ -218,10 +210,10 @@ impl CanvasOverlay {
     }
 }
 
-impl OverlayCache for CanvasOverlay {
-    type Saved = Vec<RedoPatch>;
-
-    fn reset_from_ctu(&mut self, frame: &DecodedFrame, x0: u32, y0: u32) {
+impl CanvasOverlay {
+    /// Rebase the canvas onto a new CTU: reload the committed background
+    /// strips from the frame and clear the journal.
+    pub(super) fn reset_from_ctu(&mut self, frame: &DecodedFrame, x0: u32, y0: u32) {
         self.n_comp = if frame.chroma_format == 0 { 1 } else { 3 };
         for c_idx in 0..self.n_comp {
             self.planes[c_idx].reset(frame, c_idx as u8, x0, y0);
@@ -229,24 +221,30 @@ impl OverlayCache for CanvasOverlay {
         self.journal.clear();
     }
 
-    fn clear(&mut self) {
+    /// Restore the background state (drop all pushed trial content) without
+    /// touching the frame.
+    pub(super) fn clear(&mut self) {
         for plane in self.planes[..self.n_comp].iter_mut() {
             plane.clear_to_background();
         }
         self.journal.clear();
     }
 
-    fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16> {
+    /// One merged frame+trials sample, or `None` outside the canvas (the
+    /// caller falls back to a committed-frame read).
+    pub(super) fn sample(&self, c_idx: u8, x: u32, y: u32) -> Option<u16> {
         let plane = &self.planes[c_idx as usize];
         plane
             .coords(x, y)
             .map(|(cx, cy)| plane.buf[cy * plane.stride + cx])
     }
 
-    fn overlay_row_samples(&self, c_idx: u8, y: u32, x0: u32, dst: &mut [u16]) {
-        // Every in-canvas position equals the frame+patches merge, so a
-        // blanket overwrite of the in-canvas span is value-identical to the
-        // patch pass over a frame-initialized destination.
+    /// Overlay `dst.len()` samples from row `y`, starting at `x0`, onto an
+    /// already frame-initialized destination buffer.
+    pub(super) fn overlay_row_samples(&self, c_idx: u8, y: u32, x0: u32, dst: &mut [u16]) {
+        // Every in-canvas position equals the frame+trials merge, so a
+        // blanket overwrite of the in-canvas span is value-identical to
+        // overlaying trial content onto a frame-initialized destination.
         let plane = &self.planes[c_idx as usize];
         for (i, sample) in dst.iter_mut().enumerate() {
             if let Some((cx, cy)) = plane.coords(x0 + i as u32, y) {
@@ -255,7 +253,8 @@ impl OverlayCache for CanvasOverlay {
         }
     }
 
-    fn overlay_col_samples(&self, c_idx: u8, x: u32, y0: u32, dst: &mut [u16]) {
+    /// Column variant of [`overlay_row_samples`](Self::overlay_row_samples).
+    pub(super) fn overlay_col_samples(&self, c_idx: u8, x: u32, y0: u32, dst: &mut [u16]) {
         let plane = &self.planes[c_idx as usize];
         for (i, sample) in dst.iter_mut().enumerate() {
             if let Some((cx, cy)) = plane.coords(x, y0 + i as u32) {
@@ -264,7 +263,11 @@ impl OverlayCache for CanvasOverlay {
         }
     }
 
-    fn read_row_merged(&self, c_idx: u8, y: u32, x0: u32, dst: &mut [u16]) -> bool {
+    /// Fast path: read `dst.len()` frame+trials *merged* samples from row `y`
+    /// starting at `x0` in one contiguous copy. Returns `false` when the span
+    /// leaves the canvas (the caller then frame-initializes `dst` and runs
+    /// [`overlay_row_samples`](Self::overlay_row_samples)).
+    pub(super) fn read_row_merged(&self, c_idx: u8, y: u32, x0: u32, dst: &mut [u16]) -> bool {
         let plane = &self.planes[c_idx as usize];
         let Some((cx, cy)) = plane.coords(x0, y) else {
             return false;
@@ -277,7 +280,8 @@ impl OverlayCache for CanvasOverlay {
         true
     }
 
-    fn read_col_merged(&self, c_idx: u8, x: u32, y0: u32, dst: &mut [u16]) -> bool {
+    /// Column variant of [`read_row_merged`](Self::read_row_merged).
+    pub(super) fn read_col_merged(&self, c_idx: u8, x: u32, y0: u32, dst: &mut [u16]) -> bool {
         let plane = &self.planes[c_idx as usize];
         let Some((cx, cy)) = plane.coords(x, y0) else {
             return false;
@@ -291,7 +295,18 @@ impl OverlayCache for CanvasOverlay {
         true
     }
 
-    fn push_block(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32, samples: &[u16]) {
+    /// Record the `width * height` reconstructed `samples` (row-major) as a
+    /// new trial rectangle. Only winner materialization writes recon; cheap
+    /// trials are non-committing scratch evaluations.
+    pub(super) fn push_block(
+        &mut self,
+        c_idx: u8,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        samples: &[u16],
+    ) {
         debug_assert_eq!(samples.len(), (width * height) as usize);
         self.push_rect(c_idx, x, y, width, height);
         let mut data = samples.to_vec();
@@ -306,7 +321,8 @@ impl OverlayCache for CanvasOverlay {
         );
     }
 
-    fn push_block_u8(
+    /// [`push_block`](Self::push_block) from 8-bit samples, widening in place.
+    pub(super) fn push_block_u8(
         &mut self,
         c_idx: u8,
         x: u32,
@@ -330,11 +346,15 @@ impl OverlayCache for CanvasOverlay {
         }
     }
 
-    fn mark(&self) -> usize {
+    /// Journal position token for [`truncate`](Self::truncate) /
+    /// [`detach_from`](Self::detach_from) rollback.
+    pub(super) fn mark(&self) -> usize {
         self.journal.len()
     }
 
-    fn truncate(&mut self, mark: usize) {
+    /// Drop every trial rectangle pushed after `mark` (loser rollback),
+    /// restoring the canvas content beneath them.
+    pub(super) fn truncate(&mut self, mark: usize) {
         while self.journal.len() > mark {
             let mut e = self.journal.pop().unwrap();
             Self::rect_copy(
@@ -349,18 +369,10 @@ impl OverlayCache for CanvasOverlay {
         }
     }
 
-    fn drain_range(&mut self, start: usize, end: usize) {
-        // Unused by the search (dead code on the patch overlays too); the
-        // journal model cannot remove mid-stack writes without replay, so
-        // reject rather than silently diverge.
-        let end = end.min(self.journal.len());
-        assert!(
-            start >= end,
-            "CanvasOverlay does not support drain_range({start}, {end})"
-        );
-    }
-
-    fn detach_from(&mut self, mark: usize) -> Self::Saved {
+    /// Detach every rectangle pushed after `mark` into an owned buffer
+    /// (keep-aside rollback), leaving the canvas at `mark`. The result is
+    /// either dropped or [`reattach`](Self::reattach)ed at the same `mark`.
+    pub(super) fn detach_from(&mut self, mark: usize) -> CanvasSaved {
         let mut redo: Vec<RedoPatch> = Vec::with_capacity(self.journal.len().saturating_sub(mark));
         while self.journal.len() > mark {
             let mut e = self.journal.pop().unwrap();
@@ -384,7 +396,6 @@ impl OverlayCache for CanvasOverlay {
                 true,
             );
             redo.push(RedoPatch {
-                push_id: e.push_id,
                 c_idx: e.c_idx,
                 x: e.x,
                 y: e.y,
@@ -397,7 +408,9 @@ impl OverlayCache for CanvasOverlay {
         redo
     }
 
-    fn reattach(&mut self, saved: Self::Saved) {
+    /// Re-apply rectangles previously [`detach_from`](Self::detach_from)ed,
+    /// journaling fresh undo content.
+    pub(super) fn reattach(&mut self, saved: CanvasSaved) {
         for mut patch in saved {
             let mut old = vec![0u16; (patch.width * patch.height) as usize];
             Self::rect_copy(
@@ -410,7 +423,6 @@ impl OverlayCache for CanvasOverlay {
                 false,
             );
             self.journal.push(JournalEntry {
-                push_id: patch.push_id,
                 c_idx: patch.c_idx,
                 x: patch.x,
                 y: patch.y,
@@ -430,7 +442,9 @@ impl OverlayCache for CanvasOverlay {
         }
     }
 
-    fn commit_to_frame(&self, frame: &mut DecodedFrame) {
+    /// Copy the coded CTU rectangle into the committed frame — the single
+    /// point where trial reconstruction reaches shared state.
+    pub(super) fn commit_to_frame(&self, frame: &mut DecodedFrame) {
         for c_idx in 0..self.n_comp {
             let plane = &self.planes[c_idx];
             let (dst, pstride) = frame.plane_mut(c_idx as u8);
@@ -453,29 +467,5 @@ impl OverlayCache for CanvasOverlay {
                     .copy_from_slice(src);
             }
         }
-    }
-
-    fn drain_epoch(&self) -> u64 {
-        self.drain_epoch
-    }
-
-    fn push_id_at(&self, idx: usize) -> Option<u64> {
-        self.journal.get(idx).map(|e| e.push_id)
-    }
-
-    fn any_border_overlap_since(
-        &self,
-        from: usize,
-        c_idx: u8,
-        x0: u32,
-        y0: u32,
-        size: u32,
-    ) -> bool {
-        self.journal[from.min(self.journal.len())..]
-            .iter()
-            .any(|e| {
-                e.c_idx == c_idx
-                    && patch_overlaps_border((e.x, e.y, e.width, e.height), x0, y0, size)
-            })
     }
 }

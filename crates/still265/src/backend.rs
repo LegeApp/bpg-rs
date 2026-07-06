@@ -250,15 +250,6 @@ impl HevcEncoder for RustStillHevcEncoder {
                 tusplit_at(3),
                 tusplit_at(2),
             );
-            #[cfg(feature = "overlay-probe")]
-            {
-                let (calls, iters, chroma) = crate::encoder::overlay_probe_counts();
-                eprintln!(
-                    "  overlay_probe: sample_calls={calls} patch_iters={iters} avg_patches={:.2} chroma_calls={chroma} ({:.1}%)",
-                    iters as f64 / calls.max(1) as f64,
-                    100.0 * chroma as f64 / calls.max(1) as f64,
-                );
-            }
             let dct_hist = crate::primitives::wide::dct_size_histogram();
             let dct_total: u64 = dct_hist.iter().sum();
             if dct_total > 0 {

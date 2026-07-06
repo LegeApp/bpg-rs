@@ -79,13 +79,6 @@ pub(super) struct CtuWorkspace {
     /// `eval_tt_split` calls. Merged into `EncodeStats` in `build_ctu`.
     pub(super) tu_leaf_by_log2: [u64; 7],
     pub(super) tu_split_by_log2: [u64; 7],
-    /// Small per-component associative cache of built intra reference borders
-    /// (4 ways per component). Validity is checked exactly against the overlay
-    /// patch stack (see `cached_intra_refs_for_block`), so hits are
-    /// byte-identical to rebuilding.
-    pub(super) intra_refs_cache: [[Option<super::depth::IntraRefsCacheEntry>; 4]; 3],
-    /// Round-robin replacement cursors for `intra_refs_cache`.
-    pub(super) intra_refs_cache_rr: [u8; 3],
 }
 
 impl Default for CtuWorkspace {
@@ -108,8 +101,6 @@ impl Default for CtuWorkspace {
             tu_split_bound_aborts: 0,
             tu_leaf_by_log2: [0; 7],
             tu_split_by_log2: [0; 7],
-            intra_refs_cache: [[None; 4]; 3],
-            intra_refs_cache_rr: [0; 3],
         }
     }
 }
@@ -125,8 +116,6 @@ impl CtuWorkspace {
         self.tu_split_bound_aborts = 0;
         self.tu_leaf_by_log2 = [0; 7];
         self.tu_split_by_log2 = [0; 7];
-        self.intra_refs_cache = [[None; 4]; 3];
-        self.intra_refs_cache_rr = [0; 3];
     }
 
     /// Seed the trial-pricing entry context with the live CTU-entry context.

@@ -7,7 +7,6 @@ use crate::encoder::syntax::CuNode;
 use super::canvas::CanvasOverlay;
 use super::emit;
 use super::ledger::{StillSearchLedger, WorkBucket};
-use super::overlay::{OverlayCache, ReconOverlay8, ReconOverlay16};
 use super::source::{CtuSource8, CtuSource16, CtuSourceCache};
 use super::workspace::CtuWorkspace;
 
@@ -16,26 +15,22 @@ pub(in crate::encoder) struct StillSearch {
 }
 
 enum StillSearchImpl {
-    EightBit(StillSearchDepth<CtuSource8, ReconOverlay8>),
-    HighBit(StillSearchDepth<CtuSource16, ReconOverlay16>),
-    EightBitCanvas(StillSearchDepth<CtuSource8, CanvasOverlay>),
-    HighBitCanvas(StillSearchDepth<CtuSource16, CanvasOverlay>),
+    EightBit(StillSearchDepth<CtuSource8>),
+    HighBit(StillSearchDepth<CtuSource16>),
 }
 
-pub(super) struct StillSearchDepth<S, O> {
+pub(super) struct StillSearchDepth<S> {
     pub(super) workspace: CtuWorkspace,
     pub(super) source: S,
-    pub(super) overlay: O,
+    pub(super) overlay: CanvasOverlay,
 }
 
 impl StillSearch {
     pub(in crate::encoder) fn new(bit_depth: u8) -> Self {
-        let canvas = super::env::canvas_overlay_enabled();
-        let imp = match (bit_depth == 8, canvas) {
-            (true, false) => StillSearchImpl::EightBit(StillSearchDepth::default()),
-            (false, false) => StillSearchImpl::HighBit(StillSearchDepth::default()),
-            (true, true) => StillSearchImpl::EightBitCanvas(StillSearchDepth::default()),
-            (false, true) => StillSearchImpl::HighBitCanvas(StillSearchDepth::default()),
+        let imp = if bit_depth == 8 {
+            StillSearchImpl::EightBit(StillSearchDepth::default())
+        } else {
+            StillSearchImpl::HighBit(StillSearchDepth::default())
         };
         Self { imp }
     }
@@ -56,34 +51,26 @@ impl StillSearch {
             StillSearchImpl::HighBit(search) => {
                 search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth)
             }
-            StillSearchImpl::EightBitCanvas(search) => {
-                search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth)
-            }
-            StillSearchImpl::HighBitCanvas(search) => {
-                search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth)
-            }
         }
     }
 }
 
-impl<S, O> Default for StillSearchDepth<S, O>
+impl<S> Default for StillSearchDepth<S>
 where
     S: Default,
-    O: Default,
 {
     fn default() -> Self {
         Self {
             workspace: CtuWorkspace::default(),
             source: S::default(),
-            overlay: O::default(),
+            overlay: CanvasOverlay::default(),
         }
     }
 }
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     pub(super) fn build_ctu(
         &mut self,
@@ -175,10 +162,9 @@ where
     }
 }
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     /// Predict a block into caller-owned `dst` (`size*size`, stride `size`),
     /// reading the committed frame immutably with overlay-first reference
@@ -218,10 +204,9 @@ where
     }
 }
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     /// 8-bit prediction wrapper. The decoder primitive is still u16-oriented;
     /// this narrows immediately into caller-owned u8 storage so the rest of the
@@ -318,67 +303,6 @@ where
                 refs.bit_depth,
             ),
         }
-    }
-
-    /// [`build_intra_refs_for_block`] through the per-component workspace cache.
-    ///
-    /// A cached entry is reused only when it provably reads the same samples a
-    /// fresh build would: the overlay patch stack still contains the exact
-    /// prefix present at build time (same length-`build_len` prefix, verified
-    /// by the top element's push id and the drain epoch), and no patch pushed
-    /// since intersects this block's border read region. Both checks are exact,
-    /// so a hit is byte-identical to rebuilding.
-    pub(super) fn cached_intra_refs_for_block(
-        &mut self,
-        state: &Encoder<'_>,
-        x0: u32,
-        y0: u32,
-        log2_size: u8,
-        c_idx: u8,
-    ) -> IntraRefs {
-        let len = self.overlay.mark();
-        let epoch = self.overlay.drain_epoch();
-        let slot = (c_idx as usize).min(2);
-        for way in self.workspace.intra_refs_cache[slot].iter().flatten() {
-            if way.x0 == x0
-                && way.y0 == y0
-                && way.log2_size == log2_size
-                && way.drain_epoch == epoch
-                && len >= way.build_len
-                && len - way.build_len <= 64
-                && (way.build_len == 0
-                    || self.overlay.push_id_at(way.build_len - 1) == Some(way.build_top_id))
-                && !self.overlay.any_border_overlap_since(
-                    way.build_len,
-                    c_idx,
-                    x0,
-                    y0,
-                    1u32 << log2_size,
-                )
-            {
-                return way.refs;
-            }
-        }
-        let refs = self.build_intra_refs_for_block(state, x0, y0, log2_size, c_idx);
-        let build_top_id = if len == 0 {
-            0
-        } else {
-            self.overlay.push_id_at(len - 1).unwrap_or(0)
-        };
-        let ways = &mut self.workspace.intra_refs_cache[slot];
-        let victim = self.workspace.intra_refs_cache_rr[slot] as usize % ways.len();
-        self.workspace.intra_refs_cache_rr[slot] =
-            self.workspace.intra_refs_cache_rr[slot].wrapping_add(1);
-        ways[victim] = Some(IntraRefsCacheEntry {
-            x0,
-            y0,
-            log2_size,
-            build_len: len,
-            build_top_id,
-            drain_epoch: epoch,
-            refs,
-        });
-        refs
     }
 
     #[allow(clippy::type_complexity)]
@@ -631,21 +555,6 @@ fn substitute_unavailable_refs(
             border[idx] = current;
         }
     }
-}
-
-/// One way of the per-component intra reference-border cache (see
-/// [`cached_intra_refs_for_block`](StillSearchDepth::cached_intra_refs_for_block)).
-#[derive(Clone, Copy)]
-pub(super) struct IntraRefsCacheEntry {
-    pub(super) x0: u32,
-    pub(super) y0: u32,
-    pub(super) log2_size: u8,
-    /// Overlay patch-stack length when the borders were built.
-    pub(super) build_len: usize,
-    /// Push id of the top stack element at build time (0 when empty).
-    pub(super) build_top_id: u64,
-    pub(super) drain_epoch: u64,
-    pub(super) refs: IntraRefs,
 }
 
 /// Prebuilt intra reference borders for one block, reusable across all candidate

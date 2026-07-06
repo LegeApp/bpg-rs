@@ -7,11 +7,11 @@ use crate::encoder::Encoder;
 use crate::primitives::intra_angs;
 use crate::primitives::{satd_u8, satd_u16};
 
+use super::canvas::CanvasSaved;
 use super::depth::StillSearchDepth;
 use super::emit;
 use super::eval::{BlockTrial, ResidualPricingMode};
 use super::ledger::{StillSearchLedger, WorkBucket};
-use super::overlay::OverlayCache;
 use super::plan::{CuPlan, NxnInfoPlan, ParentChromaPlan, TtPlan};
 use super::price::luma_mode_bits;
 use super::rough::build_luma_shortlist;
@@ -46,10 +46,9 @@ impl NxnRoughSet {
     }
 }
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     /// Build and price an 8x8 `PartNxN` candidate. Luma is coded as four 4x4
     /// PUs/TUs in decoder z-order; each PU's selected recon is pushed before the
@@ -466,10 +465,10 @@ where
         mpm: [IntraPredMode; 3],
         lambda: f64,
         rough_set: &NxnRoughSet,
-    ) -> (u8, BlockTrial, O::Saved, f64) {
+    ) -> (u8, BlockTrial, CanvasSaved, f64) {
         let mpm_u8 = [mpm[0].as_u8(), mpm[1].as_u8(), mpm[2].as_u8()];
         let scale = CabacEstimator::SCALE as f64;
-        let mut best: Option<(u8, BlockTrial, O::Saved, f64)> = None;
+        let mut best: Option<(u8, BlockTrial, CanvasSaved, f64)> = None;
         for &mode in rough_set.modes(pu) {
             let timer = StillSearchLedger::start_timer();
             let mark = self.overlay.mark();

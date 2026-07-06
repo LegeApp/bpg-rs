@@ -28,15 +28,13 @@ use crate::residual::get_scan_order;
 use super::depth::StillSearchDepth;
 use super::eval::ResidualPricingMode;
 use super::ledger::{StillSearchLedger, WorkBucket};
-use super::overlay::OverlayCache;
 use super::plan::{CuLeafPlan, PlanBlock, TtPlan};
 use super::price::entropy_bits;
 use super::source::CtuSourceCache;
 
-impl<S, O> StillSearchDepth<S, O>
+impl<S> StillSearchDepth<S>
 where
     S: CtuSourceCache,
-    O: OverlayCache,
 {
     /// Re-decide this 2Nx2N CU leaf's chroma intra mode across the five
     /// allowed modes. Returns the RD-cost delta relative to the incoming DM
