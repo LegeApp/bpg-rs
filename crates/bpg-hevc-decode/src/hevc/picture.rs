@@ -98,6 +98,24 @@ impl DecodedFrame {
     /// # Panics
     /// Panics if width * height overflows u32.
     pub fn with_params(width: u32, height: u32, bit_depth: u8, chroma_format: u8) -> Self {
+        Self::with_params_filled(width, height, bit_depth, chroma_format, UNINIT_SAMPLE)
+    }
+
+    /// Like [`Self::with_params`], but reconstruction samples start at
+    /// `fill`. Passing `0` yields lazily-zeroed allocations, so untouched
+    /// regions cost neither fill time nor physical pages — useful for
+    /// buffers whose every read position is written first (e.g. encoder WPP
+    /// worker frames).
+    ///
+    /// # Panics
+    /// Panics if width * height overflows u32.
+    pub fn with_params_filled(
+        width: u32,
+        height: u32,
+        bit_depth: u8,
+        chroma_format: u8,
+        fill: u16,
+    ) -> Self {
         let luma_size = width
             .checked_mul(height)
             .expect("frame dimensions overflow") as usize;
@@ -119,9 +137,9 @@ impl DecodedFrame {
         Self {
             width,
             height,
-            y_plane: vec![UNINIT_SAMPLE; luma_size],
-            cb_plane: vec![UNINIT_SAMPLE; chroma_size],
-            cr_plane: vec![UNINIT_SAMPLE; chroma_size],
+            y_plane: vec![fill; luma_size],
+            cb_plane: vec![fill; chroma_size],
+            cr_plane: vec![fill; chroma_size],
             bit_depth,
             chroma_format,
             crop_left: 0,

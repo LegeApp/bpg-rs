@@ -617,35 +617,50 @@ pub(super) fn build_slice_trees_parallel(
                 v
             },
             next_row: 0,
-            snapshots: (0..total).map(|_| None).collect(),
             trees: (0..total).map(|_| None).collect(),
             stats: Default::default(),
         }),
         Condvar::new(),
     ));
 
-    // Keep at most `worker_limit` live row states. The first WPP prototype
-    // spawned one thread (and cloned one full `Encoder`/reconstruction frame)
-    // per CTB row, then limited only the number of CTUs actively running. That
-    // is fine for 12MP smoke tests but scales badly on tall/50MP stills: dozens
-    // of parked row threads each held a full-frame clone. A fixed worker pool
-    // claims rows in wavefront order as soon as their row-start context is
-    // available, preserving the same CTU dependency graph while bounding peak
-    // memory to O(threads), not O(rows).
-    let master_state: &Encoder<'_> = &*state;
+    // Shared-frame WPP, x265-style. A fixed pool of `worker_limit` workers
+    // claims rows in wavefront order. Each worker builds CTUs in a private
+    // frame (constructed fresh from `seed`, never cloned from the master),
+    // publishes every finished CTU rectangle directly into the master
+    // planes/maps through the raw-pointer `sink`, and imports the row-above
+    // rectangles it depends on the same way. Every CTU rectangle is written
+    // exactly once (by the worker that built it) and read only after that
+    // write is observable through the row-progress mutex, so the disjoint
+    // rectangle accesses are race-free. This replaces the earlier snapshot
+    // machinery: per-worker full-frame clones, per-CTU snapshot buffers, and
+    // the master's serial end-of-build replay are all gone.
+    let seed = WppWorkerSeed::capture(state);
+    let sink = MasterFrameSink::new(state);
     std::thread::scope(|scope| {
         for _ in 0..worker_limit {
             let shared = Arc::clone(&shared);
+            let seed = &seed;
+            let sink = &sink;
             scope.spawn(move || {
+                let setup_start = std::time::Instant::now();
+                let mut worker_state = seed.make_encoder();
+                {
+                    let (lock, _) = &*shared;
+                    let mut guard = lock.lock().expect("WPP build mutex poisoned");
+                    guard.stats.phase_parallel_restore_us = guard
+                        .stats
+                        .phase_parallel_restore_us
+                        .saturating_add(setup_start.elapsed().as_micros() as u64);
+                }
                 loop {
                     let cy = claim_wpp_row(&shared, ctbs_y);
                     let Some(cy) = cy else {
                         break;
                     };
-                    let mut worker_state = clone_worker_encoder(master_state);
                     build_wpp_row(
                         &mut worker_state,
                         shared.clone(),
+                        sink,
                         slice_qp_y,
                         cy,
                         ctbs_x,
@@ -661,10 +676,6 @@ pub(super) fn build_slice_trees_parallel(
     let mut guard = lock.lock().expect("WPP build mutex poisoned");
     let mut trees: Vec<Option<CuNode>> = (0..total).map(|_| None).collect();
     std::mem::swap(&mut trees, &mut guard.trees);
-
-    for snapshot in guard.snapshots.iter().filter_map(|s| s.as_ref()) {
-        apply_ctu_snapshot(state, snapshot);
-    }
     state.stats.merge(&guard.stats);
     trees
 }
@@ -673,46 +684,365 @@ struct WppBuildShared {
     row_progress: Vec<u32>,
     row_start_ctx: Vec<Option<Contexts>>,
     next_row: u32,
-    snapshots: Vec<Option<CtuSnapshot>>,
     trees: Vec<Option<CuNode>>,
     stats: super::types::EncodeStats,
 }
 
-#[derive(Clone)]
-struct CtuSnapshot {
-    planes: Vec<PlanePatch>,
-    mode: U8MapPatch,
-    ct_depth: U8MapPatch,
-    deblock: U8MapPatch,
-    qp: I8MapPatch,
+/// Immutable worker template captured from the master encoder before the WPP
+/// scope spawns. Workers construct their private encoder state from this seed
+/// instead of cloning the master: once publishing starts, the master frame and
+/// maps are written through [`MasterFrameSink`], so they must not be read for
+/// worker setup. The seed's map templates hold the pristine slice-start
+/// contents; worker reconstruction planes start UNINIT, exactly as the
+/// master's did when the seed was captured.
+struct WppWorkerSeed<'a> {
+    display_width: u32,
+    display_height: u32,
+    cat: u8,
+    bit_depth: u8,
+    tile_grid: bpg_hevc_decode::hevc::tile::TileGrid,
+    src: super::types::Source<'a>,
+    frame_width: u32,
+    frame_height: u32,
+    frame_full_range: bool,
+    frame_matrix_coeffs: u8,
+    deblock_flags: Vec<u8>,
+    qp_map: Vec<i8>,
+    mode_map: Vec<u8>,
+    mode_stride: usize,
+    ct_depth_map: Vec<u8>,
+    ct_depth_stride: usize,
+    deblock: bool,
+    sign_data_hiding: bool,
+    aq: super::aq::AqState,
+    cur_qp_y: i32,
+    cur_qp_c: i32,
+    aq_mode: crate::AqMode,
+    aq_strength: f32,
+    aq_clamp: f32,
+    aq_offset_map: Option<Arc<crate::preanalysis::AqOffsetMap>>,
+    part_nxn_enabled: bool,
+    analysis: Arc<crate::preanalysis::AnalysisMaps>,
+    effort_template: crate::effort::EffortTemplate,
 }
 
-#[derive(Clone)]
-struct PlanePatch {
-    c_idx: u8,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    data: Vec<u16>,
+impl<'a> WppWorkerSeed<'a> {
+    fn capture(state: &Encoder<'a>) -> Self {
+        Self {
+            display_width: state.display_width,
+            display_height: state.display_height,
+            cat: state.cat,
+            bit_depth: state.bit_depth,
+            tile_grid: state.tile_grid.clone(),
+            src: state.src,
+            frame_width: state.frame.width,
+            frame_height: state.frame.height,
+            frame_full_range: state.frame.full_range,
+            frame_matrix_coeffs: state.frame.matrix_coeffs,
+            deblock_flags: state.frame.deblock_flags.clone(),
+            qp_map: state.frame.qp_map.clone(),
+            mode_map: state.mode_map.clone(),
+            mode_stride: state.mode_stride,
+            ct_depth_map: state.ct_depth_map.clone(),
+            ct_depth_stride: state.ct_depth_stride,
+            deblock: state.deblock,
+            sign_data_hiding: state.sign_data_hiding,
+            aq: state.aq.clone(),
+            cur_qp_y: state.cur_qp_y,
+            cur_qp_c: state.cur_qp_c,
+            aq_mode: state.aq_mode,
+            aq_strength: state.aq_strength,
+            aq_clamp: state.aq_clamp,
+            aq_offset_map: state.aq_offset_map.as_ref().map(Arc::clone),
+            part_nxn_enabled: state.part_nxn_enabled,
+            analysis: Arc::clone(&state.analysis),
+            effort_template: state.effort_template,
+        }
+    }
+
+    fn make_encoder(&self) -> Encoder<'a> {
+        // Same geometry as the master frame's construction in `encode_inner`;
+        // the seed's map templates restore the slice-start fills, and the
+        // alpha_plane stays `None` (the tree build never reads it). Worker
+        // reconstruction samples MUST start at UNINIT_SAMPLE: the border
+        // builder (`depth.rs::maybe_set`) uses the sample value itself as the
+        // reference-availability sentinel, so any other fill would make
+        // unwritten neighbours look like available samples.
+        let mut frame = DecodedFrame::with_params(
+            self.frame_width,
+            self.frame_height,
+            self.bit_depth,
+            self.cat,
+        );
+        frame.full_range = self.frame_full_range;
+        frame.matrix_coeffs = self.frame_matrix_coeffs;
+        frame.deblock_flags.copy_from_slice(&self.deblock_flags);
+        frame.qp_map.copy_from_slice(&self.qp_map);
+        Encoder {
+            display_width: self.display_width,
+            display_height: self.display_height,
+            cat: self.cat,
+            bit_depth: self.bit_depth,
+            tile_grid: self.tile_grid.clone(),
+            src: self.src,
+            frame,
+            mode_map: self.mode_map.clone(),
+            mode_stride: self.mode_stride,
+            ct_depth_map: self.ct_depth_map.clone(),
+            ct_depth_stride: self.ct_depth_stride,
+            deblock: self.deblock,
+            sign_data_hiding: self.sign_data_hiding,
+            aq: self.aq.clone(),
+            cur_qp_y: self.cur_qp_y,
+            cur_qp_c: self.cur_qp_c,
+            aq_mode: self.aq_mode,
+            aq_strength: self.aq_strength,
+            aq_clamp: self.aq_clamp,
+            aq_offset_map: self.aq_offset_map.as_ref().map(Arc::clone),
+            part_nxn_enabled: self.part_nxn_enabled,
+            analysis: Arc::clone(&self.analysis),
+            stats: Default::default(),
+            effort_template: self.effort_template,
+        }
+    }
 }
 
-#[derive(Clone)]
-struct U8MapPatch {
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    data: Vec<u8>,
+/// One buffer of the master frame viewed through a raw pointer, with the
+/// geometry needed for rectangle copies. Worker and master buffers share
+/// identical geometry, so a rectangle uses the same `y * stride + x` offsets
+/// on both sides.
+#[derive(Clone, Copy)]
+struct RawPlane<T> {
+    ptr: *mut T,
+    len: usize,
+    stride: usize,
 }
 
-#[derive(Clone)]
-struct I8MapPatch {
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    data: Vec<i8>,
+impl<T: Copy> RawPlane<T> {
+    fn from_slice(buf: &mut [T], stride: usize) -> Self {
+        Self {
+            ptr: buf.as_mut_ptr(),
+            len: buf.len(),
+            stride,
+        }
+    }
+
+    fn rows(&self) -> usize {
+        if self.stride == 0 {
+            0
+        } else {
+            self.len / self.stride
+        }
+    }
+
+    /// Copy `src`'s rectangle into this buffer. Returns bytes copied.
+    ///
+    /// # Safety
+    /// The rectangle must satisfy [`MasterFrameSink`]'s disjoint-write /
+    /// happens-before invariants.
+    unsafe fn publish_rect(&self, src: &[T], x0: usize, y0: usize, x1: usize, y1: usize) -> u64 {
+        debug_assert_eq!(src.len(), self.len);
+        let w = x1.saturating_sub(x0);
+        for y in y0..y1 {
+            let off = y * self.stride + x0;
+            debug_assert!(off + w <= self.len);
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr().add(off), self.ptr.add(off), w);
+            }
+        }
+        (w * y1.saturating_sub(y0) * std::mem::size_of::<T>()) as u64
+    }
+
+    /// Copy this buffer's rectangle into `dst`. Returns bytes copied.
+    ///
+    /// # Safety
+    /// The rectangle must already have been published (see
+    /// [`MasterFrameSink`]'s invariants).
+    unsafe fn import_rect(&self, dst: &mut [T], x0: usize, y0: usize, x1: usize, y1: usize) -> u64 {
+        debug_assert_eq!(dst.len(), self.len);
+        let w = x1.saturating_sub(x0);
+        for y in y0..y1 {
+            let off = y * self.stride + x0;
+            debug_assert!(off + w <= self.len);
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.ptr.add(off), dst.as_mut_ptr().add(off), w);
+            }
+        }
+        (w * y1.saturating_sub(y0) * std::mem::size_of::<T>()) as u64
+    }
+}
+
+/// Raw-pointer view of the master reconstruction frame and per-block maps,
+/// letting WPP row workers publish finished CTU rectangles and import
+/// dependency rectangles directly, with no intermediate snapshot buffers.
+///
+/// Safety invariants (upheld by the WPP row protocol):
+/// - each CTU rectangle is written exactly once, by the worker that built it;
+/// - a rectangle is only read (imported by the row below, or used by the
+///   master after the worker scope joins) after the writing worker published
+///   it and advanced `row_progress` under the shared mutex, which establishes
+///   happens-before;
+/// - rectangles of distinct CTUs are disjoint in every buffer;
+/// - the master does not touch the frame or maps while the scope runs.
+struct MasterFrameSink {
+    planes: [RawPlane<u16>; 3],
+    mode: RawPlane<u8>,
+    ct_depth: RawPlane<u8>,
+    deblock: RawPlane<u8>,
+    qp: RawPlane<i8>,
+}
+
+unsafe impl Send for MasterFrameSink {}
+unsafe impl Sync for MasterFrameSink {}
+
+impl MasterFrameSink {
+    fn new(state: &mut Encoder<'_>) -> Self {
+        let mode_stride = state.mode_stride;
+        let ct_stride = state.ct_depth_stride;
+        let deblock_stride = state.frame.deblock_stride as usize;
+        let mode = RawPlane::from_slice(&mut state.mode_map, mode_stride);
+        let ct_depth = RawPlane::from_slice(&mut state.ct_depth_map, ct_stride);
+        let deblock = RawPlane::from_slice(&mut state.frame.deblock_flags, deblock_stride);
+        let qp = RawPlane::from_slice(&mut state.frame.qp_map, deblock_stride);
+        let planes = std::array::from_fn(|c_idx| {
+            let (plane, stride) = state.frame.plane_mut(c_idx as u8);
+            RawPlane::from_slice(plane, stride)
+        });
+        Self {
+            planes,
+            mode,
+            ct_depth,
+            deblock,
+            qp,
+        }
+    }
+
+    /// Copy one finished CTU's reconstruction + map rectangles from the
+    /// worker's private state into the master buffers. Returns bytes copied.
+    ///
+    /// # Safety
+    /// Must be called exactly once per CTU, by the worker that built it,
+    /// before that CTU's `row_progress` advance.
+    unsafe fn publish_ctu(&self, state: &Encoder<'_>, cx: u32, cy: u32, ctb: u32) -> u64 {
+        let mut bytes = 0u64;
+        let plane_count = if state.cat == 0 { 1 } else { 3 };
+        for c_idx in 0..plane_count {
+            let (sx, sy) = state.plane_shifts(c_idx);
+            let (plane, _) = state.frame.plane(c_idx);
+            let sink = &self.planes[c_idx as usize];
+            let (x0, y0, x1, y1) = plane_rect(sink, sx, sy, cx, cy, ctb);
+            bytes += unsafe { sink.publish_rect(plane, x0, y0, x1, y1) };
+        }
+        let (x0, y0, x1, y1) = map_rect(&self.mode, cx, cy, 16);
+        bytes += unsafe { self.mode.publish_rect(&state.mode_map, x0, y0, x1, y1) };
+        let (x0, y0, x1, y1) = map_rect(&self.ct_depth, cx, cy, 8);
+        bytes += unsafe {
+            self.ct_depth
+                .publish_rect(&state.ct_depth_map, x0, y0, x1, y1)
+        };
+        let (x0, y0, x1, y1) = map_rect(&self.deblock, cx, cy, 16);
+        bytes += unsafe {
+            self.deblock
+                .publish_rect(&state.frame.deblock_flags, x0, y0, x1, y1)
+        };
+        let (x0, y0, x1, y1) = map_rect(&self.qp, cx, cy, 16);
+        bytes += unsafe { self.qp.publish_rect(&state.frame.qp_map, x0, y0, x1, y1) };
+        bytes
+    }
+
+    /// Copy the bottom border strips of one already-published CTU from the
+    /// master buffers into the worker's private state: the last
+    /// reconstruction pixel row of each plane rectangle plus the last
+    /// ct-depth map row. These are the only row-above positions the tree
+    /// build reads — intra reference samples come from pixel row `y0 - 1`
+    /// only, `split_ctx_inc` probes the above CU depth at `y0 - 1`, above
+    /// intra modes are DC-substituted across CTB rows
+    /// (`neighbor_above_mode`), and `deblock_flags`/`qp_map` are only read
+    /// by the master-side deblock pass after every rectangle is published.
+    ///
+    /// # Safety
+    /// The CTU must have been published (observed via `row_progress` under
+    /// the shared mutex).
+    unsafe fn import_ctu_border(&self, state: &mut Encoder<'_>, cx: u32, cy: u32, ctb: u32) -> u64 {
+        let strip_rows = wpp_import_strip_rows();
+        let mut bytes = 0u64;
+        let plane_count = if state.cat == 0 { 1 } else { 3 };
+        for c_idx in 0..plane_count {
+            let (sx, sy) = state.plane_shifts(c_idx);
+            let (plane, _) = state.frame.plane_mut(c_idx);
+            let sink = &self.planes[c_idx as usize];
+            let (x0, y0, x1, y1) = plane_rect(sink, sx, sy, cx, cy, ctb);
+            let ys = match strip_rows {
+                Some(n) => y0.max(y1.saturating_sub(n)),
+                None => y0,
+            };
+            bytes += unsafe { sink.import_rect(plane, x0, ys, x1, y1) };
+        }
+        let (x0, y0, x1, y1) = map_rect(&self.ct_depth, cx, cy, 8);
+        let ys = match strip_rows {
+            Some(_) => y0.max(y1.saturating_sub(1)),
+            None => y0,
+        };
+        bytes += unsafe {
+            self.ct_depth
+                .import_rect(&mut state.ct_depth_map, x0, ys, x1, y1)
+        };
+        if strip_rows.is_none() {
+            let (x0, y0, x1, y1) = map_rect(&self.mode, cx, cy, 16);
+            bytes += unsafe { self.mode.import_rect(&mut state.mode_map, x0, y0, x1, y1) };
+            let (x0, y0, x1, y1) = map_rect(&self.deblock, cx, cy, 16);
+            bytes += unsafe {
+                self.deblock
+                    .import_rect(&mut state.frame.deblock_flags, x0, y0, x1, y1)
+            };
+            let (x0, y0, x1, y1) = map_rect(&self.qp, cx, cy, 16);
+            bytes += unsafe { self.qp.import_rect(&mut state.frame.qp_map, x0, y0, x1, y1) };
+        }
+        bytes
+    }
+}
+
+/// Bisect helper for the WPP import width: `BPG_WPP_IMPORT_ROWS` unset uses
+/// the border-strip default; `full` imports the whole row-above rectangles;
+/// an integer imports that many bottom pixel rows per plane rectangle.
+fn wpp_import_strip_rows() -> Option<usize> {
+    static VALUE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        match std::env::var("BPG_WPP_IMPORT_ROWS") {
+            Ok(v) if v.trim() == "full" => None,
+            Ok(v) => v.trim().parse::<usize>().ok().filter(|&n| n > 0),
+            Err(_) => Some(1),
+        }
+    })
+}
+
+/// CTU rectangle in a subsampled pixel plane (clamped to the plane bounds),
+/// mirroring the old snapshot rectangle math.
+fn plane_rect<T: Copy>(
+    plane: &RawPlane<T>,
+    sx: u8,
+    sy: u8,
+    cx: u32,
+    cy: u32,
+    ctb: u32,
+) -> (usize, usize, usize, usize) {
+    let stride = plane.stride as u32;
+    let rows = plane.rows() as u32;
+    let x0 = ((cx * ctb) >> sx).min(stride) as usize;
+    let y0 = ((cy * ctb) >> sy).min(rows) as usize;
+    let x1 = ((cx + 1) * ctb).div_ceil(1u32 << sx).min(stride) as usize;
+    let y1 = ((cy + 1) * ctb).div_ceil(1u32 << sy).min(rows) as usize;
+    (x0, y0, x1, y1)
+}
+
+/// CTU rectangle in a per-block map with `unit` cells per CTU side (clamped),
+/// mirroring the old snapshot rectangle math.
+fn map_rect<T: Copy>(map: &RawPlane<T>, cx: u32, cy: u32, unit: usize) -> (usize, usize, usize, usize) {
+    let x0 = (cx as usize * unit).min(map.stride);
+    let x1 = ((cx as usize + 1) * unit).min(map.stride);
+    let y0 = (cy as usize * unit).min(map.rows());
+    let y1 = ((cy as usize + 1) * unit).min(map.rows());
+    (x0, y0, x1, y1)
 }
 
 fn claim_wpp_row(shared: &Arc<(Mutex<WppBuildShared>, Condvar)>, ctbs_y: u32) -> Option<u32> {
@@ -731,38 +1061,11 @@ fn claim_wpp_row(shared: &Arc<(Mutex<WppBuildShared>, Condvar)>, ctbs_y: u32) ->
     }
 }
 
-fn clone_worker_encoder<'a>(state: &Encoder<'a>) -> Encoder<'a> {
-    Encoder {
-        display_width: state.display_width,
-        display_height: state.display_height,
-        cat: state.cat,
-        bit_depth: state.bit_depth,
-        tile_grid: state.tile_grid.clone(),
-        src: state.src,
-        frame: state.frame.clone(),
-        mode_map: state.mode_map.clone(),
-        mode_stride: state.mode_stride,
-        ct_depth_map: state.ct_depth_map.clone(),
-        ct_depth_stride: state.ct_depth_stride,
-        deblock: state.deblock,
-        sign_data_hiding: state.sign_data_hiding,
-        aq: state.aq.clone(),
-        cur_qp_y: state.cur_qp_y,
-        cur_qp_c: state.cur_qp_c,
-        aq_mode: state.aq_mode,
-        aq_strength: state.aq_strength,
-        aq_clamp: state.aq_clamp,
-        aq_offset_map: state.aq_offset_map.as_ref().map(Arc::clone),
-        part_nxn_enabled: state.part_nxn_enabled,
-        analysis: Arc::clone(&state.analysis),
-        stats: Default::default(),
-        effort_template: state.effort_template,
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 fn build_wpp_row(
     state: &mut Encoder<'_>,
     shared: Arc<(Mutex<WppBuildShared>, Condvar)>,
+    sink: &MasterFrameSink,
     _slice_qp_y: i32,
     cy: u32,
     ctbs_x: u32,
@@ -788,33 +1091,41 @@ fn build_wpp_row(
 
     for cx in 0..ctbs_x {
         let need_prev = if cy == 0 { 0 } else { (cx + 2).min(ctbs_x) };
-        let dependency_snapshots = {
+        let import_from = {
             let mut guard = lock.lock().expect("WPP build mutex poisoned");
             loop {
                 let prev_ready = cy == 0 || guard.row_progress[cy as usize - 1] >= need_prev;
                 let left_ready = cx == 0 || guard.row_progress[cy as usize] >= cx;
                 if prev_ready && left_ready {
-                    let mut snapshots = Vec::new();
-                    if cy > 0 {
-                        for px in prev_applied..need_prev {
-                            let idx = (cy - 1) as usize * ctbs_x as usize + px as usize;
-                            snapshots.push(
-                                guard.snapshots[idx]
-                                    .as_ref()
-                                    .expect("previous-row CTU snapshot missing")
-                                    .clone(),
-                            );
-                        }
-                    }
+                    let from = prev_applied;
                     prev_applied = need_prev;
-                    break snapshots;
+                    break from;
                 }
                 guard = cvar.wait(guard).expect("WPP build mutex poisoned");
             }
         };
 
-        for snapshot in &dependency_snapshots {
-            apply_ctu_snapshot(state, snapshot);
+        if cy > 0 && import_from < need_prev {
+            let import_start = std::time::Instant::now();
+            let mut bytes = 0u64;
+            for px in import_from..need_prev {
+                // Safety: `row_progress[cy - 1] >= need_prev` was observed
+                // under the mutex, so these rectangles are published and
+                // final.
+                bytes += unsafe { sink.import_ctu_border(state, px, cy - 1, ctb) };
+            }
+            let imported = (need_prev - import_from) as u64;
+            let plane_count = if state.cat == 0 { 1u64 } else { 3 };
+            state.stats.frame_restores = state
+                .stats
+                .frame_restores
+                .saturating_add(imported * plane_count);
+            state.stats.map_restores = state.stats.map_restores.saturating_add(imported);
+            state.stats.bytes_restored = state.stats.bytes_restored.saturating_add(bytes);
+            state.stats.phase_parallel_restore_us = state
+                .stats
+                .phase_parallel_restore_us
+                .saturating_add(import_start.elapsed().as_micros() as u64);
         }
 
         let x0 = cx * ctb;
@@ -838,7 +1149,18 @@ fn build_wpp_row(
         let done = cy * ctbs_x + cx + 1;
         enc.encode_bin_trm(&mut w, (done == total) as u8);
 
-        let snapshot = snapshot_ctu(state, cx, cy, ctb);
+        let publish_start = std::time::Instant::now();
+        // Safety: this worker built the CTU and its `row_progress` advance
+        // has not happened yet, so no other thread can touch the rectangles.
+        let bytes = unsafe { sink.publish_ctu(state, cx, cy, ctb) };
+        let plane_count = if state.cat == 0 { 1u64 } else { 3 };
+        state.stats.frame_snapshots = state.stats.frame_snapshots.saturating_add(plane_count);
+        state.stats.map_snapshots = state.stats.map_snapshots.saturating_add(4);
+        state.stats.bytes_snapshotted = state.stats.bytes_snapshotted.saturating_add(bytes);
+        state.stats.phase_parallel_restore_us = state
+            .stats
+            .phase_parallel_restore_us
+            .saturating_add(publish_start.elapsed().as_micros() as u64);
         let stats = std::mem::take(&mut state.stats);
         let row_start_for_next = if cx == 1 && cy + 1 < ctbs_y {
             Some(ctxs.clone())
@@ -848,7 +1170,6 @@ fn build_wpp_row(
 
         let mut guard = lock.lock().expect("WPP build mutex poisoned");
         let idx = cy as usize * ctbs_x as usize + cx as usize;
-        guard.snapshots[idx] = Some(snapshot);
         guard.trees[idx] = Some(cu);
         guard.row_progress[cy as usize] = cx + 1;
         if let Some(ctx) = row_start_for_next {
@@ -856,206 +1177,6 @@ fn build_wpp_row(
         }
         guard.stats.merge(&stats);
         cvar.notify_all();
-    }
-}
-
-fn snapshot_ctu(state: &Encoder<'_>, cx: u32, cy: u32, ctb: u32) -> CtuSnapshot {
-    let mut planes = Vec::new();
-    let plane_count = if state.cat == 0 { 1 } else { 3 };
-    for c_idx in 0..plane_count {
-        let (plane, stride) = state.frame.plane(c_idx);
-        let plane_h = if stride == 0 { 0 } else { plane.len() / stride };
-        let (sx, sy) = state.plane_shifts(c_idx);
-        let x0 = ((cx * ctb) >> sx).min(stride as u32) as usize;
-        let y0 = ((cy * ctb) >> sy).min(plane_h as u32) as usize;
-        let x1 = ((cx + 1) * ctb).div_ceil(1u32 << sx).min(stride as u32) as usize;
-        let y1 = ((cy + 1) * ctb).div_ceil(1u32 << sy).min(plane_h as u32) as usize;
-        planes.push(snapshot_plane(c_idx, plane, stride, x0, y0, x1, y1));
-    }
-
-    let mode = snapshot_u8_map(
-        &state.mode_map,
-        state.mode_stride,
-        cx as usize * 16,
-        cy as usize * 16,
-        (cx as usize + 1) * 16,
-        (cy as usize + 1) * 16,
-    );
-    let ct_depth = snapshot_u8_map(
-        &state.ct_depth_map,
-        state.ct_depth_stride,
-        cx as usize * 8,
-        cy as usize * 8,
-        (cx as usize + 1) * 8,
-        (cy as usize + 1) * 8,
-    );
-    let deblock = snapshot_u8_map(
-        &state.frame.deblock_flags,
-        state.frame.deblock_stride as usize,
-        cx as usize * 16,
-        cy as usize * 16,
-        (cx as usize + 1) * 16,
-        (cy as usize + 1) * 16,
-    );
-    let qp = snapshot_i8_map(
-        &state.frame.qp_map,
-        state.frame.deblock_stride as usize,
-        cx as usize * 16,
-        cy as usize * 16,
-        (cx as usize + 1) * 16,
-        (cy as usize + 1) * 16,
-    );
-
-    CtuSnapshot {
-        planes,
-        mode,
-        ct_depth,
-        deblock,
-        qp,
-    }
-}
-
-fn snapshot_plane(
-    c_idx: u8,
-    plane: &[u16],
-    stride: usize,
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-) -> PlanePatch {
-    let w = x1.saturating_sub(x0);
-    let h = y1.saturating_sub(y0);
-    let mut data = Vec::with_capacity(w * h);
-    for y in y0..y1 {
-        data.extend_from_slice(&plane[y * stride + x0..][..w]);
-    }
-    PlanePatch {
-        c_idx,
-        x: x0,
-        y: y0,
-        w,
-        h,
-        data,
-    }
-}
-
-fn snapshot_u8_map(
-    buf: &[u8],
-    stride: usize,
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-) -> U8MapPatch {
-    let height = if stride == 0 { 0 } else { buf.len() / stride };
-    let x0 = x0.min(stride);
-    let x1 = x1.min(stride);
-    let y0 = y0.min(height);
-    let y1 = y1.min(height);
-    let w = x1.saturating_sub(x0);
-    let h = y1.saturating_sub(y0);
-    let mut data = Vec::with_capacity(w * h);
-    for y in y0..y1 {
-        data.extend_from_slice(&buf[y * stride + x0..][..w]);
-    }
-    U8MapPatch {
-        x: x0,
-        y: y0,
-        w,
-        h,
-        data,
-    }
-}
-
-fn snapshot_i8_map(
-    buf: &[i8],
-    stride: usize,
-    x0: usize,
-    y0: usize,
-    x1: usize,
-    y1: usize,
-) -> I8MapPatch {
-    let height = if stride == 0 { 0 } else { buf.len() / stride };
-    let x0 = x0.min(stride);
-    let x1 = x1.min(stride);
-    let y0 = y0.min(height);
-    let y1 = y1.min(height);
-    let w = x1.saturating_sub(x0);
-    let h = y1.saturating_sub(y0);
-    let mut data = Vec::with_capacity(w * h);
-    for y in y0..y1 {
-        data.extend_from_slice(&buf[y * stride + x0..][..w]);
-    }
-    I8MapPatch {
-        x: x0,
-        y: y0,
-        w,
-        h,
-        data,
-    }
-}
-
-fn apply_ctu_snapshot(state: &mut Encoder<'_>, snapshot: &CtuSnapshot) {
-    for patch in &snapshot.planes {
-        let (plane, stride) = state.frame.plane_mut(patch.c_idx);
-        apply_u16_rect(
-            plane,
-            stride,
-            patch.x,
-            patch.y,
-            patch.w,
-            patch.h,
-            &patch.data,
-        );
-    }
-    apply_u8_rect(&mut state.mode_map, state.mode_stride, &snapshot.mode);
-    apply_u8_rect(
-        &mut state.ct_depth_map,
-        state.ct_depth_stride,
-        &snapshot.ct_depth,
-    );
-    apply_u8_rect(
-        &mut state.frame.deblock_flags,
-        state.frame.deblock_stride as usize,
-        &snapshot.deblock,
-    );
-    apply_i8_rect(
-        &mut state.frame.qp_map,
-        state.frame.deblock_stride as usize,
-        &snapshot.qp,
-    );
-}
-
-fn apply_u16_rect(
-    buf: &mut [u16],
-    stride: usize,
-    x: usize,
-    y: usize,
-    w: usize,
-    h: usize,
-    data: &[u16],
-) {
-    for row in 0..h {
-        let dst = (y + row) * stride + x;
-        let src = row * w;
-        buf[dst..][..w].copy_from_slice(&data[src..][..w]);
-    }
-}
-
-fn apply_u8_rect(buf: &mut [u8], stride: usize, patch: &U8MapPatch) {
-    for row in 0..patch.h {
-        let dst = (patch.y + row) * stride + patch.x;
-        let src = row * patch.w;
-        buf[dst..][..patch.w].copy_from_slice(&patch.data[src..][..patch.w]);
-    }
-}
-
-fn apply_i8_rect(buf: &mut [i8], stride: usize, patch: &I8MapPatch) {
-    for row in 0..patch.h {
-        let dst = (patch.y + row) * stride + patch.x;
-        let src = row * patch.w;
-        buf[dst..][..patch.w].copy_from_slice(&patch.data[src..][..patch.w]);
     }
 }
 
