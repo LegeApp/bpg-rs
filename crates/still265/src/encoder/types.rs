@@ -185,6 +185,9 @@ pub struct EncodeStats {
     pub phase_total_us: u64,
     pub phase_build_us: u64,
     pub phase_parallel_restore_us: u64,
+    /// Sum across WPP workers of time spent blocked on the row-claim /
+    /// dependency condvars (wavefront idle time, not wall time).
+    pub phase_wpp_wait_us: u64,
     pub phase_deblock_us: u64,
     pub phase_sao_decide_us: u64,
     pub phase_sao_apply_us: u64,
@@ -305,6 +308,7 @@ impl EncodeStats {
         self.phase_total_us += other.phase_total_us;
         self.phase_build_us += other.phase_build_us;
         self.phase_parallel_restore_us += other.phase_parallel_restore_us;
+        self.phase_wpp_wait_us += other.phase_wpp_wait_us;
         self.phase_deblock_us += other.phase_deblock_us;
         self.phase_sao_decide_us += other.phase_sao_decide_us;
         self.phase_sao_apply_us += other.phase_sao_apply_us;
@@ -381,6 +385,7 @@ impl fmt::Display for EncodeStats {
             "  phase_parallel_restore_us: {}",
             self.phase_parallel_restore_us
         )?;
+        writeln!(f, "  phase_wpp_wait_us: {}", self.phase_wpp_wait_us)?;
         writeln!(f, "  phase_write_us: {}", self.phase_write_us)?;
         writeln!(f, "  phase_deblock_us: {}", self.phase_deblock_us)?;
         writeln!(f, "  phase_sao_decide_us: {}", self.phase_sao_decide_us)?;

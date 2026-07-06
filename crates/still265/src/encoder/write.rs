@@ -1049,15 +1049,24 @@ fn map_rect<T: Copy>(
 }
 
 fn claim_wpp_row(shared: &Arc<(Mutex<WppBuildShared>, Condvar)>, ctbs_y: u32) -> Option<u32> {
+    let claim_start = std::time::Instant::now();
     let (lock, cvar) = &**shared;
     let mut guard = lock.lock().expect("WPP build mutex poisoned");
     loop {
         let cy = guard.next_row;
         if cy >= ctbs_y {
+            guard.stats.phase_wpp_wait_us = guard
+                .stats
+                .phase_wpp_wait_us
+                .saturating_add(claim_start.elapsed().as_micros() as u64);
             return None;
         }
         if guard.row_start_ctx[cy as usize].is_some() {
             guard.next_row += 1;
+            guard.stats.phase_wpp_wait_us = guard
+                .stats
+                .phase_wpp_wait_us
+                .saturating_add(claim_start.elapsed().as_micros() as u64);
             return Some(cy);
         }
         guard = cvar.wait(guard).expect("WPP build mutex poisoned");
@@ -1080,9 +1089,14 @@ fn build_wpp_row(
     let mut prev_applied = 0u32;
 
     let mut ctxs = {
+        let wait_start = std::time::Instant::now();
         let mut guard = lock.lock().expect("WPP build mutex poisoned");
         loop {
             if let Some(ctxs) = guard.row_start_ctx[cy as usize].clone() {
+                guard.stats.phase_wpp_wait_us = guard
+                    .stats
+                    .phase_wpp_wait_us
+                    .saturating_add(wait_start.elapsed().as_micros() as u64);
                 break ctxs;
             }
             guard = cvar.wait(guard).expect("WPP build mutex poisoned");
@@ -1095,11 +1109,16 @@ fn build_wpp_row(
     for cx in 0..ctbs_x {
         let need_prev = if cy == 0 { 0 } else { (cx + 2).min(ctbs_x) };
         let import_from = {
+            let wait_start = std::time::Instant::now();
             let mut guard = lock.lock().expect("WPP build mutex poisoned");
             loop {
                 let prev_ready = cy == 0 || guard.row_progress[cy as usize - 1] >= need_prev;
                 let left_ready = cx == 0 || guard.row_progress[cy as usize] >= cx;
                 if prev_ready && left_ready {
+                    guard.stats.phase_wpp_wait_us = guard
+                        .stats
+                        .phase_wpp_wait_us
+                        .saturating_add(wait_start.elapsed().as_micros() as u64);
                     let from = prev_applied;
                     prev_applied = need_prev;
                     break from;
