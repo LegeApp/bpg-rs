@@ -96,6 +96,15 @@ pub(super) const TU_TARGET_MEAN_RANGE_MIN: &str = "BPG_STILLSEARCH_TU_TARGET_MEA
 pub(super) const CU_SPLIT_BIAS_PER_PX: &str = "BPG_STILLSEARCH_CU_SPLIT_BIAS_PER_PX";
 pub(super) const CU_FORCE_SPLIT_LOG2: &str = "BPG_STILLSEARCH_CU_FORCE_SPLIT_LOG2";
 
+/// Decision-identical CU split branch-and-bound: abort remaining split
+/// children once the partial split cost already exceeds the leaf-first bound
+/// (the split can no longer win the leaf-vs-split compare). `0` disables.
+pub(super) const CU_SPLIT_BOUND: &str = "BPG_STILLSEARCH_CU_SPLIT_BOUND";
+
+/// Same branch-and-bound at the transform-tree level (`decide_tt` leaf-first
+/// split evaluation). `0` disables.
+pub(super) const TU_SPLIT_BOUND: &str = "BPG_STILLSEARCH_TU_SPLIT_BOUND";
+
 /// Diagnostic PartNxN controls. PartNxN creates four 4x4 luma PUs/TUs inside
 /// an 8x8 CU, matching one path by which x265 emits many more 4x4 luma TUs.
 pub(super) const NXN_BIAS_PER_PX: &str = "BPG_STILLSEARCH_NXN_BIAS_PER_PX";
@@ -570,17 +579,96 @@ pub(super) fn cu_split_bias_per_px() -> f64 {
     })
 }
 
-/// Force CU splits at the given parent log2 size (for example `4` forces
-/// legal 16x16 -> 8x8 CU splits).
+/// Leaf-first CU split branch-and-bound abort. Default on; decision- and
+/// byte-identical to full evaluation (only skips children that cannot change
+/// the leaf-vs-split winner).
 #[inline]
-pub(super) fn cu_force_split_log2() -> Option<u8> {
-    static VALUE: OnceLock<Option<u8>> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var(CU_FORCE_SPLIT_LOG2)
-            .ok()
-            .and_then(|v| v.trim().parse::<u8>().ok())
-            .filter(|&v| (4..=6).contains(&v))
+pub(super) fn cu_split_bound_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(CU_SPLIT_BOUND)
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
     })
+}
+
+/// Select the trial-reconstruction storage. Default is the contiguous
+/// per-CTU canvas (`canvas.rs`, audit #6 phases 1+1.5, byte-identical and
+/// ~10% faster single-thread); `BPG_STILLSEARCH_OVERLAY=patches` restores
+/// the reference patch-stack overlays for A/B.
+#[inline]
+pub(super) fn canvas_overlay_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("BPG_STILLSEARCH_OVERLAY")
+            .map(|v| !v.trim().eq_ignore_ascii_case("patches"))
+            .unwrap_or(true)
+    })
+}
+
+/// Descent-termination instrumentation: when set, `decide_cu` logs one
+/// `DSC` line per decided CU (rough score, leaf total, split total, outcome)
+/// to stderr for offline bound calibration. Diagnostic only.
+#[inline]
+pub(super) fn descent_log_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BPG_STILLSEARCH_DESCENT_LOG").is_some())
+}
+
+/// Override for the effort template's CU descent gate thresholds
+/// (`CuSearchPolicy::descent_gate_t16/t32`). `BPG_STILLSEARCH_DESCENT_GATE`
+/// accepts `t16,t32` (floats), or `off`/`0` to disable the gate.
+#[inline]
+pub(super) fn descent_gate_override() -> Option<(f64, f64)> {
+    static VALUE: OnceLock<Option<(f64, f64)>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        let raw = std::env::var("BPG_STILLSEARCH_DESCENT_GATE").ok()?;
+        let v = raw.trim();
+        if matches!(v, "0" | "off" | "false" | "none" | "disable" | "disabled") {
+            return Some((0.0, 0.0));
+        }
+        let (a, b) = v.split_once(',')?;
+        let t16 = a.trim().parse::<f64>().ok().filter(|t| t.is_finite())?;
+        let t32 = b.trim().parse::<f64>().ok().filter(|t| t.is_finite())?;
+        Some((t16, t32))
+    })
+}
+
+/// Leaf-first TU split branch-and-bound abort. Default on; decision- and
+/// byte-identical to full evaluation (only skips TU children that cannot
+/// change the leaf-vs-split winner).
+#[inline]
+pub(super) fn tu_split_bound_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var(TU_SPLIT_BOUND)
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Force CU splits at the given parent log2 size (for example `4` forces
+/// legal 16x16 -> 8x8 CU splits). When unset, use the effort template's
+/// default. Set to `0`/`off`/`false`/`none` to disable a template default.
+#[inline]
+pub(super) fn cu_force_split_log2(default: Option<u8>) -> Option<u8> {
+    static OVERRIDE: OnceLock<Option<Option<u8>>> = OnceLock::new();
+    match *OVERRIDE.get_or_init(|| {
+        let Ok(raw) = std::env::var(CU_FORCE_SPLIT_LOG2) else {
+            return None;
+        };
+        let v = raw.trim();
+        if matches!(v, "0" | "off" | "false" | "none" | "disable" | "disabled") {
+            return Some(None);
+        }
+        v.parse::<u8>()
+            .ok()
+            .filter(|&v| (4..=6).contains(&v))
+            .map(Some)
+    }) {
+        Some(v) => v,
+        None => default,
+    }
 }
 
 /// Subtract this many RD-cost units per luma pixel from legal PartNxN candidates.

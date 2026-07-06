@@ -20,7 +20,7 @@ pub(crate) fn overlay_probe_counts() -> (u64, u64, u64) {
 use std::sync::Arc;
 
 use bpg_hevc_decode::DecodedFrame;
-use bpg_hevc_decode::hevc::sao::{SaoMap, apply_sao};
+use bpg_hevc_decode::hevc::sao::{SaoInfo, SaoMap, apply_sao_threads};
 use bpg_hevc_decode::hevc::slice::IntraPredMode;
 
 use crate::{DeblockMode, SaoMode, StillHevcConfig, nal, params, sao, slice};
@@ -351,10 +351,40 @@ impl<'a> Encoder<'a> {
         best
     }
 
+    /// Decide SAO parameters for every CTB. Each CTB's decision reads only
+    /// the committed reconstruction + source (`&self`) and writes only its own
+    /// map cell, so rows are distributed round-robin over scoped threads —
+    /// byte-identical to the serial scan.
     fn decide_sao_map(&self, ctb_size: u32) -> SaoMap {
         let ctbs_x = self.display_width.div_ceil(ctb_size);
         let ctbs_y = self.display_height.div_ceil(ctb_size);
         let mut map = SaoMap::new(ctbs_x, ctbs_y);
+
+        let workers = write::parallel_thread_count().min(ctbs_y as usize).max(1);
+        if workers <= 1 {
+            for (ctb_y, row) in map.data.chunks_mut(ctbs_x as usize).enumerate() {
+                self.decide_sao_row(ctb_size, ctb_y as u32, row);
+            }
+            return map;
+        }
+        let mut worker_rows: Vec<Vec<(u32, &mut [SaoInfo])>> =
+            (0..workers).map(|_| Vec::new()).collect();
+        for (ctb_y, row) in map.data.chunks_mut(ctbs_x as usize).enumerate() {
+            worker_rows[ctb_y % workers].push((ctb_y as u32, row));
+        }
+        std::thread::scope(|scope| {
+            for rows in worker_rows {
+                scope.spawn(move || {
+                    for (ctb_y, row) in rows {
+                        self.decide_sao_row(ctb_size, ctb_y, row);
+                    }
+                });
+            }
+        });
+        map
+    }
+
+    fn decide_sao_row(&self, ctb_size: u32, ctb_y: u32, row: &mut [SaoInfo]) {
         let (sub_x, sub_y) = self.frame.chroma_subsampling();
 
         let (luma_w, luma_h) = self.frame.component_dims(0);
@@ -364,11 +394,11 @@ impl<'a> Encoder<'a> {
             self.frame.component_dims(1)
         };
 
-        for ctb_y in 0..ctbs_y {
-            for ctb_x in 0..ctbs_x {
+        {
+            for (ctb_x, info) in row.iter_mut().enumerate() {
+                let ctb_x = ctb_x as u32;
                 let x0 = ctb_x * ctb_size;
                 let y0 = ctb_y * ctb_size;
-                let info = map.get_mut(ctb_x, ctb_y);
 
                 let lx_end = (x0 + ctb_size).min(luma_w);
                 let ly_end = (y0 + ctb_size).min(luma_h);
@@ -423,7 +453,6 @@ impl<'a> Encoder<'a> {
                 }
             }
         }
-        map
     }
 
     pub(in crate::encoder) fn same_tile_px(&self, ax: u32, ay: u32, bx: u32, by: u32) -> bool {
@@ -747,7 +776,14 @@ fn encode_inner(
         }
         if state.deblock {
             let phase_start = std::time::Instant::now();
-            bpg_hevc_decode::hevc::deblock::apply_deblocking_filter(&mut state.frame, 0, 0, 0, 0);
+            bpg_hevc_decode::hevc::deblock::apply_deblocking_filter_threads(
+                &mut state.frame,
+                0,
+                0,
+                0,
+                0,
+                write::parallel_thread_count(),
+            );
             state.stats.phase_deblock_us += phase_start.elapsed().as_micros() as u64;
         }
         let sao_map = if config.sao == SaoMode::On {
@@ -764,7 +800,7 @@ fn encode_inner(
         state.stats.phase_write_us += phase_start.elapsed().as_micros() as u64;
         if let Some(map) = &sao_map {
             let phase_start = std::time::Instant::now();
-            apply_sao(&mut state.frame, map, ctb);
+            apply_sao_threads(&mut state.frame, map, ctb, write::parallel_thread_count());
             state.stats.phase_sao_apply_us += phase_start.elapsed().as_micros() as u64;
         }
         (bytes, entries)
@@ -774,7 +810,14 @@ fn encode_inner(
         state.stats.phase_write_us += phase_start.elapsed().as_micros() as u64;
         if state.deblock {
             let phase_start = std::time::Instant::now();
-            bpg_hevc_decode::hevc::deblock::apply_deblocking_filter(&mut state.frame, 0, 0, 0, 0);
+            bpg_hevc_decode::hevc::deblock::apply_deblocking_filter_threads(
+                &mut state.frame,
+                0,
+                0,
+                0,
+                0,
+                write::parallel_thread_count(),
+            );
             state.stats.phase_deblock_us += phase_start.elapsed().as_micros() as u64;
         }
         (bytes, Vec::new())

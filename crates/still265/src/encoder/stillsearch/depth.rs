@@ -4,6 +4,7 @@ use crate::contexts::Contexts;
 use crate::encoder::Encoder;
 use crate::encoder::syntax::CuNode;
 
+use super::canvas::CanvasOverlay;
 use super::emit;
 use super::ledger::{StillSearchLedger, WorkBucket};
 use super::overlay::{OverlayCache, ReconOverlay8, ReconOverlay16};
@@ -17,6 +18,8 @@ pub(in crate::encoder) struct StillSearch {
 enum StillSearchImpl {
     EightBit(StillSearchDepth<CtuSource8, ReconOverlay8>),
     HighBit(StillSearchDepth<CtuSource16, ReconOverlay16>),
+    EightBitCanvas(StillSearchDepth<CtuSource8, CanvasOverlay>),
+    HighBitCanvas(StillSearchDepth<CtuSource16, CanvasOverlay>),
 }
 
 pub(super) struct StillSearchDepth<S, O> {
@@ -27,10 +30,12 @@ pub(super) struct StillSearchDepth<S, O> {
 
 impl StillSearch {
     pub(in crate::encoder) fn new(bit_depth: u8) -> Self {
-        let imp = if bit_depth == 8 {
-            StillSearchImpl::EightBit(StillSearchDepth::default())
-        } else {
-            StillSearchImpl::HighBit(StillSearchDepth::default())
+        let canvas = super::env::canvas_overlay_enabled();
+        let imp = match (bit_depth == 8, canvas) {
+            (true, false) => StillSearchImpl::EightBit(StillSearchDepth::default()),
+            (false, false) => StillSearchImpl::HighBit(StillSearchDepth::default()),
+            (true, true) => StillSearchImpl::EightBitCanvas(StillSearchDepth::default()),
+            (false, true) => StillSearchImpl::HighBitCanvas(StillSearchDepth::default()),
         };
         Self { imp }
     }
@@ -49,6 +54,12 @@ impl StillSearch {
                 search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth)
             }
             StillSearchImpl::HighBit(search) => {
+                search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth)
+            }
+            StillSearchImpl::EightBitCanvas(search) => {
+                search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth)
+            }
+            StillSearchImpl::HighBitCanvas(search) => {
                 search.build_ctu(state, price_ctx, x0, y0, log2_cb_size, ct_depth)
             }
         }
@@ -86,7 +97,7 @@ where
         self.workspace.reset();
         self.workspace.set_price_context(price_ctx);
         self.source.reset_from_ctu(state, x0, y0, log2_cb_size);
-        self.overlay.clear();
+        self.overlay.reset_from_ctu(&state.frame, x0, y0);
 
         let (plan, _cost) = self.decide_cu(state, x0, y0, log2_cb_size, ct_depth);
 
@@ -155,6 +166,7 @@ where
             .saturating_add(self.workspace.substage.residual_price_ns);
         state.stats.substage_calls += self.workspace.substage.calls;
         state.stats.tu_split_early_terminations += self.workspace.tu_split_early_terminations;
+        state.stats.tu_split_bound_aborts += self.workspace.tu_split_bound_aborts;
         for i in 0..7 {
             state.stats.tu_leaf_by_log2[i] += self.workspace.tu_leaf_by_log2[i];
             state.stats.tu_split_by_log2[i] += self.workspace.tu_split_by_log2[i];
@@ -483,12 +495,19 @@ where
             let top_count = (2 * size).min(frame_w.saturating_sub(x0)) as usize;
             let mut row = [UNINIT_SAMPLE; 2 * MAX_INTRA_PRED_BLOCK_SIZE];
             if top_count > 0 {
-                let row_base = (y0 - 1) as usize * stride + x0 as usize;
-                for (i, dst) in row[..top_count].iter_mut().enumerate() {
-                    *dst = plane.get(row_base + i).copied().unwrap_or(0);
+                // Canvas fast path: one contiguous merged read. Fallback:
+                // frame-initialize, then overlay the patch stack.
+                if !self
+                    .overlay
+                    .read_row_merged(c_idx, y0 - 1, x0, &mut row[..top_count])
+                {
+                    let row_base = (y0 - 1) as usize * stride + x0 as usize;
+                    for (i, dst) in row[..top_count].iter_mut().enumerate() {
+                        *dst = plane.get(row_base + i).copied().unwrap_or(0);
+                    }
+                    self.overlay
+                        .overlay_row_samples(c_idx, y0 - 1, x0, &mut row[..top_count]);
                 }
-                self.overlay
-                    .overlay_row_samples(c_idx, y0 - 1, x0, &mut row[..top_count]);
                 for (i, &raw) in row[..top_count].iter().enumerate() {
                     let rx = x0 + i as u32;
                     if in_tile(tile_bounds, rx, y0 - 1) {
@@ -509,13 +528,18 @@ where
             let left_count = (2 * size).min(frame_h.saturating_sub(y0)) as usize;
             let mut col = [UNINIT_SAMPLE; 2 * MAX_INTRA_PRED_BLOCK_SIZE];
             if left_count > 0 {
-                let left_x = (x0 - 1) as usize;
-                for (i, dst) in col[..left_count].iter_mut().enumerate() {
-                    let plane_idx = (y0 as usize + i) * stride + left_x;
-                    *dst = plane.get(plane_idx).copied().unwrap_or(0);
+                if !self
+                    .overlay
+                    .read_col_merged(c_idx, x0 - 1, y0, &mut col[..left_count])
+                {
+                    let left_x = (x0 - 1) as usize;
+                    for (i, dst) in col[..left_count].iter_mut().enumerate() {
+                        let plane_idx = (y0 as usize + i) * stride + left_x;
+                        *dst = plane.get(plane_idx).copied().unwrap_or(0);
+                    }
+                    self.overlay
+                        .overlay_col_samples(c_idx, x0 - 1, y0, &mut col[..left_count]);
                 }
-                self.overlay
-                    .overlay_col_samples(c_idx, x0 - 1, y0, &mut col[..left_count]);
                 for (i, &raw) in col[..left_count].iter().enumerate() {
                     let ry = y0 + i as u32;
                     if in_tile(tile_bounds, x0 - 1, ry) {

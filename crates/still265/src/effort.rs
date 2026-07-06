@@ -514,7 +514,25 @@ pub struct CuSearchPolicy {
     pub early_terminate: CuEarlyTerminateRule,
     pub use_preanalysis_force_leaf: bool,
     pub use_preanalysis_force_split: bool,
+    /// Force legal CUs at this parent log2 size to split without evaluating
+    /// the 2Nx2N leaf. `Some(6)` mirrors x265's still-image intra path, which
+    /// never tests a 64x64 CU leaf at the CTU root.
+    pub force_split_log2: Option<u8>,
     pub leaf_first: bool,
+    /// Descent-termination gate: after the 2Nx2N leaf is evaluated (and the
+    /// residual-based early-termination declined), skip the split branch
+    /// entirely when the leaf's RD total is at most
+    /// `t * (rd_lambda(qp) / rd_lambda(qp28)) * pixels` — the leaf already
+    /// codes the block so cheaply per pixel that a split win is implausible.
+    /// Calibrated offline against full leaf-vs-split DSC logs
+    /// (`BPG_STILLSEARCH_DESCENT_LOG`, see x265-speed-parity-audit.md §10.5):
+    /// at the shipped thresholds the wrongly skipped split wins are <~1% and
+    /// their forgone RD is <~0.01% of node RD, while 15-70% of 16x16 and
+    /// 1-34% of 32x32 descents are skipped (rising with QP and content
+    /// smoothness). `0.0` disables the gate at that size.
+    /// `BPG_STILLSEARCH_DESCENT_GATE=t16,t32|off` overrides.
+    pub descent_gate_t16: f64,
+    pub descent_gate_t32: f64,
 }
 
 /// PartNxN search policy.
@@ -723,7 +741,10 @@ pub(crate) static FAST: EffortTemplate = EffortTemplate {
         early_terminate: CuEarlyTerminateRule::Fast,
         use_preanalysis_force_leaf: true,
         use_preanalysis_force_split: false,
+        force_split_log2: None,
         leaf_first: true,
+        descent_gate_t16: 0.0,
+        descent_gate_t32: 0.0,
     },
 
     nxn: NxnSearchPolicy {
@@ -844,7 +865,14 @@ pub(crate) static SLOW: EffortTemplate = EffortTemplate {
         early_terminate: CuEarlyTerminateRule::Balanced,
         use_preanalysis_force_leaf: true,
         use_preanalysis_force_split: true,
+        // x265 placebo/`bpgenc -m9` always splits the CTU root: its intra
+        // analysis never evaluates a 64x64 2Nx2N leaf. Slow is the production
+        // x265-shaped preset, so skip that extra depth by default. Set
+        // `BPG_STILLSEARCH_CU_FORCE_SPLIT_LOG2=0` to restore the old search.
+        force_split_log2: Some(6),
         leaf_first: true,
+        descent_gate_t16: 4.0,
+        descent_gate_t32: 1.0,
     },
 
     nxn: NxnSearchPolicy {
@@ -972,7 +1000,10 @@ pub(crate) static PLACEBO: EffortTemplate = EffortTemplate {
         early_terminate: CuEarlyTerminateRule::Disabled,
         use_preanalysis_force_leaf: false,
         use_preanalysis_force_split: false,
+        force_split_log2: None,
         leaf_first: true,
+        descent_gate_t16: 0.0,
+        descent_gate_t32: 0.0,
     },
 
     nxn: NxnSearchPolicy {
