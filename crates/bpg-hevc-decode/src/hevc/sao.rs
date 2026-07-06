@@ -66,6 +66,15 @@ const EO_OFFSETS: [(i32, i32, i32, i32); 4] = [
 
 /// Apply SAO filter to the entire frame
 pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
+    apply_sao_threads(frame, sao_map, ctb_size, 1);
+}
+
+/// [`apply_sao`] with CTB rows distributed over up to `threads` scoped
+/// threads. Byte-identical to the serial pass: every CTB writes only its own
+/// rectangle (rows of CTBs own disjoint plane bands), band offsets are
+/// per-pixel in-place, and edge offsets read from the immutable pre-SAO
+/// plane clones.
+pub fn apply_sao_threads(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32, threads: usize) {
     let width = frame.width;
     let height = frame.height;
     let bit_depth = frame.bit_depth;
@@ -116,138 +125,233 @@ pub fn apply_sao(frame: &mut DecodedFrame, sao_map: &SaoMap, ctb_size: u32) {
         _ => (1, 1),
     };
 
-    // Process each CTB
-    for ctb_y in 0..sao_map.height_ctbs {
-        for ctb_x in 0..sao_map.width_ctbs {
-            let sao = sao_map.get(ctb_x, ctb_y);
-            let ctb_x_px = ctb_x * ctb_size;
-            let ctb_y_px = ctb_y * ctb_size;
+    let ctx = SaoApplyCtx {
+        sao_map,
+        ctb_size,
+        width,
+        height,
+        bit_depth,
+        y_stride: y_stride as u32,
+        c_stride: c_stride as u32,
+        sub_x,
+        sub_y,
+        chroma: frame.chroma_format > 0,
+        orig_y: &orig_y,
+        orig_cb: &orig_cb,
+        orig_cr: &orig_cr,
+    };
 
-            // Luma
-            match sao.sao_type_idx[0] {
+    // Split the planes into per-CTB-row bands (disjoint `&mut`); each row job
+    // owns its band of all three planes.
+    let luma_chunk = (ctb_size as usize * y_stride).max(1);
+    let chroma_chunk = ((ctb_size / sub_y) as usize * c_stride).max(1);
+    let mut y_bands = frame.y_plane.chunks_mut(luma_chunk);
+    let mut cb_bands = frame.cb_plane.chunks_mut(chroma_chunk);
+    let mut cr_bands = frame.cr_plane.chunks_mut(chroma_chunk);
+    let mut jobs: Vec<(u32, &mut [u16], Option<(&mut [u16], &mut [u16])>)> =
+        Vec::with_capacity(sao_map.height_ctbs as usize);
+    for ctb_y in 0..sao_map.height_ctbs {
+        let Some(y_band) = y_bands.next() else { break };
+        let c = match (cb_bands.next(), cr_bands.next()) {
+            (Some(cb), Some(cr)) => Some((cb, cr)),
+            _ => None,
+        };
+        jobs.push((ctb_y, y_band, c));
+    }
+
+    let workers = threads.clamp(1, jobs.len().max(1));
+    if workers <= 1 {
+        for (ctb_y, y_band, c) in jobs {
+            apply_sao_ctb_row(&ctx, ctb_y, y_band, c);
+        }
+        return;
+    }
+    let mut worker_jobs: Vec<Vec<_>> = (0..workers).map(|_| Vec::new()).collect();
+    for (i, job) in jobs.into_iter().enumerate() {
+        worker_jobs[i % workers].push(job);
+    }
+    std::thread::scope(|scope| {
+        for jobs in worker_jobs {
+            let ctx = &ctx;
+            scope.spawn(move || {
+                for (ctb_y, y_band, c) in jobs {
+                    apply_sao_ctb_row(ctx, ctb_y, y_band, c);
+                }
+            });
+        }
+    });
+}
+
+/// Shared read-only state for one SAO application pass.
+struct SaoApplyCtx<'a> {
+    sao_map: &'a SaoMap,
+    ctb_size: u32,
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    y_stride: u32,
+    c_stride: u32,
+    sub_x: u32,
+    sub_y: u32,
+    chroma: bool,
+    orig_y: &'a [u16],
+    orig_cb: &'a [u16],
+    orig_cr: &'a [u16],
+}
+
+/// Apply one CTB row's SAO parameters into that row's plane bands.
+/// Coordinates stay global; only the destination indexing is band-relative
+/// (`band_y0` rows above the band).
+fn apply_sao_ctb_row(
+    ctx: &SaoApplyCtx<'_>,
+    ctb_y: u32,
+    y_band: &mut [u16],
+    mut c_bands: Option<(&mut [u16], &mut [u16])>,
+) {
+    let ctb_size = ctx.ctb_size;
+    let bit_depth = ctx.bit_depth;
+    let band_y0 = ctb_y * ctb_size;
+    let c_band_y0 = band_y0 / ctx.sub_y;
+    for ctb_x in 0..ctx.sao_map.width_ctbs {
+        let sao = ctx.sao_map.get(ctb_x, ctb_y);
+        let ctb_x_px = ctb_x * ctb_size;
+        let ctb_y_px = ctb_y * ctb_size;
+
+        // Luma
+        match sao.sao_type_idx[0] {
+            1 => {
+                let x_end = (ctb_x_px + ctb_size).min(ctx.width);
+                let y_end = (ctb_y_px + ctb_size).min(ctx.height);
+                apply_sao_band_inplace(
+                    y_band,
+                    band_y0,
+                    ctx.y_stride,
+                    ctb_x_px,
+                    ctb_y_px,
+                    x_end,
+                    y_end,
+                    sao.sao_band_position[0],
+                    &sao.sao_offset_val[0],
+                    bit_depth,
+                );
+            }
+            2 => {
+                let x_end = (ctb_x_px + ctb_size).min(ctx.width);
+                let y_end = (ctb_y_px + ctb_size).min(ctx.height);
+                apply_sao_edge(
+                    ctx.orig_y,
+                    y_band,
+                    band_y0,
+                    ctx.y_stride,
+                    ctx.width,
+                    ctx.height,
+                    ctb_x_px,
+                    ctb_y_px,
+                    x_end,
+                    y_end,
+                    sao.sao_eo_class[0],
+                    &sao.sao_offset_val[0],
+                    bit_depth,
+                );
+            }
+            _ => {}
+        }
+
+        // Chroma (4:2:0: halved coordinates)
+        if ctx.chroma {
+            let Some((cb_band, cr_band)) = c_bands.as_mut() else {
+                continue;
+            };
+            let cx_start = ctb_x_px / ctx.sub_x;
+            let cy_start = ctb_y_px / ctx.sub_y;
+            let cx_end = ((ctb_x_px + ctb_size) / ctx.sub_x).min(ctx.width / ctx.sub_x);
+            let cy_end = ((ctb_y_px + ctb_size) / ctx.sub_y).min(ctx.height / ctx.sub_y);
+            let c_w = ctx.width / ctx.sub_x;
+            let c_h = ctx.height / ctx.sub_y;
+
+            // Cb
+            match sao.sao_type_idx[1] {
                 1 => {
-                    let x_end = (ctb_x_px + ctb_size).min(width);
-                    let y_end = (ctb_y_px + ctb_size).min(height);
                     apply_sao_band_inplace(
-                        &mut frame.y_plane,
-                        y_stride as u32,
-                        ctb_x_px,
-                        ctb_y_px,
-                        x_end,
-                        y_end,
-                        sao.sao_band_position[0],
-                        &sao.sao_offset_val[0],
+                        cb_band,
+                        c_band_y0,
+                        ctx.c_stride,
+                        cx_start,
+                        cy_start,
+                        cx_end,
+                        cy_end,
+                        sao.sao_band_position[1],
+                        &sao.sao_offset_val[1],
                         bit_depth,
                     );
                 }
                 2 => {
-                    let x_end = (ctb_x_px + ctb_size).min(width);
-                    let y_end = (ctb_y_px + ctb_size).min(height);
                     apply_sao_edge(
-                        &orig_y,
-                        &mut frame.y_plane,
-                        y_stride as u32,
-                        width,
-                        height,
-                        ctb_x_px,
-                        ctb_y_px,
-                        x_end,
-                        y_end,
-                        sao.sao_eo_class[0],
-                        &sao.sao_offset_val[0],
+                        ctx.orig_cb,
+                        cb_band,
+                        c_band_y0,
+                        ctx.c_stride,
+                        c_w,
+                        c_h,
+                        cx_start,
+                        cy_start,
+                        cx_end,
+                        cy_end,
+                        sao.sao_eo_class[1],
+                        &sao.sao_offset_val[1],
                         bit_depth,
                     );
                 }
                 _ => {}
             }
 
-            // Chroma (4:2:0: halved coordinates)
-            if frame.chroma_format > 0 {
-                let cx_start = ctb_x_px / sub_x;
-                let cy_start = ctb_y_px / sub_y;
-                let cx_end = ((ctb_x_px + ctb_size) / sub_x).min(width / sub_x);
-                let cy_end = ((ctb_y_px + ctb_size) / sub_y).min(height / sub_y);
-                let c_w = width / sub_x;
-                let c_h = height / sub_y;
-
-                // Cb
-                match sao.sao_type_idx[1] {
-                    1 => {
-                        apply_sao_band_inplace(
-                            &mut frame.cb_plane,
-                            c_stride as u32,
-                            cx_start,
-                            cy_start,
-                            cx_end,
-                            cy_end,
-                            sao.sao_band_position[1],
-                            &sao.sao_offset_val[1],
-                            bit_depth,
-                        );
-                    }
-                    2 => {
-                        apply_sao_edge(
-                            &orig_cb,
-                            &mut frame.cb_plane,
-                            c_stride as u32,
-                            c_w,
-                            c_h,
-                            cx_start,
-                            cy_start,
-                            cx_end,
-                            cy_end,
-                            sao.sao_eo_class[1],
-                            &sao.sao_offset_val[1],
-                            bit_depth,
-                        );
-                    }
-                    _ => {}
+            // Cr
+            match sao.sao_type_idx[2] {
+                1 => {
+                    apply_sao_band_inplace(
+                        cr_band,
+                        c_band_y0,
+                        ctx.c_stride,
+                        cx_start,
+                        cy_start,
+                        cx_end,
+                        cy_end,
+                        sao.sao_band_position[2],
+                        &sao.sao_offset_val[2],
+                        bit_depth,
+                    );
                 }
-
-                // Cr
-                match sao.sao_type_idx[2] {
-                    1 => {
-                        apply_sao_band_inplace(
-                            &mut frame.cr_plane,
-                            c_stride as u32,
-                            cx_start,
-                            cy_start,
-                            cx_end,
-                            cy_end,
-                            sao.sao_band_position[2],
-                            &sao.sao_offset_val[2],
-                            bit_depth,
-                        );
-                    }
-                    2 => {
-                        apply_sao_edge(
-                            &orig_cr,
-                            &mut frame.cr_plane,
-                            c_stride as u32,
-                            c_w,
-                            c_h,
-                            cx_start,
-                            cy_start,
-                            cx_end,
-                            cy_end,
-                            sao.sao_eo_class[2],
-                            &sao.sao_offset_val[2],
-                            bit_depth,
-                        );
-                    }
-                    _ => {}
+                2 => {
+                    apply_sao_edge(
+                        ctx.orig_cr,
+                        cr_band,
+                        c_band_y0,
+                        ctx.c_stride,
+                        c_w,
+                        c_h,
+                        cx_start,
+                        cy_start,
+                        cx_end,
+                        cy_end,
+                        sao.sao_eo_class[2],
+                        &sao.sao_offset_val[2],
+                        bit_depth,
+                    );
                 }
+                _ => {}
             }
         }
     }
 }
 
-/// Apply SAO edge offset to a single pixel with bounds checking
+/// Apply SAO edge offset to a single pixel with bounds checking. `dst` may be
+/// a band of the full plane, `band_off` samples below the plane origin.
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn apply_sao_edge_pixel(
     src: &[u16],
     dst: &mut [u16],
+    band_off: usize,
     row: usize,
     x: u32,
     dx0: i32,
@@ -288,14 +392,17 @@ fn apply_sao_edge_pixel(
 
     let offset = offset_table[edge_idx];
     if offset != 0 {
-        dst[idx] = (sample + offset).clamp(0, max_val) as u16;
+        dst[idx - band_off] = (sample + offset).clamp(0, max_val) as u16;
     }
 }
 
 /// Apply SAO band offset in-place (type 1). Reads and writes same buffer.
+/// `plane` may be a band of the full plane starting at row `band_y0`
+/// (`y_start >= band_y0`); coordinates stay plane-global.
 #[allow(clippy::too_many_arguments)]
 fn apply_sao_band_inplace(
     plane: &mut [u16],
+    band_y0: u32,
     stride: u32,
     x_start: u32,
     y_start: u32,
@@ -316,7 +423,7 @@ fn apply_sao_band_inplace(
     }
 
     for y in y_start..y_end {
-        let row = (y * stride) as usize;
+        let row = ((y - band_y0) * stride) as usize;
         for x in x_start..x_end {
             let idx = row + x as usize;
             let sample = (plane[idx] as i32).min(max_val);
@@ -329,11 +436,14 @@ fn apply_sao_band_inplace(
     }
 }
 
-/// Apply SAO edge offset (type 2). Reads from pre-cloned src, writes to dst.
+/// Apply SAO edge offset (type 2). Reads from pre-cloned src (full plane,
+/// global coordinates), writes to `dst`, which may be a band of the full
+/// plane starting at row `band_y0`.
 #[allow(clippy::too_many_arguments)]
 fn apply_sao_edge(
     src: &[u16],
     dst: &mut [u16],
+    band_y0: u32,
     stride: u32,
     plane_w: u32,
     plane_h: u32,
@@ -363,6 +473,7 @@ fn apply_sao_edge(
     let safe_y_end = y_end.min(plane_h - dy0.max(dy1).max(0) as u32);
 
     let stride_u = stride as usize;
+    let band_off = band_y0 as usize * stride_u;
     let dx0_u = dx0 as isize;
     let dy0_s = dy0 as isize * stride_u as isize;
     let dx1_u = dx1 as isize;
@@ -385,7 +496,7 @@ fn apply_sao_edge(
 
             let offset = offset_table[edge_idx];
             if offset != 0 {
-                dst[idx] = (sample + offset).clamp(0, max_val) as u16;
+                dst[idx - band_off] = (sample + offset).clamp(0, max_val) as u16;
             }
         }
     }
@@ -398,6 +509,7 @@ fn apply_sao_edge(
                 apply_sao_edge_pixel(
                     src,
                     dst,
+                    band_off,
                     row,
                     x,
                     dx0,
@@ -415,6 +527,7 @@ fn apply_sao_edge(
                 apply_sao_edge_pixel(
                     src,
                     dst,
+                    band_off,
                     row,
                     x,
                     dx0,
@@ -434,6 +547,7 @@ fn apply_sao_edge(
                 apply_sao_edge_pixel(
                     src,
                     dst,
+                    band_off,
                     row,
                     x,
                     dx0,

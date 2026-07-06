@@ -20,7 +20,7 @@ pub(crate) fn overlay_probe_counts() -> (u64, u64, u64) {
 use std::sync::Arc;
 
 use bpg_hevc_decode::DecodedFrame;
-use bpg_hevc_decode::hevc::sao::{SaoInfo, SaoMap, apply_sao};
+use bpg_hevc_decode::hevc::sao::{SaoInfo, SaoMap, apply_sao_threads};
 use bpg_hevc_decode::hevc::slice::IntraPredMode;
 
 use crate::{DeblockMode, SaoMode, StillHevcConfig, nal, params, sao, slice};
@@ -795,7 +795,7 @@ fn encode_inner(
         state.stats.phase_write_us += phase_start.elapsed().as_micros() as u64;
         if let Some(map) = &sao_map {
             let phase_start = std::time::Instant::now();
-            apply_sao(&mut state.frame, map, ctb);
+            apply_sao_threads(&mut state.frame, map, ctb, write::parallel_thread_count());
             state.stats.phase_sao_apply_us += phase_start.elapsed().as_micros() as u64;
         }
         (bytes, entries)
