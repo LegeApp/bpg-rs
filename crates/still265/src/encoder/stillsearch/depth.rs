@@ -103,12 +103,12 @@ where
         self.workspace.reset();
         self.workspace.set_price_context(price_ctx);
         self.source.reset_from_ctu(state, x0, y0, log2_cb_size);
-        self.frameless = matches!(background, ReconBackground::Strips(_));
+        self.frameless = matches!(background, ReconBackground::Strips { .. });
         match background {
             ReconBackground::Frame => self.overlay.reset_from_ctu(&state.frame, x0, y0),
-            ReconBackground::Strips(strips) => {
+            ReconBackground::Strips { strips, left } => {
                 self.overlay
-                    .reset_from_strips(strips, state.frame.chroma_format, x0, y0)
+                    .reset_from_strips(strips, left, state.frame.chroma_format, x0, y0)
             }
         }
 

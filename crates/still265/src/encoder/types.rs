@@ -188,6 +188,12 @@ pub struct EncodeStats {
     /// Sum across WPP workers of time spent blocked on the row-claim /
     /// dependency condvars (wavefront idle time, not wall time).
     pub phase_wpp_wait_us: u64,
+    /// WPP handoff: rows resumed by a different worker than the one that
+    /// built the previous CTU (each pays the strip/left-edge re-import).
+    pub wpp_row_takeovers: u64,
+    /// WPP handoff: park events (a worker set a stalled row aside and went
+    /// looking for other runnable work instead of blocking).
+    pub wpp_row_parks: u64,
     pub phase_deblock_us: u64,
     pub phase_sao_decide_us: u64,
     pub phase_sao_apply_us: u64,
@@ -309,6 +315,8 @@ impl EncodeStats {
         self.phase_build_us += other.phase_build_us;
         self.phase_parallel_restore_us += other.phase_parallel_restore_us;
         self.phase_wpp_wait_us += other.phase_wpp_wait_us;
+        self.wpp_row_takeovers += other.wpp_row_takeovers;
+        self.wpp_row_parks += other.wpp_row_parks;
         self.phase_deblock_us += other.phase_deblock_us;
         self.phase_sao_decide_us += other.phase_sao_decide_us;
         self.phase_sao_apply_us += other.phase_sao_apply_us;
@@ -386,6 +394,8 @@ impl fmt::Display for EncodeStats {
             self.phase_parallel_restore_us
         )?;
         writeln!(f, "  phase_wpp_wait_us: {}", self.phase_wpp_wait_us)?;
+        writeln!(f, "  wpp_row_takeovers: {}", self.wpp_row_takeovers)?;
+        writeln!(f, "  wpp_row_parks: {}", self.wpp_row_parks)?;
         writeln!(f, "  phase_write_us: {}", self.phase_write_us)?;
         writeln!(f, "  phase_deblock_us: {}", self.phase_deblock_us)?;
         writeln!(f, "  phase_sao_decide_us: {}", self.phase_sao_decide_us)?;

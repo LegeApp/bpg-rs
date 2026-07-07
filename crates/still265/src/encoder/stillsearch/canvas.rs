@@ -122,6 +122,7 @@ impl CanvasPlane {
         &mut self,
         strip: &[u16],
         plane_h: usize,
+        left: Option<&[u16]>,
         chroma_format: u8,
         c_idx: u8,
         ctu_x: u32,
@@ -135,20 +136,30 @@ impl CanvasPlane {
         let new_ox = ((ctu_x >> sx) as i64) - 1;
         let new_oy = ((ctu_y >> sy) as i64) - 1;
 
-        // Capture the left border column before wiping. Valid only when this
-        // canvas currently sits on the left neighbor (same CTB row, one CTU
-        // step left); at a row start (or a fresh canvas) the column stays
-        // UNINIT, exactly like the frame path at `x0c-1 < 0` / uncoded left.
-        let capture = self.stride == stride
+        // Left border column: from the explicit handoff override when given,
+        // else self-captured before wiping — valid only when this canvas
+        // currently sits on the left neighbor (same CTB row, one CTU step
+        // left); at a row start (or a fresh canvas) the column stays UNINIT,
+        // exactly like the frame path at `x0c-1 < 0` / uncoded left.
+        let capture = left.is_none()
+            && self.stride == stride
             && self.rows == rows
             && self.origin_y == new_oy
             && self.origin_x + cw as i64 == new_ox
             && !self.buf.is_empty();
+        debug_assert!(
+            left.is_some() || capture || new_ox < 0,
+            "frameless reset with a coded left neighbor but no left column \
+             (c={c_idx} ctu=({ctu_x},{ctu_y}))"
+        );
         let mut left_col = [UNINIT_SAMPLE; CTB];
         if capture {
             for (i, v) in left_col[..ch].iter_mut().enumerate() {
                 *v = self.buf[(1 + i) * stride + cw];
             }
+        } else if let Some(cols) = left {
+            let n = cols.len().min(ch);
+            left_col[..n].copy_from_slice(&cols[..n]);
         }
 
         self.stride = stride;
@@ -169,7 +180,7 @@ impl CanvasPlane {
                 self.buf[dst0..dst0 + (px1 - px0)].copy_from_slice(&strip[px0..px1]);
             }
         }
-        if capture {
+        if capture || left.is_some() {
             for (i, &v) in left_col[..ch].iter().enumerate() {
                 self.buf[(1 + i) * stride] = v;
             }
@@ -295,10 +306,13 @@ impl CanvasOverlay {
     /// Frameless rebase (canvas-design.md phase 3): the committed background
     /// comes from the worker's row-above [`RowStrips`] plus this canvas's own
     /// previous content (see [`CanvasPlane::reset_from_strip`]); no
-    /// reconstruction frame is read.
+    /// reconstruction frame is read. On a row handoff the canvas does not
+    /// hold the left neighbor, so `left` supplies the published left border
+    /// columns explicitly.
     pub(super) fn reset_from_strips(
         &mut self,
         strips: &RowStrips,
+        left: Option<&LeftCols>,
         chroma_format: u8,
         x0: u32,
         y0: u32,
@@ -308,6 +322,7 @@ impl CanvasOverlay {
             self.planes[c_idx].reset_from_strip(
                 &strips.rows[c_idx],
                 strips.heights[c_idx],
+                left.map(|l| l.cols[c_idx].as_slice()),
                 chroma_format,
                 c_idx as u8,
                 x0,
@@ -647,13 +662,38 @@ impl RowStrips {
     }
 }
 
+/// Explicit left border columns for a frameless CTU build whose worker did
+/// not build the left-neighbor CTU immediately before (WPP row handoff):
+/// per component, the published master plane column `x0c-1` over the CTU
+/// height, imported by the sink. Replaces the canvas left-edge self-capture
+/// for that one build.
+#[derive(Default)]
+pub(in crate::encoder) struct LeftCols {
+    cols: [Vec<u16>; 3],
+}
+
+impl LeftCols {
+    /// Per-component column storage for the sink import, cleared to UNINIT
+    /// and resized to the CTU's (clamped) component height.
+    pub(in crate::encoder) fn col_mut(&mut self, c_idx: usize, len: usize) -> &mut [u16] {
+        let col = &mut self.cols[c_idx];
+        col.clear();
+        col.resize(len, UNINIT_SAMPLE);
+        col
+    }
+}
+
 /// Where a CTU build loads the canvas's committed background from.
 pub(in crate::encoder) enum ReconBackground<'a> {
     /// The committed reconstruction frame (serial, tile, and master builds):
     /// the canvas reads its top-row/left-column strips from `state.frame`.
     Frame,
     /// Frameless WPP worker: the row-above strip buffer; the left column
-    /// self-captures from the previous CTU's canvas content. The worker
-    /// frame's pixel planes are empty and must never be read.
-    Strips(&'a RowStrips),
+    /// self-captures from the previous CTU's canvas content, unless the
+    /// `left` handoff override supplies it explicitly. The worker frame's
+    /// pixel planes are empty and must never be read.
+    Strips {
+        strips: &'a RowStrips,
+        left: Option<&'a LeftCols>,
+    },
 }

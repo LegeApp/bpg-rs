@@ -36,7 +36,7 @@ use bpg_hevc_decode::hevc::slice::IntraPredMode;
 
 use super::Encoder;
 pub(super) use api::StillSearch;
-pub(super) use canvas::{CanvasOverlay, ReconBackground, RowStrips};
+pub(super) use canvas::{CanvasOverlay, LeftCols, ReconBackground, RowStrips};
 
 fn intra_mpm(state: &Encoder<'_>, x0: u32, y0: u32) -> [IntraPredMode; 3] {
     intra::fill_mpm_candidates(

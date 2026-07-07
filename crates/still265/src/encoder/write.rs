@@ -617,7 +617,9 @@ pub(super) fn build_slice_trees_parallel(
                 v[0] = Some(Contexts::new(slice_qp_y));
                 v
             },
-            next_row: 0,
+            phase: (0..ctbs_y).map(|_| WppRowPhase::NotStarted).collect(),
+            rows_done: 0,
+            idle_claimers: 0,
             trees: (0..total).map(|_| None).collect(),
             stats: Default::default(),
         }),
@@ -644,6 +646,13 @@ pub(super) fn build_slice_trees_parallel(
     // (`BPG_WPP_IMPORT_ROWS` unset); `BPG_WPP_FRAMELESS=0` restores worker
     // frames for A/B.
     let frameless = wpp_frameless_enabled() && wpp_import_strip_rows() == Some(1);
+    // Row-segment handoff (wpp-handoff-design.md): rows are owner-free — a
+    // worker parks a stalled row's state instead of blocking, and any idle
+    // worker resumes it once the wavefront dependency opens. Requires
+    // frameless workers (a migrated row's earlier reconstruction must be
+    // readable from the master, not a private frame) and non-AQ builds (the
+    // AQ tree build carries worker-scoped rolling QP-prediction state).
+    let handoff = frameless && wpp_handoff_enabled() && !state.aq.active;
     std::thread::scope(|scope| {
         for _ in 0..worker_limit {
             let shared = Arc::clone(&shared);
@@ -654,6 +663,8 @@ pub(super) fn build_slice_trees_parallel(
                 let mut worker_state = seed.make_encoder(frameless);
                 let mut strips =
                     frameless.then(|| super::stillsearch::RowStrips::new(&worker_state.frame));
+                let mut search = super::stillsearch::StillSearch::new(worker_state.bit_depth);
+                let mut worker = WppWorkerLocal::default();
                 {
                     let (lock, _) = &*shared;
                     let mut guard = lock.lock().expect("WPP build mutex poisoned");
@@ -662,21 +673,21 @@ pub(super) fn build_slice_trees_parallel(
                         .phase_parallel_restore_us
                         .saturating_add(setup_start.elapsed().as_micros() as u64);
                 }
-                loop {
-                    let cy = claim_wpp_row(&shared, ctbs_y);
-                    let Some(cy) = cy else {
-                        break;
-                    };
-                    build_wpp_row(
+                let mut avoid = None;
+                while let Some((cy, run)) = claim_wpp_work(&shared, ctbs_x, ctbs_y, avoid) {
+                    avoid = run_wpp_row_segment(
                         &mut worker_state,
-                        shared.clone(),
+                        &shared,
                         sink,
-                        slice_qp_y,
                         cy,
+                        run,
                         ctbs_x,
                         ctbs_y,
                         ctb,
+                        &mut search,
                         strips.as_mut(),
+                        &mut worker,
+                        handoff,
                     );
                 }
             });
@@ -694,9 +705,59 @@ pub(super) fn build_slice_trees_parallel(
 struct WppBuildShared {
     row_progress: Vec<u32>,
     row_start_ctx: Vec<Option<Contexts>>,
-    next_row: u32,
+    /// Per-row scheduling phase (row-segment handoff): rows are owner-free;
+    /// a stalled row's in-flight state parks here for any worker to resume.
+    phase: Vec<WppRowPhase>,
+    rows_done: u32,
+    /// Workers currently blocked in [`claim_wpp_work`] with nothing
+    /// runnable. When nonzero, a running worker parks its row after each
+    /// published CTU (the row is the wavefront frontier — redistributing it
+    /// at CTU granularity is what breaks the slow-core convoy).
+    idle_claimers: u32,
     trees: Vec<Option<CuNode>>,
     stats: super::types::EncodeStats,
+}
+
+/// In-flight build state of one WPP row, parked in [`WppBuildShared`] while
+/// the row's wavefront dependency is stalled (or while the frontier row is
+/// being redistributed). `ctxs` is the live row context chain; the CABAC
+/// encoder/bit-writer are context-evolution scratch whose bits are discarded
+/// (`write_slice_from_trees` re-codes the real bitstream serially).
+struct WppRowRun {
+    /// Next CTU column to build.
+    cx: u32,
+    /// Row-above rectangles already imported (`[0, prev_applied)`).
+    prev_applied: u32,
+    ctxs: Contexts,
+    enc: CabacEncoder,
+    w: BitWriter,
+}
+
+enum WppRowPhase {
+    NotStarted,
+    Parked(Box<WppRowRun>),
+    Running,
+    Done,
+}
+
+/// Worker-local context that survives across claims and records what the
+/// worker's private buffers currently hold, so a resume can re-derive only
+/// what it actually lacks.
+#[derive(Default)]
+struct WppWorkerLocal {
+    /// Which row's `y0c-1` content the worker's strip buffer holds.
+    strips_row: Option<u32>,
+    /// How far that content extends: row-above rectangles
+    /// `[0, strips_applied)` are present in this worker's strips. May lag
+    /// the row's own `prev_applied` when another worker advanced the row in
+    /// between — the pickup must import the gap.
+    strips_applied: u32,
+    /// `(cx, cy)` of this worker's most recent `build_ctu` — the canvas
+    /// left-edge self-capture is valid iff it equals `(cx-1, cy)` of the
+    /// next build.
+    last_built: Option<(u32, u32)>,
+    /// Scratch for the handoff left-column import.
+    left_cols: super::stillsearch::LeftCols,
 }
 
 /// Immutable worker template captured from the master encoder before the WPP
@@ -1113,6 +1174,56 @@ impl MasterFrameSink {
         };
         bytes
     }
+
+    /// Row-handoff takeover import: everything a worker resuming row `cy` at
+    /// column `cx` lacks about the left-neighbor CTU another worker built —
+    /// the published master pixel column `x0c-1` (per component, CTU height)
+    /// into `left`, plus the `(cx-1, cy)` mode / ct-depth map rectangles
+    /// into the worker maps (MPM left mode, split-context left depth).
+    ///
+    /// # Safety
+    /// CTU `(cx-1, cy)` is published: the resuming claim observed
+    /// `row_progress[cy] == cx` under the shared mutex.
+    unsafe fn import_left_neighbor(
+        &self,
+        state: &mut Encoder<'_>,
+        left: &mut super::stillsearch::LeftCols,
+        cx: u32,
+        cy: u32,
+        ctb: u32,
+    ) -> u64 {
+        debug_assert!(cx > 0);
+        let mut bytes = 0u64;
+        let plane_count = if state.cat == 0 { 1 } else { 3 };
+        for c_idx in 0..plane_count {
+            let (sx, sy) = state.plane_shifts(c_idx);
+            let sink = &self.planes[c_idx as usize];
+            // The current CTU's rect: its left border column is `x0 - 1`.
+            let (x0, y0, _x1, y1) = plane_rect(sink, sx, sy, cx, cy, ctb);
+            let rows = y1.saturating_sub(y0);
+            let col = left.col_mut(c_idx as usize, rows);
+            if x0 == 0 || rows == 0 {
+                continue;
+            }
+            let px = x0 - 1;
+            for (i, dst) in col.iter_mut().enumerate() {
+                let off = (y0 + i) * sink.stride + px;
+                debug_assert!(off < sink.len);
+                unsafe {
+                    *dst = *sink.ptr.add(off);
+                }
+            }
+            bytes += (rows * std::mem::size_of::<u16>()) as u64;
+        }
+        let (x0, y0, x1, y1) = map_rect(&self.mode, cx - 1, cy, 16);
+        bytes += unsafe { self.mode.import_rect(&mut state.mode_map, x0, y0, x1, y1) };
+        let (x0, y0, x1, y1) = map_rect(&self.ct_depth, cx - 1, cy, 8);
+        bytes += unsafe {
+            self.ct_depth
+                .import_rect(&mut state.ct_depth_map, x0, y0, x1, y1)
+        };
+        bytes
+    }
 }
 
 /// Frameless WPP workers (canvas-design.md phase 3): default on; `0`
@@ -1174,86 +1285,174 @@ fn map_rect<T: Copy>(
     (x0, y0, x1, y1)
 }
 
-fn claim_wpp_row(shared: &Arc<(Mutex<WppBuildShared>, Condvar)>, ctbs_y: u32) -> Option<u32> {
+/// Claim the lowest runnable row — an unstarted row whose start context is
+/// published, or a parked row whose wavefront dependency has opened — and
+/// mark it `Running`. Earlier rows gate everything below them, so
+/// lowest-`cy`-first keeps the wavefront frontier moving. Blocks when
+/// nothing is runnable; returns `None` once every row is done.
+///
+/// `avoid` skips one row on the first scan: a worker that just voluntarily
+/// parked its row must not immediately win it back from the still-waking
+/// idle worker it parked it for (the mutex is unfair). If nothing else is
+/// runnable the avoidance lapses on the next scan, so no work is stranded.
+fn claim_wpp_work(
+    shared: &Arc<(Mutex<WppBuildShared>, Condvar)>,
+    ctbs_x: u32,
+    ctbs_y: u32,
+    avoid: Option<u32>,
+) -> Option<(u32, Box<WppRowRun>)> {
     let claim_start = std::time::Instant::now();
     let (lock, cvar) = &**shared;
     let mut guard = lock.lock().expect("WPP build mutex poisoned");
+    let record_wait = |guard: &mut WppBuildShared| {
+        guard.stats.phase_wpp_wait_us = guard
+            .stats
+            .phase_wpp_wait_us
+            .saturating_add(claim_start.elapsed().as_micros() as u64);
+    };
+    let mut avoid = avoid;
     loop {
-        let cy = guard.next_row;
-        if cy >= ctbs_y {
-            guard.stats.phase_wpp_wait_us = guard
-                .stats
-                .phase_wpp_wait_us
-                .saturating_add(claim_start.elapsed().as_micros() as u64);
+        if guard.rows_done == ctbs_y {
+            record_wait(&mut guard);
             return None;
         }
-        if guard.row_start_ctx[cy as usize].is_some() {
-            guard.next_row += 1;
-            guard.stats.phase_wpp_wait_us = guard
-                .stats
-                .phase_wpp_wait_us
-                .saturating_add(claim_start.elapsed().as_micros() as u64);
-            return Some(cy);
+        for cy in 0..ctbs_y {
+            if avoid == Some(cy) {
+                continue;
+            }
+            match &guard.phase[cy as usize] {
+                WppRowPhase::NotStarted => {
+                    let Some(ctxs) = guard.row_start_ctx[cy as usize].clone() else {
+                        continue;
+                    };
+                    guard.phase[cy as usize] = WppRowPhase::Running;
+                    record_wait(&mut guard);
+                    return Some((
+                        cy,
+                        Box::new(WppRowRun {
+                            cx: 0,
+                            prev_applied: 0,
+                            ctxs,
+                            enc: CabacEncoder::new(),
+                            w: BitWriter::new(),
+                        }),
+                    ));
+                }
+                WppRowPhase::Parked(run) => {
+                    let need_prev = if cy == 0 { 0 } else { (run.cx + 2).min(ctbs_x) };
+                    if cy == 0 || guard.row_progress[cy as usize - 1] >= need_prev {
+                        let WppRowPhase::Parked(run) =
+                            std::mem::replace(&mut guard.phase[cy as usize], WppRowPhase::Running)
+                        else {
+                            unreachable!()
+                        };
+                        record_wait(&mut guard);
+                        return Some((cy, run));
+                    }
+                }
+                WppRowPhase::Running | WppRowPhase::Done => {}
+            }
         }
+        if avoid.take().is_some() {
+            // Nothing else was runnable; re-scan with the avoidance lapsed
+            // before blocking, so the parked row cannot be stranded.
+            continue;
+        }
+        guard.idle_claimers += 1;
         guard = cvar.wait(guard).expect("WPP build mutex poisoned");
+        guard.idle_claimers -= 1;
     }
 }
 
+/// Row-segment handoff switch (wpp-handoff-design.md): default on; `0`
+/// restores whole-row blocking claims for A/B.
+fn wpp_handoff_enabled() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("BPG_WPP_HANDOFF")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Run one claimed row until it completes, its wavefront dependency stalls
+/// (handoff: park the row for any worker to resume; fallback: block), or the
+/// frontier is voluntarily released because other workers sit idle. Returns
+/// the row to avoid on this worker's next claim after a voluntary park.
 #[allow(clippy::too_many_arguments)]
-fn build_wpp_row(
+fn run_wpp_row_segment(
     state: &mut Encoder<'_>,
-    shared: Arc<(Mutex<WppBuildShared>, Condvar)>,
+    shared: &Arc<(Mutex<WppBuildShared>, Condvar)>,
     sink: &MasterFrameSink,
-    _slice_qp_y: i32,
     cy: u32,
+    mut run: Box<WppRowRun>,
     ctbs_x: u32,
     ctbs_y: u32,
     ctb: u32,
+    search: &mut super::stillsearch::StillSearch,
     mut strips: Option<&mut super::stillsearch::RowStrips>,
-) {
-    let (lock, cvar) = &*shared;
-    let mut search = super::stillsearch::StillSearch::new(state.bit_depth);
-    let mut prev_applied = 0u32;
-    if let Some(strips) = strips.as_deref_mut() {
-        // The strip buffer holds plane row `cy_prev*ctb - 1` content from
-        // this worker's previous row; this row reads `cy*ctb - 1`.
-        strips.clear();
-    }
-
-    let mut ctxs = {
-        let wait_start = std::time::Instant::now();
-        let mut guard = lock.lock().expect("WPP build mutex poisoned");
-        loop {
-            if let Some(ctxs) = guard.row_start_ctx[cy as usize].clone() {
-                guard.stats.phase_wpp_wait_us = guard
-                    .stats
-                    .phase_wpp_wait_us
-                    .saturating_add(wait_start.elapsed().as_micros() as u64);
-                break ctxs;
-            }
-            guard = cvar.wait(guard).expect("WPP build mutex poisoned");
-        }
-    };
-    let mut enc = CabacEncoder::new();
-    let mut w = BitWriter::new();
+    worker: &mut WppWorkerLocal,
+    handoff: bool,
+) -> Option<u32> {
+    let (lock, cvar) = &**shared;
     let total = ctbs_x * ctbs_y;
 
-    for cx in 0..ctbs_x {
+    // Strip pickup: the worker's strip buffer holds some other row's
+    // `y0c-1` content, or this row's from an earlier segment of its own —
+    // possibly lagging `run.prev_applied` when other workers advanced the
+    // row in between. Re-derive the missing prefix from the master:
+    // rectangles `[0, prev_applied)` of the row above are published (this
+    // row already progressed past them).
+    if let Some(strips) = strips.as_deref_mut() {
+        let refresh_from = if worker.strips_row == Some(cy) {
+            worker.strips_applied
+        } else {
+            strips.clear();
+            worker.strips_row = Some(cy);
+            worker.strips_applied = 0;
+            0
+        };
+        if cy > 0 && refresh_from < run.prev_applied {
+            let import_start = std::time::Instant::now();
+            let mut bytes = 0u64;
+            for px in refresh_from..run.prev_applied {
+                // Safety: published — see above.
+                bytes += unsafe { sink.import_ctu_border_strip(state, strips, px, cy - 1, ctb) };
+            }
+            state.stats.bytes_restored = state.stats.bytes_restored.saturating_add(bytes);
+            state.stats.phase_parallel_restore_us = state
+                .stats
+                .phase_parallel_restore_us
+                .saturating_add(import_start.elapsed().as_micros() as u64);
+        }
+        worker.strips_applied = run.prev_applied;
+    }
+
+    while run.cx < ctbs_x {
+        let cx = run.cx;
         let need_prev = if cy == 0 { 0 } else { (cx + 2).min(ctbs_x) };
         let import_from = {
             let wait_start = std::time::Instant::now();
             let mut guard = lock.lock().expect("WPP build mutex poisoned");
             loop {
+                // The left dependency is intrinsic: this run owns the row and
+                // `row_progress[cy] == cx` by construction.
                 let prev_ready = cy == 0 || guard.row_progress[cy as usize - 1] >= need_prev;
-                let left_ready = cx == 0 || guard.row_progress[cy as usize] >= cx;
-                if prev_ready && left_ready {
+                if prev_ready {
                     guard.stats.phase_wpp_wait_us = guard
                         .stats
                         .phase_wpp_wait_us
                         .saturating_add(wait_start.elapsed().as_micros() as u64);
-                    let from = prev_applied;
-                    prev_applied = need_prev;
+                    let from = run.prev_applied;
+                    run.prev_applied = need_prev;
                     break from;
+                }
+                if handoff {
+                    // Park instead of blocking; whoever observes the row
+                    // above advance can resume this row.
+                    guard.stats.wpp_row_parks += 1;
+                    guard.phase[cy as usize] = WppRowPhase::Parked(run);
+                    return None;
                 }
                 guard = cvar.wait(guard).expect("WPP build mutex poisoned");
             }
@@ -1287,16 +1486,43 @@ fn build_wpp_row(
                 .stats
                 .phase_parallel_restore_us
                 .saturating_add(import_start.elapsed().as_micros() as u64);
+            if strips.is_some() {
+                worker.strips_applied = need_prev;
+            }
         }
+
+        // Handoff takeover: this worker's canvas does not hold the left
+        // neighbor (another worker built it, or this worker built a
+        // different row in between) — import the published left border
+        // column and the left CTU's mode / ct-depth rectangles.
+        let takeover = strips.is_some() && cx > 0 && worker.last_built != Some((cx - 1, cy));
+        let left = if takeover {
+            let import_start = std::time::Instant::now();
+            // Safety: CTU (cx-1, cy) is published — this run owns the row
+            // and the claim observed `row_progress[cy] == cx` under the
+            // shared mutex.
+            let bytes =
+                unsafe { sink.import_left_neighbor(state, &mut worker.left_cols, cx, cy, ctb) };
+            state.stats.wpp_row_takeovers += 1;
+            state.stats.bytes_restored = state.stats.bytes_restored.saturating_add(bytes);
+            state.stats.phase_parallel_restore_us = state
+                .stats
+                .phase_parallel_restore_us
+                .saturating_add(import_start.elapsed().as_micros() as u64);
+            Some(&worker.left_cols)
+        } else {
+            None
+        };
 
         let x0 = cx * ctb;
         let y0 = cy * ctb;
-        let price_ctx = ctxs.clone();
+        let price_ctx = run.ctxs.clone();
         let background = match strips.as_deref() {
-            Some(strips) => super::stillsearch::ReconBackground::Strips(strips),
+            Some(strips) => super::stillsearch::ReconBackground::Strips { strips, left },
             None => super::stillsearch::ReconBackground::Frame,
         };
         let cu = search.build_ctu(state, &price_ctx, x0, y0, CTB_LOG2, 0, background);
+        worker.last_built = Some((cx, cy));
         state.record_analysis_cache_cu_node(&cu, x0, y0, CTB_LOG2, 0);
         if state.deblock {
             let (display_width, display_height) = (state.display_width, state.display_height);
@@ -1310,9 +1536,19 @@ fn build_wpp_row(
                 display_height,
             );
         }
-        write_cu(state, &mut enc, &mut w, &mut ctxs, &cu, x0, y0, CTB_LOG2, 0);
+        write_cu(
+            state,
+            &mut run.enc,
+            &mut run.w,
+            &mut run.ctxs,
+            &cu,
+            x0,
+            y0,
+            CTB_LOG2,
+            0,
+        );
         let done = cy * ctbs_x + cx + 1;
-        enc.encode_bin_trm(&mut w, (done == total) as u8);
+        run.enc.encode_bin_trm(&mut run.w, (done == total) as u8);
 
         let publish_start = std::time::Instant::now();
         // Safety: this worker built the CTU and its `row_progress` advance
@@ -1334,11 +1570,12 @@ fn build_wpp_row(
             .saturating_add(publish_start.elapsed().as_micros() as u64);
         let stats = std::mem::take(&mut state.stats);
         let row_start_for_next = if cx == 1 && cy + 1 < ctbs_y {
-            Some(ctxs.clone())
+            Some(run.ctxs.clone())
         } else {
             None
         };
 
+        run.cx = cx + 1;
         let mut guard = lock.lock().expect("WPP build mutex poisoned");
         let idx = cy as usize * ctbs_x as usize + cx as usize;
         guard.trees[idx] = Some(cu);
@@ -1347,8 +1584,25 @@ fn build_wpp_row(
             guard.row_start_ctx[cy as usize + 1] = Some(ctx);
         }
         guard.stats.merge(&stats);
+        if run.cx == ctbs_x {
+            guard.phase[cy as usize] = WppRowPhase::Done;
+            guard.rows_done += 1;
+            cvar.notify_all();
+            return None;
+        }
+        // Voluntary frontier release: other workers are idle with nothing
+        // runnable, so this row is (part of) the wavefront frontier — park
+        // it after every CTU so its continuation lands on whichever worker
+        // is free first (breaking the slow-core convoy).
+        if handoff && guard.idle_claimers > 0 {
+            guard.stats.wpp_row_parks += 1;
+            guard.phase[cy as usize] = WppRowPhase::Parked(run);
+            cvar.notify_all();
+            return Some(cy);
+        }
         cvar.notify_all();
     }
+    None
 }
 
 /// Serial CABAC write of pre-built CTU trees, optionally prefixing each CTU
