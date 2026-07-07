@@ -141,6 +141,9 @@ pub struct EncodeStats {
     pub cu_force_leaf: u64,
     pub tu_split_early_terminations: u64,
     pub tu_split_bound_aborts: u64,
+    /// Winner materializations whose root-leaf luma evaluation was replayed
+    /// from the cheap stage's capture instead of re-evaluated (audit §10.13).
+    pub root_tu_reuse_hits: u64,
     pub rmd_prunes: u64,
     pub luma_candidate_expansions: u64,
     pub chroma_candidate_expansions: u64,
@@ -262,6 +265,7 @@ impl EncodeStats {
         self.cu_early_terminations += other.cu_early_terminations;
         self.cu_split_bound_aborts += other.cu_split_bound_aborts;
         self.tu_split_bound_aborts += other.tu_split_bound_aborts;
+        self.root_tu_reuse_hits += other.root_tu_reuse_hits;
         for (dst, src) in self
             .cu_split_bound_abort_by_child
             .iter_mut()

@@ -705,12 +705,29 @@ where
     ) -> Vec<SimpleRdoResult> {
         let mut ranked: Vec<SimpleRdoResult> = Vec::with_capacity(shortlist.len());
 
+        // Root-TU dedup (audit §10.13): arm per-candidate capture of the full
+        // root-leaf outcome when the winner materialization can replay it —
+        // 8-bit, single-leaf geometry, exact residual pricing, and matching
+        // quant policy (cheap == exact on the x265-shape tiers; the consumer
+        // re-checks the actual QuantMode). Candidates never commit contexts
+        // during ranking, so one `price_cur` snapshot covers the whole batch.
+        let cheap_pricing_exact = super::env::luma_cheap_residual_price_exact(
+            state.effort_template.luma.cheap.residual_price
+                == crate::effort::ResidualPriceLevel::Exact,
+        );
+        let root_capture = super::env::root_tu_reuse_mode() != super::env::RootTuReuseMode::Off
+            && log2_cb_size <= MAX_TB_LOG2
+            && state.bit_depth == 8
+            && cheap_pricing_exact
+            && !self.workspace.commit_ctx;
+
         // Leaf-major batched evaluation: each TU leaf samples source + builds the
         // intra reference border once, then evaluates all candidate modes. This
         // is byte-identical to the old mode-major loop but eliminates the
         // per-mode source resample and border rebuild (the LumaCheap hot cost).
         let cheap_timer = StillSearchLedger::start_timer();
         let mut acc = std::mem::take(&mut self.workspace.block_scratch.simple_rdo_accum);
+        self.workspace.root_tu_capture = root_capture;
         self.eval_simple_rdo_luma_modes(
             state,
             x0,
@@ -721,6 +738,7 @@ where
             lambda,
             &mut acc,
         );
+        self.workspace.root_tu_capture = false;
         // Preserve the per-mode LumaCheap call accounting (one per candidate mode)
         // so the work ledger stays comparable across this refactor.
         for _ in 0..shortlist.len() {
@@ -756,6 +774,35 @@ where
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.mode.cmp(&b.mode))
         });
+
+        // Promote the ranking winner's capture slot into the consumable
+        // root-TU cache alongside every input the consumption site must
+        // match. Any stale cache from a previous CU is replaced.
+        self.workspace.root_tu_cache = None;
+        if root_capture {
+            let mode = ranked[0].mode;
+            if let Some(idx) = shortlist.iter().position(|&m| m == mode) {
+                let mut caps = std::mem::take(&mut self.workspace.root_tu_candidates);
+                if idx < caps.len() {
+                    let cand = std::mem::take(&mut caps[idx]);
+                    self.workspace.root_tu_cache = Some(super::workspace::RootTuCache {
+                        x0,
+                        y0,
+                        log2_size: log2_cb_size,
+                        mode,
+                        qp: state.cur_qp_y,
+                        lambda_bits: lambda.to_bits(),
+                        quant: super::eval::search_trial_quant(
+                            state.effort_template.luma.cheap.quant,
+                        ),
+                        sdh: state.sign_data_hiding,
+                        ctx: self.workspace.price_cur.clone(),
+                        cand,
+                    });
+                }
+                self.workspace.root_tu_candidates = caps;
+            }
+        }
         ranked
     }
 
@@ -994,6 +1041,7 @@ where
                     scope: super::tu::TtEvalScope::FullComponents,
                     tu,
                     retain_coeff: true,
+                    reuse_root_luma: false,
                 };
                 let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
                 let commit_scope = self.begin_winner_commit_scope();
@@ -1058,6 +1106,7 @@ where
             scope: super::tu::TtEvalScope::FullComponents,
             tu,
             retain_coeff: true,
+            reuse_root_luma: false,
         };
         let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
         let commit_scope = self.begin_winner_commit_scope();
@@ -1255,6 +1304,7 @@ where
             scope: super::tu::TtEvalScope::LumaOnly,
             tu: state.effort_template.tu_exact,
             retain_coeff: false,
+            reuse_root_luma: false,
         };
         let (_, tt_cost) =
             self.decide_tt_with_config(state, x0, y0, log2_cb_size, 0, mode, lambda, cfg);
@@ -1381,6 +1431,7 @@ where
             scope: super::tu::TtEvalScope::FullComponents,
             tu: state.effort_template.tu_exact,
             retain_coeff: true,
+            reuse_root_luma: super::env::root_tu_reuse_mode() != super::env::RootTuReuseMode::Off,
         };
         let mbits = luma_mode_bits(&self.workspace.price_cur, mpm_u8, mode);
         let commit_scope = self.begin_winner_commit_scope();

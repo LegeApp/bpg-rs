@@ -79,6 +79,84 @@ pub(super) struct CtuWorkspace {
     /// `eval_tt_split` calls. Merged into `EncodeStats` in `build_ctu`.
     pub(super) tu_leaf_by_log2: [u64; 7],
     pub(super) tu_split_by_log2: [u64; 7],
+    /// When true, the batched cheap simple-RDO evaluator captures each
+    /// candidate's full root-leaf luma outcome into `root_tu_candidates`
+    /// (slot i = shortlist candidate i). Set only around the x265-shape
+    /// cheap ranking of a root-eligible CU (8-bit, `log2 <= MAX_TB_LOG2`).
+    pub(super) root_tu_capture: bool,
+    /// Per-candidate root-leaf capture slots for the current cheap ranking.
+    /// Buffers are reused across CUs.
+    pub(super) root_tu_candidates: Vec<RootTuCandidate>,
+    /// The cheap winner's captured root-leaf luma outcome, promoted by
+    /// `rank_x265_simple_rdo_modes` and consumed (at most once) by the winner
+    /// materialization's `decide_tt_with_config` when every input matches.
+    pub(super) root_tu_cache: Option<RootTuCache>,
+    /// Consumed root-TU captures this CTU (merged into
+    /// `EncodeStats::root_tu_reuse_hits`).
+    pub(super) root_tu_reuse_hits: u64,
+}
+
+/// One captured root-TU luma evaluation outcome: everything
+/// `eval_component_8_from_src_pred` computed for a candidate, sufficient to
+/// replay its side effects (overlay push, coeff retention, context commit)
+/// and return value without re-running transform/quant/pricing.
+#[derive(Default, Debug)]
+pub(super) struct RootTuCandidate {
+    pub(super) cbf: bool,
+    pub(super) cost: f64,
+    pub(super) dist: u64,
+    pub(super) frac_bits: u64,
+    pub(super) rd_frac_bits: u64,
+    /// Block to push to the overlay: reconstruction when coded, the intra
+    /// prediction when the zero-residual outcome won.
+    pub(super) push_block: Vec<u8>,
+    /// Final (post sign-data-hiding) quantized levels; empty when `!cbf`.
+    pub(super) levels: Vec<i16>,
+}
+
+impl RootTuCandidate {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn set(
+        &mut self,
+        cbf: bool,
+        cost: f64,
+        dist: u64,
+        frac_bits: u64,
+        rd_frac_bits: u64,
+        push_block: &[u8],
+        levels: &[i16],
+    ) {
+        self.cbf = cbf;
+        self.cost = cost;
+        self.dist = dist;
+        self.frac_bits = frac_bits;
+        self.rd_frac_bits = rd_frac_bits;
+        self.push_block.clear();
+        self.push_block.extend_from_slice(push_block);
+        self.levels.clear();
+        self.levels.extend_from_slice(levels);
+    }
+}
+
+/// The promoted cheap-winner root-TU capture plus every input that must match
+/// at the consumption site for the replay to be byte-identical to a fresh
+/// evaluation.
+pub(super) struct RootTuCache {
+    pub(super) x0: u32,
+    pub(super) y0: u32,
+    pub(super) log2_size: u8,
+    pub(super) mode: u8,
+    pub(super) qp: i32,
+    pub(super) lambda_bits: u64,
+    pub(super) quant: super::eval::QuantMode,
+    pub(super) sdh: bool,
+    /// `price_cur` as seen by the cheap evaluation (candidates do not commit
+    /// context updates, so one snapshot covers the whole ranking). Compared
+    /// against the live `price_cur` at consumption time — before the
+    /// materialization commits any syntax — so any interleaved context
+    /// evolution disables the reuse instead of corrupting it.
+    pub(super) ctx: Contexts,
+    pub(super) cand: RootTuCandidate,
 }
 
 impl Default for CtuWorkspace {
@@ -101,6 +179,10 @@ impl Default for CtuWorkspace {
             tu_split_bound_aborts: 0,
             tu_leaf_by_log2: [0; 7],
             tu_split_by_log2: [0; 7],
+            root_tu_capture: false,
+            root_tu_candidates: Vec::new(),
+            root_tu_cache: None,
+            root_tu_reuse_hits: 0,
         }
     }
 }
@@ -116,6 +198,9 @@ impl CtuWorkspace {
         self.tu_split_bound_aborts = 0;
         self.tu_leaf_by_log2 = [0; 7];
         self.tu_split_by_log2 = [0; 7];
+        self.root_tu_capture = false;
+        self.root_tu_cache = None;
+        self.root_tu_reuse_hits = 0;
     }
 
     /// Seed the trial-pricing entry context with the live CTU-entry context.

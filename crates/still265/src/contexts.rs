@@ -94,7 +94,7 @@ pub static INIT_VALUES: [u8; ctx::NUM_CONTEXTS] = [
 
 /// The full 170-entry CABAC context state for one slice, initialized from
 /// [`INIT_VALUES`] and the slice QP.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Contexts {
     pub models: [ContextModel; ctx::NUM_CONTEXTS],
 }

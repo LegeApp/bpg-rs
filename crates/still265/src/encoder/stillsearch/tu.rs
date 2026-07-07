@@ -89,6 +89,11 @@ pub(super) struct ExactEvalConfig {
     pub scope: TtEvalScope,
     pub tu: crate::effort::TuExactPolicy,
     pub retain_coeff: bool,
+    /// Root-TU dedup (audit §10.13): at `trafo_depth == 0`, consume the cheap
+    /// stage's captured winning-mode root-leaf luma outcome instead of
+    /// re-evaluating, when every captured input matches. Set only by the
+    /// x265-shape winner materialization.
+    pub reuse_root_luma: bool,
 }
 
 impl<S> StillSearchDepth<S>
@@ -261,6 +266,7 @@ where
                 residual_pricing,
                 true,
                 scope,
+                None,
             );
         }
 
@@ -291,6 +297,7 @@ where
             residual_pricing,
             true,
             scope,
+            None,
         );
         let leaf_saved = self.overlay.detach_from(mark0);
         let target_4x4_admit =
@@ -386,6 +393,7 @@ where
         residual_pricing: ResidualPricingMode,
         retain_coeff: bool,
         scope: TtEvalScope,
+        root_luma_replay: Option<&super::workspace::RootTuCandidate>,
     ) -> (TtPlan, f64) {
         self.workspace.ledger.bump(WorkBucket::TuLeaf);
         self.workspace.tu_leaf_by_log2[log2_size as usize] += 1;
@@ -393,20 +401,24 @@ where
         let cat = state.cat;
         let qp_y = state.cur_qp_y;
         let luma_pred = IntraPredMode::from_u8(luma_mode).unwrap_or(IntraPredMode::Dc);
-        let luma = self.eval_component(
-            state,
-            x0,
-            y0,
-            log2_size,
-            0,
-            luma_pred,
-            qp_y,
-            trafo_depth,
-            lambda,
-            quant_mode,
-            residual_pricing,
-            retain_coeff,
-        );
+        let luma = if let Some(cand) = root_luma_replay {
+            self.replay_root_luma_component(state, x0, y0, log2_size, luma_pred, retain_coeff, cand)
+        } else {
+            self.eval_component(
+                state,
+                x0,
+                y0,
+                log2_size,
+                0,
+                luma_pred,
+                qp_y,
+                trafo_depth,
+                lambda,
+                quant_mode,
+                residual_pricing,
+                retain_coeff,
+            )
+        };
         let mut cost = luma.cost;
 
         let mut cb = emit::empty_block();
@@ -904,7 +916,17 @@ where
         let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
         pred.resize(n, 0);
 
-        for a in accum.iter_mut() {
+        // Root-TU capture (audit §10.13): record each candidate's full leaf
+        // outcome so the ranking winner's materialization can replay it
+        // instead of re-evaluating. Only armed by the x265-shape ranker for
+        // root-eligible CUs.
+        let capture = self.workspace.root_tu_capture && trafo_depth == 0;
+        let mut caps = std::mem::take(&mut self.workspace.root_tu_candidates);
+        if capture && caps.len() < accum.len() {
+            caps.resize_with(accum.len(), Default::default);
+        }
+
+        for (i, a) in accum.iter_mut().enumerate() {
             let mode = IntraPredMode::from_u8(a.mode).unwrap_or(IntraPredMode::Dc);
             self.predict_exact_from_refs_u8(&refs, log2_size, 0, mode, &mut pred);
             let trial = self.eval_component_8_from_src_pred(
@@ -923,10 +945,12 @@ where
                 false,
                 &src,
                 &pred,
+                if capture { Some(&mut caps[i]) } else { None },
             );
             a.add_leaf(trial.cost + split_false_cost, trial.cbf);
         }
 
+        self.workspace.root_tu_candidates = caps;
         self.workspace.block_scratch.component_src_u8 = src;
         self.workspace.block_scratch.component_pred_u8 = pred;
     }
@@ -1217,6 +1241,21 @@ where
         let target_4x4_possible =
             !can_split && self.target_4x4_possible(log2_size, syntax_can_split);
 
+        // Root-TU dedup: take the cheap winner's captured root-leaf luma
+        // outcome iff every input matches, *before* any context mutation
+        // below (the capture snapshot is compared against the live
+        // `price_cur`). In verify mode the fresh evaluation still runs and
+        // the capture is asserted against it afterwards.
+        let root_cache = (cfg.reuse_root_luma && trafo_depth == 0)
+            .then(|| self.take_root_tu_cache(state, x0, y0, log2_size, luma_mode, lambda, &cfg))
+            .flatten();
+        let verify_mode = super::env::root_tu_reuse_mode() == super::env::RootTuReuseMode::Verify;
+        let (root_replay, root_verify) = if verify_mode {
+            (None, root_cache)
+        } else {
+            (root_cache, None)
+        };
+
         if must_split
             || can_split
                 && (matches!(cfg.tu.split_mode, crate::effort::TuSplitMode::ForceSplit)
@@ -1238,7 +1277,7 @@ where
         if (!can_split && !target_4x4_possible)
             || matches!(cfg.tu.split_mode, crate::effort::TuSplitMode::Disabled)
         {
-            return self.eval_tt_leaf(
+            let out = self.eval_tt_leaf(
                 state,
                 x0,
                 y0,
@@ -1252,7 +1291,12 @@ where
                 cfg.residual_pricing,
                 cfg.retain_coeff,
                 cfg.scope,
+                root_replay.as_ref().map(|c| &c.cand),
             );
+            if let Some(cache) = &root_verify {
+                self.verify_root_tu_capture(&out.0, cache);
+            }
+            return out;
         }
 
         // Leaf-first evaluation. Trial-context save/restore mirrors decide_tt.
@@ -1279,7 +1323,11 @@ where
             cfg.residual_pricing,
             cfg.retain_coeff,
             cfg.scope,
+            root_replay.as_ref().map(|c| &c.cand),
         );
+        if let Some(cache) = &root_verify {
+            self.verify_root_tu_capture(&leaf_tt, cache);
+        }
         let leaf_saved = self.overlay.detach_from(mark0);
         let target_4x4_admit =
             target_4x4_possible && self.target_4x4_admit(state, x0, y0, &leaf_tt, leaf_cost);
@@ -1344,6 +1392,78 @@ where
             self.overlay.reattach(leaf_saved);
             (leaf_tt, leaf_cost)
         }
+    }
+
+    /// Take the promoted cheap-winner root-TU capture iff every input the
+    /// evaluation depends on matches this call. Any mismatch leaves the cache
+    /// unconsumed (it is overwritten by the next ranking) and falls back to a
+    /// fresh evaluation, so a `Some` here is byte-identical by construction.
+    fn take_root_tu_cache(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        luma_mode: u8,
+        lambda: f64,
+        cfg: &ExactEvalConfig,
+    ) -> Option<super::workspace::RootTuCache> {
+        let cache = self.workspace.root_tu_cache.as_ref()?;
+        let matches = cache.x0 == x0
+            && cache.y0 == y0
+            && cache.log2_size == log2_size
+            && cache.mode == luma_mode
+            && cache.qp == state.cur_qp_y
+            && cache.lambda_bits == lambda.to_bits()
+            && cache.quant == cfg.quant
+            && cfg.residual_pricing == ResidualPricingMode::Exact
+            && cache.sdh == state.sign_data_hiding
+            && cache.ctx == self.workspace.price_cur;
+        if !matches {
+            return None;
+        }
+        self.workspace.root_tu_reuse_hits += 1;
+        self.workspace.root_tu_cache.take()
+    }
+
+    /// Verify-mode check: the freshly evaluated root leaf's luma plan block
+    /// must equal the cheap-stage capture field for field (and level for
+    /// level). Panics on divergence — this is the validation gate for the
+    /// root-TU reuse fast path.
+    fn verify_root_tu_capture(&self, tt: &TtPlan, cache: &super::workspace::RootTuCache) {
+        let TtPlan::Leaf(leaf) = tt else {
+            panic!("root-TU verify: fresh evaluation did not produce a leaf");
+        };
+        let cand = &cache.cand;
+        let luma = &leaf.luma;
+        let levels: &[i16] = luma
+            .coeff
+            .map(|id| self.workspace.coeffs.get(id))
+            .unwrap_or(&[]);
+        assert!(
+            luma.cbf == cand.cbf
+                && luma.frac_bits == cand.frac_bits
+                && luma.dist == cand.dist
+                && luma.rd_frac_bits == cand.rd_frac_bits
+                && levels == &cand.levels[..],
+            "root-TU verify mismatch at ({},{}) log2={} mode={}: \
+             fresh cbf={} frac={} dist={} rd_frac={} nlev={} vs \
+             captured cbf={} frac={} dist={} rd_frac={} nlev={}",
+            cache.x0,
+            cache.y0,
+            cache.log2_size,
+            cache.mode,
+            luma.cbf,
+            luma.frac_bits,
+            luma.dist,
+            luma.rd_frac_bits,
+            levels.len(),
+            cand.cbf,
+            cand.frac_bits,
+            cand.dist,
+            cand.rd_frac_bits,
+            cand.levels.len(),
+        );
     }
 
     /// Evaluate a split node using an explicit config, recursing via

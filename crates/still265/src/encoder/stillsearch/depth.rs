@@ -188,6 +188,7 @@ where
         state.stats.substage_calls += self.workspace.substage.calls;
         state.stats.tu_split_early_terminations += self.workspace.tu_split_early_terminations;
         state.stats.tu_split_bound_aborts += self.workspace.tu_split_bound_aborts;
+        state.stats.root_tu_reuse_hits += self.workspace.root_tu_reuse_hits;
         for i in 0..7 {
             state.stats.tu_leaf_by_log2[i] += self.workspace.tu_leaf_by_log2[i];
             state.stats.tu_split_by_log2[i] += self.workspace.tu_split_by_log2[i];

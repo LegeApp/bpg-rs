@@ -164,6 +164,49 @@ where
         }
     }
 
+    /// Replay a captured root-TU luma evaluation outcome: identical side
+    /// effects (overlay push, coeff retention, context commit) and return
+    /// value to the `eval_component` call it replaces, without re-running
+    /// transform/quant/pricing. The caller has already verified that every
+    /// input (geometry, mode, QP, lambda, quant, SDH, pricing contexts)
+    /// matches the capture.
+    pub(super) fn replay_root_luma_component(
+        &mut self,
+        state: &Encoder<'_>,
+        x0: u32,
+        y0: u32,
+        log2_size: u8,
+        mode: IntraPredMode,
+        retain_coeff: bool,
+        cand: &super::workspace::RootTuCandidate,
+    ) -> BlockTrial {
+        let size = 1u32 << log2_size;
+        debug_assert_eq!(cand.push_block.len(), (size * size) as usize);
+        self.overlay
+            .push_block_u8(0, x0, y0, size, size, &cand.push_block);
+        let coeff = (retain_coeff && cand.cbf).then(|| self.workspace.coeffs.push(&cand.levels));
+        if self.workspace.commit_ctx {
+            let scan = get_scan_order(log2_size, mode.as_u8(), 0, state.cat);
+            self.commit_component_ctx(
+                cand.cbf,
+                &cand.levels,
+                log2_size,
+                0,
+                0,
+                scan,
+                state.sign_data_hiding,
+            );
+        }
+        BlockTrial {
+            coeff,
+            cbf: cand.cbf,
+            frac_bits: cand.frac_bits,
+            cost: cand.cost,
+            dist: cand.dist,
+            rd_frac_bits: cand.rd_frac_bits,
+        }
+    }
+
     /// Enter a committed-winner evaluation scope: subsequent `eval_component*`
     /// calls write their selected outcome's context updates into `price_cur`
     /// (with chroma deferred to the CU-level chroma-mode search when that is
@@ -658,6 +701,7 @@ where
             push_overlay,
             &src,
             &pred,
+            None,
         );
 
         self.workspace.block_scratch.component_src_u8 = src;
@@ -670,6 +714,11 @@ where
     /// samples + predicts then calls this) and the batched cheap-RDO leaf path
     /// (which builds source + refs once per leaf and calls this once per mode).
     /// Byte-identical to the previous monolithic `eval_component_8_impl`.
+    ///
+    /// When `capture` is provided, the selected outcome (trial fields plus the
+    /// block that would be pushed to the overlay and the final levels) is
+    /// recorded so the root-TU reuse path can replay it later without
+    /// re-running transform/quant/pricing.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn eval_component_8_from_src_pred(
         &mut self,
@@ -688,6 +737,7 @@ where
         push_overlay: bool,
         src: &[u8],
         pred: &[u8],
+        mut capture: Option<&mut super::workspace::RootTuCandidate>,
     ) -> BlockTrial {
         let profile = super::env::profile_enabled();
         self.workspace.substage.calls += u64::from(profile);
@@ -699,6 +749,7 @@ where
         let is_dst4 = c_idx == 0 && log2_size == 2;
         let commit_ctx =
             self.workspace.commit_ctx && (c_idx == 0 || !self.workspace.commit_ctx_skip_chroma);
+        let capture_on = capture.is_some();
         debug_assert!(src.len() >= n && pred.len() >= n);
 
         let mut levels_vec = Vec::new();
@@ -746,6 +797,9 @@ where
                     scan,
                     sdh_enabled,
                 );
+            }
+            if let Some(cap) = capture.as_deref_mut() {
+                cap.set(false, cost_zero, dist_zero, 0, cbf0_bits, pred, &[]);
             }
             return BlockTrial {
                 coeff: None,
@@ -983,7 +1037,9 @@ where
                     };
                     priced_residual_bits = Some(residual_bits);
                 }
-                if (retain_coeff || rdoq_audit || commit_ctx) && coded_min_cost < cost_zero {
+                if (retain_coeff || rdoq_audit || commit_ctx || capture_on)
+                    && coded_min_cost < cost_zero
+                {
                     levels_vec = levels.clone();
                 }
                 recon_coded = true;
@@ -1054,6 +1110,17 @@ where
                         sdh_enabled,
                     );
                 }
+                if let Some(cap) = capture.as_deref_mut() {
+                    cap.set(
+                        true,
+                        cost_coded,
+                        dist_coded,
+                        residual_bits,
+                        residual_bits + cbf1_bits,
+                        &recon,
+                        &levels_vec,
+                    );
+                }
                 BlockTrial {
                     coeff,
                     cbf: true,
@@ -1078,6 +1145,9 @@ where
                         scan,
                         sdh_enabled,
                     );
+                }
+                if let Some(cap) = capture.as_deref_mut() {
+                    cap.set(false, cost_zero, dist_zero, 0, cbf0_bits, pred, &[]);
                 }
                 BlockTrial {
                     coeff: None,

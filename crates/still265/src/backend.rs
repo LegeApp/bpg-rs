@@ -237,6 +237,7 @@ impl HevcEncoder for RustStillHevcEncoder {
                 stats.cu_split_bound_abort_by_child[3],
             );
             eprintln!("  tu_split_bound_aborts: {}", stats.tu_split_bound_aborts,);
+            eprintln!("  root_tu_reuse_hits: {}", stats.root_tu_reuse_hits,);
             let tuleaf_at = |l: usize| stats.tu_leaf_by_log2[l] as f64 / ctus;
             let tusplit_at = |l: usize| stats.tu_split_by_log2[l] as f64 / ctus;
             eprintln!(

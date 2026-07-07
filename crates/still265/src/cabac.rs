@@ -103,7 +103,7 @@ const NEXT_STATE: [[u8; 2]; 128] = build_next_state();
 
 /// A single CABAC context model: packed state index (0..=63) and
 /// most-probable-symbol (`state_mps = (state << 1) | mps`).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ContextModel {
     state_mps: u8,
 }

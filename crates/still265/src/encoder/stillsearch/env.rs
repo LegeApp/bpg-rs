@@ -767,6 +767,38 @@ pub(super) fn rdoq_one_pass_enabled() -> bool {
     })
 }
 
+/// Root-TU dedup: reuse the cheap stage's winning-mode root-leaf luma
+/// evaluation as the winner materialization's no-split arm instead of
+/// re-running transform/RDOQ/pricing (audit §10.13). Byte-identical by
+/// construction when every captured input matches; any mismatch falls back
+/// to a fresh evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RootTuReuseMode {
+    Off,
+    On,
+    /// Capture and match as in `On`, but run the fresh evaluation anyway and
+    /// panic if the captured outcome differs — the validation gate.
+    Verify,
+}
+
+/// `BPG_STILLSEARCH_ROOT_TU_REUSE`: `0`/`off` disables, `verify` enables the
+/// recompute-and-assert mode, anything else (default, unset) enables reuse.
+pub(super) fn root_tu_reuse_mode() -> RootTuReuseMode {
+    static MODE: OnceLock<RootTuReuseMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("BPG_STILLSEARCH_ROOT_TU_REUSE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "0" | "off" | "none" | "disable" | "disabled" => RootTuReuseMode::Off,
+            "verify" | "check" => RootTuReuseMode::Verify,
+            _ => RootTuReuseMode::On,
+        }
+    })
+}
+
 /// RDOQ-in-search override: `Some(true)` forces RDOQ trials at every search
 /// decision site, `Some(false)` forces hard quant, `None` (unset or `effort`)
 /// defers to the effort template's per-stage [`crate::effort::TrialQuant`].

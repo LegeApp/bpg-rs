@@ -131,6 +131,7 @@ where
                     ResidualPricingMode::Exact,
                     true,
                     super::tu::TtEvalScope::FullComponents,
+                    None,
                 );
                 new_tt
             }
