@@ -583,6 +583,192 @@ pub(super) fn parallel_thread_count() -> usize {
         .max(1)
 }
 
+/// Row width (in CTUs) at or above which the WPP wavefront is "wide": enough
+/// sustained parallelism to keep every host thread busy, including
+/// efficiency cores on hybrid CPUs. Shared by the handoff release policy and
+/// the hybrid worker cap; the value comes from the same 12 MP (63 CTUs/row)
+/// vs 50 MP (128 CTUs/row) interleaved sweeps.
+const WPP_WIDE_ROW_CTUS: u32 = 96;
+
+/// Performance-core *thread* count on hybrid CPUs, when the OS exposes the
+/// topology (Linux: `/sys/devices/cpu_core/cpus`; Windows:
+/// `GetLogicalProcessorInformationEx` efficiency classes). `None` on
+/// homogeneous CPUs, other hosts, or unparsable topology.
+fn perf_core_thread_count() -> Option<usize> {
+    static VALUE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(hybrid_perf_thread_count)
+}
+
+/// Linux: the hybrid-CPU sysfs interface publishes P-core and E-core CPU
+/// lists as `/sys/devices/cpu_core/cpus` / `/sys/devices/cpu_atom/cpus`
+/// (e.g. `0-11` / `12-19` on an i7-13700H).
+#[cfg(target_os = "linux")]
+fn hybrid_perf_thread_count() -> Option<usize> {
+    // Only trust the core list as a *subset* signal when an atom list also
+    // exists; on non-hybrid parts cpu_core covers every CPU.
+    std::fs::metadata("/sys/devices/cpu_atom/cpus").ok()?;
+    let list = std::fs::read_to_string("/sys/devices/cpu_core/cpus").ok()?;
+    let mut count = 0usize;
+    for part in list.trim().split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match part.split_once('-') {
+            Some((a, b)) => {
+                let a: usize = a.trim().parse().ok()?;
+                let b: usize = b.trim().parse().ok()?;
+                count += b.checked_sub(a)? + 1;
+            }
+            None => {
+                let _: usize = part.parse().ok()?;
+                count += 1;
+            }
+        }
+    }
+    (count > 0).then_some(count)
+}
+
+/// Windows: enumerate `RelationProcessorCore` records and use each core's
+/// `EfficiencyClass` (higher = more performant; all-equal = homogeneous).
+/// Returns the logical-CPU count of the highest efficiency class only when
+/// at least two classes exist.
+#[cfg(windows)]
+fn hybrid_perf_thread_count() -> Option<usize> {
+    #[repr(C)]
+    struct GroupAffinity {
+        mask: usize, // KAFFINITY
+        group: u16,
+        reserved: [u16; 3],
+    }
+    // SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX header followed by a
+    // PROCESSOR_RELATIONSHIP payload; records are variable-length (`size`).
+    #[repr(C)]
+    struct ProcInfoHeader {
+        relationship: u32,
+        size: u32,
+    }
+    #[repr(C)]
+    struct ProcessorRelationship {
+        flags: u8,
+        efficiency_class: u8,
+        reserved: [u8; 20],
+        group_count: u16,
+        // group_masks: [GroupAffinity; group_count] follows inline
+    }
+    const RELATION_PROCESSOR_CORE: u32 = 0;
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLogicalProcessorInformationEx(
+            relationship_type: u32,
+            buffer: *mut u8,
+            returned_length: *mut u32,
+        ) -> i32;
+        fn GetLastError() -> u32;
+    }
+
+    let mut len: u32 = 0;
+    // SAFETY: sizing call with a null buffer; the API reports the required
+    // length via `len` and fails with ERROR_INSUFFICIENT_BUFFER.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len)
+    };
+    if ok != 0 || unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || len == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len as usize];
+    // SAFETY: buffer is `len` bytes as required; the API writes at most
+    // `len` bytes and updates it to the amount used.
+    let ok = unsafe {
+        GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len)
+    };
+    if ok == 0 {
+        return None;
+    }
+
+    let header_len = std::mem::size_of::<ProcInfoHeader>();
+    let rel_len = std::mem::size_of::<ProcessorRelationship>();
+    let mask_len = std::mem::size_of::<GroupAffinity>();
+    let mut min_class = u8::MAX;
+    let mut max_class = u8::MIN;
+    let mut top_class_threads: Vec<(u8, usize)> = Vec::new();
+    let mut off = 0usize;
+    while off + header_len <= len as usize {
+        // SAFETY: `off + header_len` is in bounds; the buffer was fully
+        // written by the API and records are 8-byte-aligned C structs read
+        // via unaligned loads for safety.
+        let header: ProcInfoHeader =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off).cast()) };
+        let size = header.size as usize;
+        if size == 0 || off + size > len as usize {
+            return None;
+        }
+        if header.relationship == RELATION_PROCESSOR_CORE {
+            if size < header_len + rel_len {
+                return None;
+            }
+            // SAFETY: bounds checked just above.
+            let rel: ProcessorRelationship =
+                unsafe { std::ptr::read_unaligned(buf.as_ptr().add(off + header_len).cast()) };
+            let masks_off = off + header_len + rel_len;
+            let group_count = rel.group_count.max(1) as usize;
+            if masks_off + group_count * mask_len > off + size {
+                return None;
+            }
+            let mut threads = 0usize;
+            for g in 0..group_count {
+                // SAFETY: bounds checked just above.
+                let ga: GroupAffinity = unsafe {
+                    std::ptr::read_unaligned(buf.as_ptr().add(masks_off + g * mask_len).cast())
+                };
+                threads += ga.mask.count_ones() as usize;
+            }
+            min_class = min_class.min(rel.efficiency_class);
+            max_class = max_class.max(rel.efficiency_class);
+            top_class_threads.push((rel.efficiency_class, threads));
+        }
+        off += size;
+    }
+    if top_class_threads.is_empty() || min_class == max_class {
+        return None;
+    }
+    let count = top_class_threads
+        .iter()
+        .filter(|&&(class, _)| class == max_class)
+        .map(|&(_, threads)| threads)
+        .sum::<usize>();
+    (count > 0).then_some(count)
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+fn hybrid_perf_thread_count() -> Option<usize> {
+    None
+}
+
+/// WPP worker budget for a frame `ctbs_x` CTUs wide. `BPG_ENC_THREADS`
+/// overrides everything (via [`parallel_thread_count`]). Otherwise, on
+/// hybrid CPUs with a narrow wavefront the default is capped at the
+/// performance-core thread count: measured on an i7-13700H (6P+8E), 12 MP
+/// frames (63 CTUs/row) ran ~5% faster with 12 workers than 20 — the
+/// wavefront frontier convoys behind efficiency cores faster than their
+/// extra throughput pays back — while 50 MP frames (128 CTUs/row) were ~15%
+/// faster with all 20. `BPG_WPP_HYBRID_CAP=0` disables the cap for A/B.
+fn wpp_worker_budget(ctbs_x: u32) -> usize {
+    let requested = parallel_thread_count();
+    if std::env::var("BPG_ENC_THREADS").is_ok() || ctbs_x >= WPP_WIDE_ROW_CTUS {
+        return requested;
+    }
+    if std::env::var("BPG_WPP_HYBRID_CAP").is_ok_and(|v| v.trim() == "0") {
+        return requested;
+    }
+    match perf_core_thread_count() {
+        Some(p) if p < requested => p,
+        _ => requested,
+    }
+}
+
 /// Build CTU trees with WPP row-wavefront dependencies. Workers keep private
 /// encoder state and publish deterministic CTU snapshots. AQ uses this only as
 /// a tree-build acceleration path; final syntax is replayed serially.
@@ -604,7 +790,7 @@ pub(super) fn build_slice_trees_parallel(
     let ctbs_x = state.display_width.div_ceil(ctb);
     let ctbs_y = state.display_height.div_ceil(ctb);
     let total = (ctbs_x * ctbs_y) as usize;
-    let worker_limit = parallel_thread_count().min(ctbs_y as usize).max(1);
+    let worker_limit = wpp_worker_budget(ctbs_x).min(ctbs_y as usize).max(1);
     if worker_limit <= 1 || ctbs_x <= 1 || ctbs_y <= 1 {
         return build_slice_trees_serial(state, slice_qp_y);
     }
