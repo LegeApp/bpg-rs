@@ -357,10 +357,13 @@ where
         });
 
         if state.bit_depth == 8 {
-            let mut src = vec![0u8; n];
+            let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
+            src.resize(n, 0);
             self.source.sample_block_u8(0, x0, y0, size, &mut src);
-            let mut pred = vec![0u8; n];
-            let mut tmp_u16 = Vec::with_capacity(n);
+            let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
+            pred.resize(n, 0);
+            let mut tmp_u16 =
+                std::mem::take(&mut self.workspace.block_scratch.component_pred_tmp_u16);
             for &m in mode_list.iter().filter(|&&m| m <= 1) {
                 let mode = IntraPredMode::from_u8(m).expect("0..=1 are valid intra modes");
                 if use_x265_sa8d && m == 0 {
@@ -455,14 +458,19 @@ where
                     });
                 }
             }
+            self.workspace.block_scratch.component_src_u8 = src;
+            self.workspace.block_scratch.component_pred_u8 = pred;
+            self.workspace.block_scratch.component_pred_tmp_u16 = tmp_u16;
         } else {
-            let mut src = vec![0u16; n];
+            let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u16);
+            src.resize(n, 0);
             for y in 0..size {
                 for x in 0..size {
                     src[y * size + x] = self.source.sample(0, x0 + x as u32, y0 + y as u32);
                 }
             }
-            let mut pred = vec![0u16; n];
+            let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u16);
+            pred.resize(n, 0);
             for &m in mode_list.iter().filter(|&&m| m <= 1) {
                 let mode = IntraPredMode::from_u8(m).expect("0..=1 are valid intra modes");
                 if use_x265_sa8d && m == 0 {
@@ -541,6 +549,8 @@ where
                     });
                 }
             }
+            self.workspace.block_scratch.component_src_u16 = src;
+            self.workspace.block_scratch.component_pred_u16 = pred;
         }
         self.workspace.ledger.bump(WorkBucket::RoughLuma);
         self.workspace
@@ -844,6 +854,11 @@ where
             self.workspace.block_scratch.component_pred_u8 = pred;
             self.workspace.block_scratch.component_pred_tmp_u16 = tmp;
         } else {
+            let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u16);
+            let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u16);
+            src.resize(block_pixels, 0);
+            pred.resize(block_pixels, 0);
+
             for row in 0..count {
                 let y_base = cy + (row as u32) * stride_full as u32;
                 for ti_y in 0..tiles_y {
@@ -851,7 +866,6 @@ where
                     for ti_x in 0..tiles_x {
                         let x_off = cx + (ti_x as u32) * step;
                         for c_idx in [1u8, 2] {
-                            let mut src = vec![0u16; block_pixels];
                             for y in 0..block_size {
                                 for x in 0..block_size {
                                     src[y * block_size + x] = self.source.sample(
@@ -861,7 +875,6 @@ where
                                     );
                                 }
                             }
-                            let mut pred = vec![0u16; block_pixels];
                             self.predict_into(
                                 state, x_off, y_off, block_log2, c_idx, cmode, &mut pred,
                             );
@@ -870,6 +883,8 @@ where
                     }
                 }
             }
+            self.workspace.block_scratch.component_src_u16 = src;
+            self.workspace.block_scratch.component_pred_u16 = pred;
         }
         lambda_sad * total_satd as f64 / scale
     }

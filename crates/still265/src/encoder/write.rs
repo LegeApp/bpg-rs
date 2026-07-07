@@ -619,6 +619,7 @@ pub(super) fn build_slice_trees_parallel(
             },
             phase: (0..ctbs_y).map(|_| WppRowPhase::NotStarted).collect(),
             rows_done: 0,
+            first_unfinished: 0,
             idle_claimers: 0,
             trees: (0..total).map(|_| None).collect(),
             stats: Default::default(),
@@ -652,12 +653,25 @@ pub(super) fn build_slice_trees_parallel(
     // frameless workers (a migrated row's earlier reconstruction must be
     // readable from the master, not a private frame) and non-AQ builds (the
     // AQ tree build carries worker-scoped rolling QP-prediction state).
+    //
+    // Voluntary frontier releases are coarsened by
+    // `wpp_handoff_release_period`: the first handoff build released after
+    // every CTU, which maximized redistribution but can ping-pong short rows
+    // through the mutex/condvar and left-column import path. The default is
+    // geometry-aware: short 12 MP-class rows use stall-only handoff, while
+    // wide rows release every 4 CTUs. `BPG_WPP_HANDOFF_RELEASE=1` restores
+    // the original per-CTU policy and `0`/`stall-only` disables voluntary
+    // releases while retaining dependency-stall parking.
     let handoff = frameless && wpp_handoff_enabled() && !state.aq.active;
+    let handoff_release_period = handoff
+        .then(|| wpp_handoff_release_period(ctbs_x))
+        .flatten();
     std::thread::scope(|scope| {
         for _ in 0..worker_limit {
             let shared = Arc::clone(&shared);
             let seed = &seed;
             let sink = &sink;
+            let handoff_release_period = handoff_release_period;
             scope.spawn(move || {
                 let setup_start = std::time::Instant::now();
                 let mut worker_state = seed.make_encoder(frameless);
@@ -688,6 +702,7 @@ pub(super) fn build_slice_trees_parallel(
                         strips.as_mut(),
                         &mut worker,
                         handoff,
+                        handoff_release_period,
                     );
                 }
             });
@@ -709,10 +724,16 @@ struct WppBuildShared {
     /// a stalled row's in-flight state parks here for any worker to resume.
     phase: Vec<WppRowPhase>,
     rows_done: u32,
+    /// Lowest row that is not known to be `Done`. WPP rows finish in order by
+    /// dependency, but advance this with a defensive while-loop so the claim
+    /// scan does not keep walking a growing prefix of completed rows under
+    /// the mutex.
+    first_unfinished: u32,
     /// Workers currently blocked in [`claim_wpp_work`] with nothing
-    /// runnable. When nonzero, a running worker parks its row after each
-    /// published CTU (the row is the wavefront frontier — redistributing it
-    /// at CTU granularity is what breaks the slow-core convoy).
+    /// runnable. When nonzero, a running worker may voluntarily park its row
+    /// after a configured number of published CTUs (the row is the wavefront
+    /// frontier — redistributing it is what breaks the slow-core convoy, but
+    /// doing so every CTU can ping-pong short rows).
     idle_claimers: u32,
     trees: Vec<Option<CuNode>>,
     stats: super::types::EncodeStats,
@@ -1316,7 +1337,7 @@ fn claim_wpp_work(
             record_wait(&mut guard);
             return None;
         }
-        for cy in 0..ctbs_y {
+        for cy in guard.first_unfinished..ctbs_y {
             if avoid == Some(cy) {
                 continue;
             }
@@ -1375,6 +1396,85 @@ fn wpp_handoff_enabled() -> bool {
     })
 }
 
+/// Voluntary row-release cadence for WPP handoff. Dependency stalls always
+/// park when handoff is enabled; this only controls the extra "frontier
+/// release" used when other workers are idle. The first shipped policy was
+/// per-CTU (`1`), but the Linux handoff watch-list called out ping-pong as
+/// the first thing to tune if 12 MP wall time lagged. Measurements on the
+/// canonical 12 MP / smooth 50 MP pair favored stall-only for 63-CTU rows and
+/// 4-CTU releases for 128-CTU rows, so the unset default is geometry-aware.
+///
+/// `BPG_WPP_HANDOFF_RELEASE=1` restores per-CTU release, `2`/`4`/etc release
+/// every N completed CTUs, `auto` uses the geometry default, and
+/// `0`/`off`/`stall-only` disables voluntary releases while preserving
+/// parking on dependency stalls.
+fn wpp_handoff_release_period(ctbs_x: u32) -> Option<u32> {
+    fn auto_period(ctbs_x: u32) -> Option<u32> {
+        // The 12 MP canonical row width is 63 CTUs and repeatedly preferred
+        // stall-only; the smooth 50 MP canonical row width is 128 CTUs and
+        // preferred periodic release on mean wall time. Keep the threshold
+        // deliberately coarse until a wider sweep says otherwise.
+        if ctbs_x < 96 { None } else { Some(4) }
+    }
+
+    let Ok(raw) = std::env::var("BPG_WPP_HANDOFF_RELEASE") else {
+        return auto_period(ctbs_x);
+    };
+    let v = raw.trim();
+    let lower = v.to_ascii_lowercase();
+    if matches!(lower.as_str(), "" | "auto" | "default") {
+        return auto_period(ctbs_x);
+    }
+    if matches!(
+        lower.as_str(),
+        "0" | "off" | "false" | "none" | "disable" | "disabled" | "stall" | "stall-only"
+    ) {
+        return None;
+    }
+    v.parse::<u32>().ok().filter(|&n| n > 0).or_else(|| {
+        eprintln!(
+            "warning: ignoring invalid BPG_WPP_HANDOFF_RELEASE={v:?}; using geometry default"
+        );
+        auto_period(ctbs_x)
+    })
+}
+
+/// WPP progress notification policy. The first handoff scheduler woke every
+/// sleeping worker after every CTU, which is simple but creates a thundering
+/// herd around the same claim mutex when rows are short or voluntarily parked
+/// frequently. The default now wakes one sleeper per progress event; final
+/// completion still wakes all waiters so every worker can exit. Set
+/// `BPG_WPP_NOTIFY_ALL=1` to restore the old notify-all behavior for A/B.
+fn wpp_notify_all_progress() -> bool {
+    static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("BPG_WPP_NOTIFY_ALL")
+            .map(|v| v.trim() != "0")
+            .unwrap_or(false)
+    })
+}
+
+fn notify_wpp_progress(cvar: &Condvar, guard: &WppBuildShared, handoff: bool) {
+    if !handoff {
+        // Whole-row fallback mode has workers blocked inside a claimed row's
+        // dependency wait as well as workers blocked in `claim_wpp_work`, and
+        // only the latter are counted by `idle_claimers`. A single notify may
+        // wake the wrong dependency waiter and strand the row that just became
+        // runnable, so preserve the original notify-all semantics off the
+        // owner-free handoff path.
+        cvar.notify_all();
+        return;
+    }
+    if guard.idle_claimers == 0 {
+        return;
+    }
+    if guard.rows_done == guard.row_progress.len() as u32 || wpp_notify_all_progress() {
+        cvar.notify_all();
+    } else {
+        cvar.notify_one();
+    }
+}
+
 /// Run one claimed row until it completes, its wavefront dependency stalls
 /// (handoff: park the row for any worker to resume; fallback: block), or the
 /// frontier is voluntarily released because other workers sit idle. Returns
@@ -1393,6 +1493,7 @@ fn run_wpp_row_segment(
     mut strips: Option<&mut super::stillsearch::RowStrips>,
     worker: &mut WppWorkerLocal,
     handoff: bool,
+    handoff_release_period: Option<u32>,
 ) -> Option<u32> {
     let (lock, cvar) = &**shared;
     let total = ctbs_x * ctbs_y;
@@ -1587,20 +1688,31 @@ fn run_wpp_row_segment(
         if run.cx == ctbs_x {
             guard.phase[cy as usize] = WppRowPhase::Done;
             guard.rows_done += 1;
-            cvar.notify_all();
+            while guard.first_unfinished < ctbs_y
+                && matches!(
+                    guard.phase[guard.first_unfinished as usize],
+                    WppRowPhase::Done
+                )
+            {
+                guard.first_unfinished += 1;
+            }
+            notify_wpp_progress(cvar, &guard, handoff);
             return None;
         }
         // Voluntary frontier release: other workers are idle with nothing
         // runnable, so this row is (part of) the wavefront frontier — park
-        // it after every CTU so its continuation lands on whichever worker
-        // is free first (breaking the slow-core convoy).
-        if handoff && guard.idle_claimers > 0 {
+        // it periodically so its continuation lands on whichever worker is
+        // free first (breaking the slow-core convoy) without forcing a
+        // mutex/condvar + left-edge-import ping-pong after every CTU.
+        let voluntary_release = handoff_release_period
+            .is_some_and(|period| guard.idle_claimers > 0 && run.cx % period == 0);
+        if handoff && voluntary_release {
             guard.stats.wpp_row_parks += 1;
             guard.phase[cy as usize] = WppRowPhase::Parked(run);
-            cvar.notify_all();
+            notify_wpp_progress(cvar, &guard, handoff);
             return Some(cy);
         }
-        cvar.notify_all();
+        notify_wpp_progress(cvar, &guard, handoff);
     }
     None
 }

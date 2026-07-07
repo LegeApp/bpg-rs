@@ -2,9 +2,12 @@
 //!
 //! Encoding many images at once is bounded by RAM as much as by CPU: each
 //! in-flight encode holds a reconstruction frame, and the parallel wavefront
-//! path additionally clones one frame per wavefront worker. This module surfaces a
-//! [`MemoryEstimate`] so a caller can size concurrency against a RAM budget
-//! *before* spawning work, plus a simple image-parallel [`encode_batch`] runner.
+//! path additionally holds worker-local state. Modern frameless WPP workers no
+//! longer clone the reconstruction pixel planes, but still carry small maps and
+//! row-strip buffers; `BPG_WPP_FRAMELESS=0` restores full worker frames. This
+//! module surfaces a [`MemoryEstimate`] so a caller can size concurrency against
+//! a RAM budget *before* spawning work, plus a simple image-parallel
+//! [`encode_batch`] runner.
 //!
 //! ```no_run
 //! use still265::{batch, StillHevcConfig, Effort, SaoMode, DeblockMode, ChromaFormat};
@@ -50,9 +53,13 @@ pub struct MemoryEstimate {
     /// The input source planes (display resolution, all components).
     pub source_bytes: u64,
     /// Number of per-worker frame clones the chosen effort will hold
-    /// concurrently (0 for serial configs; the parallel wavefront path clones
-    /// one frame per wavefront worker).
+    /// concurrently (0 for serial configs and for the default frameless WPP
+    /// path; `BPG_WPP_FRAMELESS=0` restores one full frame per worker).
     pub worker_frames: u32,
+    /// Worker-local memory not counted in `frame_bytes`: either full
+    /// per-worker frames (`worker_frames * frame_bytes`) or, for frameless WPP,
+    /// the worker-local metadata maps plus row-strip buffers.
+    pub worker_bytes: u64,
     /// Estimated peak resident memory for the whole encode.
     pub peak_bytes: u64,
 }
@@ -111,6 +118,21 @@ fn worker_count(coded_h: u32) -> u32 {
     requested.min(ctbs_y)
 }
 
+/// Mirror the encoder's frameless WPP gate for memory estimation. Frameless is
+/// the default when the import width is the 1-row strip default; explicit
+/// wider imports or `BPG_WPP_FRAMELESS=0` require full worker frames.
+fn frameless_wpp_estimate_enabled() -> bool {
+    let frameless = std::env::var("BPG_WPP_FRAMELESS")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true);
+    let import_one = match std::env::var("BPG_WPP_IMPORT_ROWS") {
+        Ok(v) if v.trim() == "full" => false,
+        Ok(v) => v.trim().parse::<usize>().ok() == Some(1),
+        Err(_) => true,
+    };
+    frameless && import_one
+}
+
 /// Estimate peak memory for one encode of `config`, accounting for the chosen
 /// effort's parallelism (per-worker frame clones) and the current
 /// `BPG_ENC_THREADS` / CPU count. Pure — does not encode anything.
@@ -122,26 +144,42 @@ pub fn estimate_memory(config: &StillHevcConfig) -> MemoryEstimate {
     // maps (qp map, mode/ct-depth/tu-depth maps at 4x4 granularity, deblock edge
     // flags): ~0.25x the plane bytes, rounded up.
     let frame_pixels = plane_samples(coded_w, coded_h, config.chroma) * BYTES_PER_SAMPLE;
-    let frame_bytes = frame_pixels + frame_pixels / 4;
+    let frame_aux_bytes = frame_pixels / 4;
+    let frame_bytes = frame_pixels + frame_aux_bytes;
     let source_bytes = plane_samples(config.width, config.height, config.chroma) * BYTES_PER_SAMPLE;
 
-    let worker_frames = if is_parallel(config) {
+    let workers = if is_parallel(config) {
         worker_count(coded_h)
     } else {
         0
     };
+    let frameless_workers = workers > 0 && frameless_wpp_estimate_enabled();
+    let worker_frames = if frameless_workers { 0 } else { workers };
+    let worker_bytes = if workers == 0 {
+        0
+    } else if frameless_workers {
+        // Frameless WPP workers keep per-frame metadata maps (deblock/QP plus
+        // encoder mode and CT-depth maps) but no reconstruction pixel planes.
+        // They also keep one full-plane-width row strip per component. Add a
+        // small fixed scratch allowance for CABAC/search/canvas workspaces.
+        let row_strip_bytes =
+            plane_samples(coded_w, 1, config.chroma).saturating_mul(BYTES_PER_SAMPLE);
+        workers as u64 * (frame_aux_bytes + row_strip_bytes + 64 * 1024)
+    } else {
+        workers as u64 * frame_bytes
+    };
 
-    // The main reconstruction frame is always live; the parallel path adds one
-    // frame per worker. Plus the source, plus ~15% for transform/RDOQ/CABAC
+    // The main reconstruction frame is always live; the parallel path adds
+    // worker-local state. Plus the source, plus ~15% for transform/RDOQ/CABAC
     // scratch and the output bitstream.
-    let frames = frame_bytes * (worker_frames as u64 + 1);
-    let base = frames + source_bytes;
+    let base = frame_bytes + worker_bytes + source_bytes;
     let peak_bytes = base + base / 7;
 
     MemoryEstimate {
         frame_bytes,
         source_bytes,
         worker_frames,
+        worker_bytes,
         peak_bytes,
     }
 }
@@ -275,14 +313,15 @@ mod tests {
         fast_aq.adaptive_qp = true;
         let est = estimate_memory(&fast_aq);
         if crate::params::effective_wpp_build_enabled(&fast_aq) {
-            assert!(est.worker_frames > 0);
+            assert!(est.worker_bytes > 0);
         } else {
             assert_eq!(est.worker_frames, 0);
+            assert_eq!(est.worker_bytes, 0);
         }
     }
 
     #[test]
-    fn uniform_speed_tiers_account_for_wavefront_worker_frames() {
+    fn uniform_speed_tiers_account_for_wavefront_worker_memory() {
         if std::env::var("BPG_BEST2_PARALLEL")
             .ok()
             .is_some_and(|v| v.trim() == "0")
@@ -290,8 +329,21 @@ mod tests {
             return;
         }
         let slow = estimate_memory(&cfg(1024, 768, Effort::Slow, ChromaFormat::Yuv420));
-        assert!(slow.worker_frames > 0);
-        assert!(slow.worker_frames <= 12);
+        assert!(slow.worker_bytes > 0);
+        if std::env::var("BPG_WPP_FRAMELESS")
+            .ok()
+            .is_some_and(|v| v.trim() == "0")
+            || std::env::var("BPG_WPP_IMPORT_ROWS")
+                .ok()
+                .is_some_and(|v| v.trim() != "1")
+        {
+            assert!(slow.worker_frames > 0);
+            assert!(slow.worker_frames <= 12);
+        } else {
+            assert_eq!(slow.worker_frames, 0);
+            let full_clone_bytes = worker_count(round_up(768, CTB)) as u64 * slow.frame_bytes;
+            assert!(slow.worker_bytes < full_clone_bytes / 2);
+        }
     }
 
     #[test]

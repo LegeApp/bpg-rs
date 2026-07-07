@@ -146,6 +146,9 @@ pub(super) struct BlockScratch {
     pub(super) component_src_u8: Vec<u8>,
     pub(super) component_pred_u8: Vec<u8>,
     pub(super) component_recon_u8: Vec<u8>,
+    pub(super) component_src_u16: Vec<u16>,
+    pub(super) component_pred_u16: Vec<u16>,
+    pub(super) component_recon_u16: Vec<u16>,
     pub(super) component_pred_tmp_u16: Vec<u16>,
     /// Reusable per-mode accumulators for the batched simple-RDO ranker.
     pub(super) simple_rdo_accum: Vec<super::tu::SimpleRdoAccum>,
@@ -167,6 +170,9 @@ impl BlockScratch {
         self.component_src_u8.clear();
         self.component_pred_u8.clear();
         self.component_recon_u8.clear();
+        self.component_src_u16.clear();
+        self.component_pred_u16.clear();
+        self.component_recon_u16.clear();
         self.component_pred_tmp_u16.clear();
         self.simple_rdo_accum.clear();
     }

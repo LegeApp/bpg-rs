@@ -340,34 +340,35 @@ where
     /// Rough source activity: sum of absolute differences from the mean
     /// for the luma block, normalized per pixel.  Low values indicate
     /// smooth regions where leaf-only search is likely sufficient.
-    fn source_activity(&self, state: &Encoder<'_>, x0: u32, y0: u32, log2_cb_size: u8) -> f64 {
+    fn source_activity(&mut self, state: &Encoder<'_>, x0: u32, y0: u32, log2_cb_size: u8) -> f64 {
         let size = 1usize << log2_cb_size;
         let n = size * size;
         if state.bit_depth == 8 {
-            let mut buf = vec![0u8; n];
+            let mut buf = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
+            buf.resize(n, 0);
             self.source.sample_block_u8(0, x0, y0, size, &mut buf);
             let mean = buf.iter().map(|&s| s as u64).sum::<u64>() / n as u64;
             let sad = buf
                 .iter()
                 .map(|&s| (s as i64 - mean as i64).unsigned_abs())
                 .sum::<u64>();
+            self.workspace.block_scratch.component_src_u8 = buf;
             sad as f64 / n as f64
         } else {
-            let mut sad: u64 = 0;
-            let mut sum: u64 = 0;
+            let mut buf = std::mem::take(&mut self.workspace.block_scratch.component_src_u16);
+            buf.resize(n, 0);
             for y in 0..size {
                 for x in 0..size {
-                    let v = self.source.sample(0, x0 + x as u32, y0 + y as u32) as u64;
-                    sum += v;
+                    buf[y * size + x] = self.source.sample(0, x0 + x as u32, y0 + y as u32);
                 }
             }
+            let sum = buf.iter().map(|&s| s as u64).sum::<u64>();
             let mean = sum / n as u64;
-            for y in 0..size {
-                for x in 0..size {
-                    let v = self.source.sample(0, x0 + x as u32, y0 + y as u32) as u64;
-                    sad += (v as i64 - mean as i64).unsigned_abs();
-                }
-            }
+            let sad = buf
+                .iter()
+                .map(|&s| (s as i64 - mean as i64).unsigned_abs())
+                .sum::<u64>();
+            self.workspace.block_scratch.component_src_u16 = buf;
             sad as f64 / n as f64
         }
     }

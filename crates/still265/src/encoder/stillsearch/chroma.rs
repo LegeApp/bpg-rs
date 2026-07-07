@@ -23,7 +23,7 @@ use crate::contexts::ctx;
 use crate::encoder::Encoder;
 use crate::encoder::types::{CHROMA_DM_IDX, chroma_pred_mode, chroma_tb_geom, has_chroma_tb};
 use crate::primitives::{sa8d_u8, sa8d_u16, satd_u8, satd_u16};
-use crate::residual::get_scan_order;
+use crate::residual::{estimate_residual_bits, get_scan_order};
 
 use super::depth::StillSearchDepth;
 use super::eval::ResidualPricingMode;
@@ -252,10 +252,13 @@ where
         let size = 1usize << log2_size;
         let n = size * size;
         if state.bit_depth == 8 {
-            let mut src = vec![0u8; n];
+            let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u8);
+            src.resize(n, 0);
             self.source.sample_block_u8(c_idx, x0, y0, size, &mut src);
-            let mut pred = vec![0u8; n];
-            let mut tmp_u16 = Vec::with_capacity(n);
+            let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u8);
+            pred.resize(n, 0);
+            let mut tmp_u16 =
+                std::mem::take(&mut self.workspace.block_scratch.component_pred_tmp_u16);
             self.predict_into_u8(
                 state,
                 x0,
@@ -266,25 +269,34 @@ where
                 &mut pred,
                 &mut tmp_u16,
             );
-            if log2_size >= 3 {
+            let satd = if log2_size >= 3 {
                 sa8d_u8(&src, size, &pred, size, size)
             } else {
                 satd_u8(&src, size, &pred, size, size)
-            }
+            };
+            self.workspace.block_scratch.component_src_u8 = src;
+            self.workspace.block_scratch.component_pred_u8 = pred;
+            self.workspace.block_scratch.component_pred_tmp_u16 = tmp_u16;
+            satd
         } else {
-            let mut src = vec![0u16; n];
+            let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u16);
+            src.resize(n, 0);
             for y in 0..size {
                 for x in 0..size {
                     src[y * size + x] = self.source.sample(c_idx, x0 + x as u32, y0 + y as u32);
                 }
             }
-            let mut pred = vec![0u16; n];
+            let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u16);
+            pred.resize(n, 0);
             self.predict_into(state, x0, y0, log2_size, c_idx, pred_mode, &mut pred);
-            if log2_size >= 3 {
+            let satd = if log2_size >= 3 {
                 sa8d_u16(&src, size, &pred, size, size)
             } else {
                 satd_u16(&src, size, &pred, size, size)
-            }
+            };
+            self.workspace.block_scratch.component_src_u16 = src;
+            self.workspace.block_scratch.component_pred_u16 = pred;
+            satd
         }
     }
 
@@ -392,21 +404,32 @@ where
         if block.rd_frac_bits == 0 && !block.cbf {
             return;
         }
-        let levels: Vec<i16> = block
+        let levels: &[i16] = block
             .coeff
             .map(|id| self.workspace.coeffs.get(id))
-            .unwrap_or(&[])
-            .to_vec();
+            .unwrap_or(&[]);
         let scan = get_scan_order(log2_size, mode, c_idx, state.cat);
-        self.commit_component_ctx(
-            block.cbf,
-            &levels,
-            log2_size,
-            c_idx,
-            trafo_depth,
-            scan,
-            state.sign_data_hiding,
-        );
+        let cbf_ci = if c_idx == 0 {
+            ctx::CBF_LUMA + if trafo_depth == 0 { 1 } else { 0 }
+        } else {
+            ctx::CBF_CBCR + trafo_depth as usize
+        };
+        let ctxs = &mut self.workspace.price_cur;
+        ctxs.models[cbf_ci].update(block.cbf as u8);
+        if block.cbf {
+            debug_assert!(
+                !levels.is_empty(),
+                "committed coded block must retain levels"
+            );
+            let _ = estimate_residual_bits(
+                ctxs,
+                levels,
+                log2_size,
+                c_idx,
+                scan,
+                state.sign_data_hiding,
+            );
+        }
     }
 
     /// Sum the RD cost of every chroma block in this transform tree when

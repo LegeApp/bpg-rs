@@ -266,19 +266,21 @@ where
         let commit_ctx =
             self.workspace.commit_ctx && (c_idx == 0 || !self.workspace.commit_ctx_skip_chroma);
 
-        let mut src = vec![0u16; n];
+        let mut src = std::mem::take(&mut self.workspace.block_scratch.component_src_u16);
+        src.resize(n, 0);
         for y in 0..size {
             for x in 0..size {
                 src[y * size + x] = self.source.sample(c_idx, x0 + x as u32, y0 + y as u32);
             }
         }
 
-        let mut pred = vec![0u16; n];
+        let mut pred = std::mem::take(&mut self.workspace.block_scratch.component_pred_u16);
+        pred.resize(n, 0);
         self.predict_into(state, x0, y0, log2_size, c_idx, mode, &mut pred);
 
         let mut levels_vec = Vec::new();
         let mut nnz;
-        let mut recon_coded: Option<Vec<u16>> = None;
+        let mut recon_coded: Option<()> = None;
         let dist_zero = ssd_u16(&src, size, &pred, size, size);
         let cbf_ci = if c_idx == 0 {
             ctx::CBF_LUMA + if trafo_depth == 0 { 1 } else { 0 }
@@ -314,6 +316,8 @@ where
                     sdh_enabled,
                 );
             }
+            self.workspace.block_scratch.component_src_u16 = src;
+            self.workspace.block_scratch.component_pred_u16 = pred;
             return BlockTrial {
                 coeff: None,
                 cbf: false,
@@ -327,6 +331,8 @@ where
         let mut dist_coded = dist_zero;
         let mut ssim_coded = ssim_zero;
         let scan = get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
+        let mut recon_buf = std::mem::take(&mut self.workspace.block_scratch.component_recon_u16);
+        recon_buf.resize(n, 0);
         {
             let bs: &mut BlockScratch = &mut self.workspace.block_scratch;
             let (residual, coeff, tmp, levels, dequant, recon_residual) =
@@ -455,13 +461,12 @@ where
                     recon_residual,
                 );
                 let max_sample = ((1i32 << bit_depth) - 1) as u16;
-                let mut recon = vec![0u16; n];
-                add_clip_u16(&pred, recon_residual, &mut recon, n, max_sample);
-                dist_coded = ssd_u16(&src, size, &recon, size, size);
+                add_clip_u16(&pred, recon_residual, &mut recon_buf, n, max_sample);
+                dist_coded = ssd_u16(&src, size, &recon_buf, size, size);
                 if ssim_rd {
                     ssim_coded = ssim_rd_energy_u16(
                         &src,
-                        &recon,
+                        &recon_buf,
                         size,
                         ssim_norm.expect("SSIM-RD norm"),
                         qp,
@@ -469,7 +474,7 @@ where
                     );
                 }
                 levels_vec = levels.clone();
-                recon_coded = Some(recon);
+                recon_coded = Some(());
             }
         }
 
@@ -536,10 +541,10 @@ where
 
         let out = match coded {
             Some((residual_bits, cost_coded)) if cost_coded < cost_zero => {
-                let recon = recon_coded.expect("coded candidate has recon");
+                recon_coded.expect("coded candidate has recon");
                 if push_overlay {
                     self.overlay
-                        .push_block(c_idx, x0, y0, size as u32, size as u32, &recon);
+                        .push_block(c_idx, x0, y0, size as u32, size as u32, &recon_buf);
                 }
                 let coeff = retain_coeff.then(|| self.workspace.coeffs.push(&levels_vec));
                 if commit_ctx {
@@ -589,6 +594,9 @@ where
                 }
             }
         };
+        self.workspace.block_scratch.component_src_u16 = src;
+        self.workspace.block_scratch.component_pred_u16 = pred;
+        self.workspace.block_scratch.component_recon_u16 = recon_buf;
         out
     }
 

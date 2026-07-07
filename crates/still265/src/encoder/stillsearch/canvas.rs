@@ -269,6 +269,26 @@ impl CanvasOverlay {
         }
     }
 
+    fn write_rect_from_slice(
+        plane: &mut CanvasPlane,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        data: &[u16],
+    ) {
+        debug_assert_eq!(data.len(), (width * height) as usize);
+        let (cx, cy) = plane
+            .coords(x, y)
+            .expect("canvas rect outside canvas bounds");
+        debug_assert!(cx + width as usize <= plane.stride && cy + height as usize <= plane.rows);
+        for row in 0..height as usize {
+            let off = (cy + row) * plane.stride + cx;
+            let line = &data[row * width as usize..(row + 1) * width as usize];
+            plane.buf[off..off + width as usize].copy_from_slice(line);
+        }
+    }
+
     fn push_rect(&mut self, c_idx: u8, x: u32, y: u32, width: u32, height: u32) -> usize {
         let mut old = vec![0u16; (width * height) as usize];
         Self::rect_copy(
@@ -420,15 +440,13 @@ impl CanvasOverlay {
     ) {
         debug_assert_eq!(samples.len(), (width * height) as usize);
         self.push_rect(c_idx, x, y, width, height);
-        let mut data = samples.to_vec();
-        Self::rect_copy(
+        Self::write_rect_from_slice(
             &mut self.planes[c_idx as usize],
             x,
             y,
             width,
             height,
-            &mut data,
-            true,
+            samples,
         );
     }
 
@@ -522,7 +540,7 @@ impl CanvasOverlay {
     /// Re-apply rectangles previously [`detach_from`](Self::detach_from)ed,
     /// journaling fresh undo content.
     pub(super) fn reattach(&mut self, saved: CanvasSaved) {
-        for mut patch in saved {
+        for patch in saved {
             let mut old = vec![0u16; (patch.width * patch.height) as usize];
             Self::rect_copy(
                 &mut self.planes[patch.c_idx as usize],
@@ -541,14 +559,13 @@ impl CanvasOverlay {
                 height: patch.height,
                 old,
             });
-            Self::rect_copy(
+            Self::write_rect_from_slice(
                 &mut self.planes[patch.c_idx as usize],
                 patch.x,
                 patch.y,
                 patch.width,
                 patch.height,
-                &mut patch.samples,
-                true,
+                &patch.samples,
             );
         }
     }
