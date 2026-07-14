@@ -87,11 +87,11 @@ checksum = "bef38d45163c2f1dde094a7dfd33ccf595c92905c8f8f4fdc18d06fb1037718a"
 
 [[package]]
 name = "bpg-bitstream"
-version = "0.4.5"
+version = "0.5.0"
 
 [[package]]
 name = "bpg-decode"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "bpg-bitstream",
  "bpg-format",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "bpg-encode"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "bpg-format",
  "bpg-hevc",
@@ -110,21 +110,21 @@ dependencies = [
 
 [[package]]
 name = "bpg-format"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "bpg-bitstream",
 ]
 
 [[package]]
 name = "bpg-hevc"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "bpg-bitstream",
 ]
 
 [[package]]
 name = "bpg-hevc-decode"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "archmage",
  "rayon",
@@ -134,11 +134,11 @@ dependencies = [
 
 [[package]]
 name = "bpg-image"
-version = "0.4.5"
+version = "0.5.0"
 
 [[package]]
 name = "bpg-tools"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "bpg-decode",
  "bpg-encode",
@@ -375,7 +375,7 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
 name = "still265"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "bpg-bitstream",
  "bpg-encode",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "toojpeg"
-version = "0.4.5"
+version = "0.5.0"
 
 [[package]]
 name = "unicode-ident"

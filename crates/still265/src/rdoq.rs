@@ -148,6 +148,7 @@ fn ic_level_bits(
 /// Estimated bits for one axis of `last_sig_coeff_{x,y}` (context-coded
 /// truncated-unary prefix + bypass suffix), mirroring `encode_last_prefix` /
 /// `encode_bypass_bits` but counting entropy bits instead of coding.
+#[cfg(test)]
 fn last_axis_bits(ctxs: &Contexts, value: u32, log2_size: u8, c_idx: u8, is_x: bool) -> u64 {
     let ctx_base = if is_x {
         ctx::LAST_SIG_COEFF_X_PREFIX
@@ -182,6 +183,61 @@ fn last_axis_bits(ctxs: &Contexts, value: u32, log2_size: u8, c_idx: u8, is_x: b
         bits += n_bits as u64 * BYPASS_BITS;
     }
     bits
+}
+
+/// Fill last-position costs for one axis in O(size): every value shares the
+/// same context-coded truncated-unary prefix, so carry its cumulative `1`-bin
+/// cost instead of walking the prefix again for each table entry.
+#[inline]
+fn fill_last_axis_bits(
+    out: &mut [u64; 32],
+    ctxs: &Contexts,
+    size: usize,
+    log2_size: u8,
+    c_idx: u8,
+    is_x: bool,
+) {
+    let ctx_base = if is_x {
+        ctx::LAST_SIG_COEFF_X_PREFIX
+    } else {
+        ctx::LAST_SIG_COEFF_Y_PREFIX
+    };
+    let (ctx_offset, ctx_shift) = if c_idx == 0 {
+        (
+            3 * (log2_size as usize - 2) + ((log2_size as usize - 1) >> 2),
+            (log2_size + 1) >> 2,
+        )
+    } else {
+        (15usize, log2_size - 2)
+    };
+    let max_prefix = ((log2_size << 1) - 1) as usize;
+    let mut one_prefix = [0u64; 11];
+    for prefix in 0..max_prefix {
+        let ci = ctx_base + ctx_offset + (prefix >> ctx_shift as usize);
+        one_prefix[prefix + 1] = one_prefix[prefix] + ctxs.models[ci].entropy_bits(1) as u64;
+    }
+
+    for (value, slot) in out.iter_mut().take(size).enumerate() {
+        let value = value as u32;
+        let (prefix, n_bits) = if value <= 3 {
+            (value as usize, 0u8)
+        } else {
+            let group = 31 - value.leading_zeros();
+            (
+                (2 * group + ((value >> (group - 1)) & 1)) as usize,
+                (group - 1) as u8,
+            )
+        };
+        let mut bits = one_prefix[prefix];
+        if prefix < max_prefix {
+            let ci = ctx_base + ctx_offset + (prefix >> ctx_shift as usize);
+            bits += ctxs.models[ci].entropy_bits(0) as u64;
+        }
+        if value > 3 {
+            bits += n_bits as u64 * BYPASS_BITS;
+        }
+        *slot = bits;
+    }
 }
 
 /// Per-coefficient state captured during the level-decision scan, indexed by
@@ -1171,10 +1227,8 @@ pub fn rdoq_single_scan_into<'scratch>(
     // truncated-unary contexts for every non-zero last-position candidate.
     let mut last_x_bits_by_val = [0u64; 32];
     let mut last_y_bits_by_val = [0u64; 32];
-    for v in 0..size {
-        last_x_bits_by_val[v] = last_axis_bits(ctxs, v as u32, log2_size, c_idx, true);
-        last_y_bits_by_val[v] = last_axis_bits(ctxs, v as u32, log2_size, c_idx, false);
-    }
+    fill_last_axis_bits(&mut last_x_bits_by_val, ctxs, size, log2_size, c_idx, true);
+    fill_last_axis_bits(&mut last_y_bits_by_val, ctxs, size, log2_size, c_idx, false);
     let last_bits_for_rec = |rec: &CoeffRec| -> u64 {
         let (raw_x, raw_y) = if scan_order == ScanOrder::Vertical {
             (rec.y as usize, rec.x as usize)
@@ -1551,6 +1605,35 @@ mod rdoq_optimality_tests {
             agg_rdoq_excess / count as f64,
             agg_hq_excess / count as f64
         );
+    }
+}
+
+#[cfg(test)]
+mod last_axis_table_tests {
+    use super::{fill_last_axis_bits, last_axis_bits};
+    use crate::contexts::Contexts;
+
+    #[test]
+    fn cumulative_last_axis_tables_match_scalar_reference() {
+        for qp in [0, 22, 28, 37, 51] {
+            let ctxs = Contexts::new(qp);
+            for log2_size in 2..=5 {
+                let size = 1usize << log2_size;
+                for c_idx in [0u8, 1, 2] {
+                    for is_x in [false, true] {
+                        let mut got = [0u64; 32];
+                        fill_last_axis_bits(&mut got, &ctxs, size, log2_size, c_idx, is_x);
+                        for (value, &bits) in got.iter().take(size).enumerate() {
+                            assert_eq!(
+                                bits,
+                                last_axis_bits(&ctxs, value as u32, log2_size, c_idx, is_x,),
+                                "qp={qp} log2={log2_size} c={c_idx} x={is_x} value={value}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
