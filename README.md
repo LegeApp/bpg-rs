@@ -117,9 +117,16 @@ formatting conventions and recent measurements were run with rustc 1.94.x.
 Encode a PNG or JPEG to BPG:
 
 ```bash
-cargo run -p bpg-tools --release -- encode input.png -o out.bpg \
-  --qp 28 --format 420 --effort slow
+# Installable end-user command (also available as `cargo run -p bpg-tools`).
+cargo run -p bpg-tools --release -- input.png -o out.bpg \
+  --qp 28 --format 420 --effort slow --aq
 ```
+
+The installed binary is `bpgenc`, so the equivalent command is
+`bpgenc input.png -o out.bpg --qp 28 --format 420 --effort slow --aq`.
+Install it locally with `cargo install --path crates/bpg-tools --bin bpgenc`.
+`bpg-tools encode ...` remains as a compatible explicit-subcommand form; use
+`bpgenc decode ...` (or `bpg-tools decode ...`) for decoding.
 
 Important encode options:
 
@@ -128,8 +135,10 @@ Important encode options:
 - `--format gray|420|422|444`: output chroma format.
 - `--bit-depth 8|10|12`: encode bit depth. 10/12-bit paths need suitable input
   to be useful.
-- `--aq`: optional adaptive quantization preset. Defaults to `off` to match
-  stock `bpgenc`'s effective uniform-QP behavior.
+- `--aq [MODE]`: optional adaptive quantization. Bare `--aq` chooses the
+  recommended measured two-pass mode; omit it (or use `--aq off`) for
+  stock-`bpgenc`-comparable uniform QP. Pass a mode explicitly to experiment
+  with a single-pass alternative.
 - `--no-sao` / `--no-deblock`: disable in-loop filters. Both are on by default.
 - `--color-space ycbcr|rgb|ycgco|bt709|bt2020` and `--limited-range`: color
   handling options. RGB/YCgCo encode requires `--format 444`.
@@ -271,15 +280,17 @@ x265 clears its AQ state under CQP. In practice, stock `bpgenc` still images are
 uniform-QP even when the preset name suggests SSIM tuning.
 
 `bpg-rs` exposes real still-image AQ via legal per-quantization-group
-`cu_qp_delta` syntax, while keeping `--aq off` as the default for stock-`bpgenc`
-comparability.
+`cu_qp_delta` syntax. AQ remains opt-in for stock-`bpgenc` comparability, but
+when enabled bare `--aq` selects the measured two-pass path by default.
 
 Available AQ presets:
 
+- `two-pass` (the bare `--aq` default): measures coded complexity in a first
+  pass, redistributes QP in a second pass, and keeps the result only when it
+  wins the perceptual RD check;
 - `perceptual` / `perceptual-mild`: luma-activity variance AQ;
 - `perceptual-chroma` / `perceptual-chroma-mild`: luma+chroma activity AQ;
-- `two-pass`: measures coded complexity in a first pass, redistributes QP in a
-  second pass, and keeps the result only when it wins the perceptual RD check.
+- `auto-variance` / `auto-variance-biased`: x265-style single-pass AQ modes.
 
 `--aq-strength` and `--aq-clamp` tune the presets. `legacy-shrink`,
 `psnr-probe`, and `positive-probe` are diagnostics rather than recommended

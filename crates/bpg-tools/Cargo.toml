@@ -3,10 +3,17 @@ name = "bpg-tools"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+default-run = "bpgenc"
 
 [[bin]]
 name = "bpg-tools"
 path = "src/main.rs"
+
+[[bin]]
+# End-user encoder name, intentionally matching the reference BPG tool.
+# `bpg-tools` remains available for its encode/decode subcommand interface.
+name = "bpgenc"
+path = "src/bin/bpgenc.rs"
 
 [[bin]]
 name = "bpg-highres-compare"

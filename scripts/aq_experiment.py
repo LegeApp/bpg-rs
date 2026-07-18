@@ -81,6 +81,12 @@ class Variant:
     # `clamp` are forwarded as --aq-strength/--aq-clamp overrides.
     cli_aq: str | None = None
     clamp: int = 2
+    # psy-rd / psy-rdoq strengths forwarded as --psy-rd/--psy-rdoq when > 0.
+    # Composable with cli_aq (e.g. two-pass AQ + psy-rd in one variant).
+    psy_rd: float = 0.0
+    psy_rdoq: float = 0.0
+    # AQ quantization-group size forwarded as --aq-qg when 16 (32 = default).
+    aq_qg: int = 32
 
 
 def parse_csv(raw: str) -> list[str]:
@@ -327,7 +333,13 @@ def encode_decode_measure(
             "--aq-clamp",
             f"{variant.clamp}",
         ]
-    is_aq = map_path is not None or variant.cli_aq is not None
+    if variant.psy_rd > 0.0:
+        cmd += ["--psy-rd", f"{variant.psy_rd}"]
+    if variant.psy_rdoq > 0.0:
+        cmd += ["--psy-rdoq", f"{variant.psy_rdoq}"]
+    if variant.aq_qg == 16:
+        cmd += ["--aq-qg", "16"]
+    is_aq = map_path is not None or variant.cli_aq is not None or variant.psy_rd > 0.0 or variant.psy_rdoq > 0.0
     t0 = time.perf_counter()
     enc = run(cmd, env=env)
     if enc.returncode != 0:
@@ -524,12 +536,37 @@ def main() -> int:
     sweep = [float(s) for s in parse_csv(args.strengths)] if args.strengths.strip() else None
 
     def make_variant(v: str, name: str, strength: float) -> Variant:
+        # A trailing "+qg16" on any token requests 16x16 quantization groups.
         # "cli:<arg>" → in-tree `--aq <arg>` variant (e.g. cli:two-pass);
+        # "psy:<rd>[:<rdoq>][:aq=<preset>]" → psy-rd/psy-rdoq variant, its
+        # optional aq= suffix composing with in-tree AQ (--strengths does not
+        # apply to psy:* variants — the psy values are in the token itself);
         # otherwise an external offset-map variant whose map_mode is the name.
+        aq_qg = 32
+        if "+qg16" in v:
+            aq_qg = 16
+            v = v.replace("+qg16", "")
+        if v.startswith("psy:"):
+            parts = v[len("psy:"):].split(":")
+            psy_rd = float(parts[0])
+            psy_rdoq = float(parts[1]) if len(parts) > 1 and not parts[1].startswith("aq=") else 0.0
+            aq = next((p[len("aq="):] for p in parts[1:] if p.startswith("aq=")), None)
+            return Variant(
+                name.replace(":", "_").replace("=", ""),
+                None,
+                strength,
+                cli_aq=aq,
+                clamp=args.clamp,
+                psy_rd=psy_rd,
+                psy_rdoq=psy_rdoq,
+                aq_qg=aq_qg,
+            )
         if v.startswith("cli:"):
             arg = v[len("cli:"):]
-            return Variant(name.replace("cli:", ""), None, strength, cli_aq=arg, clamp=args.clamp)
-        return Variant(name, v, strength, clamp=args.clamp)
+            return Variant(
+                name.replace("cli:", ""), None, strength, cli_aq=arg, clamp=args.clamp, aq_qg=aq_qg
+            )
+        return Variant(name, v, strength, clamp=args.clamp, aq_qg=aq_qg)
 
     aq_variants: list[Variant] = []
     for v in requested_variants:

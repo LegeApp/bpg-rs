@@ -3,7 +3,8 @@
 //! M1 supports `encode` and still-image `decode` subcommands. See
 //! `bpg-rs/PLAN.md`.
 
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::{fs::OpenOptions, io::Write};
 
@@ -16,7 +17,7 @@ use still265::backend::RustStillHevcEncoder;
 use still265::{AqMode, DeblockMode, Effort, SaoMode};
 
 #[derive(Parser)]
-#[command(name = "bpg-tools", about = "Rust BPG encoder")]
+#[command(name = "bpgenc", about = "BPG still-image encoder and decoder")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -70,7 +71,7 @@ impl From<EffortArg> for Effort {
 /// `perceptual*` presets redistribute QP around the picture mean (MS-SSIM
 /// leaning); the `*-mild` variants halve the strength. `legacy-shrink`,
 /// `psnr-probe`, and `positive-probe` are diagnostics, not quality features.
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum AqArg {
     Off,
     LegacyShrink,
@@ -78,11 +79,25 @@ enum AqArg {
     Perceptual,
     PerceptualChromaMild,
     PerceptualChroma,
+    /// x265 aq-mode 2 (AUTO_VARIANCE): energy-power-law AQ self-normalized by
+    /// the picture's energy statistics.
+    AutoVariance,
+    /// x265 aq-mode 3 (AUTO_VARIANCE_BIASED): auto-variance plus a dark/flat
+    /// bias that spends extra bits on low-energy regions.
+    AutoVarianceBiased,
     PsnrProbe,
     PositiveProbe,
     /// Two-pass measured AQ (the reliable path): pass-1 measures coded
     /// complexity, pass-2 redistributes QP. Works on Slow and Placebo.
     TwoPass,
+}
+
+/// Validate `--aq-qg`: only 16 and 32 are meaningful quantization-group sizes.
+fn parse_aq_qg(s: &str) -> Result<u8, String> {
+    match s.trim().parse::<u8>() {
+        Ok(v @ (16 | 32)) => Ok(v),
+        _ => Err(format!("--aq-qg must be 16 or 32 (got {s})")),
+    }
 }
 
 impl AqArg {
@@ -96,6 +111,8 @@ impl AqArg {
             AqArg::Perceptual => "perceptual",
             AqArg::PerceptualChromaMild => "perceptual-chroma-mild",
             AqArg::PerceptualChroma => "perceptual-chroma",
+            AqArg::AutoVariance => "auto-variance",
+            AqArg::AutoVarianceBiased => "auto-variance-biased",
             AqArg::PsnrProbe => "psnr-probe",
             AqArg::PositiveProbe => "positive-probe",
             AqArg::TwoPass => "two-pass",
@@ -169,11 +186,16 @@ struct EncodeArgs {
     #[arg(long, value_enum, default_value_t = EffortArg::Slow)]
     effort: EffortArg,
 
-    /// Adaptive quantization mode. `off` (default) is uniform QP.
-    /// `perceptual-mild`/`perceptual` redistribute QP by luma activity;
-    /// `perceptual-chroma-mild`/`perceptual-chroma` add chroma activity.
-    /// `legacy-shrink`, `psnr-probe`, and `positive-probe` are diagnostics.
-    #[arg(long = "aq", value_enum, default_value_t = AqArg::Off)]
+    /// Adaptive quantization. Bare `--aq` selects the recommended measured
+    /// two-pass mode; omit it or use `--aq off` for uniform QP. Other values
+    /// are explicit experimental single-pass alternatives.
+    #[arg(
+        long = "aq",
+        value_enum,
+        default_value_t = AqArg::Off,
+        default_missing_value = "two-pass",
+        num_args = 0..=1
+    )]
     aq: AqArg,
 
     /// Override the AQ preset strength (x265 --aq-strength). For tuning sweeps.
@@ -184,11 +206,27 @@ struct EncodeArgs {
     #[arg(long = "aq-clamp")]
     aq_clamp: Option<u8>,
 
+    /// Adaptive-quantization quantization-group size in luma samples: 32
+    /// (default) or 16 (finer AQ granularity, PPS diff_cu_qp_delta_depth = 2).
+    /// `--aq two-pass` always uses 32. Ignored when AQ is off.
+    #[arg(long = "aq-qg", default_value_t = 32, value_parser = parse_aq_qg)]
+    aq_qg: u8,
+
     /// Disable the two-pass AQ candidate-compare gate (`--aq two-pass`). By
     /// default two-pass keeps its AQ result only when it is a perceptual RD win
     /// over uniform; this forces the AQ result unconditionally (for A/B).
     #[arg(long = "no-two-pass-gate")]
     no_two_pass_gate: bool,
+
+    /// Psychovisual RD strength (x265 --psy-rd, sane range 0..=5). 0 (default)
+    /// keeps the plain SSE+rate cost byte-identically.
+    #[arg(long = "psy-rd", default_value_t = 0.0)]
+    psy_rd: f32,
+
+    /// Psychovisual RDOQ strength (x265 --psy-rdoq, sane range 0..=50).
+    /// 0 (default) disables the RDOQ energy bias.
+    #[arg(long = "psy-rdoq", default_value_t = 0.0)]
+    psy_rdoq: f32,
 
     /// Print Rust-backend analysis counters after encoding.
     #[arg(long)]
@@ -321,7 +359,7 @@ fn open_png(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::E
             return Err(format!(
                 "PNG color type {other:?} is not supported; use grayscale, RGB, or RGBA PNG",
             )
-            .into())
+            .into());
         }
     };
 
@@ -604,7 +642,9 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .with_sao(sao)
         .with_deblock(deblock)
         .with_aq(aq_mode, aq_strength, aq_clamp)
-        .with_two_pass_gate(!args.no_two_pass_gate);
+        .with_aq_qg(args.aq_qg)
+        .with_two_pass_gate(!args.no_two_pass_gate)
+        .with_psy(args.psy_rd, args.psy_rdoq);
     let caps = backend.caps();
     if !caps.supports_bit_depth(args.bit_depth) {
         return Err(format!(
@@ -1237,8 +1277,54 @@ fn chroma_name(chroma: ChromaFormat) -> &'static str {
     }
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
+/// Parse the CLI, accepting the reference-style `bpgenc INPUT -o OUTPUT`
+/// spelling when invoked through the public `bpgenc` binary. The older
+/// `bpg-tools encode INPUT -o OUTPUT` spelling stays intact for scripts and
+/// retains its explicit subcommand.
+fn parse_cli_from(mut argv: Vec<OsString>) -> Cli {
+    let invoked_as_bpgenc = argv
+        .first()
+        .and_then(|program| Path::new(program).file_stem())
+        .is_some_and(|name| name == "bpgenc");
+    let has_subcommand_or_top_level_flag =
+        argv.get(1).and_then(|arg| arg.to_str()).is_some_and(|arg| {
+            matches!(
+                arg,
+                "encode" | "decode" | "-h" | "--help" | "-V" | "--version"
+            )
+        });
+
+    if invoked_as_bpgenc && !has_subcommand_or_top_level_flag {
+        argv.insert(1, OsString::from("encode"));
+    }
+    normalize_bare_aq(&mut argv);
+    Cli::parse_from(argv)
+}
+
+/// `--aq` has an optional mode value. Before Clap sees the arguments, turn a
+/// bare flag followed by the input positional into `--aq=two-pass`; otherwise
+/// `bpgenc --aq input.png` is ambiguous and Clap tries to parse the filename as
+/// a mode. Known mode values retain the established `--aq MODE` spelling.
+fn normalize_bare_aq(argv: &mut [OsString]) {
+    for index in 1..argv.len() {
+        if argv[index] != "--aq" {
+            continue;
+        }
+        let followed_by_input = argv.get(index + 1).is_some_and(|next| {
+            next.to_str().is_some_and(|value| {
+                !value.starts_with('-') && AqArg::from_str(value, true).is_err()
+            })
+        });
+        if followed_by_input {
+            argv[index] = OsString::from("--aq=two-pass");
+        }
+    }
+}
+
+/// Run the command-line application. Kept public so the `bpgenc` binary can
+/// be a thin named wrapper while `bpg-tools` remains compatible.
+pub fn run() -> ExitCode {
+    let cli = parse_cli_from(std::env::args_os().collect());
     let result = match &cli.command {
         Command::Encode(args) => run_encode(args),
         Command::Decode(args) => run_decode(args),
@@ -1249,5 +1335,71 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[allow(dead_code)] // Used as the crate entry point; unused in the bpgenc wrapper module.
+fn main() -> ExitCode {
+    run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encode_args(cli: Cli) -> EncodeArgs {
+        match cli.command {
+            Command::Encode(args) => args,
+            Command::Decode(_) => panic!("expected encode command"),
+        }
+    }
+
+    #[test]
+    fn bare_aq_selects_recommended_two_pass_mode() {
+        let args = encode_args(parse_cli_from(vec![
+            "bpgenc".into(),
+            "input.png".into(),
+            "-o".into(),
+            "output.bpg".into(),
+            "--aq".into(),
+        ]));
+        assert_eq!(args.aq, AqArg::TwoPass);
+        assert_eq!(args.aq.resolve(), still265::recommended_aq_preset());
+    }
+
+    #[test]
+    fn omitted_aq_is_uniform_qp() {
+        let args = encode_args(parse_cli_from(vec![
+            "bpgenc".into(),
+            "input.png".into(),
+            "-o".into(),
+            "output.bpg".into(),
+        ]));
+        assert_eq!(args.aq, AqArg::Off);
+    }
+
+    #[test]
+    fn bare_aq_before_input_is_not_parsed_as_an_aq_mode() {
+        let args = encode_args(parse_cli_from(vec![
+            "bpgenc".into(),
+            "--aq".into(),
+            "input.png".into(),
+            "-o".into(),
+            "output.bpg".into(),
+        ]));
+        assert_eq!(args.aq, AqArg::TwoPass);
+    }
+
+    #[test]
+    fn explicit_aq_alternatives_remain_selectable() {
+        let args = encode_args(parse_cli_from(vec![
+            "bpgenc".into(),
+            "input.png".into(),
+            "-o".into(),
+            "output.bpg".into(),
+            "--aq".into(),
+            "auto-variance-biased".into(),
+        ]));
+        assert_eq!(args.aq, AqArg::AutoVarianceBiased);
     }
 }
