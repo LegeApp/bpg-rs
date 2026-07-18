@@ -11,6 +11,11 @@ use bpg_bitstream::BitWriter;
 
 use super::types::{QG_LOG2, chroma_qp_from_luma};
 
+// `QG_LOG2` (= 5, 32x32) is only the *default* quantization-group size; the
+// runtime size for an encode lives in [`AqState::qg_log2`] (4 for the
+// `aq_qg = 16` opt-in) and must be used for every QG-grid computation here so
+// the encoder mirror tracks the PPS `diff_cu_qp_delta_depth` it emitted.
+
 /// Adaptive-quantization writer state — the encoder-side mirror of the decoder's
 /// `decode_quantization_parameters` QP-prediction machine
 /// (`bpg-hevc-decode::hevc::ctu`). Inert (`active == false`) for uniform-QP
@@ -30,6 +35,11 @@ use super::types::{QG_LOG2, chroma_qp_from_luma};
 pub(super) struct AqState {
     /// Adaptive QP active for this encode.
     pub(super) active: bool,
+    /// log2 of the quantization-group size in luma samples (5 = 32x32 default,
+    /// 4 = 16x16 opt-in), from [`crate::resolve_aq_qg_log2`]. Must agree with
+    /// the PPS `diff_cu_qp_delta_depth` (`CTB_LOG2 − qg_log2`) — the decoder
+    /// derives its QG grid from the PPS, and this mirror must match it.
+    pub(super) qg_log2: u8,
     /// `6 * (bit_depth − 8)` — the QP bit-depth offset (H.265 8.6.1). All
     /// prediction arithmetic is in the *without-offset* `QpY` domain `[0,51]`
     /// (matching the decoder's `current_qpy`); quantization QPs add it back.
@@ -63,7 +73,7 @@ pub(super) struct AqState {
     pub(super) cu_x: u32,
     pub(super) cu_y: u32,
     pub(super) cu_log2_size: u8,
-    /// Memo for [`Encoder::aq_qg_target`]: the QG origin (`& !31`) the cached
+    /// Memo for [`Encoder::aq_qg_target`]: the QG origin (`& !(QG-1)`) the cached
     /// `target` was computed for, or `(-1, -1)` when unset. The QG target is a
     /// pure function of QG position (slice QP + importance), so it is computed
     /// once per QG and reused across all of that QG's CUs (every recursion
@@ -78,6 +88,7 @@ impl AqState {
     pub(super) fn inert() -> Self {
         AqState {
             active: false,
+            qg_log2: QG_LOG2,
             qp_bd_offset: 0,
             slice_qp_y: 0,
             current_qpy: 0,
@@ -134,7 +145,7 @@ impl<'a> super::Encoder<'a> {
     /// it is folded from the importance map once per QG and reused across all of
     /// that QG's CUs (every recursion level) and the writer pass.
     pub(super) fn aq_qg_target(&mut self, x0: u32, y0: u32) -> i32 {
-        let mask = (1u32 << QG_LOG2) - 1;
+        let mask = (1u32 << self.aq.qg_log2) - 1;
         let (qx, qy) = ((x0 & !mask) as i32, (y0 & !mask) as i32);
         if (qx, qy) != self.aq.target_qg {
             let offset = if let Some(map) = &self.aq_offset_map {
@@ -144,41 +155,95 @@ impl<'a> super::Encoder<'a> {
                 use crate::AqMode::*;
                 use crate::preanalysis as pre;
                 let analysis = &self.analysis;
+                // With 16x16 QGs the variance-family modes read the optional
+                // fine (per-16x16) grid; absent (32x32 default) they read the
+                // coarse 32x32 analysis cells. Both expose the same signals,
+                // so the offset functions themselves stay grid-agnostic.
+                let fine = self.fine_aq.as_deref();
                 let (qx, qy) = (qx as u32, qy as u32);
                 let strength = self.aq_strength;
                 let clamp = self.aq_clamp;
+                let qg_log2 = self.aq.qg_log2;
                 match self.aq_mode {
                     Off => 0,
                     LegacyShrink => {
                         // One-directional importance shrink (legacy default).
-                        let imp = analysis.importance_at(qx, qy, QG_LOG2);
+                        // Importance is a contextual (classification) signal
+                        // with no fine-grid analogue; a 16x16 QG folds the
+                        // 32x32 cell(s) it touches, exactly like any block
+                        // smaller than a cell.
+                        let imp = analysis.importance_at(qx, qy, qg_log2);
                         pre::aq_qp_offset(imp)
                     }
                     Perceptual => pre::aq_qp_offset_variance(
-                        analysis.variance_at(qx, qy),
-                        analysis.frame_mean_log2var(),
+                        fine.map_or_else(
+                            || analysis.variance_at(qx, qy),
+                            |f| f.variance_at(qx, qy),
+                        ),
+                        fine.map_or_else(
+                            || analysis.frame_mean_log2var(),
+                            |f| f.frame_mean_log2var(),
+                        ),
                         strength,
                         true,
                         clamp,
                     ),
                     PsnrProbe => pre::aq_qp_offset_variance(
-                        analysis.variance_at(qx, qy),
-                        analysis.frame_mean_log2var(),
+                        fine.map_or_else(
+                            || analysis.variance_at(qx, qy),
+                            |f| f.variance_at(qx, qy),
+                        ),
+                        fine.map_or_else(
+                            || analysis.frame_mean_log2var(),
+                            |f| f.frame_mean_log2var(),
+                        ),
                         strength,
                         false,
                         clamp,
                     ),
                     PerceptualChroma => pre::aq_qp_offset_chroma(
-                        analysis.variance_at(qx, qy),
-                        analysis.chroma_activity_at(qx, qy),
-                        analysis.frame_mean_log2activity(),
+                        fine.map_or_else(
+                            || analysis.variance_at(qx, qy),
+                            |f| f.variance_at(qx, qy),
+                        ),
+                        fine.map_or_else(
+                            || analysis.chroma_activity_at(qx, qy),
+                            |f| f.chroma_activity_at(qx, qy),
+                        ),
+                        fine.map_or_else(
+                            || analysis.frame_mean_log2activity(),
+                            |f| f.frame_mean_log2activity(),
+                        ),
                         strength,
                         clamp,
                     ),
+                    AutoVariance | AutoVarianceBiased => pre::aq_qp_offset_autovar(
+                        fine.map_or_else(
+                            || analysis.autovar_qp_adj0_at(qx, qy),
+                            |f| f.autovar_qp_adj0_at(qx, qy),
+                        ),
+                        fine.map_or_else(|| analysis.autovar_avg_adj(), |f| f.autovar_avg_adj()),
+                        fine.map_or_else(
+                            || analysis.autovar_avg_adj_final(),
+                            |f| f.autovar_avg_adj_final(),
+                        ),
+                        strength,
+                        self.aq_mode == AutoVarianceBiased,
+                        clamp,
+                    ),
                     PositiveProbe => pre::aq_qp_offset_positive(
-                        analysis.variance_at(qx, qy),
-                        analysis.frame_min_log2var(),
-                        analysis.frame_max_log2var(),
+                        fine.map_or_else(
+                            || analysis.variance_at(qx, qy),
+                            |f| f.variance_at(qx, qy),
+                        ),
+                        fine.map_or_else(
+                            || analysis.frame_min_log2var(),
+                            |f| f.frame_min_log2var(),
+                        ),
+                        fine.map_or_else(
+                            || analysis.frame_max_log2var(),
+                            |f| f.frame_max_log2var(),
+                        ),
                         clamp,
                     ),
                     // Two-pass measured AQ always supplies an in-memory
@@ -225,7 +290,9 @@ impl<'a> super::Encoder<'a> {
 
     /// Reset the per-quantization-group delta state, mirroring the decoder's
     /// `coding_quadtree` reset at every node `>=` the QG size (and at CTU start).
-    /// Called from the writer at each `write_cu` node with `log2_cb_size >= 5`.
+    /// Called from the writer at each `write_cu` node with
+    /// `log2_cb_size >= qg_log2` — the decoder's condition is
+    /// `log2_cb_size >= log2_ctb_size − diff_cu_qp_delta_depth`.
     pub(super) fn aq_qg_reset(&mut self) {
         self.aq.coded = false;
         self.aq.cu_qp_delta = 0;
@@ -238,7 +305,7 @@ impl<'a> super::Encoder<'a> {
         self.aq.cu_x = cu_x;
         self.aq.cu_y = cu_y;
         self.aq.cu_log2_size = cu_log2_size;
-        let qg_mask = (1u32 << QG_LOG2) - 1;
+        let qg_mask = (1u32 << self.aq.qg_log2) - 1;
         let x_qg = (cu_x & !qg_mask) as i32;
         let y_qg = (cu_y & !qg_mask) as i32;
         if x_qg != self.aq.qg_x || y_qg != self.aq.qg_y {
@@ -300,7 +367,7 @@ impl<'a> super::Encoder<'a> {
     /// partially outside picture edges, where forced splits can otherwise leave
     /// the predictor one QG behind stock/libbpg.
     pub(super) fn aq_node_end(&mut self, x0: u32, y0: u32, log2_size: u8) {
-        let mask = (1u32 << QG_LOG2) - 1;
+        let mask = (1u32 << self.aq.qg_log2) - 1;
         let size = 1u32 << log2_size;
         if ((x0 + size) & mask) == 0 && ((y0 + size) & mask) == 0 {
             self.aq.qpy_pred = self.aq.current_qpy;

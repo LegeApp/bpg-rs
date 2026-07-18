@@ -281,6 +281,26 @@ pub struct RdoqResult<'a> {
     pub nnz: u32,
 }
 
+/// Optional psy-rdoq inputs (x265 `rdoQuant` + `psyRdoQuant_c`): bias RDOQ
+/// toward preserving the SOURCE block's AC energy in the reconstruction.
+///
+/// `src_dct` is the source block's forward transform taken with the SAME
+/// basis as the residual (including DST for 4x4 intra luma — a deliberate
+/// divergence from x265, which transforms fenc with DCT even then; same-basis
+/// is the correct form of their intent), row-major, same layout as `coeffs`.
+/// `psy_scale` is `round(psy_rdoq * 256) * lambda_q8`, with `lambda_q8` the
+/// Q8 sqrt-domain (SAD) lambda `floor(x265_sad_lambda(qp, bit_depth) * 256)`.
+///
+/// For each AC position the reconstructed-without-residual ("predicted")
+/// coefficient is `src_dct[pos] - coeffs[pos]`, and candidate costs are
+/// credited `PSYVALUE(rec) = (psy_scale * rec) >> max(0, 2*transform_shift+1)`
+/// for the AC energy `rec` they reconstruct (quant.cpp:885,972,1004-1007).
+#[derive(Clone, Copy)]
+pub struct RdoqPsy<'a> {
+    pub src_dct: &'a [i16],
+    pub psy_scale: i64,
+}
+
 /// Experimental post-RDOQ residual-pricing models selected by
 /// `BPG_RDOQ_PRICING`. `Frozen` is the existing single-scan behavior.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -895,6 +915,7 @@ pub fn rdoq_single_scan(
     scan_order: ScanOrder,
     lambda: f64,
     level2: bool,
+    psy: Option<RdoqPsy<'_>>,
 ) -> (Vec<i16>, u32) {
     let mut scratch = RdoqScratch::default();
     let result = rdoq_single_scan_into(
@@ -907,6 +928,7 @@ pub fn rdoq_single_scan(
         scan_order,
         lambda,
         level2,
+        psy,
         &mut scratch,
     );
     (result.levels.to_vec(), result.nnz)
@@ -925,6 +947,7 @@ pub fn rdoq_single_scan_into<'scratch>(
     scan_order: ScanOrder,
     lambda: f64,
     level2: bool,
+    psy: Option<RdoqPsy<'_>>,
     scratch: &'scratch mut RdoqScratch,
 ) -> RdoqResult<'scratch> {
     let size = 1usize << log2_size;
@@ -954,6 +977,26 @@ pub fn rdoq_single_scan_into<'scratch>(
     debug_assert!((SCALE_BITS - 2 * transform_shift) > 0);
     let lam = (rdoq_lambda_scale() * lambda * 256.0).round() as i64;
     let rate = |bits: u64| -> i64 { (lam * bits as i64) >> 8 };
+    // psy-rdoq (x265 quant.cpp `rdoQuant` psy path): AC-only energy credit.
+    // `PSYVALUE(rec) = (psy_scale * rec) >> max(0, 2*transform_shift + 1)`.
+    // The credit is SUBTRACTED from candidate costs, so costs (and the
+    // uncoded/zeroing distortion sums that fold it in) may go negative; the
+    // whole cost domain here is i64, which stays exact.
+    let psy_shift = (2 * transform_shift + 1).max(0) as u32;
+    let psy_value = |rec: i64| -> i64 {
+        match psy {
+            Some(p) => (p.psy_scale * rec) >> psy_shift,
+            None => 0,
+        }
+    };
+    // Predicted (reconstructed-without-residual) coefficient at raster `idx`;
+    // `None` when psy is off or at the DC position (psy is AC-only).
+    let psy_predicted = |idx: usize| -> Option<i64> {
+        match psy {
+            Some(p) if idx != 0 => Some(p.src_dct[idx] as i64 - coeffs[idx] as i64),
+            _ => None,
+        }
+    };
     let bits = |ci: usize, bin: u8| -> u64 { ctxs.models[ci].entropy_bits(bin) as u64 };
 
     // Frozen representative greater1/greater2 contexts (greater1_ctx = 1, first
@@ -1025,12 +1068,22 @@ pub fn rdoq_single_scan_into<'scratch>(
     // Zeroing distortion of the trimmed tail (ranks kept..size*size). Full
     // coding groups beyond the last significant one first, then the last
     // group's tail positions. i64 sums are order-independent and exact.
+    // With psy on, each tail position's uncoded cost also carries its psy
+    // credit (`-PSYVALUE(predicted)` — when nothing is coded the recon coef
+    // equals the predicted coef), keeping the CBF=0 total and the stage
+    // (b)/(c) comparisons consistent with the per-record uncoded costs. The
+    // trimmed tail never contains the DC position (its ranks are strictly
+    // above `last_sig_rank >= 0`), so `psy_predicted`'s AC gate is enough.
     let mut tail_zero_dist = 0i64;
     for &(sbx, sby) in scan_sub[kept_cgs..].iter() {
         let row0 = sby as usize * 4 * size + sbx as usize * 4;
         for &(px, py) in scan_pos.iter() {
-            let abs = coeffs[row0 + py as usize * size + px as usize].unsigned_abs() as i64;
+            let idx = row0 + py as usize * size + px as usize;
+            let abs = coeffs[idx].unsigned_abs() as i64;
             tail_zero_dist += (abs * abs) << scale_bits;
+            if let Some(predicted) = psy_predicted(idx) {
+                tail_zero_dist -= psy_value(predicted);
+            }
         }
     }
     {
@@ -1038,8 +1091,12 @@ pub fn rdoq_single_scan_into<'scratch>(
         let row0 = sby as usize * 4 * size + sbx as usize * 4;
         for pos in last_cg_top + 1..16 {
             let (px, py) = scan_pos[pos];
-            let abs = coeffs[row0 + py as usize * size + px as usize].unsigned_abs() as i64;
+            let idx = row0 + py as usize * size + px as usize;
+            let abs = coeffs[idx].unsigned_abs() as i64;
             tail_zero_dist += (abs * abs) << scale_bits;
+            if let Some(predicted) = psy_predicted(idx) {
+                tail_zero_dist -= psy_value(predicted);
+            }
         }
     }
 
@@ -1092,16 +1149,26 @@ pub fn rdoq_single_scan_into<'scratch>(
             let x = sbx * 4 + px as usize;
             let y = sby * 4 + py as usize;
             let rank = sb_i * 16 + pos;
-            let coeff = coeffs[y * size + x];
+            let idx = y * size + x;
+            let coeff = coeffs[idx];
             let abs = coeff.unsigned_abs() as i64;
             let q = ((abs * scale + round) >> qbits).min(32767) as i32;
 
             let sig_ci = sig_row[pos] as usize;
             let sig0 = bits(sig_ci, 0);
-            let dist0 = (abs * abs) << scale_bits;
+            // Uncoded cost, including the psy credit for AC positions
+            // (quant.cpp:885: recon coef == predicted coef when uncoded).
+            // Folding it into `dist0` propagates it to `rd_normal` for zero
+            // levels, the stage-(b) zeroing suffixes, and the stage-(c)
+            // sub-block zeroing sums.
+            let predicted = psy_predicted(idx);
+            let mut dist0 = (abs * abs) << scale_bits;
+            if let Some(predicted) = predicted {
+                dist0 -= psy_value(predicted);
+            }
 
             let rec = &mut recs[rank];
-            rec.idx = y * size + x;
+            rec.idx = idx;
             rec.x = x as u32;
             rec.y = y as u32;
             rec.dist0 = dist0;
@@ -1140,8 +1207,17 @@ pub fn rdoq_single_scan_into<'scratch>(
             let mut best_distl = dist0;
             let mut best_cost = dist0 + rate(sig0);
             for l in (q - 1).max(1)..=q {
-                let dl = abs - dq.apply(l as i16) as i64;
-                let dist = (dl * dl) << scale_bits;
+                let unquant = dq.apply(l as i16) as i64;
+                let dl = abs - unquant;
+                let mut dist = (dl * dl) << scale_bits;
+                if let Some(predicted) = predicted {
+                    // quant.cpp:972,1004-1007: credit the candidate for the
+                    // AC energy it reconstructs. The unquantized level is an
+                    // absolute value, so sign-align the predicted coef with
+                    // the coefficient before summing.
+                    let aligned = if coeff >= 0 { predicted } else { -predicted };
+                    dist -= psy_value((unquant + aligned).abs());
+                }
                 let mb = if level2 {
                     ic_level_bits(l as u32, base_level, gt1, gt2, c1c2idx, go_rice) + BYPASS_BITS
                 } else {
@@ -1427,7 +1503,7 @@ mod rdoq_optimality_tests {
             .collect();
         let coeffs = forward_transform(&residual, log2, false, bd);
         let ctx = Contexts::new(qp);
-        let (start, _) = rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true);
+        let (start, _) = rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true, None);
 
         for mode in [
             RdoqPricingMode::Running,
@@ -1561,7 +1637,7 @@ mod rdoq_optimality_tests {
                     let (hq, _) = quantize(&coeffs, log2, qp, bd);
                     let ctx = Contexts::new(qp);
                     let (rdoq, _) =
-                        rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true);
+                        rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true, None);
                     if hq.iter().all(|&l| l == 0) && rdoq.iter().all(|&l| l == 0) {
                         continue;
                     }
@@ -1605,6 +1681,83 @@ mod rdoq_optimality_tests {
             agg_rdoq_excess / count as f64,
             agg_hq_excess / count as f64
         );
+    }
+}
+
+#[cfg(test)]
+mod psy_rdoq_tests {
+    use super::{RdoqPsy, rdoq_single_scan};
+    use crate::contexts::Contexts;
+    use crate::residual::ScanOrder;
+
+    fn lambda(qp: i32) -> f64 {
+        0.57 * 2f64.powf((qp as f64 - 12.0) / 3.0)
+    }
+
+    /// psy-rdoq keeps an AC coefficient that plain RDOQ zeroes: a lone small
+    /// AC coefficient quantizes to level 1 but its sig/level/last bits
+    /// outweigh the distortion saving, so plain RDOQ drops the whole block.
+    /// With a psy bias (source DCT == residual DCT, so the uncoded credit is
+    /// zero while a coded level reconstructs AC energy), the coefficient is
+    /// kept.
+    #[test]
+    fn psy_keeps_ac_coefficient_that_plain_rdoq_zeroes() {
+        let log2 = 3u8;
+        let size = 1usize << log2;
+        let qp = 34;
+        let bd = 8u8;
+        let scan = ScanOrder::Diagonal;
+        let lam = lambda(qp);
+        let ctx = Contexts::new(qp);
+
+        let mut coeffs = vec![0i16; size * size];
+        let pos = 3 * size + 2;
+        coeffs[pos] = 260; // just above the qp34 8x8 significance threshold (256)
+
+        let (plain, plain_nnz) =
+            rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true, None);
+        assert_eq!(plain[pos], 0, "test premise: plain RDOQ zeroes this coef");
+        assert_eq!(plain_nnz, 0);
+
+        let psy = RdoqPsy {
+            src_dct: &coeffs,   // predicted == 0 everywhere: uncoded preserves no AC energy
+            psy_scale: 1 << 28, // strong synthetic psy weight
+        };
+        let (kept, kept_nnz) =
+            rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true, Some(psy));
+        assert_ne!(kept[pos], 0, "psy-rdoq must keep the AC coefficient");
+        assert_eq!(kept_nnz, 1);
+        assert!(kept[pos] > 0, "level sign must follow the coefficient sign");
+    }
+
+    /// The psy bias is AC-only: a DC-only block must be unaffected even by an
+    /// extreme psy weight and a wildly different DC prediction.
+    #[test]
+    fn psy_skips_dc_position() {
+        let log2 = 3u8;
+        let size = 1usize << log2;
+        let qp = 30;
+        let bd = 8u8;
+        let scan = ScanOrder::Diagonal;
+        let lam = lambda(qp);
+        let ctx = Contexts::new(qp);
+
+        let mut coeffs = vec![0i16; size * size];
+        coeffs[0] = 600;
+
+        let (plain, plain_nnz) =
+            rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true, None);
+
+        let mut src_dct = vec![0i16; size * size];
+        src_dct[0] = 30000; // huge DC "prediction" energy that must be ignored
+        let psy = RdoqPsy {
+            src_dct: &src_dct,
+            psy_scale: 1 << 30,
+        };
+        let (biased, biased_nnz) =
+            rdoq_single_scan(&ctx, &coeffs, log2, 0, qp, bd, scan, lam, true, Some(psy));
+        assert_eq!(plain, biased, "DC-only block must be psy-invariant");
+        assert_eq!(plain_nnz, biased_nnz);
     }
 }
 

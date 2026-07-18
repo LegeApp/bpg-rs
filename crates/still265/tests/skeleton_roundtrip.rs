@@ -24,6 +24,9 @@ fn syntax_skeleton_headers_parse() {
         aq_strength: 0.35,
         aq_clamp: 2,
         two_pass_gate: true,
+        psy_rd: 0.0,
+        psy_rdoq: 0.0,
+        aq_qg: 32,
     };
 
     let bytes = StillHevcEncoder::syntax_skeleton(&config);
@@ -85,6 +88,9 @@ fn syntax_skeleton_decode_fails_on_missing_slice_data() {
         aq_strength: 0.35,
         aq_clamp: 2,
         two_pass_gate: true,
+        psy_rd: 0.0,
+        psy_rdoq: 0.0,
+        aq_qg: 32,
     };
 
     let bytes = StillHevcEncoder::syntax_skeleton(&config);

@@ -42,6 +42,13 @@ fn textured_420(w: usize, h: usize) -> (Vec<u16>, Vec<u16>, Vec<u16>) {
 }
 
 fn run_slow_sao(w: u32, h: u32, qp: u8) {
+    run_slow_sao_psy(w, h, qp, 0.0, 0.0);
+}
+
+/// Encode with the given psy-rd / psy-rdoq strengths, assert recon == decode,
+/// and return the emitted bytes (so the psy tests can also assert the stream
+/// changed).
+fn run_slow_sao_psy(w: u32, h: u32, qp: u8, psy_rd: f32, psy_rdoq: f32) -> Vec<u8> {
     let (y, cb, cr) = textured_420(w as usize, h as usize);
     let config = StillHevcConfig {
         width: w,
@@ -57,6 +64,9 @@ fn run_slow_sao(w: u32, h: u32, qp: u8) {
         aq_strength: 0.35,
         aq_clamp: 2,
         two_pass_gate: true,
+        psy_rd,
+        psy_rdoq,
+        aq_qg: 32,
     };
     let (bytes, recon) = encode(
         &config,
@@ -99,6 +109,7 @@ fn run_slow_sao(w: u32, h: u32, qp: u8) {
         qp,
         "cr",
     );
+    bytes
 }
 
 fn assert_display_eq(
@@ -131,6 +142,85 @@ fn assert_display_eq(
     );
 }
 
+/// Encode with a single-pass AQ mode at the given quantization-group size,
+/// assert recon == decode, and return the bytes.
+fn run_slow_sao_aq(w: u32, h: u32, qp: u8, aq_mode: still265::AqMode, aq_qg: u8) -> Vec<u8> {
+    let (y, cb, cr) = textured_420(w as usize, h as usize);
+    let config = StillHevcConfig {
+        width: w,
+        height: h,
+        bit_depth: 8,
+        chroma: ChromaFormat::Yuv420,
+        qp,
+        effort: Effort::Slow,
+        sao: SaoMode::On,
+        deblock: DeblockMode::On,
+        adaptive_qp: false,
+        aq_mode,
+        aq_strength: 1.0,
+        aq_clamp: 4,
+        two_pass_gate: true,
+        psy_rd: 0.0,
+        psy_rdoq: 0.0,
+        aq_qg,
+    };
+    let (bytes, recon) = encode(
+        &config,
+        Source {
+            y: &y,
+            cb: &cb,
+            cr: &cr,
+        },
+    );
+    let decoded = decode(&bytes).expect("decoder must accept the AQ stream");
+    let dw = decoded.width as usize;
+    let cw = decoded.width.div_ceil(2) as usize;
+    assert_display_eq(
+        &decoded.y_plane,
+        &recon.y_plane,
+        dw,
+        w as usize,
+        h as usize,
+        qp,
+        "luma",
+    );
+    assert_display_eq(
+        &decoded.cb_plane,
+        &recon.cb_plane,
+        cw,
+        w.div_ceil(2) as usize,
+        h.div_ceil(2) as usize,
+        qp,
+        "cb",
+    );
+    assert_display_eq(
+        &decoded.cr_plane,
+        &recon.cr_plane,
+        cw,
+        w.div_ceil(2) as usize,
+        h.div_ceil(2) as usize,
+        qp,
+        "cr",
+    );
+    bytes
+}
+
+/// 16x16 quantization groups (`aq_qg = 16`, PPS `diff_cu_qp_delta_depth = 2`)
+/// must keep recon == decode for the single-pass AQ modes — on a non-CTU-
+/// aligned picture so edge CUs / forced splits exercise the depth-2 QG QP
+/// prediction — and must actually change the stream relative to 32x32 QGs.
+#[test]
+fn aq_qg16_recon_equals_decode_and_changes_bytes() {
+    for mode in [still265::AqMode::Perceptual, still265::AqMode::AutoVariance] {
+        let qg32 = run_slow_sao_aq(200, 136, 29, mode, 32);
+        let qg16 = run_slow_sao_aq(200, 136, 29, mode, 16);
+        assert_ne!(
+            qg32, qg16,
+            "{mode:?}: aq_qg 16 produced a byte-identical stream to aq_qg 32"
+        );
+    }
+}
+
 #[test]
 fn slow_sao_recon_equals_decode_aligned() {
     // CTU-aligned (128x128 = 2x2 CTUs).
@@ -142,4 +232,35 @@ fn slow_sao_recon_equals_decode_unaligned() {
     // Not CTU-aligned (exercises boundary CUs + crop window) at two QPs.
     run_slow_sao(200, 136, 28);
     run_slow_sao(200, 136, 36);
+}
+
+/// psy-rd streams must stay decodable (recon == decode) and must actually
+/// change the encode relative to psy-rd 0 (the feature does something).
+#[test]
+fn psy_rd_recon_equals_decode_and_changes_bytes() {
+    let baseline = run_slow_sao_psy(200, 136, 29, 0.0, 0.0);
+    let psy = run_slow_sao_psy(200, 136, 29, 2.0, 0.0);
+    assert_ne!(
+        baseline, psy,
+        "psy-rd 2.0 produced a byte-identical stream to psy-rd 0"
+    );
+}
+
+/// psy-rdoq streams must stay decodable (recon == decode) and must actually
+/// change the encode relative to psy-rdoq 0 (the feature does something) —
+/// alone and combined with psy-rd.
+#[test]
+fn psy_rdoq_recon_equals_decode_and_changes_bytes() {
+    let baseline = run_slow_sao_psy(200, 136, 29, 0.0, 0.0);
+    let psy = run_slow_sao_psy(200, 136, 29, 0.0, 1.0);
+    assert_ne!(
+        baseline, psy,
+        "psy-rdoq 1.0 produced a byte-identical stream to psy-rdoq 0"
+    );
+    let both = run_slow_sao_psy(200, 136, 29, 2.0, 1.0);
+    let psy_rd_only = run_slow_sao_psy(200, 136, 29, 2.0, 0.0);
+    assert_ne!(
+        psy_rd_only, both,
+        "psy-rdoq 1.0 on top of psy-rd 2.0 produced a byte-identical stream"
+    );
 }

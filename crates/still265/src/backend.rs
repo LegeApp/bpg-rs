@@ -33,6 +33,9 @@ pub struct RustStillHevcEncoder {
     aq_strength: f32,
     aq_clamp: u8,
     two_pass_gate: bool,
+    psy_rd: f32,
+    psy_rdoq: f32,
+    aq_qg: u8,
     last_stats: Mutex<Option<LastEncodeStats>>,
     last_recon: Mutex<Option<DecodedFrame>>,
 }
@@ -49,6 +52,9 @@ impl RustStillHevcEncoder {
             aq_strength: 0.35,
             aq_clamp: 2,
             two_pass_gate: true,
+            psy_rd: 0.0,
+            psy_rdoq: 0.0,
+            aq_qg: 32,
             last_stats: Mutex::new(None),
             last_recon: Mutex::new(None),
         }
@@ -76,6 +82,23 @@ impl RustStillHevcEncoder {
     /// always applies the AQ candidate (for A/B measurement).
     pub fn with_two_pass_gate(mut self, enabled: bool) -> Self {
         self.two_pass_gate = enabled;
+        self
+    }
+
+    /// Set the psychovisual RD / RDOQ strengths (the `--psy-rd` / `--psy-rdoq`
+    /// flags; x265 sane ranges 0..=5 and 0..=50). `0.0` (the default) keeps the
+    /// plain SSE+rate cost byte-identically.
+    pub fn with_psy(mut self, psy_rd: f32, psy_rdoq: f32) -> Self {
+        self.psy_rd = psy_rd;
+        self.psy_rdoq = psy_rdoq;
+        self
+    }
+
+    /// Set the adaptive-quantization quantization-group size (the `--aq-qg`
+    /// flag): `32` (default) or `16` (opt-in, PPS `diff_cu_qp_delta_depth = 2`).
+    /// Other values resolve to 32; `TwoPassMeasured` always keeps 32x32 QGs.
+    pub fn with_aq_qg(mut self, aq_qg: u8) -> Self {
+        self.aq_qg = aq_qg;
         self
     }
 
@@ -177,6 +200,9 @@ impl HevcEncoder for RustStillHevcEncoder {
             aq_strength: self.aq_strength,
             aq_clamp: self.aq_clamp,
             two_pass_gate: self.two_pass_gate,
+            psy_rd: self.psy_rd,
+            psy_rdoq: self.psy_rdoq,
+            aq_qg: self.aq_qg,
         };
 
         let src = Source {

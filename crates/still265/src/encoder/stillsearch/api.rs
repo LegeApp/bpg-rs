@@ -83,6 +83,9 @@ mod tests {
             aq_strength: 0.35,
             aq_clamp: 2,
             two_pass_gate: true,
+            psy_rd: 0.0,
+            psy_rdoq: 0.0,
+            aq_qg: 32,
         };
         super::LUMA_NONDC_PICKS.store(0, Ordering::Relaxed);
         let _ = encode(
@@ -135,6 +138,9 @@ mod tests {
             aq_strength: 0.35,
             aq_clamp: 2,
             two_pass_gate: true,
+            psy_rd: 0.0,
+            psy_rdoq: 0.0,
+            aq_qg: 32,
         };
         super::CU_SPLIT_WINS.store(0, Ordering::Relaxed);
         let _ = encode(
@@ -181,6 +187,9 @@ mod tests {
             aq_strength: 0.35,
             aq_clamp: 2,
             two_pass_gate: true,
+            psy_rd: 0.0,
+            psy_rdoq: 0.0,
+            aq_qg: 32,
         };
 
         super::SPLIT_WINS.store(0, Ordering::Relaxed);

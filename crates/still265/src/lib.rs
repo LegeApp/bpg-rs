@@ -121,6 +121,15 @@ pub enum AqMode {
     Perceptual,
     /// Perceptual AQ with chroma-aware activity (Prangnell 2017 luma+chroma).
     PerceptualChroma,
+    /// Port of x265 aq-mode 2 (`AUTO_VARIANCE`): per-QG offset
+    /// `strength·avg_adj·(qp_adj0 − avg_adj_final)` on the AC-energy power law
+    /// `qp_adj0 = (energy + 1)^0.1`, self-normalized by the picture's energy
+    /// statistics ([`preanalysis::aq_qp_offset_autovar`]).
+    AutoVariance,
+    /// Port of x265 aq-mode 3 (`AUTO_VARIANCE_BIASED`): [`Self::AutoVariance`]
+    /// plus a dark/flat bias `strength·(1 − 11/qp_adj0²)` that pushes
+    /// low-energy QGs further negative (extra bits on flat/dark regions).
+    AutoVarianceBiased,
     /// Experiment control: PSNR/SSE-leaning bidirectional AQ (opposite sign of
     /// `Perceptual`). Not RD-efficient at equal bytes — diagnostic only.
     PsnrProbe,
@@ -136,11 +145,28 @@ pub enum AqMode {
 }
 
 impl AqMode {
+    /// The recommended opt-in AQ mode. It measures coded complexity in a
+    /// uniform first pass, then applies AQ only when its candidate gate finds a
+    /// perceptual rate-distortion win. `Default` deliberately remains `Off` so
+    /// applications must opt into the extra encode work explicitly.
+    #[inline]
+    pub const fn recommended() -> Self {
+        Self::TwoPassMeasured
+    }
+
     /// Whether this mode requires the two-pass encode driver
     /// ([`crate::encoder::encode_two_pass`]) rather than a single in-tree pass.
     pub fn is_two_pass(self) -> bool {
         matches!(self, AqMode::TwoPassMeasured)
     }
+}
+
+/// Tunables for the recommended measured two-pass AQ mode. Keeping this named
+/// API next to [`AqMode::recommended`] lets applications opt in without
+/// duplicating the CLI's tested strength and clamp.
+#[inline]
+pub const fn recommended_aq_preset() -> (AqMode, f32, u8) {
+    (AqMode::recommended(), 1.00, 4)
 }
 
 /// Resolve a named adaptive-quantization preset to `(mode, strength, clamp)` —
@@ -156,9 +182,16 @@ pub fn aq_preset(name: &str) -> Option<(AqMode, f32, u8)> {
         "perceptual" => (AqMode::Perceptual, 0.35, 2),
         "perceptual-chroma-mild" => (AqMode::PerceptualChroma, 0.20, 2),
         "perceptual-chroma" => (AqMode::PerceptualChroma, 0.35, 2),
+        // x265's native aq-strength scale is ~1.0; clamp 6 covers the offsets
+        // aq-strength 1.0 actually produces without truncating the tails.
+        "auto-variance" | "autovar" => (AqMode::AutoVariance, 1.0, 6),
+        "auto-variance-biased" | "autovar-biased" => (AqMode::AutoVarianceBiased, 1.0, 6),
         "psnr-probe" | "psnr" => (AqMode::PsnrProbe, 0.35, 2),
         "positive-probe" | "positive" => (AqMode::PositiveProbe, 0.35, 2),
-        "two-pass" | "twopass" => (AqMode::TwoPassMeasured, 0.60, 3),
+        // Measured optimum on the 7-image test set (2026-07 sweeps): s1.0 is the
+        // peak of the strength curve (s0.6 gets roughly half the BD-rate gain,
+        // s1.4+ declines); clamp 4 — 6 was indistinguishable at s1.0.
+        "two-pass" | "twopass" => recommended_aq_preset(),
         _ => return None,
     })
 }
@@ -294,6 +327,42 @@ pub struct StillHevcConfig {
     /// uniform encode. Makes two-pass AQ safe to enable by default — it can
     /// improve a picture but never regress one. Ignored for non-two-pass modes.
     pub two_pass_gate: bool,
+    /// Psychovisual RD strength (x265 `--psy-rd`, sane range 0..=5, x265
+    /// default 2.0). Adds an AC-energy-preservation term to mode/TU/CU RD
+    /// decisions. `0.0` (the default) is byte-identical to the plain SSE+rate
+    /// cost. Clamped on resolve; see `encoder::stillsearch::env::psy_rd`.
+    pub psy_rd: f32,
+    /// Psychovisual RDOQ strength (x265 `--psy-rdoq`, sane range 0..=50).
+    /// Biases RDOQ level decisions toward preserving AC coefficient energy.
+    /// `0.0` (the default) disables it. Clamped on resolve; see
+    /// `encoder::stillsearch::env::psy_rdoq`.
+    pub psy_rdoq: f32,
+    /// Adaptive-quantization quantization-group size in luma samples: `32`
+    /// (default, PPS `diff_cu_qp_delta_depth = 1`) or `16` (opt-in,
+    /// `diff_cu_qp_delta_depth = 2`; yeo2013 found 16x16 the best AQ
+    /// granularity for BD-rate). Any other value resolves to 32. Applies to
+    /// the single-pass AQ modes and the external `BPG_AQ_OFFSET_MAP`;
+    /// [`AqMode::TwoPassMeasured`] always uses 32x32 QGs (its pass-1 activity
+    /// accumulator is 32x32-only for now). Ignored when AQ is off.
+    pub aq_qg: u8,
+}
+
+/// Resolve the effective quantization-group size (log2, luma samples) for an
+/// encode: `5` (32x32, the default) or `4` (16x16, `aq_qg = 16` opt-in). The
+/// single source of truth shared by the PPS writer (`diff_cu_qp_delta_depth =
+/// CTB_LOG2 − qg_log2`) and the encoder's QP-prediction mirror, so the
+/// bitstream and the per-CU QP plan can never disagree on the QG grid.
+///
+/// [`AqMode::TwoPassMeasured`] is forced to 32x32 regardless of `aq_qg`: its
+/// pass-1 per-QG activity accumulator and candidate gate are defined on the
+/// 32x32 grid (16x16 QGs there are out of scope for now).
+#[inline]
+pub fn resolve_aq_qg_log2(config: &StillHevcConfig) -> u8 {
+    if config.aq_qg == 16 && resolve_aq_mode(config) != AqMode::TwoPassMeasured {
+        4
+    } else {
+        5
+    }
 }
 
 /// Rust-native still-picture HEVC intra encoder.

@@ -51,6 +51,16 @@ pub(super) struct Encoder<'a> {
     pub(super) aq_strength: f32,
     pub(super) aq_clamp: f32,
     pub(super) aq_offset_map: Option<Arc<crate::preanalysis::AqOffsetMap>>,
+    /// Per-16x16 AQ signal grid, present only when 16x16 quantization groups
+    /// (`aq_qg = 16`) are active for a variance-family AQ mode. The coarse
+    /// 32x32 [`Self::analysis`] grid keeps feeding search steering untouched.
+    pub(super) fine_aq: Option<Arc<crate::preanalysis::FineAqGrid>>,
+    /// Resolved psy-rd strength (config + `BPG_PSY_RD` override, clamped; see
+    /// `stillsearch::env::psy_rd`). `0.0` disables the psy energy term.
+    pub(super) psy_rd: f32,
+    /// Resolved psy-rdoq strength (config + `BPG_PSY_RDOQ` override, clamped).
+    /// Plumbed for the RDOQ energy bias; `0.0` disables it.
+    pub(super) psy_rdoq: f32,
     pub(super) part_nxn_enabled: bool,
     pub(super) analysis: Arc<crate::preanalysis::AnalysisMaps>,
     pub(super) stats: EncodeStats,
@@ -680,19 +690,49 @@ fn encode_inner(
     };
 
     let eff_t = crate::effort::template_for_encode(config.effort);
+    // Effective quantization-group size (log2): 5 (32x32 default) or 4 (16x16
+    // `aq_qg = 16` opt-in; TwoPassMeasured is forced to 5). Must agree with
+    // the PPS `diff_cu_qp_delta_depth` `write_pps` emits — both read this one
+    // resolver.
+    let qg_log2 = crate::resolve_aq_qg_log2(config);
     let aq_offset_map = if aq_override.is_some() {
         aq_override
     } else if aq_active {
-        crate::preanalysis::load_external_aq_offset_map(width, height).map(Arc::new)
+        crate::preanalysis::load_external_aq_offset_map(width, height, qg_log2).map(Arc::new)
     } else {
         None
     };
     let (aq_mode, aq_strength, aq_clamp) = crate::resolve_aq(config);
+    let psy_rd = stillsearch::env::psy_rd(config.psy_rd);
+    let psy_rdoq = stillsearch::env::psy_rdoq(config.psy_rdoq);
 
     let analysis = if aq_active || !eff_t.oracle {
         Arc::new(crate::preanalysis::analyze(width, height, bd, cat, src))
     } else {
         Arc::new(crate::preanalysis::AnalysisMaps::empty())
+    };
+
+    // 16x16 QGs need per-16x16 AQ signals for the variance-family modes; the
+    // coarse 32x32 grid stays untouched (it also steers the search). Modes fed
+    // from other sources (external/in-memory offset map, LegacyShrink's
+    // importance fold, Off) don't read it.
+    let fine_aq = if aq_active
+        && qg_log2 == crate::preanalysis::FINE_CELL_LOG2
+        && aq_offset_map.is_none()
+        && matches!(
+            aq_mode,
+            crate::AqMode::Perceptual
+                | crate::AqMode::PerceptualChroma
+                | crate::AqMode::PsnrProbe
+                | crate::AqMode::PositiveProbe
+                | crate::AqMode::AutoVariance
+                | crate::AqMode::AutoVarianceBiased
+        ) {
+        Some(Arc::new(crate::preanalysis::analyze_fine(
+            width, height, bd, cat, src,
+        )))
+    } else {
+        None
     };
 
     let mut state = Encoder {
@@ -711,6 +751,7 @@ fn encode_inner(
         sign_data_hiding: crate::sdh_active(config),
         aq: AqState {
             active: aq_active,
+            qg_log2,
             qp_bd_offset,
             slice_qp_y,
             current_qpy: slice_qp_y,
@@ -735,6 +776,9 @@ fn encode_inner(
         aq_strength,
         aq_clamp,
         aq_offset_map,
+        fine_aq,
+        psy_rd,
+        psy_rdoq,
         part_nxn_enabled: eff_t.nxn.enabled,
         analysis,
         stats: EncodeStats::default(),
@@ -1136,7 +1180,10 @@ fn two_pass_activity(m: &QgMeasurements, slice_qp: i32) -> Vec<f64> {
 }
 
 /// Measure per-QG (32x32) coded coefficient energy from the built CU trees —
-/// the two-pass AQ pass-1 signal. Energy is `Σ|level|` over every transform
+/// the two-pass AQ pass-1 signal. Uses the compile-time `QG_LOG2` (32x32)
+/// deliberately: `TwoPassMeasured` always runs on 32x32 QGs
+/// (`resolve_aq_qg_log2` forces it), so this accumulator never sees the 16x16
+/// opt-in. Energy is `Σ|level|` over every transform
 /// block (luma + chroma), attributed to the quantization group containing each
 /// transform unit's top-left. Mirrors [`write::write_cu`]'s position recursion.
 fn collect_qg_activity(
@@ -1250,6 +1297,8 @@ fn collect_qg_activity(
 
 /// Per-QG luma SSE between the source and the (final, deblocked + SAO'd) pass-1
 /// reconstruction — the distortion half of the two-pass RD-slope signal.
+/// Like [`collect_qg_activity`], fixed to the 32x32 `QG_LOG2` grid (two-pass
+/// AQ never uses 16x16 QGs).
 fn collect_qg_sse(
     src_y: &[u16],
     recon: &DecodedFrame,

@@ -4,7 +4,6 @@ use crate::cabac::CabacEstimator;
 use crate::contexts::ctx;
 use crate::effort::{CuEarlyTerminateRule, SplitSearch};
 use crate::encoder::Encoder;
-use crate::encoder::types::QG_LOG2;
 use crate::plan::DecisionConfidence;
 
 use super::depth::StillSearchDepth;
@@ -108,12 +107,13 @@ where
         if !fully_inside && can_split {
             return self.decide_cu_split(state, x0, y0, log2_cb_size, ct_depth);
         }
-        // AQ targets are defined per 32x32 quantization group. Keeping larger
-        // leaf CUs would quantize the whole leaf with its top-left QG target,
-        // while the bitstream/decoder QP prediction can change at QG
-        // boundaries. For AQ-active experiments, force the CU tree down to QG
-        // size so analysis, writer, and decoder agree.
-        if state.aq.active && can_split && log2_cb_size > QG_LOG2 {
+        // AQ targets are defined per quantization group (32x32 by default,
+        // 16x16 with `aq_qg = 16`). Keeping larger leaf CUs would quantize the
+        // whole leaf with its top-left QG target, while the bitstream/decoder
+        // QP prediction can change at QG boundaries. For AQ-active
+        // experiments, force the CU tree down to the runtime QG size so
+        // analysis, writer, and decoder agree.
+        if state.aq.active && can_split && log2_cb_size > state.aq.qg_log2 {
             if super::env::ctx_evolve_search() {
                 self.commit_cu_split_flag_ctx(state, x0, y0, ct_depth, true);
             }

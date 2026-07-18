@@ -261,6 +261,9 @@ fn cfg_chroma(w: u32, h: u32, qp: u8, bd: u8, chroma: ChromaFormat) -> StillHevc
         aq_strength: 0.35,
         aq_clamp: 2,
         two_pass_gate: true,
+        psy_rd: 0.0,
+        psy_rdoq: 0.0,
+        aq_qg: 32,
     }
 }
 
@@ -939,6 +942,9 @@ fn yuv422_adaptive_qp_round_trip() {
         aq_strength: 0.35,
         aq_clamp: 2,
         two_pass_gate: true,
+        psy_rd: 0.0,
+        psy_rdoq: 0.0,
+        aq_qg: 32,
         ..cfg_chroma(w, h, 34, bd, ChromaFormat::Yuv422)
     };
     assert!(still265::aq_active(&config));
@@ -990,6 +996,9 @@ fn two_pass_aq_wpp_tree_build_round_trip_420() {
     let config = StillHevcConfig {
         aq_mode: still265::AqMode::TwoPassMeasured,
         two_pass_gate: false,
+        psy_rd: 0.0,
+        psy_rdoq: 0.0,
+        aq_qg: 32,
         ..cfg(w, h, 32, bd)
     };
     assert!(still265::aq_active(&config));
@@ -1051,6 +1060,9 @@ fn two_pass_aq_explicit_tiles_round_trip_420() {
     let config = StillHevcConfig {
         aq_mode: still265::AqMode::TwoPassMeasured,
         two_pass_gate: false,
+        psy_rd: 0.0,
+        psy_rdoq: 0.0,
+        aq_qg: 32,
         ..cfg(w, h, 32, bd)
     };
     assert!(still265::aq_active(&config));
@@ -1111,6 +1123,9 @@ fn two_pass_aq_wpp_tree_build_round_trip_422() {
     let config = StillHevcConfig {
         aq_mode: still265::AqMode::TwoPassMeasured,
         two_pass_gate: false,
+        psy_rd: 0.0,
+        psy_rdoq: 0.0,
+        aq_qg: 32,
         ..cfg_chroma(w, h, 32, bd, ChromaFormat::Yuv422)
     };
     assert!(still265::aq_active(&config));

@@ -14,6 +14,15 @@ pub(super) struct SsimRdNorm {
     pub(super) f_ac_den: u64,
 }
 
+/// Cached per-component psy-rd weight (`psy::psy_rd_weight`), keyed by the
+/// component QP so it is computed once per CU/QP instead of per block trial.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct PsyRdWeight {
+    pub(super) valid: bool,
+    pub(super) qp: i32,
+    pub(super) weight: f64,
+}
+
 /// Per-CTU substage profile accumulators for `eval_component_8`.
 /// Populated only when `BPG_STILLSEARCH_PROFILE=1`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -68,6 +77,8 @@ pub(super) struct CtuWorkspace {
     pub(super) substage: SubstageProfile,
     /// Per-component CTU source normalization for the opt-in SSIM-RD cost.
     pub(super) ssim_rd_norm: [SsimRdNorm; 3],
+    /// Per-component cached psy-rd weight for the opt-in psy-rd cost.
+    pub(super) psy_rd_weight: [PsyRdWeight; 3],
     /// Number of TU split evaluations skipped due to zero-residual early
     /// termination in this CTU.
     pub(super) tu_split_early_terminations: u64,
@@ -175,6 +186,7 @@ impl Default for CtuWorkspace {
             last_rough_best_cost: f64::INFINITY,
             substage: SubstageProfile::default(),
             ssim_rd_norm: [SsimRdNorm::default(); 3],
+            psy_rd_weight: [PsyRdWeight::default(); 3],
             tu_split_early_terminations: 0,
             tu_split_bound_aborts: 0,
             tu_leaf_by_log2: [0; 7],
@@ -194,6 +206,7 @@ impl CtuWorkspace {
         self.block_scratch.clear_ctu();
         self.substage = SubstageProfile::default();
         self.ssim_rd_norm = [SsimRdNorm::default(); 3];
+        self.psy_rd_weight = [PsyRdWeight::default(); 3];
         self.tu_split_early_terminations = 0;
         self.tu_split_bound_aborts = 0;
         self.tu_leaf_by_log2 = [0; 7];
@@ -235,6 +248,11 @@ pub(super) struct BlockScratch {
     pub(super) component_pred_u16: Vec<u16>,
     pub(super) component_recon_u16: Vec<u16>,
     pub(super) component_pred_tmp_u16: Vec<u16>,
+    /// psy-rdoq scratch: i16-widened SOURCE samples and their forward
+    /// transform (same basis as the residual transform), fed to RDOQ as the
+    /// energy-preservation reference. Only touched when `psy_rdoq > 0`.
+    pub(super) psy_src_i16: Vec<i16>,
+    pub(super) psy_dct_i16: Vec<i16>,
     /// Reusable per-mode accumulators for the batched simple-RDO ranker.
     pub(super) simple_rdo_accum: Vec<super::tu::SimpleRdoAccum>,
 }
@@ -259,6 +277,8 @@ impl BlockScratch {
         self.component_pred_u16.clear();
         self.component_recon_u16.clear();
         self.component_pred_tmp_u16.clear();
+        self.psy_src_i16.clear();
+        self.psy_dct_i16.clear();
         self.simple_rdo_accum.clear();
     }
 

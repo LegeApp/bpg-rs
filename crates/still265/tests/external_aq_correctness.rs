@@ -53,6 +53,9 @@ fn cfg(w: u32, h: u32, qp: u8, bd: u8) -> StillHevcConfig {
         aq_strength: 0.35,
         aq_clamp: 2,
         two_pass_gate: true,
+        psy_rd: 0.0,
+        psy_rdoq: 0.0,
+        aq_qg: 32,
     }
 }
 
@@ -68,6 +71,18 @@ fn map_rows(offset_at: impl Fn(u32, u32) -> i8) -> String {
     let mut out = String::from("# x,y,offset\n");
     for y in [0u32, 32, 64] {
         for x in [0u32, 32, 64] {
+            out.push_str(&format!("{x},{y},{}\n", offset_at(x, y)));
+        }
+    }
+    out
+}
+
+/// Map rows on the 16x16 QG grid (for `aq_qg = 16` encodes): 16-aligned
+/// coordinates covering the whole 96x96 test picture.
+fn map_rows16(offset_at: impl Fn(u32, u32) -> i8) -> String {
+    let mut out = String::from("# x,y,offset (16x16 QGs)\n");
+    for y in (0u32..96).step_by(16) {
+        for x in (0u32..96).step_by(16) {
             out.push_str(&format!("{x},{y},{}\n", offset_at(x, y)));
         }
     }
@@ -103,6 +118,12 @@ fn run_external_map_case_with_config(
     map_body: String,
     config_for: impl Fn(u32, u32, u8, u8) -> StillHevcConfig,
 ) {
+    // `BPG_AQ_OFFSET_MAP` is process-global and the harness runs `#[test]`s on
+    // parallel threads — serialize every external-map case on one lock so the
+    // tests can't clobber each other's map path mid-encode.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let w = 96u32;
     let h = 96u32;
     let bd = 8u8;
@@ -179,6 +200,31 @@ fn external_aq_420_offset_maps_recon_decode_round_trip() {
         "mixed_nonzero_sao_deblock",
         mixed_nonzero_map(),
         cfg_sao_deblock,
+    );
+}
+
+/// External offset map on the 16x16 QG grid (`aq_qg = 16`, PPS
+/// `diff_cu_qp_delta_depth = 2`): the emitted stream must decode to exactly
+/// the encoder's reconstruction, with and without SAO+deblock.
+#[test]
+fn external_aq_qg16_offset_maps_recon_decode_round_trip() {
+    let cfg_qg16 = |w, h, qp, bd| StillHevcConfig {
+        aq_qg: 16,
+        ..cfg(w, h, qp, bd)
+    };
+    let cfg_qg16_sao_deblock = |w, h, qp, bd| StillHevcConfig {
+        aq_qg: 16,
+        ..cfg_sao_deblock(w, h, qp, bd)
+    };
+    // Per-16x16-cell offsets spanning the clamp range, varying between
+    // horizontally/vertically adjacent QGs so the depth-2 QP prediction is
+    // genuinely exercised.
+    let fine = |x: u32, y: u32| (((x / 16 + 2 * (y / 16)) % 5) as i8) - 2;
+    run_external_map_case_with_config("qg16_mixed", map_rows16(fine), cfg_qg16);
+    run_external_map_case_with_config(
+        "qg16_mixed_sao_deblock",
+        map_rows16(fine),
+        cfg_qg16_sao_deblock,
     );
 }
 

@@ -113,6 +113,13 @@ pub(super) const NXN_FORCE: &str = "BPG_STILLSEARCH_NXN_FORCE";
 /// Multiplier for the experimental SSIM-RD residual-energy term.
 pub(super) const SSIM_RD_WEIGHT: &str = "BPG_STILLSEARCH_SSIM_RD_WEIGHT";
 
+/// Sweep-script overrides for the psy-rd / psy-rdoq config values
+/// ([`crate::StillHevcConfig::psy_rd`] / `psy_rdoq`). When set, the env value
+/// replaces the config value; both are clamped to their sane ranges
+/// (psy-rd 0..=5, psy-rdoq 0..=50) on resolve.
+pub(in crate::encoder) const PSY_RD: &str = "BPG_PSY_RD";
+pub(in crate::encoder) const PSY_RDOQ: &str = "BPG_PSY_RDOQ";
+
 /// Residual syntax pricing mode used only by the luma-cheap first pass.
 /// Defaults to `exact`. Set to `skip` or `0` to rank cheap luma candidates
 /// without exact residual syntax bits; the selected winner is still remeasured
@@ -849,6 +856,34 @@ pub(super) fn rdoq_trellis_beam() -> usize {
             .filter(|&v| v > 0)
             .unwrap_or(4)
     })
+}
+
+/// Resolved psy-rd strength: `BPG_PSY_RD` overrides `config_value` when set,
+/// then the result is clamped to 0..=5 (x265's sane range).
+#[inline]
+pub(in crate::encoder) fn psy_rd(config_value: f32) -> f32 {
+    static ENV: OnceLock<Option<f32>> = OnceLock::new();
+    let env_val = *ENV.get_or_init(|| {
+        std::env::var(PSY_RD)
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+    });
+    env_val.unwrap_or(config_value).clamp(0.0, 5.0)
+}
+
+/// Resolved psy-rdoq strength: `BPG_PSY_RDOQ` overrides `config_value` when
+/// set, then the result is clamped to 0..=50 (x265's sane range).
+#[inline]
+pub(in crate::encoder) fn psy_rdoq(config_value: f32) -> f32 {
+    static ENV: OnceLock<Option<f32>> = OnceLock::new();
+    let env_val = *ENV.get_or_init(|| {
+        std::env::var(PSY_RDOQ)
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+    });
+    env_val.unwrap_or(config_value).clamp(0.0, 50.0)
 }
 
 /// True when experimental SSIM-RD-style candidate ranking is enabled.

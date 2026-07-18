@@ -17,7 +17,8 @@
 //!     width: 4096, height: 3072, bit_depth: 8, chroma: ChromaFormat::Yuv420,
 //!     qp: 28, effort: Effort::Slow, sao: SaoMode::On, deblock: DeblockMode::On,
 //!     adaptive_qp: false, aq_mode: still265::AqMode::Off, aq_strength: 0.35,
-//!     aq_clamp: 2, two_pass_gate: true,
+//!     aq_clamp: 2, two_pass_gate: true, psy_rd: 0.0, psy_rdoq: 0.0,
+//!     aq_qg: 32,
 //! };
 //! // How much RAM will one encode of this size take?
 //! let est = batch::estimate_memory(&cfg);
@@ -290,6 +291,9 @@ mod tests {
             aq_strength: 0.35,
             aq_clamp: 2,
             two_pass_gate: true,
+            psy_rd: 0.0,
+            psy_rdoq: 0.0,
+            aq_qg: 32,
         }
     }
 

@@ -345,7 +345,10 @@ pub(super) fn write_cu(
     let can_split = log2_cb_size > 3;
     let split_coded = fully_inside && can_split;
 
-    if state.aq.active && log2_cb_size >= 5 {
+    // Decoder mirror: `coding_quadtree` resets the QG delta state at every
+    // node with `log2_cb_size >= Log2MinCuQpDeltaSize` (= the runtime QG size,
+    // 5 for 32x32 / 4 for 16x16 QGs).
+    if state.aq.active && log2_cb_size >= state.aq.qg_log2 {
         state.aq_qg_reset();
     }
 
@@ -1000,6 +1003,9 @@ struct WppWorkerSeed<'a> {
     aq_strength: f32,
     aq_clamp: f32,
     aq_offset_map: Option<Arc<crate::preanalysis::AqOffsetMap>>,
+    fine_aq: Option<Arc<crate::preanalysis::FineAqGrid>>,
+    psy_rd: f32,
+    psy_rdoq: f32,
     part_nxn_enabled: bool,
     analysis: Arc<crate::preanalysis::AnalysisMaps>,
     effort_template: crate::effort::EffortTemplate,
@@ -1033,6 +1039,9 @@ impl<'a> WppWorkerSeed<'a> {
             aq_strength: state.aq_strength,
             aq_clamp: state.aq_clamp,
             aq_offset_map: state.aq_offset_map.as_ref().map(Arc::clone),
+            fine_aq: state.fine_aq.as_ref().map(Arc::clone),
+            psy_rd: state.psy_rd,
+            psy_rdoq: state.psy_rdoq,
             part_nxn_enabled: state.part_nxn_enabled,
             analysis: Arc::clone(&state.analysis),
             effort_template: state.effort_template,
@@ -1099,6 +1108,9 @@ impl<'a> WppWorkerSeed<'a> {
             aq_strength: self.aq_strength,
             aq_clamp: self.aq_clamp,
             aq_offset_map: self.aq_offset_map.as_ref().map(Arc::clone),
+            fine_aq: self.fine_aq.as_ref().map(Arc::clone),
+            psy_rd: self.psy_rd,
+            psy_rdoq: self.psy_rdoq,
             part_nxn_enabled: self.part_nxn_enabled,
             analysis: Arc::clone(&self.analysis),
             stats: Default::default(),

@@ -49,6 +49,11 @@ pub(super) fn chroma_pred_mode(cat: u8, chroma_mode: u8) -> u8 {
 }
 
 pub(super) const CTB_LOG2: u8 = 6;
+/// *Default* adaptive-quantization quantization-group size (32x32,
+/// `diff_cu_qp_delta_depth = 1`). The runtime QG size for an encode is
+/// `AqState::qg_log2` (4 with the `aq_qg = 16` opt-in, resolved by
+/// `crate::resolve_aq_qg_log2`); this constant remains only as that field's
+/// default and as the fixed grid of the two-pass AQ measurement accumulators.
 pub(super) const QG_LOG2: u8 = CTB_LOG2 - 1;
 pub(super) const MAX_TB_LOG2: u8 = 5;
 pub(super) const MIN_TB_LOG2: u8 = 2;

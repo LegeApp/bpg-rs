@@ -20,8 +20,9 @@ use super::depth::StillSearchDepth;
 use super::ledger::{StillSearchLedger, WorkBucket};
 use super::plan::PlanBlock;
 use super::price::entropy_bits;
+use super::psy::{psy_energy_diff_u8, psy_energy_diff_u16};
 use super::source::CtuSourceCache;
-use super::workspace::{BlockScratch, SsimRdNorm};
+use super::workspace::{BlockScratch, PsyRdWeight, SsimRdNorm};
 
 /// Quantization mode for the shared component evaluator. Search/screening uses
 /// [`QuantMode::HardQuantSearch`] (the green baseline); the winner-only
@@ -340,8 +341,17 @@ where
         } else {
             0
         };
-        let cost_zero =
+        // psy-rd (x265 psyCost_pp): charge candidates for AC energy lost vs
+        // the source. `None` (zero extra work) unless `state.psy_rd > 0`. The
+        // zero/uncoded candidate reconstructs as the prediction, so its
+        // energy is src-vs-pred.
+        let psy_weight = (state.psy_rd > 0.0).then(|| self.psy_rd_weight(state, c_idx, qp));
+        let psy_zero = psy_weight.map_or(0, |_| psy_energy_diff_u16(&src, size, &pred, size, size));
+        let mut cost_zero =
             component_rd_cost(dist_zero, ssim_zero, cbf0_bits, lambda, scale, ssim_weight);
+        if let Some(w) = psy_weight {
+            cost_zero += w * psy_zero as f64;
+        }
         if dist_zero == 0 {
             if push_overlay {
                 self.overlay
@@ -373,13 +383,47 @@ where
 
         let mut dist_coded = dist_zero;
         let mut ssim_coded = ssim_zero;
+        let mut psy_coded = psy_zero;
         let scan = get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
         let mut recon_buf = std::mem::take(&mut self.workspace.block_scratch.component_recon_u16);
         recon_buf.resize(n, 0);
+        // psy-rdoq (x265 `usePsy = psyRdoqScale && isLuma`): luma-only, and
+        // only for quant modes that actually run RDOQ. Zero extra work when
+        // off. The SOURCE block is forward-transformed with the SAME basis as
+        // the residual (including DST-4x4) into pooled scratch below.
+        let psy_rdoq_on =
+            state.psy_rdoq > 0.0 && c_idx == 0 && !matches!(quant_mode, QuantMode::HardQuantSearch);
+        let psy_scale = if psy_rdoq_on {
+            psy_rdoq_scale(state.psy_rdoq, qp, bit_depth)
+        } else {
+            0
+        };
         {
             let bs: &mut BlockScratch = &mut self.workspace.block_scratch;
-            let (residual, coeff, tmp, levels, dequant, recon_residual) =
+            if psy_rdoq_on {
+                let BlockScratch {
+                    psy_src_i16,
+                    psy_dct_i16,
+                    transform_tmp_i16,
+                    ..
+                } = bs;
+                psy_src_i16.clear();
+                psy_src_i16.extend(src.iter().map(|&v| v as i16));
+                transform::forward_transform_into(
+                    psy_src_i16,
+                    log2_size,
+                    is_dst4,
+                    bit_depth,
+                    psy_dct_i16,
+                    transform_tmp_i16,
+                );
+            }
+            let (residual, coeff, tmp, levels, dequant, recon_residual, psy_dct) =
                 scratch_parts_for_log2(bs, log2_size);
+            let psy = psy_rdoq_on.then_some(crate::rdoq::RdoqPsy {
+                src_dct: psy_dct,
+                psy_scale,
+            });
 
             residual.clear();
             residual.resize(n, 0);
@@ -402,6 +446,7 @@ where
                         scan,
                         lambda,
                         true,
+                        psy,
                         &mut self.workspace.rdoq_scratch,
                     );
                     levels.clear();
@@ -409,6 +454,9 @@ where
                     let mut nnz = rdoq.nnz;
                     self.workspace.ledger.bump(WorkBucket::Rdoq);
                     self.workspace.ledger.finish_timer(WorkBucket::Rdoq, timer);
+                    // v1: the env-gated post-passes below (pricing modes /
+                    // refine) re-price levels WITHOUT the psy-rdoq bias, so
+                    // they may partially undo it. Measure before complicating.
                     let pricing_mode = super::env::rdoq_pricing_mode();
                     if pricing_mode != crate::rdoq::RdoqPricingMode::Frozen {
                         nnz = crate::rdoq::apply_rdoq_pricing_mode(
@@ -457,6 +505,7 @@ where
                         scan,
                         lambda,
                         true,
+                        psy,
                         &mut self.workspace.rdoq_scratch,
                     );
                     levels.clear();
@@ -466,6 +515,9 @@ where
                     self.workspace
                         .ledger
                         .finish_timer(WorkBucket::RdoqTrial, timer);
+                    // v1: the env-gated post-passes below (pricing modes /
+                    // refine) re-price levels WITHOUT the psy-rdoq bias, so
+                    // they may partially undo it. Measure before complicating.
                     let pricing_mode = super::env::rdoq_pricing_mode();
                     if pricing_mode != crate::rdoq::RdoqPricingMode::Frozen {
                         nnz = crate::rdoq::apply_rdoq_pricing_mode(
@@ -516,6 +568,9 @@ where
                         state.bit_depth,
                     );
                 }
+                if psy_weight.is_some() {
+                    psy_coded = psy_energy_diff_u16(&src, size, &recon_buf, size, size);
+                }
                 levels_vec = levels.clone();
                 recon_coded = Some(());
             }
@@ -523,7 +578,7 @@ where
 
         let cbf1_bits = entropy_bits(&self.workspace.price_cur.models[cbf_ci], 1);
 
-        let coded_min_cost = component_rd_cost(
+        let mut coded_min_cost = component_rd_cost(
             dist_coded,
             ssim_coded,
             cbf1_bits,
@@ -531,6 +586,9 @@ where
             scale,
             ssim_weight,
         );
+        if let Some(w) = psy_weight {
+            coded_min_cost += w * psy_coded as f64;
+        }
         let coded = if nnz > 0 && residual_pricing == ResidualPricingMode::Skip {
             Some((0, coded_min_cost))
         } else if nnz > 0 && coded_min_cost < cost_zero {
@@ -549,7 +607,7 @@ where
             self.workspace
                 .ledger
                 .finish_timer(WorkBucket::ResidualPrice, timer);
-            let cost = component_rd_cost(
+            let mut cost = component_rd_cost(
                 dist_coded,
                 ssim_coded,
                 residual_bits + cbf1_bits,
@@ -557,6 +615,9 @@ where
                 scale,
                 ssim_weight,
             );
+            if let Some(w) = psy_weight {
+                cost += w * psy_coded as f64;
+            }
             maybe_dump_rdoq_audit(
                 &self.workspace.price_cur,
                 &levels_vec,
@@ -778,8 +839,17 @@ where
         } else {
             0
         };
-        let cost_zero =
+        // psy-rd (x265 psyCost_pp): charge candidates for AC energy lost vs
+        // the source. `None` (zero extra work) unless `state.psy_rd > 0`. The
+        // zero/uncoded candidate reconstructs as the prediction, so its
+        // energy is src-vs-pred.
+        let psy_weight = (state.psy_rd > 0.0).then(|| self.psy_rd_weight(state, c_idx, qp));
+        let psy_zero = psy_weight.map_or(0, |_| psy_energy_diff_u8(src, size, pred, size, size));
+        let mut cost_zero =
             component_rd_cost(dist_zero, ssim_zero, cbf0_bits, lambda, scale, ssim_weight);
+        if let Some(w) = psy_weight {
+            cost_zero += w * psy_zero as f64;
+        }
         if dist_zero == 0 {
             if push_overlay {
                 self.overlay
@@ -813,11 +883,45 @@ where
 
         let mut dist_coded = dist_zero;
         let mut ssim_coded = ssim_zero;
+        let mut psy_coded = psy_zero;
         let scan = get_scan_order(log2_size, mode.as_u8(), c_idx, cat);
+        // psy-rdoq (x265 `usePsy = psyRdoqScale && isLuma`): luma-only, and
+        // only for quant modes that actually run RDOQ. Zero extra work when
+        // off. The SOURCE block is forward-transformed with the SAME basis as
+        // the residual (including DST-4x4) into pooled scratch below.
+        let psy_rdoq_on =
+            state.psy_rdoq > 0.0 && c_idx == 0 && !matches!(quant_mode, QuantMode::HardQuantSearch);
+        let psy_scale = if psy_rdoq_on {
+            psy_rdoq_scale(state.psy_rdoq, qp, 8)
+        } else {
+            0
+        };
         {
             let bs: &mut BlockScratch = &mut self.workspace.block_scratch;
-            let (residual, coeff, tmp, levels, dequant, recon_residual) =
+            if psy_rdoq_on {
+                let BlockScratch {
+                    psy_src_i16,
+                    psy_dct_i16,
+                    transform_tmp_i16,
+                    ..
+                } = bs;
+                psy_src_i16.clear();
+                psy_src_i16.extend(src.iter().take(n).map(|&v| v as i16));
+                transform::forward_transform_into(
+                    psy_src_i16,
+                    log2_size,
+                    is_dst4,
+                    8,
+                    psy_dct_i16,
+                    transform_tmp_i16,
+                );
+            }
+            let (residual, coeff, tmp, levels, dequant, recon_residual, psy_dct) =
                 scratch_parts_for_log2(bs, log2_size);
+            let psy = psy_rdoq_on.then_some(crate::rdoq::RdoqPsy {
+                src_dct: psy_dct,
+                psy_scale,
+            });
 
             residual.clear();
             residual.resize(n, 0);
@@ -848,6 +952,7 @@ where
                         scan,
                         lambda,
                         true,
+                        psy,
                         &mut self.workspace.rdoq_scratch,
                     );
                     levels.clear();
@@ -855,6 +960,9 @@ where
                     let mut nnz = rdoq.nnz;
                     self.workspace.ledger.bump(WorkBucket::Rdoq);
                     self.workspace.ledger.finish_timer(WorkBucket::Rdoq, timer);
+                    // v1: the env-gated post-passes below (pricing modes /
+                    // refine) re-price levels WITHOUT the psy-rdoq bias, so
+                    // they may partially undo it. Measure before complicating.
                     let pricing_mode = super::env::rdoq_pricing_mode();
                     if pricing_mode != crate::rdoq::RdoqPricingMode::Frozen {
                         nnz = crate::rdoq::apply_rdoq_pricing_mode(
@@ -903,6 +1011,7 @@ where
                         scan,
                         lambda,
                         true,
+                        psy,
                         &mut self.workspace.rdoq_scratch,
                     );
                     levels.clear();
@@ -912,6 +1021,9 @@ where
                     self.workspace
                         .ledger
                         .finish_timer(WorkBucket::RdoqTrial, timer);
+                    // v1: the env-gated post-passes below (pricing modes /
+                    // refine) re-price levels WITHOUT the psy-rdoq bias, so
+                    // they may partially undo it. Measure before complicating.
                     let pricing_mode = super::env::rdoq_pricing_mode();
                     if pricing_mode != crate::rdoq::RdoqPricingMode::Frozen {
                         nnz = crate::rdoq::apply_rdoq_pricing_mode(
@@ -963,6 +1075,9 @@ where
                     ssim_coded =
                         ssim_rd_energy_u8(src, &recon, size, ssim_norm.expect("SSIM-RD norm"), qp);
                 }
+                if psy_weight.is_some() {
+                    psy_coded = psy_energy_diff_u8(src, size, &recon, size, size);
+                }
                 if let Some((dx, dy, dlog2, dci)) = super::env::dump_target() {
                     if x0 == dx && y0 == dy && log2_size == dlog2 && c_idx == dci {
                         dump_block_pipeline(
@@ -992,7 +1107,7 @@ where
                     self.workspace.substage.recon_dist_ns =
                         self.workspace.substage.recon_dist_ns.saturating_add(ns);
                 }
-                let coded_min_cost = component_rd_cost(
+                let mut coded_min_cost = component_rd_cost(
                     dist_coded,
                     ssim_coded,
                     cbf1_bits,
@@ -1000,6 +1115,9 @@ where
                     scale,
                     ssim_weight,
                 );
+                if let Some(w) = psy_weight {
+                    coded_min_cost += w * psy_coded as f64;
+                }
                 if residual_pricing == ResidualPricingMode::Exact && coded_min_cost < cost_zero {
                     let t_price = profile.then(Instant::now);
                     let residual_bits = if super::env::cheap_bits_static() {
@@ -1046,7 +1164,7 @@ where
             }
         }
 
-        let coded_min_cost = component_rd_cost(
+        let mut coded_min_cost = component_rd_cost(
             dist_coded,
             ssim_coded,
             cbf1_bits,
@@ -1054,11 +1172,14 @@ where
             scale,
             ssim_weight,
         );
+        if let Some(w) = psy_weight {
+            coded_min_cost += w * psy_coded as f64;
+        }
         let coded = if nnz > 0 && residual_pricing == ResidualPricingMode::Skip {
             Some((0, coded_min_cost))
         } else if nnz > 0 && coded_min_cost < cost_zero {
             let residual_bits = priced_residual_bits.expect("exact residual bits were priced");
-            let cost = component_rd_cost(
+            let mut cost = component_rd_cost(
                 dist_coded,
                 ssim_coded,
                 residual_bits + cbf1_bits,
@@ -1066,6 +1187,9 @@ where
                 scale,
                 ssim_weight,
             );
+            if let Some(w) = psy_weight {
+                cost += w * psy_coded as f64;
+            }
             maybe_dump_rdoq_audit(
                 &self.workspace.price_cur,
                 &levels_vec,
@@ -1162,6 +1286,25 @@ where
 
         self.workspace.block_scratch.component_recon_u8 = recon;
         out
+    }
+
+    /// Cached psy-rd weight for this component/QP (see [`super::psy::psy_rd_weight`]).
+    /// Uses the qp passed to the component eval — luma QP for luma, chroma QP
+    /// for chroma. x265 builds a single `m_psyRd`/`m_lambda` from the slice QP
+    /// for the whole CU; still265 prices per component with the component QP,
+    /// so the per-component QP is the consistent choice here.
+    fn psy_rd_weight(&mut self, state: &Encoder<'_>, c_idx: u8, qp: i32) -> f64 {
+        let slot = &mut self.workspace.psy_rd_weight[c_idx as usize];
+        if slot.valid && slot.qp == qp {
+            return slot.weight;
+        }
+        let weight = super::psy::psy_rd_weight(state.psy_rd, qp, state.bit_depth);
+        *slot = PsyRdWeight {
+            valid: true,
+            qp,
+            weight,
+        };
+        weight
     }
 
     fn ssim_rd_norm(
@@ -1420,6 +1563,7 @@ type BlockScratchParts<'a> = (
     &'a mut Vec<i16>,
     &'a mut Vec<i16>,
     &'a mut Vec<i16>,
+    &'a mut Vec<i16>,
 );
 
 fn scratch_parts_for_log2(scratch: &mut BlockScratch, log2_size: u8) -> BlockScratchParts<'_> {
@@ -1431,6 +1575,7 @@ fn scratch_parts_for_log2(scratch: &mut BlockScratch, log2_size: u8) -> BlockScr
             &mut scratch.levels_i16,
             &mut scratch.dequant_coeff_i16,
             &mut scratch.recon_residual_i16,
+            &mut scratch.psy_dct_i16,
         ),
         3 => (
             &mut scratch.residual_i16_8x8,
@@ -1439,6 +1584,7 @@ fn scratch_parts_for_log2(scratch: &mut BlockScratch, log2_size: u8) -> BlockScr
             &mut scratch.levels_i16,
             &mut scratch.dequant_coeff_i16,
             &mut scratch.recon_residual_i16,
+            &mut scratch.psy_dct_i16,
         ),
         4 => (
             &mut scratch.residual_i16_16x16,
@@ -1447,6 +1593,7 @@ fn scratch_parts_for_log2(scratch: &mut BlockScratch, log2_size: u8) -> BlockScr
             &mut scratch.levels_i16,
             &mut scratch.dequant_coeff_i16,
             &mut scratch.recon_residual_i16,
+            &mut scratch.psy_dct_i16,
         ),
         _ => (
             &mut scratch.residual_i16_32x32,
@@ -1455,8 +1602,19 @@ fn scratch_parts_for_log2(scratch: &mut BlockScratch, log2_size: u8) -> BlockScr
             &mut scratch.levels_i16,
             &mut scratch.dequant_coeff_i16,
             &mut scratch.recon_residual_i16,
+            &mut scratch.psy_dct_i16,
         ),
     }
+}
+
+/// psy-rdoq scale for [`crate::rdoq::RdoqPsy`]: `round(psy_rdoq * 256) *
+/// lambda_q8` with `lambda_q8 = floor(x265_sad_lambda(qp, bit_depth) * 256)`
+/// (x265 `m_psyRdoqScale * m_qpParam.lambda`). Computed here so `rdoq.rs`
+/// stays independent of the stillsearch lambda tables.
+#[inline]
+fn psy_rdoq_scale(psy_rdoq: f32, qp: i32, bit_depth: u8) -> i64 {
+    (psy_rdoq as f64 * 256.0).round() as i64
+        * super::price::x265_sad_lambda_q8(qp, bit_depth) as i64
 }
 
 /// Forensic single-block pipeline dump (env-gated by `BPG_STILL_DUMP`).

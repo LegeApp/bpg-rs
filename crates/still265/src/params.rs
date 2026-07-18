@@ -36,10 +36,14 @@ use crate::{ChromaFormat, StillHevcConfig};
 
 /// `diff_cu_qp_delta_depth` written in the PPS when adaptive quantization is
 /// active. `1` ⇒ `Log2MinCuQpDeltaSize = CtbLog2SizeY(6) − 1 = 5`, i.e. a 32x32
-/// quantization group, aligned 1:1 with the 32x32 preanalysis cell grid. The
-/// adaptive-QP writer in `encoder.rs` reads the same constant so the PPS and the
+/// quantization group (the default), `2` ⇒ a 16x16 quantization group
+/// (`aq_qg = 16` opt-in). Derived from [`crate::resolve_aq_qg_log2`] — the same
+/// resolver the adaptive-QP writer in `encoder` consults — so the PPS and the
 /// per-CU QP plan agree on the QG size.
-pub const AQ_DIFF_CU_QP_DELTA_DEPTH: u32 = 1;
+pub fn aq_diff_cu_qp_delta_depth(config: &StillHevcConfig) -> u32 {
+    // CTB_LOG2 (6) − qg_log2: 1 for 32x32 QGs, 2 for 16x16.
+    (6 - crate::resolve_aq_qg_log2(config)) as u32
+}
 
 /// `rbsp_trailing_bits()`: `rbsp_stop_one_bit` (1) followed by zero
 /// `rbsp_alignment_zero_bit`s up to the next byte boundary.
@@ -138,6 +142,9 @@ mod tests {
             aq_strength: 0.35,
             aq_clamp: 2,
             two_pass_gate: true,
+            psy_rd: 0.0,
+            psy_rdoq: 0.0,
+            aq_qg: 32,
         }
     }
 
@@ -173,8 +180,9 @@ mod tests {
         let cu_qp_delta_enabled = r.read_bits(1); // cu_qp_delta_enabled_flag
         assert_eq!(cu_qp_delta_enabled, crate::aq_active(config) as u32);
         if cu_qp_delta_enabled == 1 {
-            // diff_cu_qp_delta_depth — present only when the flag is set.
-            assert_eq!(ue(&mut r), AQ_DIFF_CU_QP_DELTA_DEPTH);
+            // diff_cu_qp_delta_depth — present only when the flag is set, and
+            // must match the shared QG-size resolver (1 ⇒ 32x32, 2 ⇒ 16x16).
+            assert_eq!(ue(&mut r), aq_diff_cu_qp_delta_depth(config));
         }
         r.read_se_golomb().unwrap(); // pps_cb_qp_offset
         r.read_se_golomb().unwrap(); // pps_cr_qp_offset
@@ -244,6 +252,33 @@ mod tests {
                 );
                 check_pps_rbsp_terminates_config(&config);
             }
+        }
+    }
+
+    /// `aq_qg = 16` must emit `diff_cu_qp_delta_depth = 2` (16x16 QGs) for the
+    /// single-pass AQ modes, stay at depth 1 for `TwoPassMeasured` (which is
+    /// forced to 32x32 QGs), resolve invalid values to 32, and still terminate
+    /// cleanly for a conformant decoder.
+    #[test]
+    fn pps_aq_qg16_emits_depth_two() {
+        let mut config = test_config(crate::DeblockMode::On);
+        config.aq_mode = crate::AqMode::Perceptual;
+        config.aq_qg = 16;
+        assert_eq!(crate::resolve_aq_qg_log2(&config), 4);
+        assert_eq!(aq_diff_cu_qp_delta_depth(&config), 2);
+        check_pps_rbsp_terminates_config(&config);
+
+        // TwoPassMeasured keeps 32x32 QGs regardless of aq_qg.
+        config.aq_mode = crate::AqMode::TwoPassMeasured;
+        assert_eq!(crate::resolve_aq_qg_log2(&config), 5);
+        assert_eq!(aq_diff_cu_qp_delta_depth(&config), 1);
+        check_pps_rbsp_terminates_config(&config);
+
+        // Invalid aq_qg values resolve to the 32x32 default.
+        config.aq_mode = crate::AqMode::Perceptual;
+        for bad in [0u8, 8, 24, 64] {
+            config.aq_qg = bad;
+            assert_eq!(crate::resolve_aq_qg_log2(&config), 5, "aq_qg = {bad}");
         }
     }
 
@@ -635,14 +670,15 @@ pub fn write_pps(config: &StillHevcConfig, tiles: Option<(u32, u32)>, wpp: bool)
     // Adaptive quantization (per-CU QP) is gated by [`crate::aq_active`] (the
     // single gate the encoder also consults, so the flag and the per-CU QP plan
     // can't disagree). It is `0` (and the stream is the exact reference bitstream)
-    // only on the high-quality uniform-QP tiers. `diff_cu_qp_delta_depth = 1` ⇒
-    // Log2MinCuQpDeltaSize = CtbLog2(6) − 1 = 5, i.e. a 32x32 quantization group
-    // aligned 1:1 with the preanalysis cell grid (H.265 7.3.2.3; decoder
+    // only on the high-quality uniform-QP tiers. `diff_cu_qp_delta_depth` (1 ⇒
+    // Log2MinCuQpDeltaSize = CtbLog2(6) − 1 = 5, i.e. a 32x32 quantization group;
+    // 2 ⇒ 16x16, the `aq_qg = 16` opt-in) comes from the same resolver the
+    // encoder's QP-prediction mirror uses (H.265 7.3.2.3; decoder
     // `bpg-hevc-decode::hevc::ctu::decode_quantization_parameters`).
     let aq_active = crate::aq_active(config);
     w.write_bit(aq_active as u32); // cu_qp_delta_enabled_flag
     if aq_active {
-        w.write_ue_golomb(AQ_DIFF_CU_QP_DELTA_DEPTH); // diff_cu_qp_delta_depth (QG = 32x32)
+        w.write_ue_golomb(aq_diff_cu_qp_delta_depth(config)); // diff_cu_qp_delta_depth
     }
     let chroma_qp_offset = crate::chroma_qp_offset() as i32;
     w.write_se_golomb(chroma_qp_offset); // pps_cb_qp_offset

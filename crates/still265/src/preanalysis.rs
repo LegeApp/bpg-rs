@@ -117,18 +117,36 @@ pub struct AnalysisMaps {
     /// the reference point for [`aq_qp_offset_chroma`] (Prangnell 2017-style
     /// luma+chroma QG activity). 0 when the map is empty.
     frame_mean_activity: f32,
+    /// Weight applied to `cell.chroma_activity` when reconstructing an x265
+    /// `acEnergyCu`-style 16x16-block AC energy for the auto-variance AQ modes
+    /// (per-cell `qp_adj0` is recomputed on demand from this;
+    /// see [`Self::autovar_qp_adj0_at`]). Depends on the chroma format: 0 for
+    /// monochrome, 64 for 4:2:0 (8x8 chroma block), 128 for 4:2:2, 256 for
+    /// 4:4:4.
+    autovar_chroma_weight: f32,
+    /// Picture mean of the auto-variance `qp_adj0 = (energy + 1)^0.1` — x265
+    /// `AUTO_VARIANCE`'s `avg_adj`. 0 when the map is empty.
+    autovar_avg_adj: f32,
+    /// x265's bias-corrected reference point
+    /// `avg_adj − 0.5·(avg_adj_pow2 − modeTwoConst)/avg_adj` (modeTwoConst = 11
+    /// for the 16x16 quant-group size). The value each cell's `qp_adj0` is
+    /// compared against in [`aq_qp_offset_autovar`]. 0 when the map is empty.
+    autovar_avg_adj_final: f32,
 }
 
 /// Optional external per-QG QP-offset map for two-pass AQ experiments.
 ///
 /// Loaded from `BPG_AQ_OFFSET_MAP` when present. The file is intentionally
 /// simple CSV/text: each useful row starts with `x,y,offset`, where `x`/`y` are
-/// luma sample coordinates (normally 32x32 QG origins) and `offset` is added to
-/// the slice QP. Extra columns are ignored, so diagnostic tools can append
-/// labels after the first three fields.
+/// luma sample coordinates (normally QG origins — 32x32 by default, 16x16 with
+/// `aq_qg = 16`) and `offset` is added to the slice QP. Extra columns are
+/// ignored, so diagnostic tools can append labels after the first three fields.
 pub struct AqOffsetMap {
     cells_x: u32,
     cells_y: u32,
+    /// log2 of the map's cell size in luma samples — the active QG size (5 =
+    /// 32x32 default, 4 = 16x16 opt-in).
+    cell_log2: u8,
     offsets: Vec<i8>,
 }
 
@@ -193,9 +211,12 @@ pub fn external_aq_map_requested() -> bool {
         .unwrap_or(false)
 }
 
-/// Load `BPG_AQ_OFFSET_MAP` for the current picture. Bad rows are ignored; if no
-/// valid row lands inside the image's 32x32 QG grid, the caller gets `None`.
-pub fn load_external_aq_offset_map(width: u32, height: u32) -> Option<AqOffsetMap> {
+/// Load `BPG_AQ_OFFSET_MAP` for the current picture. `qg_log2` is the active
+/// quantization-group size (5 = 32x32, 4 = 16x16) — the map's cell grid follows
+/// it, so row coordinates snap to QG origins of that size. Bad rows are
+/// ignored; if no valid row lands inside the image's QG grid, the caller gets
+/// `None`.
+pub fn load_external_aq_offset_map(width: u32, height: u32, qg_log2: u8) -> Option<AqOffsetMap> {
     let path = std::env::var("BPG_AQ_OFFSET_MAP").ok()?;
     let path = path.trim();
     if path.is_empty() || path == "0" {
@@ -208,8 +229,9 @@ pub fn load_external_aq_offset_map(width: u32, height: u32) -> Option<AqOffsetMa
             return None;
         }
     };
-    let cells_x = width.div_ceil(CELL).max(1);
-    let cells_y = height.div_ceil(CELL).max(1);
+    let cell = 1u32 << qg_log2;
+    let cells_x = width.div_ceil(cell).max(1);
+    let cells_y = height.div_ceil(cell).max(1);
     let mut offsets = vec![0i8; (cells_x * cells_y) as usize];
     let mut used = 0u32;
     for line in text.lines() {
@@ -232,8 +254,8 @@ pub fn load_external_aq_offset_map(width: u32, height: u32) -> Option<AqOffsetMa
         if x < 0 || y < 0 {
             continue;
         }
-        let cx = ((x as u32) >> CELL_LOG2).min(cells_x.saturating_sub(1));
-        let cy = ((y as u32) >> CELL_LOG2).min(cells_y.saturating_sub(1));
+        let cx = ((x as u32) >> qg_log2).min(cells_x.saturating_sub(1));
+        let cy = ((y as u32) >> qg_log2).min(cells_y.saturating_sub(1));
         offsets[(cy * cells_x + cx) as usize] = offset.clamp(-12, 12) as i8;
         used += 1;
     }
@@ -244,6 +266,7 @@ pub fn load_external_aq_offset_map(width: u32, height: u32) -> Option<AqOffsetMa
         Some(AqOffsetMap {
             cells_x,
             cells_y,
+            cell_log2: qg_log2,
             offsets,
         })
     }
@@ -300,24 +323,51 @@ pub fn analyze(width: u32, height: u32, bit_depth: u8, cat: u8, src: Source<'_>)
 
     fill_contextual_features(&mut cells, cells_x, cells_y);
 
-    let (frame_mean_log2var, frame_min_log2var, frame_max_log2var, frame_mean_activity) =
-        if cells.is_empty() {
-            (0.0, 0.0, 0.0, 0.0)
-        } else {
-            let n = cells.len() as f32;
-            let mut sum_lv = 0.0f32;
-            let mut sum_act = 0.0f32;
-            let mut min_lv = f32::INFINITY;
-            let mut max_lv = f32::NEG_INFINITY;
-            for c in &cells {
-                let lv = ((1 + c.variance) as f32).log2();
-                sum_lv += lv;
-                sum_act += combined_activity(c.variance, c.chroma_activity);
-                min_lv = min_lv.min(lv);
-                max_lv = max_lv.max(lv);
-            }
-            (sum_lv / n, min_lv, max_lv, sum_act / n)
-        };
+    let autovar_chroma_weight = autovar_chroma_weight(cat);
+    let (
+        frame_mean_log2var,
+        frame_min_log2var,
+        frame_max_log2var,
+        frame_mean_activity,
+        autovar_avg_adj,
+        autovar_avg_adj_final,
+    ) = if cells.is_empty() {
+        (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    } else {
+        let n = cells.len() as f32;
+        let mut sum_lv = 0.0f32;
+        let mut sum_act = 0.0f32;
+        let mut min_lv = f32::INFINITY;
+        let mut max_lv = f32::NEG_INFINITY;
+        let mut sum_adj = 0.0f32;
+        let mut sum_adj_pow2 = 0.0f32;
+        for c in &cells {
+            let lv = ((1 + c.variance) as f32).log2();
+            sum_lv += lv;
+            sum_act += combined_activity(c.variance, c.chroma_activity);
+            min_lv = min_lv.min(lv);
+            max_lv = max_lv.max(lv);
+            let adj = autovar_qp_adj0(c.variance, c.chroma_activity, autovar_chroma_weight);
+            sum_adj += adj;
+            sum_adj_pow2 += adj * adj;
+        }
+        // x265 slicetype.cpp AUTO_VARIANCE picture stats: avg_adj is the plain
+        // mean of qp_adj0; the *final* reference point is bias-corrected by the
+        // second moment around modeTwoConst (= 11 for qgSize 16):
+        // `avg_adj − 0.5·(avg_adj_pow2 − 11)/avg_adj`. qp_adj0 >= 1 always
+        // (energy >= 0), so avg_adj >= 1 and the division is safe.
+        let avg_adj = sum_adj / n;
+        let avg_adj_pow2 = sum_adj_pow2 / n;
+        let avg_adj_final = avg_adj - 0.5 * (avg_adj_pow2 - AUTOVAR_MODE_TWO_CONST) / avg_adj;
+        (
+            sum_lv / n,
+            min_lv,
+            max_lv,
+            sum_act / n,
+            avg_adj,
+            avg_adj_final,
+        )
+    };
 
     AnalysisMaps {
         cells_x,
@@ -327,6 +377,9 @@ pub fn analyze(width: u32, height: u32, bit_depth: u8, cat: u8, src: Source<'_>)
         frame_min_log2var,
         frame_max_log2var,
         frame_mean_activity,
+        autovar_chroma_weight,
+        autovar_avg_adj,
+        autovar_avg_adj_final,
     }
 }
 
@@ -514,6 +567,79 @@ pub fn aq_qp_offset_positive(
         ((log2var - frame_min_log2var) / span).clamp(0.0, 1.0)
     };
     (1.0 + 7.0 * rank).round().clamp(1.0, clamp.max(1.0)) as i32
+}
+
+/// x265's `modeTwoConst` for the 16x16 quantization-group size — the constant
+/// x265 uses in both the `AUTO_VARIANCE` picture-mean bias correction and the
+/// `AUTO_VARIANCE_BIASED` dark/flat bias term (slicetype.cpp).
+pub const AUTOVAR_MODE_TWO_CONST: f32 = 11.0;
+
+/// x265 `acEnergyCu`-style chroma-plane energy weight per chroma format `cat`
+/// (0 = mono, 1 = 4:2:0, 2 = 4:2:2, 3 = 4:4:4): the number of chroma samples
+/// (Cb + Cr summed variance × samples-per-plane) a 16x16 luma block spans —
+/// 2×8x8 = 64 per plane for 4:2:0, 128 for 4:2:2, 256 for 4:4:4.
+fn autovar_chroma_weight(cat: u8) -> f32 {
+    match cat {
+        0 => 0.0,
+        1 => 64.0,
+        2 => 128.0,
+        _ => 256.0,
+    }
+}
+
+/// Per-cell `qp_adj0 = (energy + 1)^0.1` for the auto-variance AQ modes, where
+/// `energy` reconstructs x265's `acEnergyCu` (sum over planes of
+/// `N_samples × variance`, i.e. the block's AC energy) for a 16x16 block:
+/// `256·var_luma + weight·var_chroma` with the format-dependent chroma weight
+/// from [`autovar_chroma_weight`].
+///
+/// Approximation vs. x265: x265 measures each 16x16 block's own variance,
+/// while our cell features are one 32x32 luma variance (`cell.variance`) and
+/// one summed Cb+Cr chroma variance (`cell.chroma_activity`) per cell — we use
+/// them as the 16x16-block variances of every block in the cell, i.e. one
+/// energy sample per 32x32 QG instead of four 16x16 samples. Bit-depth
+/// correction (x265's `1/(1 << 2·(depth−8))`) is identically 1 here because
+/// [`analyze`] already right-shifts samples to 8-bit before computing the cell
+/// features, so the variances are already in 8-bit units.
+#[inline]
+fn autovar_qp_adj0(luma_var: u32, chroma_activity: u16, chroma_weight: f32) -> f32 {
+    let energy = 256.0 * luma_var as f32 + chroma_weight * chroma_activity as f32;
+    (energy + 1.0).powf(0.1)
+}
+
+/// x265 aq-mode 2/3 (`AUTO_VARIANCE` / `AUTO_VARIANCE_BIASED`) QP offset for
+/// one quantization group, ported from slicetype.cpp with qgSize-16 constants:
+///
+/// ```text
+/// strength'              = strength × avg_adj
+/// offset                 = strength' × (qp_adj0 − avg_adj_final)
+/// offset (biased, +=)      strength × (1 − 11 / qp_adj0²)
+/// ```
+///
+/// `qp_adj0` is the cell's `(energy + 1)^0.1` ([`AnalysisMaps::autovar_qp_adj0_at`]),
+/// `avg_adj` its picture mean, and `avg_adj_final` the bias-corrected picture
+/// reference ([`AnalysisMaps::autovar_avg_adj_final`]). Direction matches
+/// `Perceptual`: high-energy cells get **+QP** (masking), low-energy cells
+/// **−QP** (anti-banding); the `biased` term additionally pushes low-energy
+/// (dark/flat, `qp_adj0² < 11`) cells further negative. `strength` is x265's
+/// `--aq-strength` (~1.0 nominal); the result is rounded and clamped to
+/// `±clamp` QP steps. Caller adds this to the slice QP and clamps to `[0, 51]`.
+pub fn aq_qp_offset_autovar(
+    qp_adj0: f32,
+    avg_adj: f32,
+    avg_adj_final: f32,
+    strength: f32,
+    biased: bool,
+    clamp: f32,
+) -> i32 {
+    if avg_adj <= 0.0 || qp_adj0 <= 0.0 {
+        return 0; // empty/degenerate map ⇒ uniform QP
+    }
+    let mut adj = strength * avg_adj * (qp_adj0 - avg_adj_final);
+    if biased {
+        adj += strength * (1.0 - AUTOVAR_MODE_TWO_CONST / (qp_adj0 * qp_adj0));
+    }
+    adj.round().clamp(-clamp, clamp) as i32
 }
 
 fn compute_importance(c: &CellAnalysis) -> u16 {
@@ -741,6 +867,9 @@ impl AnalysisMaps {
             frame_min_log2var: 0.0,
             frame_max_log2var: 0.0,
             frame_mean_activity: 0.0,
+            autovar_chroma_weight: 0.0,
+            autovar_avg_adj: 0.0,
+            autovar_avg_adj_final: 0.0,
         }
     }
 
@@ -842,6 +971,35 @@ impl AnalysisMaps {
         self.frame_mean_activity
     }
 
+    /// The auto-variance `qp_adj0 = (energy + 1)^0.1` of the cell covering
+    /// `(x0, y0)` — the per-QG input to [`aq_qp_offset_autovar`]. Recomputed on
+    /// demand from the cell's stored variance/chroma-activity (cheap: one `powf`
+    /// per QG, memoized per QG by the encoder's AQ target cache). 1.0 when the
+    /// map is empty (zero energy).
+    pub fn autovar_qp_adj0_at(&self, x0: u32, y0: u32) -> f32 {
+        if self.cells.is_empty() {
+            return 1.0;
+        }
+        let cx = (x0 / CELL).min(self.cells_x - 1);
+        let cy = (y0 / CELL).min(self.cells_y - 1);
+        let c = &self.cells[(cy * self.cells_x + cx) as usize];
+        autovar_qp_adj0(c.variance, c.chroma_activity, self.autovar_chroma_weight)
+    }
+
+    /// Picture mean of the auto-variance `qp_adj0` (x265's `avg_adj`) — scales
+    /// the effective strength in [`aq_qp_offset_autovar`]. 0 when the map is
+    /// empty.
+    pub fn autovar_avg_adj(&self) -> f32 {
+        self.autovar_avg_adj
+    }
+
+    /// Bias-corrected auto-variance picture reference point (x265's post-loop
+    /// `avg_adj`) — what each cell's `qp_adj0` is compared against. 0 when the
+    /// map is empty.
+    pub fn autovar_avg_adj_final(&self) -> f32 {
+        self.autovar_avg_adj_final
+    }
+
     /// Picture min/max `log2(1 + variance)` — the [`aq_qp_offset_positive`]
     /// rank span.
     pub fn frame_min_log2var(&self) -> f32 {
@@ -863,10 +1021,11 @@ impl AnalysisMaps {
 }
 
 impl AqOffsetMap {
-    /// QP offset for the 32x32 quantization group containing `(x0, y0)`.
+    /// QP offset for the quantization group containing `(x0, y0)` (the map's
+    /// cell grid is the active QG size, recorded at construction).
     pub fn offset_at(&self, x0: u32, y0: u32) -> i32 {
-        let cx = (x0 >> CELL_LOG2).min(self.cells_x.saturating_sub(1));
-        let cy = (y0 >> CELL_LOG2).min(self.cells_y.saturating_sub(1));
+        let cx = (x0 >> self.cell_log2).min(self.cells_x.saturating_sub(1));
+        let cy = (y0 >> self.cell_log2).min(self.cells_y.saturating_sub(1));
         self.offsets[(cy * self.cells_x + cx) as usize] as i32
     }
 
@@ -905,8 +1064,219 @@ impl AqOffsetMap {
         AqOffsetMap {
             cells_x,
             cells_y,
+            // Two-pass measured AQ is defined on the 32x32 QG grid (its pass-1
+            // activity accumulator is 32x32-only; `resolve_aq_qg_log2` forces
+            // qg_log2 = 5 for `TwoPassMeasured`).
+            cell_log2: CELL_LOG2,
             offsets,
         }
+    }
+}
+
+/// Per-16x16-cell AQ signal grid for the `aq_qg = 16` opt-in.
+///
+/// The coarse [`AnalysisMaps`] cell grid (32x32, [`CELL_LOG2`]) feeds **both**
+/// search steering and AQ; its size cannot change without perturbing steered
+/// tiers byte-identically. When 16x16 quantization groups are active, the AQ
+/// offset functions instead read this separate fine grid — the same per-cell
+/// luma-variance / chroma-activity math as [`analyze`] at 16x16 granularity,
+/// plus the frame-level statistics the offset functions normalize against
+/// (computed over the fine grid, so the AQ redistribution stays ~rate-neutral
+/// on its own grid). Search steering keeps reading the untouched coarse grid.
+///
+/// The offset functions themselves ([`aq_qp_offset_variance`],
+/// [`aq_qp_offset_chroma`], [`aq_qp_offset_positive`],
+/// [`aq_qp_offset_autovar`]) are grid-agnostic and shared between both grids.
+pub struct FineAqGrid {
+    cells_x: u32,
+    cells_y: u32,
+    luma_var: Vec<u32>,
+    chroma_act: Vec<u16>,
+    frame_mean_log2var: f32,
+    frame_min_log2var: f32,
+    frame_max_log2var: f32,
+    frame_mean_activity: f32,
+    autovar_chroma_weight: f32,
+    autovar_avg_adj: f32,
+    autovar_avg_adj_final: f32,
+}
+
+/// log2 of the fine AQ cell size (16x16 luma samples — one cell per 16x16 QG).
+pub const FINE_CELL_LOG2: u8 = 4;
+const FINE_CELL: u32 = 1 << FINE_CELL_LOG2;
+
+/// Build the per-16x16 AQ signal grid ([`FineAqGrid`]) from the source
+/// picture. Scalar mirror of [`analyze`]'s per-cell luma-variance and
+/// chroma-activity math at 16x16 granularity (no Sobel / classification /
+/// contextual passes — the fine grid only feeds the variance-family AQ offset
+/// functions). Run only when 16x16 quantization groups are requested.
+pub fn analyze_fine(
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+    cat: u8,
+    src: Source<'_>,
+) -> FineAqGrid {
+    let cells_x = width.div_ceil(FINE_CELL).max(1);
+    let cells_y = height.div_ceil(FINE_CELL).max(1);
+    let n_cells = (cells_x * cells_y) as usize;
+    let mut luma_var = Vec::with_capacity(n_cells);
+    let mut chroma_act = Vec::with_capacity(n_cells);
+
+    let shift = (bit_depth - 8) as u32;
+    let luma_stride = width as usize;
+    let (cw, ch) = chroma_dims(width, height, cat);
+    // Chroma samples spanned by one 16x16 luma cell, per chroma format.
+    let (cell_cw, cell_ch) = match cat {
+        0 => (0, 0),
+        1 => (FINE_CELL / 2, FINE_CELL / 2),
+        2 => (FINE_CELL / 2, FINE_CELL),
+        _ => (FINE_CELL, FINE_CELL),
+    };
+
+    // Variance of one clamped plane rectangle in 8-bit units (mirrors
+    // `analyze_cell` / `chroma_cell_activity`).
+    let var_of = |plane: &[u16], stride: usize, x0: u32, y0: u32, x1: u32, y1: u32| -> i64 {
+        let n = ((x1 - x0) * (y1 - y0)) as i64;
+        let mut sum = 0i64;
+        let mut sum_sq = 0i64;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let v = (plane[y as usize * stride + x as usize] >> shift) as i64;
+                sum += v;
+                sum_sq += v * v;
+            }
+        }
+        let mean = sum / n;
+        ((sum_sq / n) - mean * mean).max(0)
+    };
+
+    for cy in 0..cells_y {
+        for cx in 0..cells_x {
+            let x0 = cx * FINE_CELL;
+            let y0 = cy * FINE_CELL;
+            let x1 = (x0 + FINE_CELL).min(width);
+            let y1 = (y0 + FINE_CELL).min(height);
+            luma_var.push(var_of(src.y, luma_stride, x0, y0, x1, y1) as u32);
+
+            let act = if cat == 0 {
+                0
+            } else {
+                let cx0 = cx * cell_cw;
+                let cy0 = cy * cell_ch;
+                let cx1 = (cx0 + cell_cw).min(cw);
+                let cy1 = (cy0 + cell_ch).min(ch);
+                if cx1 <= cx0 || cy1 <= cy0 {
+                    0
+                } else {
+                    let v_cb = var_of(src.cb, cw as usize, cx0, cy0, cx1, cy1);
+                    let v_cr = var_of(src.cr, cw as usize, cx0, cy0, cx1, cy1);
+                    (v_cb + v_cr).min(u16::MAX as i64) as u16
+                }
+            };
+            chroma_act.push(act);
+        }
+    }
+
+    // Frame statistics over the fine grid — the same folds `analyze` performs
+    // over the coarse cells, so each offset function sees its reference point
+    // computed on the grid it reads per-QG signals from.
+    let autovar_chroma_weight = autovar_chroma_weight(cat);
+    let n = luma_var.len().max(1) as f32;
+    let mut sum_lv = 0.0f32;
+    let mut sum_act = 0.0f32;
+    let mut min_lv = f32::INFINITY;
+    let mut max_lv = f32::NEG_INFINITY;
+    let mut sum_adj = 0.0f32;
+    let mut sum_adj_pow2 = 0.0f32;
+    for (&v, &c) in luma_var.iter().zip(&chroma_act) {
+        let lv = ((1 + v) as f32).log2();
+        sum_lv += lv;
+        sum_act += combined_activity(v, c);
+        min_lv = min_lv.min(lv);
+        max_lv = max_lv.max(lv);
+        let adj = autovar_qp_adj0(v, c, autovar_chroma_weight);
+        sum_adj += adj;
+        sum_adj_pow2 += adj * adj;
+    }
+    let avg_adj = sum_adj / n;
+    let avg_adj_pow2 = sum_adj_pow2 / n;
+    let avg_adj_final = avg_adj - 0.5 * (avg_adj_pow2 - AUTOVAR_MODE_TWO_CONST) / avg_adj;
+
+    FineAqGrid {
+        cells_x,
+        cells_y,
+        luma_var,
+        chroma_act,
+        frame_mean_log2var: sum_lv / n,
+        frame_min_log2var: min_lv,
+        frame_max_log2var: max_lv,
+        frame_mean_activity: sum_act / n,
+        autovar_chroma_weight,
+        autovar_avg_adj: avg_adj,
+        autovar_avg_adj_final: avg_adj_final,
+    }
+}
+
+impl FineAqGrid {
+    #[inline]
+    fn cell_idx(&self, x0: u32, y0: u32) -> usize {
+        let cx = (x0 >> FINE_CELL_LOG2).min(self.cells_x - 1);
+        let cy = (y0 >> FINE_CELL_LOG2).min(self.cells_y - 1);
+        (cy * self.cells_x + cx) as usize
+    }
+
+    /// Luma variance of the 16x16 cell covering `(x0, y0)` (8-bit units).
+    pub fn variance_at(&self, x0: u32, y0: u32) -> u32 {
+        self.luma_var[self.cell_idx(x0, y0)]
+    }
+
+    /// Combined Cb+Cr activity of the 16x16 cell covering `(x0, y0)`.
+    pub fn chroma_activity_at(&self, x0: u32, y0: u32) -> u16 {
+        self.chroma_act[self.cell_idx(x0, y0)]
+    }
+
+    /// Fine-grid mean of `log2(1 + variance)` — the AQ reference point.
+    pub fn frame_mean_log2var(&self) -> f32 {
+        self.frame_mean_log2var
+    }
+
+    /// Fine-grid min/max `log2(1 + variance)` — the [`aq_qp_offset_positive`]
+    /// rank span.
+    pub fn frame_min_log2var(&self) -> f32 {
+        self.frame_min_log2var
+    }
+
+    pub fn frame_max_log2var(&self) -> f32 {
+        self.frame_max_log2var
+    }
+
+    /// Fine-grid mean chroma-aware activity — the [`aq_qp_offset_chroma`]
+    /// reference point.
+    pub fn frame_mean_log2activity(&self) -> f32 {
+        self.frame_mean_activity
+    }
+
+    /// The auto-variance `qp_adj0 = (energy + 1)^0.1` of the 16x16 cell
+    /// covering `(x0, y0)` — here the cell size matches x265's native 16x16
+    /// `acEnergyCu` block exactly (the coarse grid approximates it at 32x32).
+    pub fn autovar_qp_adj0_at(&self, x0: u32, y0: u32) -> f32 {
+        let i = self.cell_idx(x0, y0);
+        autovar_qp_adj0(
+            self.luma_var[i],
+            self.chroma_act[i],
+            self.autovar_chroma_weight,
+        )
+    }
+
+    /// Fine-grid mean of the auto-variance `qp_adj0` (x265's `avg_adj`).
+    pub fn autovar_avg_adj(&self) -> f32 {
+        self.autovar_avg_adj
+    }
+
+    /// Bias-corrected auto-variance reference point over the fine grid.
+    pub fn autovar_avg_adj_final(&self) -> f32 {
+        self.autovar_avg_adj_final
     }
 }
 
@@ -1016,6 +1386,72 @@ mod tests {
         assert!(counts[RegionClass::Flat.index()] >= 1, "flat left half");
         let structured: u64 = counts.iter().sum::<u64>() - counts[RegionClass::Flat.index()];
         assert!(structured >= 1, "edges on the right half: {counts:?}");
+    }
+
+    /// x265 AUTO_VARIANCE / AUTO_VARIANCE_BIASED offset math on the same
+    /// flat-left / striped-right synthetic picture: high-energy cells must get
+    /// +QP and flat cells −QP, the biased mode must push flat cells further
+    /// negative, offsets must be monotone in cell energy, and strength = 0 must
+    /// be a uniform no-op.
+    #[test]
+    fn autovar_offsets_signs_and_bias() {
+        let (w, h) = (128usize, 64usize);
+        let mut y = vec![0u16; w * h];
+        for r in 0..h {
+            for c in 0..w {
+                y[r * w + c] = if c < w / 2 {
+                    128
+                } else if c % 2 == 0 {
+                    16
+                } else {
+                    235
+                };
+            }
+        }
+        let gray = vec![128u16; w * h];
+        let src = Source {
+            y: &y,
+            cb: &gray,
+            cr: &gray,
+        };
+        let maps = analyze(w as u32, h as u32, 8, 3, src);
+
+        let (avg, avg_final) = (maps.autovar_avg_adj(), maps.autovar_avg_adj_final());
+        assert!(avg >= 1.0, "qp_adj0 >= 1 per cell, so avg_adj >= 1: {avg}");
+
+        // Flat cell at (0,0): zero luma variance, zero chroma activity.
+        let flat = maps.autovar_qp_adj0_at(0, 0);
+        // Striped cell on the right half: huge variance.
+        let busy = maps.autovar_qp_adj0_at(96, 0);
+        assert!(flat < busy, "flat {flat} vs striped {busy}");
+
+        let clamp = 20.0;
+        let off = |adj0: f32, biased: bool, s: f32| {
+            aq_qp_offset_autovar(adj0, avg, avg_final, s, biased, clamp)
+        };
+
+        // AutoVariance: busy up, flat down.
+        assert!(off(busy, false, 1.0) > 0, "high-energy cell must get +QP");
+        assert!(off(flat, false, 1.0) < 0, "flat cell must get -QP");
+        // Monotone in qp_adj0 (both modes).
+        for biased in [false, true] {
+            assert!(off(flat, biased, 1.0) <= off((flat + busy) / 2.0, biased, 1.0));
+            assert!(off((flat + busy) / 2.0, biased, 1.0) <= off(busy, biased, 1.0));
+        }
+        // Biased mode pushes low-energy (qp_adj0^2 < 11) cells further negative.
+        assert!(
+            off(flat, true, 1.0) < off(flat, false, 1.0),
+            "dark/flat bias must lower flat-cell QP further: biased {} vs {}",
+            off(flat, true, 1.0),
+            off(flat, false, 1.0)
+        );
+        // strength = 0 is a uniform no-op in both modes.
+        for adj0 in [flat, busy] {
+            assert_eq!(off(adj0, false, 0.0), 0);
+            assert_eq!(off(adj0, true, 0.0), 0);
+        }
+        // Degenerate stats (empty map) resolve to 0 offset.
+        assert_eq!(aq_qp_offset_autovar(1.0, 0.0, 0.0, 1.0, true, clamp), 0);
     }
 
     #[test]
