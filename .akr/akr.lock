@@ -5,8 +5,8 @@ build {
     tool "akr 0.1.0"
     grammar "0.1"
     vocabulary "0.1"
-    commit git:fdc89eb2143ec53f48a9376e95aac45c94993f97
-    source_graph "sha256:1ee324c7041c8bc2a5b08a51106793a5c0e7f5dbdbef4df01f9423b1d87bd776"
+    commit git:d1c018b3662f0a6a51a8a35561a1a64a06a9d466
+    source_graph "sha256:3e11ce228ab4b991fe91e43f0933b606427dda7435ef0f380e028fdfcc889d9e"
 }
 
 source ".akr/project.akr" {
@@ -45,8 +45,8 @@ source ".akr/records/bpg/observations.akr" {
 }
 
 source ".akr/records/bpg/papercuts.akr" {
-    hash "sha256:14041c6201ab33656722041543b700dbd41da66291d5fc18df1346c3c220ed0b"
-    records 1
+    hash "sha256:11ba96c5f14f6178e45e70ee14fe4b7ed4fa11432ed04f9814d9b68aaece8473"
+    records 2
 }
 
 source ".akr/records/bpg/policies.akr" {
@@ -348,6 +348,11 @@ seal @bpg.observation.wpp-idle-time/1 {
 seal @bpg.papercut.task-brief-for-a-historical-port-asked-for-docs/1 {
     state verified
     hash "sha256:05b26551d9e72d495c7a162cdca5d67e7cf83d79263bd268f8ee249d81296bd7"
+}
+
+seal @bpg.papercut.v-020-s-descendant-commit-freshness-gate-akr/1 {
+    state verified
+    hash "sha256:4f95e2ebf48455a0bebeace723c04399d3c26b55f50fbabd74ba8176809b3491"
 }
 
 seal @bpg.policy.commit-scoping/1 {
