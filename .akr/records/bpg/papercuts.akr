@@ -11,3 +11,14 @@ record bpg.papercut.task-brief-for-a-historical-port-asked-for-docs/1 : papercut
     author "sonnet"
     created_at 2026-08-05
 }
+
+record bpg.papercut.v-020-s-descendant-commit-freshness-gate-akr/1 : papercut {
+    title "V-020's descendant-commit freshness gate (AKR-R022) is structurally…"
+    state verified
+    statement """
+        V-020's descendant-commit freshness gate (AKR-R022) is structurally incompatible with a single-commit historical/bulk port: once the .akr records themselves are committed, that commit becomes the 'last commit that changed the content' for every completed milestone/work record, and no historical evidence (dated before the port, which is the whole point of a historical port) can ever be a descendant of it. akr check --views-current was clean on the working tree before committing the ledger; the same check fails with ~19 AKR-R022 diagnostics immediately after committing, for every completed record with an evidence-backed acceptance check. No amount of re-running akr build fixes it since the evidence commits are fixed historical facts. Possible product answers: exempt records whose source is  from the descendant check, or document that bulk historical imports should land as one commit per original doc/commit to keep evidence descendant-valid, or accept this as an expected one-time 'stale on arrival, re-verify to close' state for historical ports and say so in docs/12-migration.md.
+        """
+    observed_at git:6934e2f49f1434278f89c5222f4639e8889dae2e
+    author "sonnet"
+    created_at 2026-08-05
+}
