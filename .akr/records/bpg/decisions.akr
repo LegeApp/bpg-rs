@@ -1,0 +1,467 @@
+akr 0.1
+project bpg-rs
+
+record bpg.decision.canonical-slow-variant-c/1 : decision {
+    title "Canonical Slow search switched from cheap-top-1 to promoted-exact variant-C"
+    state active
+    scope [ path "crates/still265/src/encoder/stillsearch/**" ]
+    topic slow-search-shape
+    decision """
+        Canonical `Slow` search mode is switched from the legacy
+        cheap-winner/materialize-winner shortcut to the promoted-exact
+        variant-C shape. The legacy shortcut is retained only behind
+        `BPG_STILLSEARCH_SLOW_AUDIT_VARIANT=A`/`legacy` for comparison.
+        """
+    context """
+        Sparse-oracle sampling found the legacy cheap-top-1 decision
+        matched the full-mode winner only 51.5-58.3% of the time across
+        single-image and 10-source samples, while the rough shortlist
+        itself contained the winner 88-95% of the time - the risk was
+        early finalization, not shortlist coverage.
+        """
+    consequences """
+        Variant-C moves the hot profile into exact mode evaluation
+        (LumaExact 43.5%, ForwardXform 46.1% of substage time), which is
+        why later SIMD work targeted the exact-evaluation path rather than
+        the cheap shortlist.
+        """
+    supported_by [ @bpg.evidence.slow-oracle-rejection/1 ]
+    author "dk"
+    created_at 2026-06-26
+    source {
+        kind legacy
+        path "docs/still265-pre-simd-audit.md"
+        excerpt """
+            Canonical Slow has therefore been switched to the
+            promoted-exact variant-C shape. The legacy shortcut is retained
+            only as BPG_STILLSEARCH_SLOW_AUDIT_VARIANT=A / legacy for
+            comparison.
+            """
+    }
+}
+
+record bpg.decision.canvas-journal-undo-model/1 : decision {
+    title "Canvas rollback uses an undo journal, not x265's per-depth buffer copy-up"
+    state active
+    scope [ path "crates/still265/src/encoder/**" ]
+    topic canvas-rollback-model
+    decision """
+        Phase 1 of the canvas implements rollback via an undo journal
+        rather than adopting x265's per-RQT-depth reconstruction buffer
+        copy-up shape.
+        """
+    context """
+        x265's shape cannot implement `OverlayCache` (it has no
+        `mark`/`detach` analogue), so it forfeits the drop-in A/B and
+        byte-identity-by-construction that the journal gives phase 1.
+        """
+    consequences """
+        The journal keeps search code untouched for phase 1. If the canvas
+        wins and the trait is later simplified in phase 2, converting the
+        journal to per-depth rectangles becomes a contained follow-up
+        inside the canvas type - which is what phase 2 (patch overlay and
+        border cache retirement) then did.
+        """
+    supported_by [ @bpg.evidence.canvas-frameless-workers/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/canvas-design.md"
+        excerpt """
+            Phase 1 deliberately picks the journal to keep the search
+            untouched; if the canvas wins and the trait is later simplified
+            (phase 2), converting the journal to per-depth rectangles
+            becomes a contained follow-up inside the canvas type.
+            """
+    }
+}
+
+record bpg.decision.canvas-u16-storage/1 : decision {
+    title "Canvas backing buffer is u16 for every bit depth, including 8-bit"
+    state active
+    scope [ path "crates/still265/src/encoder/**" ]
+    topic canvas-storage-width
+    decision """
+        The contiguous per-CTU canvas stores samples as `u16` for every bit
+        depth, not `u8` even when encoding 8-bit content.
+        """
+    context """
+        An alternative u8-canvas-plus-validity-bitmap design was considered
+        and rejected as "complexity not worth it before phase-1 numbers
+        exist". The canvas background uses `UNINIT_SAMPLE = u16::MAX` as an
+        availability sentinel, which does not fit in u8; clamping it to 255
+        destroys the sentinel because 255 is a legal pixel value, silently
+        corrupting decisions - the exact failure mode already hit once with
+        zero-filled worker frames.
+        """
+    consequences """
+        33 KB/component per CTU stays L2-resident, and readers that already
+        produce u16/i32 border arrays need no conversion. The sentinel is
+        preserved by construction.
+        """
+    supported_by [ @bpg.evidence.canvas-frameless-workers/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/canvas-design.md"
+        excerpt """
+            u16 canvas (chosen): sentinel preserved by construction; 33 KB/comp
+            is still L2-resident; readers already produce u16/i32 border
+            arrays.
+            """
+    }
+}
+
+record bpg.decision.chroma-dm-reuse-conservative/1 : decision {
+    title "Chroma DM state is reused only for the commit path, on the already-pruned rough path"
+    state active
+    scope [ path "crates/still265/src/encoder/**" ]
+    topic chroma-search-cost-reuse
+    decision """
+        The shipped chroma search keeps exact DM (derived-mode)
+        recomputation for the cost comparison, and only reuses DM state for
+        the commit path, and only on the already-pruned (intentionally
+        non-identical) rough path.
+        """
+    context """
+        The original plan proposed reusing the stored DM plan-block cost as
+        the DM baseline directly, which changed decisions and was
+        rejected. The shipped, more conservative design keeps output
+        byte-identical to the old exhaustive path with
+        `CHROMA_ROUGH=0` or `CHROMA_ROUGH_K=4` plus skip off (verified
+        sha256-equal).
+        """
+    consequences """
+        Retains about 98% of the chroma RGB BD-rate gain while cutting
+        about 75% of the exact chroma work and about 27% of the added time
+        on the 14-image calibration set.
+        """
+    supported_by [ @bpg.evidence.chroma-calibration/1 ]
+    author "dk"
+    created_at 2026-07-03
+    source {
+        kind legacy
+        path "docs/handoff2.md"
+        excerpt """
+            The shipped code keeps exact DM recomputation for the cost
+            comparison and only reuses DM state for the commit path, and
+            only on the already-pruned (intentionally non-identical) rough
+            path.
+            """
+    }
+}
+
+record bpg.decision.finalize-skip-not-shipped/1 : decision {
+    title "Finalize re-code skip is not shipped; the finalize pass stays load-bearing"
+    state active
+    scope [ path "crates/still265/src/rdoq.rs" ]
+    topic finalize-recode-skip
+    decision """
+        The proposed skip of the decoder-order `RdoqFinal` finalize walk,
+        substituting retained search-time coefficients and reconstruction,
+        is not shipped. The finalize pass remains load-bearing for
+        recon/decode equality.
+        """
+    context """
+        An attempt found the divergence between retained search state and
+        the decoder-order finalize walk too broad: retained coefficients
+        and reconstruction are not a drop-in substitute.
+        """
+    consequences """
+        This closes off one of the six audit-listed speed levers; a
+        correctness-equality investigation (finalize equality) would need
+        to land first before any future finalize-skip attempt.
+        """
+    supported_by [ @bpg.evidence.finalize-skip-attempt-failed/1 ]
+    author "dk"
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Attempted and reverted ... the finalize pass is currently
+            load-bearing for recon/decode equality.
+            """
+    }
+}
+
+record bpg.decision.hybrid-cpu-worker-cap/1 : decision {
+    title "WPP worker count is capped at performance-core thread count on narrow wavefronts"
+    state active
+    scope [ path "crates/still265/src/encoder/write.rs" ]
+    topic hybrid-cpu-scheduling
+    decision """
+        On hybrid-topology CPUs, the default WPP worker count is capped at
+        the performance-core thread count when rows are narrow enough that
+        efficiency cores would otherwise be assigned a wavefront slot.
+        """
+    context """
+        The 12 MP residual gap versus C was root-caused to parallel
+        scheduling efficiency on a hybrid i7-13700H, not per-thread kernel
+        throughput, which was already at parity or better.
+        """
+    consequences """
+        Fresh 7-image sweep moved from 1.056x to 1.040x aggregate after
+        this cap landed, on the way to the final 1.016x after root-TU
+        dedup.
+        """
+    supported_by [ @bpg.evidence.parity-sweep-1-04x/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Root cause of the 12 MP residual found and it is NOT kernels.
+            """
+    }
+}
+
+record bpg.decision.psy-off-by-default/1 : decision {
+    title "psy-rd and psy-rdoq are off-by-default, opt-in levers"
+    state active
+    scope [ path "crates/still265/src/encoder/stillsearch/**" ]
+    topic psy-levers-default-state
+    decision """
+        x265's two psychovisual energy-preservation levers, `psy_rd` and
+        `psy_rdoq`, are ported to still265 off by default and opt-in via
+        config and CLI, tunable for the AQ/perceptual-quality effort.
+        """
+    context """
+        The goal was parity with x265's psychovisual tooling without
+        changing default output for callers who never opt in.
+        """
+    consequences """
+        Every new code path is guarded behind `psy_rd > 0` / `psy_rdoq >
+        0`, and the ported weight kernel was verified to match x265's
+        `rdcost.h` shape.
+        """
+    depends_on [ @bpg.constraint.psy-zero-cost-when-off/1 ]
+    supported_by [ @bpg.evidence.psy-rd-shape-match/1 ]
+    author "dk"
+    created_at 2026-07-16
+    source {
+        kind legacy
+        path "docs/psy-design.md"
+        excerpt """
+            Goal: port x265's two psychovisual energy-preservation levers to
+            still265, off by default (byte-identical when 0.0), opt-in via
+            config + CLI, tunable for the AQ/perceptual-quality effort.
+            """
+    }
+}
+
+record bpg.decision.rdoq-int64-cost-domain/1 : decision {
+    title "Port RDOQ's cost domain to x265's exact int64 fixed point"
+    state active
+    scope [ path "crates/still265/src/rdoq.rs" ]
+    topic rdoq-arithmetic-domain
+    decision """
+        RDOQ's cost domain is ported from scalar f64 arithmetic to x265's
+        exact int64 fixed-point arithmetic, as one atomic unit rather than
+        a partial port.
+        """
+    context """
+        `rdoq_single_scan_into` was deeply f64-based against x265's
+        fixed-point int64 plus assembly. A partial port would change
+        decisions and fail BD/recon parity, so it had to be ported as one
+        atomic unit with `lambda2`/`scaleBits` seeded exactly from x265.
+        """
+    consequences """
+        BD-rate +0.002% (12 MP) / +0.0001% (50 MP) over QP 22-34 - neutral;
+        wall -1% single-thread. The f64 arithmetic turned out not to be the
+        RDOQ bottleneck, which re-scoped the follow-on vectorization work
+        (see @bpg.decision.rdoq-vectorization-rescoped).
+        """
+    supported_by [ @bpg.evidence.rdoq-int64-neutral/1 ]
+    author "dk"
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Port the cost domain to x265's exact fixed point.
+            """
+    }
+}
+
+record bpg.decision.rdoq-vectorization-rescoped/1 : decision {
+    title "AVX2 residual-pricing vectorization is re-scoped, not implemented as originally planned"
+    state active
+    scope [ path "crates/still265/src/rdoq.rs" ]
+    topic rdoq-vectorization
+    decision """
+        The originally-planned `costCoeffNxN`-style AVX2 vectorization of
+        residual pricing is not implemented as scoped; the approach is
+        re-scoped pending further design.
+        """
+    context """
+        still265's pricing sink evolves CABAC-style contexts per bin, so
+        sig-flag/C1/C2 costing is a serial dependency chain through the
+        context models - x265's SIMD shape does not map onto it directly.
+        """
+    consequences """
+        Vectorization work on residual pricing is deferred behind a
+        redesign of the pricing sink rather than attempted as a direct
+        port.
+        """
+    supported_by [ @bpg.evidence.rdoq-int64-neutral/1 ]
+    author "dk"
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Re-scoped, not done ... still265's pricing sink evolves contexts
+            per bin ... so sig/C1C2 costing is a serial dependency chain
+            through the context models - costCoeffNxN-style SIMD does not
+            map.
+            """
+    }
+}
+
+record bpg.decision.ssim-aq-active-under-cqp/1 : decision {
+    title "CQP mode must still be able to emit spatial AQ via legal cu_qp_delta"
+    state proposed
+    scope [ path "crates/still265/src/encoder/**" ]
+    topic ssim-tune-aq-interaction
+    decision """
+        still265 should not mimic x265's behavior of disabling adaptive
+        quantization under CQP rate control. Instead it needs a
+        still-image-specific rule: CQP may still use spatial AQ by emitting
+        legal per-QG `cu_qp_delta` syntax.
+        """
+    context """
+        x265 forcibly clears AQ under CQP and warns that SSIM-tune with AQ
+        off is invalid, which would make an SSIM-RD-style mode pointless
+        for a CQP-only still encoder. A minimal, experimental
+        `ssim_rd`/`ssim_rd_weight` scalar has landed
+        (env-gated, `SSIM_RD`/`SSIM_RD_WEIGHT`), but the fuller
+        CTU-normalized `SsimNorm`/`Tune::Ssim` design this decision
+        describes, and the guaranteed-active-AQ-under-CQP behavior with its
+        three named regression tests, had not been confirmed shipped as of
+        this ledger's authoring.
+        """
+    consequences """
+        Any future SSIM-tune work must prove AQ is exercised by checking
+        that `cu_qp_delta` is actually emitted, not just that the analysis
+        cost changed.
+        """
+    author "dk"
+    created_at 2026-06-26
+    source {
+        kind legacy
+        path "docs/ssimtune.md"
+        excerpt """
+            So for bpg-rs, do not mimic x265's CQP-disable-AQ behavior if
+            the goal is to actually exercise SSIM-style AQ. You need a
+            still-image-specific rule: CQP may still use spatial AQ by
+            emitting legal per-QG cu_qp_delta syntax.
+            """
+    }
+}
+
+record bpg.decision.wpp-geometry-aware-release-policy/1 : decision {
+    title "Unset WPP release policy becomes geometry-aware (stall-only under 96 CTUs wide)"
+    state active
+    scope [ path "crates/still265/src/encoder/write.rs" ]
+    topic wpp-release-cadence
+    decision """
+        The unset/`auto` WPP release policy is geometry-aware instead of
+        unconditionally K=4: rows narrower than 96 CTUs default to
+        stall-only, rows 96 CTUs or wider default to K=4.
+        """
+    context """
+        Interleaved sweeps found stall-only had the best 12 MP min/mean,
+        while K=4 had the best 50 MP mean - no single fixed K served both
+        geometries well.
+        """
+    consequences """
+        Replaces the flat K=4 default from
+        @bpg.decision.wpp-release-coarsening with a per-row-width rule; the
+        env override remains available for manual tuning.
+        """
+    supersedes [ @bpg.decision.wpp-release-coarsening/1 ]
+    supported_by [ @bpg.evidence.wpp-handoff-scheduler/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/wpp-handoff-design.md"
+        excerpt """
+            the unset release policy is now geometry-aware instead of
+            unconditionally K=4: rows narrower than 96 CTUs default to
+            stall-only, rows 96 CTUs or wider default to K=4.
+            """
+    }
+}
+
+record bpg.decision.wpp-notify-one-wakeup/1 : decision {
+    title "Normal WPP handoff progress wakes one claimer, not the whole pool"
+    state active
+    scope [ path "crates/still265/src/encoder/write.rs" ]
+    topic wpp-wakeup-policy
+    decision """
+        Normal handoff progress wakes one sleeping claimer per CTU instead
+        of broadcasting to the whole pool after every CTU. The whole-row
+        fallback path (`BPG_WPP_HANDOFF=0`, worker-frame fallback, AQ-WPP
+        tree builds) intentionally keeps notify-all.
+        """
+    context """
+        Targets ping-pong/claim-mutex overhead from broadcasting on every
+        CTU. The fallback exception exists because workers blocked on a
+        dependency inside an already-claimed row are not counted by
+        `idle_claimers`, so notify-one there could strand a runnable row.
+        """
+    consequences """
+        Reduces wakeup churn on the common path while preserving
+        correctness on the excluded, scheduling-shaped paths.
+        """
+    supported_by [ @bpg.evidence.wpp-handoff-scheduler/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/wpp-handoff-design.md"
+        excerpt """
+            normal handoff progress now wakes one sleeping claimer instead
+            of broadcasting to the whole pool after every CTU.
+            """
+    }
+}
+
+record bpg.decision.wpp-release-coarsening/1 : decision {
+    title "Voluntary WPP frontier release coarsened to every 4 completed CTUs"
+    state superseded
+    scope [ path "crates/still265/src/encoder/write.rs" ]
+    topic wpp-release-cadence
+    decision """
+        Voluntary idle-worker releases of the WPP handoff frontier happen
+        every 4 completed CTUs by default, instead of every CTU. Dependency
+        stalls still park immediately.
+        """
+    context """
+        First Linux numbers showed the large smooth 50 MP case at
+        parity/noise (~0.95x of `bpgenc -m9`) but the 12 MP case still
+        around ~1.25x, motivating a tunable release cadence.
+        """
+    consequences """
+        Made tunable via `BPG_WPP_HANDOFF_RELEASE`; later refined into a
+        geometry-aware policy (see
+        @bpg.decision.wpp-geometry-aware-release-policy).
+        """
+    supported_by [ @bpg.evidence.wpp-handoff-scheduler/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/wpp-handoff-design.md"
+        excerpt """
+            Default handoff still parks immediately on dependency stalls,
+            but voluntary idle-worker releases happen every 4 completed
+            CTUs instead of every CTU.
+            """
+    }
+}

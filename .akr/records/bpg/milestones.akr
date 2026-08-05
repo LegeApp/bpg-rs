@@ -1,0 +1,183 @@
+akr 0.1
+project bpg-rs
+
+record bpg.milestone.parity-baseline-pre-refactor/1 : milestone {
+    title "Speed parity baseline: 1.9-2.5x slower than bpgenc -m9"
+    state completed
+    intent """
+        Establish the starting wall-clock gap between still265 Slow and C
+        `bpgenc -e x265 -m9` before the speed-parity audit's large
+        refactors (depth-0 leaf skip, canvas, WPP handoff, root-TU dedup)
+        began.
+        """
+    acceptance {
+        check baseline-ratio-measured {
+            statement """
+                The aggregate still265-vs-bpgenc-m9 wall-clock ratio for the
+                pre-refactor architecture is known and recorded as 1.9-2.5x.
+                """
+            method observation
+            verified_by [ @bpg.evidence.baseline-ratio-measured/1 ]
+        }
+    }
+    author "dk"
+    created_at 2026-07-14
+    source {
+        kind legacy
+        path "docs/optimization-testing-plan.md"
+        excerpt """
+            | Pre large refactors | 1.9-2.5x |
+            """
+    }
+}
+
+record bpg.milestone.parity-canvas/1 : milestone {
+    title "Speed parity: aggregate 1.14x after the contiguous CTU canvas"
+    state completed
+    intent """
+        Replace the per-CTU patch-overlay reconstruction stack with a
+        contiguous per-CTU canvas (phases 1, 1.5, 2 and 3: canvas overlay,
+        patch/border-cache retirement, frameless WPP workers), the biggest
+        single refactor on the audit's list.
+        """
+    acceptance {
+        check frameless-workers-memory {
+            statement """
+                Canvas phase 3 (frameless WPP workers) is byte-identical
+                everywhere and cuts 50 MP peak working set from 3855 MB to
+                999 MB.
+                """
+            method command
+            verified_by [ @bpg.evidence.canvas-frameless-workers/1 ]
+        }
+        check post-canvas-ratio {
+            statement """
+                The 7-image test-set-large aggregate ratio vs bpgenc -m9 is
+                1.14x (range 0.99-1.23x) after canvas phases 1 and 1.5 land.
+                """
+            method command
+            verified_by [ @bpg.evidence.parity-sweep-1-14x/1 ]
+        }
+    }
+    after [ @bpg.milestone.parity-depth0-sao/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/canvas-design.md"
+        excerpt """
+            Status: all phases shipped.
+            """
+    }
+}
+
+record bpg.milestone.parity-depth0-sao/1 : milestone {
+    title "Speed parity: aggregate 1.32x after depth-0 leaf skip and parallel SAO/deblock"
+    state completed
+    intent """
+        Land the depth-0 CTU leaf skip (matching x265's tree shape) and
+        parallelize SAO/deblocking so still265 meets the interim 1.5x
+        parity goal on every image in the 7-image sweep.
+        """
+    acceptance {
+        check interim-1-5x-goal-met {
+            statement """
+                The interim 1.5x parity goal is met on every image in the
+                test-set-large sweep, with an aggregate ratio of 1.32x.
+                """
+            method command
+            verified_by [ @bpg.evidence.parity-sweep-1-32x/1 ]
+        }
+    }
+    after [ @bpg.milestone.parity-baseline-pre-refactor/1 ]
+    author "dk"
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            The interim 1.5x goal is met on every image.
+            """
+    }
+}
+
+record bpg.milestone.parity-handoff-hybrid/1 : milestone {
+    title "Speed parity: aggregate 1.040x after WPP row-segment handoff and hybrid-CPU cap"
+    state completed
+    intent """
+        Land the WPP row-segment handoff scheduler (idle workers take over
+        stalled/parked rows) and the hybrid-CPU worker cap for narrow
+        wavefronts, closing most of the remaining parallel-scheduling gap.
+        """
+    acceptance {
+        check handoff-byte-identical {
+            statement """
+                The WPP row-segment handoff scheduler is byte-identical to
+                pre-handoff output across the full correctness matrix
+                before being shipped default-on.
+                """
+            method command
+            verified_by [ @bpg.evidence.wpp-handoff-scheduler/1 ]
+        }
+        check post-hybrid-cap-ratio {
+            statement """
+                The 7-image test-set-large aggregate ratio vs bpgenc -m9
+                reaches 1.040x after the hybrid-CPU worker cap lands.
+                """
+            method command
+            verified_by [ @bpg.evidence.parity-sweep-1-04x/1 ]
+        }
+    }
+    after [ @bpg.milestone.parity-canvas/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/wpp-handoff-design.md"
+        excerpt """
+            Status: implemented and committed, correctness fully gated.
+            """
+    }
+}
+
+record bpg.milestone.parity-root-tu-dedup/1 : milestone {
+    title "Speed parity: final aggregate 1.016x after root-TU dedup"
+    state completed
+    intent """
+        Land root-TU dedup (reuse the cheap-winner root-leaf luma result in
+        materialization) as the closing lever of the speed-parity effort,
+        reaching practical speed parity with C bpgenc -m9 on the documented
+        7-image sweep.
+        """
+    target 2026-07-07
+    acceptance {
+        check dedup-hit-rate {
+            statement """
+                Root-TU dedup reaches a 100% hit rate on the 12 MP
+                canonical case with no output byte change.
+                """
+            method command
+            verified_by [ @bpg.evidence.root-tu-dedup-hit-rate/1 ]
+        }
+        check final-aggregate-ratio {
+            statement """
+                The 7-image test-set-large sweep reaches aggregate 1.016x
+                vs bpgenc -m9, with two images faster than C and the
+                remaining tail mostly in textured 12 MP inputs.
+                """
+            method command
+            verified_by [ @bpg.evidence.parity-sweep-1-016x/1 ]
+        }
+    }
+    after [ @bpg.milestone.parity-handoff-hybrid/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "README.md"
+        excerpt """
+            still265 is now in practical speed parity range with C bpgenc
+            -e x265 -m9 for the tested still-image workload.
+            """
+    }
+}

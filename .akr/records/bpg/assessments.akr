@@ -1,0 +1,178 @@
+akr 0.1
+project bpg-rs
+
+record bpg.assessment.headline-diagnosis/1 : assessment {
+    title "The 2x gap is architecture, not over-searching"
+    state verified
+    scope [ path "crates/still265/**" ]
+    statement """
+        The candidate funnel is already at x265 parity or better. The
+        remaining wall-clock gap is not "searching too much per CU" - it is
+        (1) one whole CU depth x265 never evaluates, (2) a WPP
+        implementation that clones the full reconstruction frame per row
+        claim, (3) an RDOQ/rate-costing kernel family that runs in scalar
+        f64 against x265's fixed-point int64 plus assembly, and (4) the
+        overlay/border architecture vs x265's contiguous recon planes.
+        """
+    confidence high
+    as_of git:6c5bafc8dfc3f4c9b2b2bd5e9a17a6599c73ef0b
+    author "dk"
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Headline: the candidate funnel is already at x265 parity or
+            better. The 2x is not "searching too much per CU" - it is (1)
+            one whole CU depth x265 never evaluates, (2) a WPP
+            implementation that clones the full reconstruction frame per
+            row claim, (3) an RDOQ/rate-costing kernel family that runs in
+            scalar f64 against x265's fixed-point int64 + assembly, and (4)
+            the overlay/border architecture vs x265's contiguous recon
+            planes.
+            """
+    }
+}
+
+record bpg.assessment.parallel-efficiency-not-kernels/1 : assessment {
+    title "The residual 12 MP gap is parallel scheduling, not kernel throughput"
+    state verified
+    scope [ path "crates/still265/src/encoder/write.rs" ]
+    statement """
+        The remaining speed difference is not a general kernel-throughput
+        deficit: per-thread kernel work is at parity or better on the
+        worst 12 MP image. The residual gap is mainly parallel scheduling
+        efficiency and image-content sensitivity on the hybrid i7-13700H,
+        which motivated capping WPP worker count at the performance-core
+        thread count on narrow wavefronts.
+        """
+    confidence high
+    as_of git:e656bbcfc1320c49098d6566f37b680a3fe3456f
+    supported_by [ @bpg.observation.wpp-idle-time/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Root cause of the 12 MP residual found and it is NOT kernels -
+            per-thread kernel work is at parity or better.
+            """
+    }
+}
+
+record bpg.assessment.rdoq-selection-refuted/1 : assessment {
+    title "RDOQ coefficient selection is not the quality lever"
+    state verified
+    scope [ path "crates/still265/src/rdoq.rs" ]
+    statement """
+        RDOQ coefficient SELECTION is not the lever for the still265-vs-C
+        quality gap - this refutes the prior leading hypothesis. RDOQ was
+        measured mean 1.5% above the local optimum (hard-quant 5.1% above),
+        and a coordinate-descent refinement experiment on top of it was
+        RD-negative. Strategic conclusion, from reading x265 source: there
+        is no missing x265 algorithm; the ~1.5x wall gap is distributed
+        per-call implementation efficiency, and the quality gap is
+        partition-independent, search-independent, and filter-independent.
+        """
+    confidence high
+    as_of git:4e68042a4b731a4f73096f3ccc0988631d789dce
+    author "dk"
+    created_at 2026-06-28
+    source {
+        kind legacy
+        path "docs/handoff.md"
+        excerpt """
+            RDOQ coefficient SELECTION is NOT the lever - this refutes the
+            prior turn's leading hypothesis.
+            """
+    }
+}
+
+record bpg.assessment.saliency-proposals-superseded/1 : assessment {
+    title "Saliency ideation proposals were overtaken by implementation"
+    state superseded
+    scope [ path "crates/still265/src/effort.rs", path "crates/still265/src/preanalysis.rs" ]
+    statement """
+        An AI-summarized ideation memo proposed four saliency-driven
+        encoder changes for still265, including forcing a CU split (skip
+        the 64x64 parent RDO trial) when `RegionClass == TextLike`. That
+        specific proposal is already implemented: `RegionClass::TextLike`
+        exists in `preanalysis.rs`, and `SearchPolicy::force_split` is set
+        in `effort.rs` when the region is `TextLike` and importance clears
+        a threshold - essentially matching the memo's proposal. The
+        document's proposal-as-written is therefore stale, superseded by
+        the shipped mechanism rather than by a follow-on design doc.
+        """
+    confidence high
+    author "AI-generated ideation summary, no human author of record"
+    created_at 2026-06-13
+    source {
+        kind legacy
+        path "saliency/conclusions.md"
+        excerpt """
+            Force Split (Skip Parent): If RegionClass == TextLike and the CU
+            is 64x64, the parent RDO trial is almost certainly going to lose
+            to the 32x32 kids because text requires fine detail. Skip the
+            64x64 RDO entirely, forcefully split, and only evaluate the
+            sub-CUs. ... 4. Add force_split to SearchPolicy for TextLike
+            regions on large CUs to skip evaluating the predictably bad
+            parent CU.
+            """
+    }
+}
+
+record bpg.assessment.slow-canonical-switch-interpretation/1 : assessment {
+    title "The architectural risk was early cheap-top-1 finalization, not shortlist coverage"
+    state verified
+    scope [ path "crates/still265/src/encoder/stillsearch/**" ]
+    statement """
+        On the sampled image, the main architectural risk was not rough
+        shortlist coverage; it was finalizing the cheap top-1 winner too
+        early. Serious SIMD work should optimize the exact-evaluation path
+        because the more x265-shaped search spends much more time in exact
+        prediction and transform.
+        """
+    confidence medium
+    as_of git:4e68042a4b731a4f73096f3ccc0988631d789dce
+    supported_by [ @bpg.observation.simd-audit-work-buckets/1 ]
+    author "dk"
+    created_at 2026-06-26
+    source {
+        kind legacy
+        path "docs/still265-pre-simd-audit.md"
+        excerpt """
+            Interpretation: the main architectural risk is not rough
+            shortlist coverage on this image; it is finalizing the cheap
+            top-1 winner too early.
+            """
+    }
+}
+
+record bpg.assessment.wide-simd-predictor-refuted/1 : assessment {
+    title "Wide-SIMD intra predictors gave no measurable gain at the trial block sizes"
+    state verified
+    scope [ path "crates/still265/src/encoder/**" ]
+    statement """
+        Honest result: no measurable gain from wide-SIMD prediction kernels
+        - trial blocks are 8x8/4x4-heavy, and 8-wide i32 lanes with scalar
+        u8 packing don't pay at those sizes (4x4 falls back to scalar
+        entirely). A later substage split found the wide predictors had
+        optimized the trivial part: border building was 4.77s (26%) of the
+        Predict substage, the prediction kernels themselves only 0.53s
+        (3%).
+        """
+    confidence high
+    as_of git:4bc91bb9d2ee6d51a8ebc41369f9304a1f13a7ff
+    author "dk"
+    created_at 2026-07-02
+    source {
+        kind legacy
+        path "docs/handoff2.md"
+        excerpt """
+            Honest result: ~no measurable gain - trial blocks are
+            8x8/4x4-heavy; 8-wide i32 lanes with scalar u8 packing don't pay
+            at those sizes.
+            """
+    }
+}

@@ -1,0 +1,249 @@
+akr 0.1
+project bpg-rs
+
+record bpg.observation.canvas-memory-reduction/1 : observation {
+    title "Frameless WPP canvas cuts 50 MP peak working set roughly 4x"
+    state verified
+    scope [ path "crates/still265/src/encoder/**" ]
+    statement """
+        After canvas phase 3 (frameless WPP workers, eliminating per-worker
+        private full-resolution `DecodedFrame` pixel planes in favor of a
+        row-strip buffer plus canvas left-edge self-capture): 50 MP peak
+        working set 999 MB vs 3855 MB under the prior per-worker frame
+        design, with -2.5...-5.4% wall at 50 MP and neutral...-2% at 12 MP.
+        """
+    observed_at git:0cfa2afe9836672aad0287609aee38f15515ce8f
+    method instrumented
+    watches [ "crates/still265/src/encoder/**" ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/canvas-design.md"
+        excerpt """
+            50 MP peak working set 999 MB vs 3855 MB.
+            """
+    }
+}
+
+record bpg.observation.critical-review-5x-gap/1 : observation {
+    title "still265 measured ~5x slower than x265 at 12 MP"
+    state superseded
+    scope [ path "crates/still265/**" ]
+    statement """
+        still265 is about 5x slower than x265 (`bpgenc -e x265` at matching
+        effort) at 12 MP resolutions and above. A 12 MP photo takes about
+        45s with still265 (Slow) vs about 9s with x265 (medium preset). At
+        1024x768 the gap narrows but still265 trails at about 3s vs 0.6s.
+        """
+    observed_at git:4e68042a4b731a4f73096f3ccc0988631d789dce
+    method manual
+    watches [ "crates/still265/src/**" ]
+    author "unattributed critical review"
+    created_at 2026-06-26
+    source {
+        kind legacy
+        path "docs/x265-vs-still265-critical-review.md"
+        excerpt """
+            still265 is ~5x slower than x265 (`bpgenc -e x265` at matching
+            effort) at 12 MP resolutions and above. A 12 MP photo takes
+            ~45 s with still265 (Slow) vs ~9 s with x265 (medium preset). At
+            1024x768 the gap narrows but still265 trails at ~3 s vs ~0.6 s.
+            """
+    }
+}
+
+record bpg.observation.ctx-evolve-chroma-gains/1 : observation {
+    title "Context evolution + CU-header pricing + chroma modes: small, clean, cheap win"
+    state verified
+    scope [ path "crates/still265/src/encoder/**" ]
+    statement """
+        Architecture A/B on 14 native images (7 small + 7 large), QP sweep
+        24/28/32/36, decoded RGB PSNR: `CTX_EVOLVE=1` alone -0.168% Y BD /
+        -0.221% RGB BD / +2.8% time; `CU_HEADER_BITS=1` alone -0.002% Y /
+        -0.023% RGB / +1.3% time; `CHROMA_MODES=1` alone -0.012% Y / -0.623%
+        RGB / +13.9% time; all three on: -0.117% Y / -0.782% RGB / +16.6%
+        time.
+        """
+    observed_at git:4bc91bb9d2ee6d51a8ebc41369f9304a1f13a7ff
+    method command
+    watches [ "crates/still265/src/encoder/**" ]
+    author "dk"
+    created_at 2026-07-03
+    source {
+        kind legacy
+        path "docs/handoff2.md"
+        excerpt """
+            | all three on | -0.117% | -0.782% | +0.05% | +16.6% |
+            """
+    }
+}
+
+record bpg.observation.pivotal-bucket-comparison/1 : observation {
+    title "still265 does fewer evaluations than x265 in every bucket, yet is slower"
+    state verified
+    scope [ path "crates/still265/**" ]
+    statement """
+        Per-CTU profiling comparison: RoughSA8D 336 (x265) vs 83 (still265)
+        calls, 17x per-call cost; CheapRDO 1217 vs 620 calls, 4.3x per-call
+        cost; FullIntraRDO 336 vs 83 calls, 6x per-call cost; RDOQ 7109 vs
+        32 calls, 44x per-call cost. still265 does fewer evaluations than
+        x265 in every bucket, yet was ~2x slower at the time of this
+        profile - the gap is per-call cost, not search breadth.
+        """
+    observed_at git:4e68042a4b731a4f73096f3ccc0988631d789dce
+    method instrumented
+    watches [ "crates/still265/src/encoder/**" ]
+    author "dk"
+    created_at 2026-06-28
+    source {
+        kind legacy
+        path "docs/handoff.md"
+        excerpt """
+            still265 does fewer evaluations than x265 in every bucket, yet
+            is ~2x slower. The gap is per-call cost.
+            """
+    }
+}
+
+record bpg.observation.rdoq-in-search-bdrate/1 : observation {
+    title "RDOQ-in-search extension closes about half the small-set quality gap"
+    state verified
+    scope [ path "crates/still265/src/rdoq.rs" ]
+    statement """
+        BD-rate vs pre-change default, slow, 4 QPs, decoded PSNR: small set
+        (7x 1024x768) Y -2.78% mean / -2.76% median, RGB -2.70%, time +46%;
+        large set (7x 12-50 MP) Y -1.45% mean / -1.53% median, RGB -1.40%,
+        time +26%. All 14 images improved on both axes.
+        """
+    observed_at git:4bc91bb9d2ee6d51a8ebc41369f9304a1f13a7ff
+    method command
+    watches [ "crates/still265/src/rdoq.rs" ]
+    author "dk"
+    created_at 2026-07-02
+    source {
+        kind legacy
+        path "docs/handoff2.md"
+        excerpt """
+            All 14 images improved on both axes. This closes roughly half of
+            the ~5% small-set gap to C in one lever.
+            """
+    }
+}
+
+record bpg.observation.simd-audit-work-buckets/1 : observation {
+    title "SIMD readiness profile: LumaCheap dominates work buckets, ForwardXform dominates substages"
+    state verified
+    scope [ path "crates/still265/src/encoder/**" ]
+    statement """
+        Work buckets (18.632s wall inside StillSearch): LumaCheap 1,845,494
+        calls / 9.100s / 48.8%; LumaExact 245,863 / 4.066s / 21.8%;
+        RoughLuma 245,863 / 3.275s / 17.6%; ChromaTrial 1,493,464 / 1.640s /
+        8.8%; Rdoq 93,628 / 0.527s / 2.8%. Component substages:
+        ForwardXform 5.384s / 40.7%; ResidualPrice 3.524s / 26.6%; Predict
+        2.529s / 19.1%; Recon+Dist 1.069s / 8.1%; Quant+SDH 0.737s / 5.6%.
+        This audit supersedes any older SIMD guidance not tied to the
+        current x265shape profile.
+        """
+    observed_at git:4e68042a4b731a4f73096f3ccc0988631d789dce
+    method instrumented
+    watches [ "crates/still265/src/encoder/**" ]
+    review_after 2026-12-01
+    supersedes [ @bpg.observation.slow-canonical-oracle-rejection/1 ]
+    author "dk"
+    created_at 2026-06-27
+    source {
+        kind legacy
+        path "docs/simd-audit.md"
+        excerpt """
+            This audit supersedes any older SIMD guidance that is not tied
+            to the current x265shape profile.
+            """
+    }
+}
+
+record bpg.observation.slow-canonical-oracle-rejection/1 : observation {
+    title "Sparse-oracle sampling rejects legacy cheap-top-1 Slow as canonical"
+    state superseded
+    scope [ path "crates/still265/src/encoder/stillsearch/**" ]
+    statement """
+        Sparse luma-oracle sampling on `20240501_110934` found current
+        Slow's rough shortlist contained the full-mode winner in 57/60
+        samples (95.0%), but the cheap top-1 decision matched it only
+        35/60 times (58.3%). A 10-source follow-up found 146 misses in 301
+        samples (48.5%) with only 155 cheap-top-1 hits (51.5%). Canonical
+        Slow was therefore switched to the promoted-exact variant-C shape;
+        the legacy shortcut is retained only behind
+        `BPG_STILLSEARCH_SLOW_AUDIT_VARIANT=A`/`legacy`.
+        """
+    observed_at git:4e68042a4b731a4f73096f3ccc0988631d789dce
+    method command
+    watches [ "crates/still265/src/encoder/stillsearch/**" ]
+    author "dk"
+    created_at 2026-06-26
+    source {
+        kind legacy
+        path "docs/still265-pre-simd-audit.md"
+        excerpt """
+            The legacy cheap-winner/materialize-winner regime has been
+            rejected by oracle sampling and is retained only as an audit
+            variant.
+            """
+    }
+}
+
+record bpg.observation.speed-parity-final-sweep/1 : observation {
+    title "Speed-parity progression: 1.9-2.5x down to 1.016x"
+    state verified
+    scope [ path "crates/still265/**" ]
+    statement """
+        Across the life of the speed-parity audit, the aggregate ratio vs
+        `bpgenc -m9` on the 7-image test-set-large sweep moved: 1.9-2.5x ->
+        1.32 -> 1.25 -> 1.14 -> 1.056 (hybrid cap) -> 1.040 -> 1.016 (root-TU
+        dedup, final). The ~5x figure from the earlier critical review was
+        measured on a different, smaller-effort comparison and does not
+        carry forward once Slow was reshaped to x265's tree/search shape.
+        """
+    observed_at git:bae552ad70f80b708a3a3014fe04b560fb24877c
+    method command
+    watches [ "crates/still265/src/**" ]
+    supersedes [ @bpg.observation.critical-review-5x-gap/1 ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Progression across the audit's life: 1.9-2.5x -> 1.32 -> 1.25 ->
+            1.14 -> 1.056 (cap) -> 1.040 -> 1.016 (dedup).
+            """
+    }
+}
+
+record bpg.observation.wpp-idle-time/1 : observation {
+    title "WPP wavefront idle time: 30% of thread time at 12 MP, 16% at 50 MP"
+    state verified
+    scope [ path "crates/still265/src/encoder/write.rs" ]
+    statement """
+        Instrumented WPP wavefront idle time shows about 30% of thread time
+        idle at 12 MP (9.8 of 32 thread-seconds), 16% at 50 MP. The rest of
+        the parallel gap is per-thread CPU inflation (~1.6x vs single-thread
+        run) from cache/bandwidth contention and P/E-core heterogeneity.
+        """
+    observed_at git:680d91e41657fbb7dee13375d07e26b39a8a6b05
+    method instrumented
+    watches [ "crates/still265/src/encoder/write.rs" ]
+    review_after 2026-12-01
+    author "dk"
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            30% of thread time idle at 12 MP (9.8 of 32 thread-s), 16% at
+            50 MP. The rest of the parallel gap is per-thread CPU inflation
+            (~1.6x vs single-thread run) from cache/bandwidth contention and
+            P/E-core heterogeneity.
+            """
+    }
+}

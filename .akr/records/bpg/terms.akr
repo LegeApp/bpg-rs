@@ -1,0 +1,94 @@
+akr 0.1
+project bpg-rs
+
+record bpg.term.bpg-hevc-decode/1 : term {
+    title "bpg-hevc-decode"
+    state active
+    scope [ path "crates/bpg-hevc-decode/**" ]
+    definition """
+        The pure-Rust HEVC still-image intra decoder crate: CABAC, intra
+        prediction, transform/dequant, deblocking, and SAO. AGENTS.md's own
+        prose names this crate `bpg-hevc-decode` in one sentence and then
+        refers to its tests at `crates/bpg-decode/tests` in the same
+        sentence — a naming lag in the source document, preserved here
+        rather than silently normalized.
+        """
+    aliases [ "bpg-decode" ]
+    author "AGENTS.md"
+    created_at 2026-06-30
+    source {
+        kind legacy
+        path "AGENTS.md"
+        excerpt """
+            `bpg-hevc-decode` the decoder ... Integration tests are in
+            crate-local `tests/` directories, especially `crates/still265/tests`,
+            `crates/bpg-decode/tests`, and `crates/bpg-tools/tests`.
+            """
+    }
+}
+
+record bpg.term.bpg-tools/1 : term {
+    title "bpg-tools"
+    state active
+    scope [ path "crates/bpg-tools/**" ]
+    definition """
+        The CLI crate exposing `encode`, `decode`, and comparison/development
+        tools; the installed end-user binary built from it is named `bpgenc`.
+        """
+    author "AGENTS.md"
+    created_at 2026-06-30
+    source {
+        kind legacy
+        path "AGENTS.md"
+        excerpt """
+            `bpg-tools` the CLI
+            """
+    }
+}
+
+record bpg.term.still265/1 : term {
+    title "still265"
+    state active
+    scope [ path "crates/still265/**" ]
+    definition """
+        The Rust-native HEVC still-image encoder crate, shaped after x265's
+        all-intra still-picture path but not a direct transplant of x265's
+        frame encoder.
+        """
+    author "AGENTS.md"
+    created_at 2026-06-30
+    source {
+        kind legacy
+        path "AGENTS.md"
+        excerpt """
+            `still265` contains the HEVC still-image encoder
+            """
+    }
+}
+
+record bpg.term.support-crates/1 : term {
+    title "Support crates"
+    state active
+    scope [
+        path "crates/bpg-bitstream/**",
+        path "crates/bpg-format/**",
+        path "crates/bpg-image/**"
+    ]
+    definition """
+        `bpg-bitstream`, `bpg-image`, and `bpg-format` hold shared primitives
+        used by the encoder and decoder: container varints and bit I/O, image
+        planes and color-space conversion, and BPG container header
+        read/write, respectively.
+        """
+    aliases [ "shared primitives" ]
+    author "AGENTS.md"
+    created_at 2026-06-30
+    source {
+        kind legacy
+        path "AGENTS.md"
+        excerpt """
+            support crates such as `bpg-bitstream`, `bpg-image`, and
+            `bpg-format` hold shared primitives.
+            """
+    }
+}

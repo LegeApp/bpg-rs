@@ -1,0 +1,334 @@
+akr 0.1
+project bpg-rs
+
+record bpg.evidence.baseline-ratio-measured/1 : evidence {
+    title "Pre-refactor baseline ratio recorded as 1.9-2.5x"
+    state verified
+    result pass
+    method observation
+    observed_at git:d87aee7ddedccc9a9a33c9c58ec3da4b460897fd
+    summary """
+        The known-good historical baseline table records the aggregate
+        still265-vs-bpgenc-m9 ratio before the large speed-parity refactors
+        as 1.9-2.5x. The nearest identifiable commit for this pre-refactor
+        architecture state is the full intra encoder / x265 intra-search
+        parity commit; no single dedicated benchmark commit is separately
+        tagged for the baseline figure itself.
+        """
+    created_at 2026-07-14
+    source {
+        kind legacy
+        path "docs/optimization-testing-plan.md"
+        excerpt """
+            | Pre large refactors | 1.9-2.5x |
+            """
+    }
+}
+
+record bpg.evidence.canvas-frameless-workers/1 : evidence {
+    title "Frameless WPP workers: byte-identical, lower wall time and memory"
+    state verified
+    result pass
+    method command
+    observed_at git:0cfa2afe9836672aad0287609aee38f15515ce8f
+    summary """
+        Canvas phase 3 (frameless WPP workers): byte-identical everywhere;
+        -2.5...-5.4% wall at 50 MP, neutral...-2% at 12 MP; 50 MP peak
+        working set 999 MB vs 3855 MB for the prior per-worker
+        full-resolution frame design.
+        """
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/canvas-design.md"
+        excerpt """
+            Measured: byte-identical everywhere; -2.5...-5.4% wall at 50 MP,
+            neutral...-2% at 12 MP; 50 MP peak working set 999 MB vs 3855
+            MB.
+            """
+    }
+}
+
+record bpg.evidence.chroma-calibration/1 : evidence {
+    title "Chroma search calibration: keeps ~98% of RGB gain at ~27% less added time"
+    state verified
+    result pass
+    method command
+    observed_at git:4bc91bb9d2ee6d51a8ebc41369f9304a1f13a7ff
+    summary """
+        New chroma default (K=1, skip off) vs old exhaustive: RGB BD-rate
+        -0.358% vs -0.365% (old), time +20.1% vs +27.5% (old), exact
+        non-DM candidates cut from 1,629,632 to 407,144. Retains ~98% of the
+        chroma RGB gain while cutting ~75% of the exact chroma work.
+        """
+    created_at 2026-07-03
+    source {
+        kind legacy
+        path "docs/handoff2.md"
+        excerpt """
+            The new default retains ~98% of the chroma RGB gain while
+            cutting ~75% of the exact chroma work and ~27% of the added time
+            on this set.
+            """
+    }
+}
+
+record bpg.evidence.cu-tu-bound-byte-identical/1 : evidence {
+    title "CU/TU branch-and-bound: 84-file byte sweep, zero mismatches"
+    state verified
+    result pass
+    method command
+    observed_at git:90fe97b6ed74afdcb6e299525b7bf4d0ad1d6548
+    summary """
+        84-file byte sweep (slow/placebo/fast x q28/q36 x 7 images, each
+        gate on vs off vs pre-change binary) found zero mismatches; suite
+        green.
+        """
+    created_at 2026-07-05
+    source {
+        kind legacy
+        path "docs/handoff2.md"
+        excerpt """
+            84-file byte sweep (slow/placebo/fast x q28/q36 x 7 images, each
+            gate on vs off vs pre-change binary) - 0 mismatches; suite
+            green.
+            """
+    }
+}
+
+record bpg.evidence.finalize-skip-attempt-failed/1 : evidence {
+    title "Finalize re-code skip: attempted and reverted"
+    state verified
+    result fail
+    method command
+    observed_at git:680d91e41657fbb7dee13375d07e26b39a8a6b05
+    summary """
+        The retained-search coefficients/recon are not a drop-in substitute
+        for the decoder-order RdoqFinal walk; the finalize pass is
+        currently load-bearing for recon/decode equality. The divergence is
+        broad enough that the attempted skip was reverted rather than
+        shipped.
+        """
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Attempted and reverted ... the finalize pass is currently
+            load-bearing for recon/decode equality - the retained search
+            coefficients/recon are not a drop-in substitute for the
+            decoder-order RdoqFinal walk.
+            """
+    }
+}
+
+record bpg.evidence.parity-sweep-1-016x/1 : evidence {
+    title "Final 7-image sweep: aggregate 1.016x vs bpgenc -m9"
+    state verified
+    result pass
+    method command
+    observed_at git:bae552ad70f80b708a3a3014fe04b560fb24877c
+    artifact "README.md"
+    summary """
+        Seven 12MP/50MP native photos, still265 slow QP 28 native mode,
+        release-lto build, best-of-2 idle desktop, vs on-PATH x265 4.1
+        `bpgenc -m9`: aggregate 14.36s vs 14.14s, ratio 1.016x. Two images
+        faster than C; the remaining tail is mostly textured 12 MP inputs.
+        Mean of per-image ratios 1.036x, median 1.044x.
+        """
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "README.md"
+        excerpt """
+            the latest 7-image sweep is 1.016x aggregate against `bpgenc
+            -m9`, with two images faster than C and the remaining tail
+            mostly in textured 12 MP inputs.
+            """
+    }
+}
+
+record bpg.evidence.parity-sweep-1-04x/1 : evidence {
+    title "Aggregate 1.040x after WPP handoff and hybrid-CPU worker cap"
+    state verified
+    result pass
+    method command
+    observed_at git:e656bbcfc1320c49098d6566f37b680a3fe3456f
+    summary """
+        Fresh 7-image test-set-large sweep: aggregate 1.056x after the WPP
+        row-segment handoff scheduler, then 1.040x after the hybrid-CPU
+        worker cap for narrow wavefronts landed.
+        """
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Progression across the audit's life: 1.9-2.5x -> 1.32 -> 1.25 ->
+            1.14 -> 1.056 (cap) -> 1.040 -> 1.016 (dedup).
+            """
+    }
+}
+
+record bpg.evidence.parity-sweep-1-14x/1 : evidence {
+    title "Aggregate 1.14x after canvas phases 1+1.5"
+    state verified
+    result pass
+    method command
+    observed_at git:277cd80c8d83cd3715705913162b7a993d144d18
+    summary """
+        7-image test-set-large sweep vs `bpgenc -m9` after the contiguous
+        per-CTU canvas overlay (phase 1+1.5): aggregate 1.14x, range
+        0.99-1.23x.
+        """
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            aggregate 1.14x vs `bpgenc -m9` (range 0.99-1.23x)
+            """
+    }
+}
+
+record bpg.evidence.parity-sweep-1-32x/1 : evidence {
+    title "Interim 1.5x parity goal met on every image, aggregate 1.32x"
+    state verified
+    result pass
+    method command
+    observed_at git:6c5bafc8dfc3f4c9b2b2bd5e9a17a6599c73ef0b
+    summary """
+        7-image test-set-large sweep vs `bpgenc -m9` after the depth-0 CTU
+        leaf skip and SAO/deblock parallelization: the interim 1.5x goal is
+        met on every image, aggregate 1.32x.
+        """
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            The interim 1.5x goal is met on every image.
+            """
+    }
+}
+
+record bpg.evidence.psy-rd-shape-match/1 : evidence {
+    title "psy_rd_weight matches x265's weighting shape"
+    state verified
+    result pass
+    method command
+    observed_at git:aa273f46f02f7f682369da49ca06b3bbcf85e6e6
+    command "cargo test -p still265 psy_rd_weight_matches_x265_shape"
+    summary """
+        The ported psy-rd energy weight kernel (factor = psy_rd * 0.33 *
+        (96.0/256.0), tapered above QP 40, zero at QP>=51) matches x265's
+        rdcost.h formula shape; env overrides BPG_PSY_RD (clamp 0..=5) and
+        BPG_PSY_RDOQ (clamp 0..=50) resolve as designed.
+        """
+    created_at 2026-07-18
+    source {
+        kind legacy
+        path "docs/psy-design.md"
+        excerpt """
+            Weight (rdcost.h:42-65) ... Sane ranges 0..=5 ... 0..=50 ...
+            Env overrides ... BPG_PSY_RD, BPG_PSY_RDOQ.
+            """
+    }
+}
+
+record bpg.evidence.rdoq-int64-neutral/1 : evidence {
+    title "RDOQ int64 fixed-point port: BD-neutral, -1% single-thread wall"
+    state verified
+    result pass
+    method command
+    observed_at git:edf12d7785c73e4994e542159ca73af665521f7c
+    summary """
+        Porting RDOQ's cost domain from f64 to x265's exact int64 fixed
+        point: BD-rate +0.002% (12 MP) / +0.0001% (50 MP) over QP 22-34 -
+        neutral; wall -1% single-thread. The f64 arithmetic was not the
+        RDOQ bottleneck.
+        """
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            BD-rate +0.002% (12 MP) / +0.0001% (50 MP) over QP 22-34 -
+            neutral; wall -1% single-thread. The f64 arithmetic was not
+            the RDOQ bottleneck.
+            """
+    }
+}
+
+record bpg.evidence.root-tu-dedup-hit-rate/1 : evidence {
+    title "Root-TU dedup: 100% hit rate, -3.9% single-thread CPU"
+    state verified
+    result pass
+    method command
+    observed_at git:bae552ad70f80b708a3a3014fe04b560fb24877c
+    command "bpg-highres-compare --native --sizes 12MP --efforts slow -q 28"
+    summary """
+        root_tu_reuse_hits == cu_trials exactly on the 12 MP canonical case
+        (100% hit rate). Interleaved A/B: 12 MP mean 1.567s vs 1.595s
+        (-1.8%), 50 MP 2.36s vs 2.43s (-2.6%); single-thread 12 MP 10.21s vs
+        10.64s (-3.9% CPU).
+        """
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Hit rate 100% - root_tu_reuse_hits ... = 182,340 = cu_trials
+            exactly on the 12 MP canonical.
+            """
+    }
+}
+
+record bpg.evidence.slow-oracle-rejection/1 : evidence {
+    title "Legacy cheap-top-1 Slow rejected by 10-source sparse-oracle sampling"
+    state verified
+    result fail
+    method command
+    observed_at git:4e68042a4b731a4f73096f3ccc0988631d789dce
+    summary """
+        10-source sparse-oracle sampling of the legacy cheap-top-1 search
+        path found 146 misses in 301 samples (48.5%), only 155 cheap-top-1
+        hits (51.5%). The result rejects legacy cheap-top-1 Slow as the
+        canonical m9 path: oracle misses are meaningful, not rare.
+        """
+    created_at 2026-06-26
+    source {
+        kind legacy
+        path "docs/still265-pre-simd-audit.md"
+        excerpt """
+            Follow-up 10-source sparse-oracle sampling of the legacy
+            cheap-top-1 path found 146 misses in 301 samples (48.5%) with
+            only 155 cheap-top-1 hits (51.5%).
+            """
+    }
+}
+
+record bpg.evidence.wpp-handoff-scheduler/1 : evidence {
+    title "WPP row-segment handoff: byte-identical across the correctness matrix"
+    state verified
+    result pass
+    method command
+    observed_at git:8ac8c2493d9063b123f1250afd3f2501bbc3ca64
+    command "cargo test -p still265 --tests -- --seed-sweep"
+    summary """
+        Full suite plus 5x stress: byte-identical to pre-handoff including
+        run-to-run determinism, `BPG_WPP_HANDOFF=0`, `BPG_WPP_FRAMELESS=0`,
+        serial, and tiles. Performance A/B was explicitly pending at land
+        time - shipped default-on on byte-identity grounds only.
+        """
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/wpp-handoff-design.md"
+        excerpt """
+            suite + 5x stress; byte-identical to pre-handoff incl.
+            run-to-run determinism, BPG_WPP_HANDOFF=0, BPG_WPP_FRAMELESS=0,
+            serial, tiles. Perf A/B pending
+            """
+    }
+}

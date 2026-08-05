@@ -1,0 +1,86 @@
+akr 0.1
+project bpg-rs
+
+record bpg.policy.commit-scoping/1 : policy {
+    title "Commits are scoped to one behavior or subsystem"
+    state active
+    scope [ all ]
+    topic commit-scoping
+    rule """
+        Recent commits use concise, imperative subjects with an optional
+        crate prefix. Commits stay scoped to one behavior or subsystem. Pull
+        requests describe the codec behavior changed, list commands run,
+        mention relevant env vars, and link any issue or comparison data.
+        """
+    author "AGENTS.md"
+    created_at 2026-06-30
+    source {
+        kind legacy
+        path "AGENTS.md"
+        excerpt """
+            Recent commits use concise, imperative subjects with an optional
+            crate prefix, for example `still265: AVX2 forward DCT...`. Keep
+            commits scoped to one behavior or subsystem. Pull requests should
+            describe the codec behavior changed, list commands run, mention
+            relevant env vars, and link any issue or comparison data. Include
+            screenshots only for viewer/UI changes.
+            """
+    }
+}
+
+record bpg.policy.env-toggle-naming/1 : policy {
+    title "Environment toggles follow BPG_* naming"
+    state active
+    scope [ path "crates/still265/**" ]
+    topic env-toggle-naming
+    rule """
+        Environment toggles follow `BPG_*` names, for example
+        `BPG_ENC_THREADS`, `BPG_TILES`, and `BPG_PRIMITIVES`.
+        """
+    rationale """
+        Use descriptive test names such as
+        `two_pass_aq_explicit_tiles_round_trip_420`, and keep environment
+        toggles consistently namespaced so ad hoc debug flags don't collide
+        with each other across search, WPP, and AQ subsystems.
+        """
+    author "AGENTS.md"
+    created_at 2026-06-30
+    source {
+        kind legacy
+        path "AGENTS.md"
+        excerpt """
+            Use descriptive test names such as
+            `two_pass_aq_explicit_tiles_round_trip_420`. Environment toggles
+            follow `BPG_*` names, for example `BPG_ENC_THREADS`, `BPG_TILES`,
+            and `BPG_PRIMITIVES`.
+            """
+    }
+}
+
+record bpg.policy.testing-conventions/1 : policy {
+    title "Codec changes get exact reconstruction or round-trip tests"
+    state active
+    scope [ path "crates/**/tests/**" ]
+    topic testing-conventions
+    rule """
+        Favor exact reconstruction or round-trip assertions for codec
+        changes, and include focused regressions for bitstream features such
+        as tiles, WPP, SAO, AQ, chroma formats, and bit depths. When changing
+        one crate, run its targeted tests first, then broader workspace
+        tests when practical.
+        """
+    author "AGENTS.md"
+    created_at 2026-06-30
+    source {
+        kind legacy
+        path "AGENTS.md"
+        excerpt """
+            Tests use Rust's built-in test framework. Favor exact
+            reconstruction or round-trip assertions for codec changes, and
+            include focused regressions for bitstream features such as
+            tiles, WPP, SAO, AQ, chroma formats, and bit depths. When
+            changing one crate, run its targeted tests first, then broader
+            workspace tests when practical.
+            """
+    }
+}

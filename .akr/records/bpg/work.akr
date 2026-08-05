@@ -1,0 +1,324 @@
+akr 0.1
+project bpg-rs
+
+record bpg.work.canonical-slow-variant-c/1 : work {
+    title "Switch canonical Slow search from cheap-top-1 to promoted-exact variant-C"
+    state completed
+    intent """
+        Replace the canonical Slow search's cheap-winner/materialize-winner
+        shortcut with the promoted-exact variant-C shape, retaining the
+        legacy shortcut only behind an audit-variant env flag.
+        """
+    implements [ @bpg.decision.canonical-slow-variant-c/1 ]
+    author "dk"
+    created_at 2026-06-26
+    source {
+        kind legacy
+        path "docs/still265-pre-simd-audit.md"
+        excerpt """
+            Canonical Slow has therefore been switched to the
+            promoted-exact variant-C shape.
+            """
+    }
+}
+
+record bpg.work.chroma-search-optimization/1 : work {
+    title "Chroma search optimization: SATD pre-selection, effort-aware budget, DM reuse"
+    state completed
+    intent """
+        Add a SATD-based rough pre-selection pass to chroma mode search
+        with an effort-aware candidate budget, and reuse derived-mode (DM)
+        state on the commit path of the already-pruned rough search, while
+        keeping exact DM recomputation for the cost comparison itself.
+        """
+    acceptance {
+        check chroma-calibration {
+            statement """
+                The new chroma default retains about 98% of the RGB
+                BD-rate gain of the old exhaustive search while cutting
+                about 75% of the exact chroma work and about 27% of the
+                added time on the 14-image calibration set.
+                """
+            method command
+            verified_by [ @bpg.evidence.chroma-calibration/1 ]
+        }
+    }
+    implements [ @bpg.decision.chroma-dm-reuse-conservative/1 ]
+    author "dk"
+    created_at 2026-07-03
+    source {
+        kind legacy
+        path "docs/handoff2.md"
+        excerpt """
+            The new default retains ~98% of the chroma RGB gain while
+            cutting ~75% of the exact chroma work and ~27% of the added
+            time on this set.
+            """
+    }
+}
+
+record bpg.work.contiguous-ctu-canvas/1 : work {
+    title "Contiguous per-CTU canvas overlay, phases 1 through 3"
+    state completed
+    intent """
+        Replace the per-CTU reconstruction overlay patch stack with a
+        contiguous working canvas: phase 1+1.5 lands the canvas itself and
+        an undo-journal rollback model; phase 2 retires the patch overlays
+        and the intra reference-border cache entirely; phase 3 removes
+        per-worker private full-resolution frame planes in favor of a
+        row-strip buffer plus canvas left-edge self-capture (frameless WPP
+        workers).
+        """
+    acceptance {
+        check phase-1-1-5-shipped {
+            statement """
+                Phase 1+1.5 (canvas overlay) lands byte-identical, default
+                on, with a measured -9...11% single-thread wall-time
+                improvement, reflected in the post-canvas 1.14x aggregate
+                sweep.
+                """
+            method command
+            verified_by [ @bpg.evidence.parity-sweep-1-14x/1 ]
+        }
+        check phase-3-shipped {
+            statement """
+                Phase 3 (frameless WPP workers) lands byte-identical
+                everywhere, cutting 50 MP peak working set from 3855 MB to
+                999 MB.
+                """
+            method command
+            verified_by [ @bpg.evidence.canvas-frameless-workers/1 ]
+        }
+    }
+    implements [ @bpg.decision.canvas-journal-undo-model/1, @bpg.decision.canvas-u16-storage/1 ]
+    part_of [ @bpg.milestone.parity-canvas ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/canvas-design.md"
+        excerpt """
+            Status: all phases shipped. Phase 1+1.5 landed as 277cd80
+            (2026-07-07, -9...11% single-thread, byte-identical, default-on);
+            """
+    }
+}
+
+record bpg.work.cu-tu-branch-and-bound/1 : work {
+    title "CU/TU leaf-first split branch-and-bound"
+    state completed
+    intent """
+        Once the partial child-cost sum makes the leaf-vs-split compare
+        unwinnable for split, skip the remaining children and run the
+        existing losing-split cleanup, shipped byte-identical by
+        construction and default-on for both the CU and TU split gates.
+        """
+    acceptance {
+        check byte-identical-suite {
+            statement """
+                An 84-file byte sweep across effort/QP combinations, gate on
+                vs off vs pre-change binary, finds zero mismatches.
+                """
+            method command
+            verified_by [ @bpg.evidence.cu-tu-bound-byte-identical/1 ]
+        }
+    }
+    author "dk"
+    created_at 2026-07-05
+    source {
+        kind legacy
+        path "docs/handoff2.md"
+        excerpt """
+            Once the partial child-cost sum makes the final leaf-vs-split
+            compare unwinnable for split, remaining children are skipped
+            and the existing losing-split cleanup runs... decisions and
+            output bytes are identical to full evaluation.
+            """
+    }
+}
+
+record bpg.work.hybrid-cpu-worker-cap/1 : work {
+    title "Hybrid-CPU WPP worker cap for narrow wavefronts"
+    state completed
+    intent """
+        Cap the default WPP worker count at the performance-core thread
+        count when rows are narrow enough that efficiency cores would
+        otherwise take a wavefront slot, closing the parallel-scheduling
+        gap identified on the 12 MP case.
+        """
+    acceptance {
+        check hybrid-cap-ratio {
+            statement """
+                The 7-image test-set-large aggregate ratio vs bpgenc -m9
+                reaches 1.040x with the cap in place.
+                """
+            method command
+            verified_by [ @bpg.evidence.parity-sweep-1-04x/1 ]
+        }
+    }
+    implements [ @bpg.decision.hybrid-cpu-worker-cap/1 ]
+    part_of [ @bpg.milestone.parity-handoff-hybrid ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            the default worker count is capped at the performance-core
+            thread count
+            """
+    }
+}
+
+record bpg.work.psy-rd-psy-rdoq/1 : work {
+    title "Implement psy-rd and psy-rdoq psychovisual levers"
+    state completed
+    intent """
+        Port x265's psy-rd (mode/TU/CU RD-cost energy term) and psy-rdoq
+        (RDOQ energy bias) levers to still265: config fields, env-override
+        resolvers (BPG_PSY_RD, BPG_PSY_RDOQ), thread-through to parallel
+        workers, and the weight kernel matching x265's rdcost.h shape.
+        """
+    acceptance {
+        check byte-identical-at-zero {
+            statement """
+                The encode is byte-identical to the pre-psy encoder when
+                psy_rd and psy_rdoq are both 0.0.
+                """
+            method command
+            verified_by [ @bpg.evidence.psy-rd-shape-match/1 ]
+        }
+        check weight-kernel-matches-x265 {
+            statement """
+                The psy-rd weight kernel matches x265's rdcost.h formula
+                shape, verified by a dedicated unit test.
+                """
+            method command
+            verified_by [ @bpg.evidence.psy-rd-shape-match/1 ]
+        }
+    }
+    implements [ @bpg.decision.psy-off-by-default/1 ]
+    author "dk"
+    created_at 2026-07-18
+    source {
+        kind legacy
+        path "docs/psy-design.md"
+        excerpt """
+            Goal: port x265's two psychovisual energy-preservation levers to
+            still265, off by default (byte-identical when 0.0), opt-in via
+            config + CLI, tunable for the AQ/perceptual-quality effort.
+            """
+    }
+}
+
+record bpg.work.rdoq-int64-cost-domain/1 : work {
+    title "Port RDOQ cost domain to x265-style int64 fixed point"
+    state completed
+    intent """
+        Replace RDOQ's scalar f64 cost arithmetic with x265's exact int64
+        fixed-point domain, seeded from x265's lambda2/scaleBits, as one
+        atomic change.
+        """
+    acceptance {
+        check bd-neutral-and-faster {
+            statement """
+                The port is BD-rate neutral (+0.002% at 12 MP, +0.0001% at
+                50 MP over QP 22-34) with a -1% single-thread wall-time
+                improvement.
+                """
+            method command
+            verified_by [ @bpg.evidence.rdoq-int64-neutral/1 ]
+        }
+    }
+    implements [ @bpg.decision.rdoq-int64-cost-domain/1 ]
+    part_of [ @bpg.milestone.parity-depth0-sao ]
+    author "dk"
+    created_at 2026-07-06
+    source {
+        kind legacy
+        path "docs/x265-speed-parity-audit.md"
+        excerpt """
+            Port the cost domain to x265's exact fixed point.
+            """
+    }
+}
+
+record bpg.work.root-tu-dedup/1 : work {
+    title "Root-TU dedup: reuse cheap-winner root-leaf luma in materialization"
+    state completed
+    intent """
+        Reuse the cheap-winner root-leaf luma result during materialization
+        instead of recomputing it, closing the final measured lever of the
+        speed-parity effort.
+        """
+    acceptance {
+        check final-aggregate-ratio {
+            statement """
+                The 7-image test-set-large sweep reaches aggregate 1.016x
+                vs bpgenc -m9.
+                """
+            method command
+            verified_by [ @bpg.evidence.parity-sweep-1-016x/1 ]
+        }
+        check hit-rate-and-cpu {
+            statement """
+                Root-TU dedup reaches a 100% hit rate on the 12 MP canonical
+                case with a measured -3.9% single-thread CPU reduction and
+                no output byte change.
+                """
+            method command
+            verified_by [ @bpg.evidence.root-tu-dedup-hit-rate/1 ]
+        }
+    }
+    part_of [ @bpg.milestone.parity-root-tu-dedup ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "README.md"
+        excerpt """
+            the latest 7-image sweep is 1.016x aggregate against bpgenc
+            -m9
+            """
+    }
+}
+
+record bpg.work.wpp-row-segment-handoff/1 : work {
+    title "WPP row-segment handoff scheduler"
+    state completed
+    intent """
+        Let idle workers take over stalled/parked WPP rows mid-stream
+        instead of blocking on the whole row, to reduce convoy/idle time
+        behind slow rows on hybrid P/E-core machines. Includes the
+        continuation tuning patches: release-cadence coarsening,
+        geometry-aware release policy, and notify-one wakeup.
+        """
+    acceptance {
+        check correctness-fully-gated {
+            statement """
+                The full suite plus 5x stress is byte-identical to
+                pre-handoff, including run-to-run determinism, the
+                whole-row and frameless fallbacks, serial, and tiles, before
+                shipping default-on.
+                """
+            method command
+            verified_by [ @bpg.evidence.wpp-handoff-scheduler/1 ]
+        }
+    }
+    implements [
+        @bpg.decision.wpp-geometry-aware-release-policy/1,
+        @bpg.decision.wpp-notify-one-wakeup/1,
+        @bpg.decision.wpp-release-coarsening/1
+    ]
+    part_of [ @bpg.milestone.parity-handoff-hybrid ]
+    author "dk"
+    created_at 2026-07-07
+    source {
+        kind legacy
+        path "docs/wpp-handoff-design.md"
+        excerpt """
+            Status: implemented and committed (8ac8c24), correctness fully
+            gated.
+            """
+    }
+}

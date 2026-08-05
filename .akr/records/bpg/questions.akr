@@ -1,0 +1,102 @@
+akr 0.1
+project bpg-rs
+
+record bpg.question.chroma-dm-capture-replay/1 : question {
+    title "Can DM capture/replay be extended beyond the existing partial reuse path?"
+    state open
+    question """
+        The existing chroma_reuse_dm path only skips DM rebuild when DM
+        wins under rough pruning. Item 1 of the optimization-testing-plan
+        asks whether capturing the materialized DM chroma result for wider
+        cost/rebuild reuse is worth doing, as a low-risk, byte-identical,
+        first item in the sequencing order (before WPP tuning, residual
+        SIMD, and the finalize-equality work).
+        """
+    author "dk"
+    created_at 2026-07-14
+    source {
+        kind legacy
+        path "docs/optimization-testing-plan.md"
+        excerpt """
+            Existing partial path: chroma_reuse_dm only skips DM rebuild
+            when DM wins under rough pruning. This item extends capture of
+            the materialized DM chroma result for cost/rebuild reuse.
+            """
+    }
+}
+
+record bpg.question.finalize-equality-before-skip/1 : question {
+    title "Can the finalize walk be made provably equal to retained search state before any skip is attempted again?"
+    state open
+    question """
+        The prior finalize-skip attempt (BPG_STILLSEARCH_REUSE_RETAINED_FINAL)
+        failed across Placebo chroma, deblocked luma, and 4:4:4 patterns.
+        Item 2A of the optimization-testing-plan treats finalize equality
+        as a correctness-investment prerequisite that must land, and pass,
+        before item 2B (finalize skip) is attempted again - "item 2B must
+        not leapfrog 2A".
+        """
+    blocks [ @bpg.decision.finalize-skip-not-shipped ]
+    depends_on [ @bpg.evidence.finalize-skip-attempt-failed/1 ]
+    author "dk"
+    created_at 2026-07-14
+    source {
+        kind legacy
+        path "docs/optimization-testing-plan.md"
+        excerpt """
+            Prior attempt (BPG_STILLSEARCH_REUSE_RETAINED_FINAL) failed
+            across Placebo chroma, deblocked luma, and 4:4:4 patterns. Do
+            not re-enable skip until 2A passes.
+            """
+    }
+}
+
+record bpg.question.residual-pricing-simd-path/1 : question {
+    title "What residual-pricing SIMD shape works given the serial per-bin context dependency?"
+    state open
+    question """
+        The originally-scoped costCoeffNxN-style AVX2 vectorization of
+        residual pricing does not map onto still265's context-evolving
+        pricing sink, since sig-flag/C1/C2 costing is a serial dependency
+        chain through the CABAC-style context models. Item 3 of the
+        optimization-testing-plan lists context-free residual-pricing SIMD
+        as an open lever, sequenced after WPP/hybrid tuning and before the
+        finalize-equality work.
+        """
+    depends_on [ @bpg.decision.rdoq-vectorization-rescoped/1 ]
+    author "dk"
+    created_at 2026-07-14
+    source {
+        kind legacy
+        path "docs/optimization-testing-plan.md"
+        excerpt """
+            Context-free residual-pricing SIMD ... byte-identical (if
+            bit-identical costs) or decision-affecting
+            """
+    }
+}
+
+record bpg.question.textured-12mp-tail/1 : question {
+    title "Why do textured 12 MP images stay slower than bpgenc -m9 after root-TU dedup?"
+    state open
+    question """
+        After the final 1.016x aggregate sweep, two of seven images beat C
+        outright and the smoothest 50 MP image is effectively at parity,
+        but the two textured 12 MP images still sit at 1.11x and 1.15x.
+        Item 6 of the optimization-testing-plan ("textured equal-bytes
+        quality gap") names this as an open, decision-affecting parallel
+        track, never blocked by the speed items but re-baselined after any
+        decision-affecting merge.
+        """
+    author "dk"
+    created_at 2026-07-14
+    source {
+        kind legacy
+        path "docs/optimization-testing-plan.md"
+        excerpt """
+            Item 1-5 success is measured against the current 1.016x
+            baseline and the textured 12 MP tail (historically ~1.11-1.15x),
+            not against audit-era 2x gaps.
+            """
+    }
+}

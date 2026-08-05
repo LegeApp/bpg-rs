@@ -1,0 +1,9 @@
+akr 0.1
+project bpg-rs
+
+namespace bpg "BPG format implementation: still265 encoder, bpg-hevc-decode, bpg-tools, bpg-viewer."
+
+defaults {
+    review_after_days 90
+    view_output "docs/generated"
+}

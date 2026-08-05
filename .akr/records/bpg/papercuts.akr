@@ -1,0 +1,13 @@
+akr 0.1
+project bpg-rs
+
+record bpg.papercut.task-brief-for-a-historical-port-asked-for-docs/1 : papercut {
+    title "Task brief for a historical port asked for…"
+    state verified
+    statement """
+        Task brief for a historical port asked for docs/generated/DECISION-HISTORY.md alongside ROADMAP.md to read as the development story, but this akr 0.1.0 build only implements the roadmap and papercuts view renderers -- decision-history, current-state, active-work, review-required, and open-questions all fail with AKR-E003 'the X renderer arrives with a later phase'. akr build and akr check --views-current silently treat the unimplemented views as vacuously current instead of warning, so the gap is only visible by running akr view <name> directly. Worth a note in the CLI help or check output that these renderers are stubs in 0.1.0.
+        """
+    observed_at git:fdc89eb2143ec53f48a9376e95aac45c94993f97
+    author "sonnet"
+    created_at 2026-08-05
+}

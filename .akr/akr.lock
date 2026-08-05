@@ -1,0 +1,451 @@
+akr-lock 0.1
+project bpg-rs
+
+build {
+    tool "akr 0.1.0"
+    grammar "0.1"
+    vocabulary "0.1"
+    commit git:fdc89eb2143ec53f48a9376e95aac45c94993f97
+    source_graph "sha256:1ee324c7041c8bc2a5b08a51106793a5c0e7f5dbdbef4df01f9423b1d87bd776"
+}
+
+source ".akr/project.akr" {
+    hash "sha256:6ea4d784216d6c7e09653777d55a34e4ae68c4539c6a8d73a467e54c894d012f"
+    records 0
+}
+
+source ".akr/records/bpg/assessments.akr" {
+    hash "sha256:9bbee402c276cd98ec2023e6929fdacb1201f8bd9f02390f35a9b9777e7e56a1"
+    records 6
+}
+
+source ".akr/records/bpg/constraints.akr" {
+    hash "sha256:4b7db5de9bbb203d56c0f24da785f19e741dd7396dbfab1ee43aabb7c6e7b747"
+    records 2
+}
+
+source ".akr/records/bpg/decisions.akr" {
+    hash "sha256:d54f73e3be36bea57838111532c746b10ed42783d5be76108af36b6ec7d53e42"
+    records 13
+}
+
+source ".akr/records/bpg/evidence.akr" {
+    hash "sha256:e12a329d48d8d104241232262bac9c09f18f9de03367cc1a74b5e06c16c2a541"
+    records 14
+}
+
+source ".akr/records/bpg/milestones.akr" {
+    hash "sha256:34219f9040b3870dd4bdee5d9fc0f1aa519bf4f692e02e6fe131a41b9cff920c"
+    records 5
+}
+
+source ".akr/records/bpg/observations.akr" {
+    hash "sha256:5de727a18543587e6cbc2b08eafe780d731d91e17f61e4ecdf9493d81787a82b"
+    records 9
+}
+
+source ".akr/records/bpg/papercuts.akr" {
+    hash "sha256:14041c6201ab33656722041543b700dbd41da66291d5fc18df1346c3c220ed0b"
+    records 1
+}
+
+source ".akr/records/bpg/policies.akr" {
+    hash "sha256:84d4e1d06ebd3b47258cb97d1b12f121de61b7946b7667c38d483550fcdfe1d2"
+    records 3
+}
+
+source ".akr/records/bpg/questions.akr" {
+    hash "sha256:29a48f79c24c78f476b81f79a06a9737f56fe6e9f482bead14c8bfe36401cea8"
+    records 4
+}
+
+source ".akr/records/bpg/terms.akr" {
+    hash "sha256:59fa9585cc999e27c1e5eb9cfc311d7badd3cb522e24271b1a147ce2e55d551b"
+    records 4
+}
+
+source ".akr/records/bpg/work.akr" {
+    hash "sha256:77399c9c12bbdb194a10f749c6e8a57c2741e6d25c97e4d93cba20dfc3c0f3f9"
+    records 9
+}
+
+resolution @bpg.question.finalize-equality-before-skip/1 {
+    slot blocks
+    to @bpg.decision.finalize-skip-not-shipped/1
+    hash "sha256:45a1728039ea7f17f32e284783b1d4dd2ca8971fb6e9ead46102f7c7d15865bf"
+}
+
+resolution @bpg.work.contiguous-ctu-canvas/1 {
+    slot part_of
+    to @bpg.milestone.parity-canvas/1
+    hash "sha256:c615c3530031f3ff8f9eaa01fccc0ca81c821115bd0830f4820cf5dcf04acc5a"
+}
+
+resolution @bpg.work.hybrid-cpu-worker-cap/1 {
+    slot part_of
+    to @bpg.milestone.parity-handoff-hybrid/1
+    hash "sha256:92ced9782c7855d3b7d5231aa5ac30634e419467346394f1d7f4152b4ee62eba"
+}
+
+resolution @bpg.work.rdoq-int64-cost-domain/1 {
+    slot part_of
+    to @bpg.milestone.parity-depth0-sao/1
+    hash "sha256:23d56964ad9f911ebb3b1caa01b8e7866978358a5f16eb1138fb5730223eeefe"
+}
+
+resolution @bpg.work.root-tu-dedup/1 {
+    slot part_of
+    to @bpg.milestone.parity-root-tu-dedup/1
+    hash "sha256:36fb468cfaf8727502e2a20917a4a5663fb3e951f2b2aae1ac56f6c3dd44126c"
+}
+
+resolution @bpg.work.wpp-row-segment-handoff/1 {
+    slot part_of
+    to @bpg.milestone.parity-handoff-hybrid/1
+    hash "sha256:92ced9782c7855d3b7d5231aa5ac30634e419467346394f1d7f4152b4ee62eba"
+}
+
+seal @bpg.assessment.headline-diagnosis/1 {
+    state verified
+    hash "sha256:514f21bc3a97c475a6a1e41c575222c8fa9343f9b6920ecae578f66253997b1d"
+}
+
+seal @bpg.assessment.parallel-efficiency-not-kernels/1 {
+    state verified
+    hash "sha256:d681c2691934781bdcd132c93fd42d013e37df497eb9ddfe3a1424440309681f"
+}
+
+seal @bpg.assessment.rdoq-selection-refuted/1 {
+    state verified
+    hash "sha256:b92c5ff0c8b783e89c88ce1663bb4f4ed26163dfc56d27d2967612cf95a059e4"
+}
+
+seal @bpg.assessment.saliency-proposals-superseded/1 {
+    state superseded
+    hash "sha256:e52c083659f7bd652f6bd33f5df54be9031c7818f52174199ac6c9e65867e808"
+}
+
+seal @bpg.assessment.slow-canonical-switch-interpretation/1 {
+    state verified
+    hash "sha256:7d23fd92c08063d43e96dd560d72a04e22338f086113f36b26dcd37341e2eb0a"
+}
+
+seal @bpg.assessment.wide-simd-predictor-refuted/1 {
+    state verified
+    hash "sha256:6ffeaa759692e3a6e891f737894a8d6758e1e18b775fa9d45f24de3d51c48d00"
+}
+
+seal @bpg.constraint.decision-class-taxonomy/1 {
+    state active
+    hash "sha256:e4ee515985d5e03fd529118c7eab0f27c99218ebc9630a66394e956a3678db34"
+}
+
+seal @bpg.constraint.psy-zero-cost-when-off/1 {
+    state active
+    hash "sha256:c32182dfb290f66bdbd59cf3e88735d8885e9438ddae854f2e726a131d1e117e"
+}
+
+seal @bpg.decision.canonical-slow-variant-c/1 {
+    state active
+    hash "sha256:648bd26f2467db18afa08f11e2987a509618ab3d62f8274c77ccee3defc0c8d6"
+}
+
+seal @bpg.decision.canvas-journal-undo-model/1 {
+    state active
+    hash "sha256:0573951d61ee72e25913bb9c473eb97ffb901be4be7220932ef98dbfc10f78af"
+}
+
+seal @bpg.decision.canvas-u16-storage/1 {
+    state active
+    hash "sha256:70a15b77315f22ee9bfd908d9015283a222f1722c2845bdd0909980ab173f0f1"
+}
+
+seal @bpg.decision.chroma-dm-reuse-conservative/1 {
+    state active
+    hash "sha256:1560b5a2dae353c93db1d6dd3ef5495c86c4562f75d9b3dc4bf14a753898911b"
+}
+
+seal @bpg.decision.finalize-skip-not-shipped/1 {
+    state active
+    hash "sha256:45a1728039ea7f17f32e284783b1d4dd2ca8971fb6e9ead46102f7c7d15865bf"
+}
+
+seal @bpg.decision.hybrid-cpu-worker-cap/1 {
+    state active
+    hash "sha256:b6c864ebc4f17f31d1c3956d2847855d3967abc080060d9c20380849808e4043"
+}
+
+seal @bpg.decision.psy-off-by-default/1 {
+    state active
+    hash "sha256:0e2459c39060617d3c69601e60fce87d11b431f9feb4f6731f80f9e3d19b106d"
+}
+
+seal @bpg.decision.rdoq-int64-cost-domain/1 {
+    state active
+    hash "sha256:5d21b31befbc48940ae598d25507dcde17b73b9e08c29dbef92c8cb973bd9bc7"
+}
+
+seal @bpg.decision.rdoq-vectorization-rescoped/1 {
+    state active
+    hash "sha256:7af68f07e89c8cce0be943a59e493aead05a571e981ac9a1daf84d37e65aa9fc"
+}
+
+seal @bpg.decision.wpp-geometry-aware-release-policy/1 {
+    state active
+    hash "sha256:5557bd2b2d127594681826cd82d0cc56ffee202994b1547dd436170fc911a086"
+}
+
+seal @bpg.decision.wpp-notify-one-wakeup/1 {
+    state active
+    hash "sha256:a53644cdfea4879029da155825b78b8b218fa44003f7877428e6cd60092f9d04"
+}
+
+seal @bpg.decision.wpp-release-coarsening/1 {
+    state superseded
+    hash "sha256:b40b58719488f1c67b85b55ae924b9790da5bb64d60c6ff4b7f6c7cb94fa0291"
+}
+
+seal @bpg.evidence.baseline-ratio-measured/1 {
+    state verified
+    hash "sha256:eef25f0d54710a63a0bdee460daca42be918826cd378aa51ee58dcd3bfa7c2ba"
+}
+
+seal @bpg.evidence.canvas-frameless-workers/1 {
+    state verified
+    hash "sha256:9f6d5a9bf752952d40a28e6ffa70699853b079acb8da801d7133b0e17bbf7340"
+}
+
+seal @bpg.evidence.chroma-calibration/1 {
+    state verified
+    hash "sha256:2819f41642480e3c3d39fe77e12dd63bd0c2cd2c361da408b594328571d67dd9"
+}
+
+seal @bpg.evidence.cu-tu-bound-byte-identical/1 {
+    state verified
+    hash "sha256:d355b68b81a4ae18261c511174fa2e01791a9653b01366055f0324571b6793db"
+}
+
+seal @bpg.evidence.finalize-skip-attempt-failed/1 {
+    state verified
+    hash "sha256:f95453ef2317a9bac25f7461b3446bcdc7816e3dc6520bfdd449ff593b7934d0"
+}
+
+seal @bpg.evidence.parity-sweep-1-016x/1 {
+    state verified
+    hash "sha256:1a7f74c64f587f9b092842730406114bd98eb1dc8129d82d0b8137875833cb00"
+}
+
+seal @bpg.evidence.parity-sweep-1-04x/1 {
+    state verified
+    hash "sha256:7f277f283f48901fa6b6f0d6e04a17fb38b8892d710cfd2aafd2c059020b62fa"
+}
+
+seal @bpg.evidence.parity-sweep-1-14x/1 {
+    state verified
+    hash "sha256:fa2797ce61ebc72ebcec1d8acde6f7dbeba74b44d4f90c42c89d753002ece6f8"
+}
+
+seal @bpg.evidence.parity-sweep-1-32x/1 {
+    state verified
+    hash "sha256:0814d8bb8213dbbd429fc414df263619f724b9a19133463a981ea2080174fd6c"
+}
+
+seal @bpg.evidence.psy-rd-shape-match/1 {
+    state verified
+    hash "sha256:67985ec11099497536dabc02a20c612889bc4021aec238148523a2af68a4e16c"
+}
+
+seal @bpg.evidence.rdoq-int64-neutral/1 {
+    state verified
+    hash "sha256:afe8792c3cb9e2052af0225c68ce3364f506a057c6a1f860ff5681e6f48197af"
+}
+
+seal @bpg.evidence.root-tu-dedup-hit-rate/1 {
+    state verified
+    hash "sha256:42622e07b7f62242c16f767564b99a4ab6300e21e8dadae5f6f53a636f9c39aa"
+}
+
+seal @bpg.evidence.slow-oracle-rejection/1 {
+    state verified
+    hash "sha256:f3ac687a837f115809542d0ccc2530f6f8ba8097d42a57bf577403b5065a653d"
+}
+
+seal @bpg.evidence.wpp-handoff-scheduler/1 {
+    state verified
+    hash "sha256:0a7acd36d005ad9651ba36f774f678dc8defa28fff3c0d5bdb7f86da9403c2b7"
+}
+
+seal @bpg.milestone.parity-baseline-pre-refactor/1 {
+    state completed
+    hash "sha256:0f7df397334ad887dfe98bb9833f3b0952920a9c45bf2d2fdc1def357b99d4d3"
+}
+
+seal @bpg.milestone.parity-canvas/1 {
+    state completed
+    hash "sha256:c615c3530031f3ff8f9eaa01fccc0ca81c821115bd0830f4820cf5dcf04acc5a"
+}
+
+seal @bpg.milestone.parity-depth0-sao/1 {
+    state completed
+    hash "sha256:23d56964ad9f911ebb3b1caa01b8e7866978358a5f16eb1138fb5730223eeefe"
+}
+
+seal @bpg.milestone.parity-handoff-hybrid/1 {
+    state completed
+    hash "sha256:92ced9782c7855d3b7d5231aa5ac30634e419467346394f1d7f4152b4ee62eba"
+}
+
+seal @bpg.milestone.parity-root-tu-dedup/1 {
+    state completed
+    hash "sha256:36fb468cfaf8727502e2a20917a4a5663fb3e951f2b2aae1ac56f6c3dd44126c"
+}
+
+seal @bpg.observation.canvas-memory-reduction/1 {
+    state verified
+    hash "sha256:3a9f7f7ef43c95337664f437bed21aeed00456d7a6bb5716dcfc805fe45492ca"
+}
+
+seal @bpg.observation.critical-review-5x-gap/1 {
+    state superseded
+    hash "sha256:b1314e624263d333a297de230ecc454080ea27d65d728d26de064d089c6c531c"
+}
+
+seal @bpg.observation.ctx-evolve-chroma-gains/1 {
+    state verified
+    hash "sha256:48e509b5c796290dc5a589a9518301163bf463ebe5d028ac627d6b95cb4ebcd0"
+}
+
+seal @bpg.observation.pivotal-bucket-comparison/1 {
+    state verified
+    hash "sha256:703614b6e347746e112e24c1edfb9f80f2219c2316677c740e94673b105d3cd0"
+}
+
+seal @bpg.observation.rdoq-in-search-bdrate/1 {
+    state verified
+    hash "sha256:9ae5291290ed72cfb83b1c2664c68211fa73765b8829b6d0dab32b18e919fc96"
+}
+
+seal @bpg.observation.simd-audit-work-buckets/1 {
+    state verified
+    hash "sha256:a4e2661ecc2b78d2de5ed03a5311c8f4fab1217805e7bf1e00240c02e2db7816"
+}
+
+seal @bpg.observation.slow-canonical-oracle-rejection/1 {
+    state superseded
+    hash "sha256:5637699deb6a1fd13f777b53d10968dc6c9a1e0a39a73737ec37741abe41a110"
+}
+
+seal @bpg.observation.speed-parity-final-sweep/1 {
+    state verified
+    hash "sha256:8a918eb42d8cd3b120f60ed4e6f6126670470e36b4e87a13d856763177028ce0"
+}
+
+seal @bpg.observation.wpp-idle-time/1 {
+    state verified
+    hash "sha256:b584a502792c46ade9b43946b4091793535e2363863c12d024c08c43946db694"
+}
+
+seal @bpg.papercut.task-brief-for-a-historical-port-asked-for-docs/1 {
+    state verified
+    hash "sha256:05b26551d9e72d495c7a162cdca5d67e7cf83d79263bd268f8ee249d81296bd7"
+}
+
+seal @bpg.policy.commit-scoping/1 {
+    state active
+    hash "sha256:2691cd35f2a2da3af886503e916a8d57736d6d766c22120b030f13b39a194464"
+}
+
+seal @bpg.policy.env-toggle-naming/1 {
+    state active
+    hash "sha256:b54afa5f28efd5ea2e0269ce77920df85f85d2f6f06be1e371b5d42e0c2c629d"
+}
+
+seal @bpg.policy.testing-conventions/1 {
+    state active
+    hash "sha256:4a2e875bedc1a569e58ca5638b34157778e8673c42aadde5eeaabeaf81f90629"
+}
+
+seal @bpg.question.chroma-dm-capture-replay/1 {
+    state open
+    hash "sha256:d05af40c50b2ef7252eb1ce8caf1ecb057a82ba1ed852c46febae5dd69cd1b70"
+}
+
+seal @bpg.question.finalize-equality-before-skip/1 {
+    state open
+    hash "sha256:8a87cba4939a1bd180edde0f47ed45c2bb769476946e874e4321687ce8f9bb62"
+}
+
+seal @bpg.question.residual-pricing-simd-path/1 {
+    state open
+    hash "sha256:dedae56976ddcc396de15dd6584d9dc47869508838cab8a38efd09302584cbe7"
+}
+
+seal @bpg.question.textured-12mp-tail/1 {
+    state open
+    hash "sha256:4bec07a107dc56fc03dc3adf7813d692d25978121264d105a5260018cf8e904a"
+}
+
+seal @bpg.term.bpg-hevc-decode/1 {
+    state active
+    hash "sha256:e71a2f3a96efe0af3e00e10e10ed7c54fb8bfdf447a6c7f8b4e55ed665f168d9"
+}
+
+seal @bpg.term.bpg-tools/1 {
+    state active
+    hash "sha256:45356763f2f91045def9e4ee0fe1ac0402f4776d0f09330471e9da2bf2dd76c9"
+}
+
+seal @bpg.term.still265/1 {
+    state active
+    hash "sha256:6df6ebdccc687bcf83dba7ff0ce0551e835629613d19c6e94808b8d56637c229"
+}
+
+seal @bpg.term.support-crates/1 {
+    state active
+    hash "sha256:61e5493e0f874e312d644298d2a72e4c1d9bdc43d60b3a8ec597c7e4156efe12"
+}
+
+seal @bpg.work.canonical-slow-variant-c/1 {
+    state completed
+    hash "sha256:8d062a603dfca12b12ac5567000dd2f634f833b37650d2a9c76542de37adf02c"
+}
+
+seal @bpg.work.chroma-search-optimization/1 {
+    state completed
+    hash "sha256:0a5f6bcdef6c1d611fa1231eee56b30e8b48d4400deaecd4bf2e8353c97dc031"
+}
+
+seal @bpg.work.contiguous-ctu-canvas/1 {
+    state completed
+    hash "sha256:b971bb2dc705ef773a761dc06b274a06b0df250068718393ececd7b571288b9b"
+}
+
+seal @bpg.work.cu-tu-branch-and-bound/1 {
+    state completed
+    hash "sha256:c4ec5f53e65b3030cde8c4f27b5bf9eaf0706282863c118383feb31175a3965b"
+}
+
+seal @bpg.work.hybrid-cpu-worker-cap/1 {
+    state completed
+    hash "sha256:56ce4b715042c2c9fe58ac70cad4abe4b2ad5d78a702b90fcb24d0e2a9990c86"
+}
+
+seal @bpg.work.psy-rd-psy-rdoq/1 {
+    state completed
+    hash "sha256:81e8620605a4881a6e334abfc6b3d0429dfae998d4b1d32c368a08cc4cf35ce9"
+}
+
+seal @bpg.work.rdoq-int64-cost-domain/1 {
+    state completed
+    hash "sha256:21e5f542952f384fc3a1eb197b3ce260742987feb59d50a9f4ebbeda270cd7fd"
+}
+
+seal @bpg.work.root-tu-dedup/1 {
+    state completed
+    hash "sha256:cf9d0e2f1563d0db308a3bf712be04b189861caf71b80910c5fc6d483c5fd75c"
+}
+
+seal @bpg.work.wpp-row-segment-handoff/1 {
+    state completed
+    hash "sha256:121f83ed9102ac4b98311b672651af0d724114a85df4c3f3eb748208ce7950f7"
+}

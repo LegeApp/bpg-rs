@@ -1,0 +1,70 @@
+akr 0.1
+project bpg-rs
+
+record bpg.constraint.decision-class-taxonomy/1 : constraint {
+    title "Every optimization claim is byte-identical, decision-neutral, or decision-affecting"
+    state active
+    scope [ path "crates/still265/**" ]
+    statement """
+        Any change to still265's search or encode path must be classified
+        into exactly one of three classes before it can be promoted, and
+        each class carries its own required gate: byte-identical changes
+        need a hash match across a resolution/QP/threading matrix;
+        decision-neutral changes need a BD-rate sweep showing |BD| at or
+        below about 0.05%; decision-affecting changes need a full
+        multi-image BD-rate and quality narrative and must never be
+        described as "free speed".
+        """
+    measure """
+        Byte-identical: hash match at 12+50 MP x QP {22,28,34}, serial +
+        tiles + WPP. Decision-neutral: BD-rate over QP {22,28,34} or
+        {28,30,32,34}, |BD| <= ~0.05% to promote.
+        """
+    rationale """
+        Distinguishing these three classes is what let the project keep
+        landing speed work through the 1.9-2.5x -> 1.016x parity
+        progression without silently drifting quality.
+        """
+    author "dk"
+    created_at 2026-07-14
+    source {
+        kind legacy
+        path "docs/optimization-testing-plan.md"
+        excerpt """
+            | Class | Meaning | Required extra gate |
+            | **Byte-identical** | Same bitstream as feature-off baseline |
+            Hash match at 12+50 MP x QP {22,28,34}; serial + tiles + WPP |
+            | **Decision-neutral** | May restructure work but BD-rate ~ 0 |
+            BD-rate over QP {22,28,34} or {28,30,32,34}; |BD| <= ~0.05% to
+            promote | | **Decision-affecting** | Changes RD choices | Full
+            multi-image BD + quality narrative; do not claim "free speed" |
+            """
+    }
+}
+
+record bpg.constraint.psy-zero-cost-when-off/1 : constraint {
+    title "psy-rd/psy-rdoq must be byte-identical when both are zero"
+    state active
+    scope [ path "crates/still265/src/encoder/stillsearch/**" ]
+    statement """
+        When both `psy_rd` and `psy_rdoq` are 0.0, the encode must be
+        byte-identical to the pre-psy encoder. All new psychovisual work is
+        guarded behind `psy_rd > 0` / `psy_rdoq > 0`.
+        """
+    measure "byte-identical at psy_rd = psy_rdoq = 0.0"
+    rationale """
+        The two levers are off by default and opt-in, so nothing may change
+        for a caller who never sets them.
+        """
+    author "dk"
+    created_at 2026-07-16
+    source {
+        kind legacy
+        path "docs/psy-design.md"
+        excerpt """
+            When both are 0.0 the encode must be byte-identical to today.
+            Zero-cost when off: guard all new work behind `psy_rd > 0` /
+            `psy_rdoq > 0`.
+            """
+    }
+}
