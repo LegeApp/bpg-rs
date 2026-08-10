@@ -1578,6 +1578,24 @@ fn apply_clean_aperture(frame: DecodedFrame, clap: &CleanAperture) -> DecodedFra
 // Public entry points
 // ---------------------------------------------------------------------------
 
+fn transformed_dimensions(mut width: u32, mut height: u32, transforms: &[Transform]) -> (u32, u32) {
+    for transform in transforms {
+        match transform {
+            Transform::CleanAperture(clap) => {
+                if clap.width_d != 0 && clap.height_d != 0 {
+                    width = clap.width_n / clap.width_d;
+                    height = clap.height_n / clap.height_d;
+                }
+            }
+            Transform::Rotation(rotation) if matches!(rotation.angle, 90 | 270) => {
+                std::mem::swap(&mut width, &mut height);
+            }
+            Transform::Mirror(_) | Transform::Rotation(_) => {}
+        }
+    }
+    (width, height)
+}
+
 /// Parse HEIC/HEIF metadata without decoding pixel data.
 pub fn get_heic_image_info(data: &[u8]) -> Result<HeicImageInfo, DecodeError> {
     let container = parse_container(data)?;
@@ -1605,9 +1623,11 @@ pub fn get_heic_image_info(data: &[u8]) -> Result<HeicImageInfo, DecodeError> {
     if let Some(ref cfg) = primary.hevc_config {
         let bhd_cfg = cfg.to_bhd();
         if let Ok(info) = hevc::get_info_from_config(&bhd_cfg) {
+            let (width, height) =
+                transformed_dimensions(info.width, info.height, &primary.transforms);
             return Ok(HeicImageInfo {
-                width: info.width,
-                height: info.height,
+                width,
+                height,
                 has_alpha,
                 bit_depth: cfg.bit_depth_luma_minus8 + 8,
                 chroma_format: cfg.chroma_format,
@@ -1621,10 +1641,11 @@ pub fn get_heic_image_info(data: &[u8]) -> Result<HeicImageInfo, DecodeError> {
     // Grid/iden/iovl: dimensions from ispe
     if primary.kind != ItemKind::Hvc1 {
         if let Some((w, h)) = primary.dimensions {
+            let (width, height) = transformed_dimensions(w, h, &primary.transforms);
             let (bit_depth, chroma_format) = tile_format_from_dimg(&container, primary.id);
             return Ok(HeicImageInfo {
-                width: w,
-                height: h,
+                width,
+                height,
                 has_alpha,
                 bit_depth,
                 chroma_format,
@@ -1640,9 +1661,11 @@ pub fn get_heic_image_info(data: &[u8]) -> Result<HeicImageInfo, DecodeError> {
         .get_item_data(primary.id)
         .ok_or_else(|| invalid_data("missing image data"))?;
     let hevc_info = hevc::get_info(image_data).map_err(DecodeError::HevcDecode)?;
+    let (width, height) =
+        transformed_dimensions(hevc_info.width, hevc_info.height, &primary.transforms);
     Ok(HeicImageInfo {
-        width: hevc_info.width,
-        height: hevc_info.height,
+        width,
+        height,
         has_alpha,
         bit_depth: 8,
         chroma_format: 1,

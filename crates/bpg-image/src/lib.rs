@@ -373,6 +373,40 @@ impl Image {
         self.chroma_format = ChromaFormat::Yuv422;
     }
 
+    /// Downscale an image so neither luma dimension exceeds `max_edge`.
+    ///
+    /// A separable, scale-aware Lanczos-3 filter is used for thumbnail
+    /// generation. Images already within the bound are cloned unchanged.
+    pub fn resize_to_fit(&self, max_edge: u32) -> Self {
+        assert!(max_edge > 0, "max_edge must be non-zero");
+        let longest = self.width.max(self.height);
+        if longest <= max_edge {
+            return self.clone();
+        }
+        let scale = max_edge as f64 / longest as f64;
+        let width = ((self.width as f64 * scale).round() as u32).max(1);
+        let height = ((self.height as f64 * scale).round() as u32).max(1);
+        let mut planes = Vec::with_capacity(self.planes.len());
+        for (index, plane) in self.planes.iter().enumerate() {
+            let (pw, ph) = if index == 0 {
+                (width, height)
+            } else {
+                chroma_plane_dims(width, height, self.chroma_format)
+            };
+            planes.push(resize_plane_lanczos3(plane, pw, ph, self.bit_depth));
+        }
+        Self {
+            width,
+            height,
+            bit_depth: self.bit_depth,
+            chroma_format: self.chroma_format,
+            color_space: self.color_space,
+            limited_range: self.limited_range,
+            planes,
+            has_alpha: false,
+        }
+    }
+
     /// Returns the (h_shift, v_shift) of plane `idx` relative to the luma
     /// plane: chroma plane dimensions are `(w + h_shift) >> h_shift` etc.
     fn plane_shifts(&self, idx: usize) -> (u32, u32) {
@@ -404,6 +438,94 @@ impl Image {
         }
         self.width = w1;
         self.height = h1;
+    }
+}
+
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-9 {
+        1.0
+    } else {
+        let p = std::f64::consts::PI * x;
+        p.sin() / p
+    }
+}
+
+fn lanczos_weight(distance: f64, downscale: f64) -> f64 {
+    let x = distance / downscale;
+    if x.abs() >= 3.0 {
+        0.0
+    } else {
+        sinc(x) * sinc(x / 3.0)
+    }
+}
+
+fn resize_plane_lanczos3(
+    source: &Plane<u16>,
+    width: u32,
+    height: u32,
+    bit_depth: u8,
+) -> Plane<u16> {
+    let src_w = source.width as usize;
+    let src_h = source.height as usize;
+    let dst_w = width as usize;
+    let dst_h = height as usize;
+    let sx = src_w as f64 / dst_w as f64;
+    let sy = src_h as f64 / dst_h as f64;
+    let support_x = 3.0 * sx.max(1.0);
+    let support_y = 3.0 * sy.max(1.0);
+
+    let mut horizontal = vec![0.0f64; dst_w * src_h];
+    for y in 0..src_h {
+        for dx in 0..dst_w {
+            let center = (dx as f64 + 0.5) * sx - 0.5;
+            let first = (center - support_x).floor() as i64;
+            let last = (center + support_x).ceil() as i64;
+            let mut sum = 0.0;
+            let mut weight_sum = 0.0;
+            for ix in first..=last {
+                let clamped = ix.clamp(0, src_w as i64 - 1) as usize;
+                let weight = lanczos_weight(center - ix as f64, sx.max(1.0));
+                sum += source.data[y * source.stride + clamped] as f64 * weight;
+                weight_sum += weight;
+            }
+            horizontal[y * dst_w + dx] = if weight_sum.abs() > 1e-12 {
+                sum / weight_sum
+            } else {
+                source.data
+                    [y * source.stride + center.round().clamp(0.0, src_w as f64 - 1.0) as usize]
+                    as f64
+            };
+        }
+    }
+
+    let pixel_max = ((1u32 << bit_depth) - 1) as f64;
+    let mut data = vec![0u16; dst_w * dst_h];
+    for dy in 0..dst_h {
+        let center = (dy as f64 + 0.5) * sy - 0.5;
+        let first = (center - support_y).floor() as i64;
+        let last = (center + support_y).ceil() as i64;
+        for x in 0..dst_w {
+            let mut sum = 0.0;
+            let mut weight_sum = 0.0;
+            for iy in first..=last {
+                let clamped = iy.clamp(0, src_h as i64 - 1) as usize;
+                let weight = lanczos_weight(center - iy as f64, sy.max(1.0));
+                sum += horizontal[clamped * dst_w + x] * weight;
+                weight_sum += weight;
+            }
+            let value = if weight_sum.abs() > 1e-12 {
+                sum / weight_sum
+            } else {
+                horizontal[center.round().clamp(0.0, src_h as f64 - 1.0) as usize * dst_w + x]
+            };
+            data[dy * dst_w + x] = value.round().clamp(0.0, pixel_max) as u16;
+        }
+    }
+    Plane {
+        data,
+        width,
+        height,
+        stride: dst_w,
     }
 }
 
@@ -529,5 +651,32 @@ mod tests {
         assert_eq!(img.planes[0].data[0], 255);
         // 512/1023 * 255 ≈ 127
         assert!((img.planes[1].data[0] as i32 - 127).abs() <= 1);
+    }
+
+    #[test]
+    fn resize_to_fit_preserves_format_and_chroma_geometry() {
+        let pixels = vec![96u8; 17 * 9 * 3];
+        let mut image = Image::from_rgb8(&pixels, 17, 9, ColorSpace::YCbCrBt709, true, 10);
+        image.subsample_to_420(1);
+
+        let thumbnail = image.resize_to_fit(8);
+
+        assert_eq!((thumbnail.width, thumbnail.height), (8, 4));
+        assert_eq!(thumbnail.bit_depth, 10);
+        assert_eq!(thumbnail.chroma_format, ChromaFormat::Yuv420);
+        assert_eq!(thumbnail.color_space, ColorSpace::YCbCrBt709);
+        assert!(thumbnail.limited_range);
+        assert_eq!(
+            (thumbnail.planes[0].width, thumbnail.planes[0].height),
+            (8, 4)
+        );
+        assert_eq!(
+            (thumbnail.planes[1].width, thumbnail.planes[1].height),
+            (4, 2)
+        );
+        assert_eq!(
+            (thumbnail.planes[2].width, thumbnail.planes[2].height),
+            (4, 2)
+        );
     }
 }

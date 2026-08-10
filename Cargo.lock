@@ -378,6 +378,7 @@ name = "still265"
 version = "0.5.2"
 dependencies = [
  "bpg-bitstream",
+ "bpg-decode",
  "bpg-encode",
  "bpg-hevc",
  "bpg-hevc-decode",

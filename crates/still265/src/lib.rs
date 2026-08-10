@@ -382,7 +382,7 @@ impl StillHevcEncoder {
     /// data (Phase 5).
     pub fn syntax_skeleton(config: &StillHevcConfig) -> Vec<u8> {
         let mut out = Vec::new();
-        nal::write_annexb_nal(&mut out, nal::NalType::Vps, &params::write_vps());
+        nal::write_annexb_nal(&mut out, nal::NalType::Vps, &params::write_vps(config));
         nal::write_annexb_nal(&mut out, nal::NalType::Sps, &params::write_sps(config));
         let wpp = params::effective_wpp_enabled(config);
         let tiles = params::effective_tile_dims(config);

@@ -14,7 +14,7 @@ The workspace provides:
 
 No C or C++ encoder/decoder is built or linked. There is no `cmake`, `libx265`,
 `libde265`, or `libbpg` dependency in the Rust workspace. The tools read PNG/JPEG,
-write BPG, and decode BPG/HEIC/HEIF back to JPEG or PNG.
+write BPG or HEIC, and decode BPG/HEIC/HEIF back to JPEG or PNG.
 
 ## Current state
 
@@ -86,7 +86,7 @@ encode path, or lossless mode.
 | `bpg-hevc` | Annex-B NAL parsing, emulation-prevention handling, and VPS/SPS rewriting for BPG's modified HEVC stream. |
 | `bpg-hevc-decode` | Pure-Rust HEVC still-picture intra decoder: CABAC, intra prediction, transform/dequant, deblocking, and SAO. |
 | `bpg-decode` | BPG/HEIC/HEIF container decode to RGB(A), BGR(A), PNG, or JPEG output paths. |
-| `bpg-encode` | `HevcEncoder` trait and still-image encode orchestration. |
+| `bpg-encode` | `HevcEncoder` trait, still-image encode orchestration, and item-based HEIC writer. |
 | `still265` | Rust-native HEVC intra still encoder. |
 | `toojpeg` | Vendored minimal JPEG writer used by decode output. |
 | `bpg-tools` | CLI exposing `encode`, `decode`, and comparison/development tools. |
@@ -122,6 +122,15 @@ cargo run -p bpg-tools --release -- input.png -o out.bpg \
   --qp 28 --format 420 --effort slow --aq
 ```
 
+Encode HEIC by using a `.heic`/`.heif` output name, or select the container
+explicitly. HEIC output preserves EXIF/XMP and embeds a maximum-edge 320-pixel
+thumbnail by default:
+
+```bash
+cargo run -p bpg-tools --release -- input.jpg -o out.heic --qp 28
+cargo run -p bpg-tools --release -- input.png -o out.bin --container heic
+```
+
 The installed binary is `bpgenc`, so the equivalent command is
 `bpgenc input.png -o out.bpg --qp 28 --format 420 --effort slow --aq`.
 Install it locally with `cargo install --path crates/bpg-tools --bin bpgenc`.
@@ -135,6 +144,10 @@ Important encode options:
 - `--format gray|420|422|444`: output chroma format.
 - `--bit-depth 8|10|12`: encode bit depth. 10/12-bit paths need suitable input
   to be useful.
+- `--container auto|bpg|heic`: output container. `auto` selects HEIC for
+  `.heic`/`.heif` output names and BPG otherwise.
+- `--no-thumbnail` / `--strip-metadata`: omit the default HEIC thumbnail or
+  copied EXIF/XMP metadata.
 - `--aq [MODE]`: optional adaptive quantization. Bare `--aq` chooses the
   recommended measured two-pass mode; omit it (or use `--aq off`) for
   stock-`bpgenc`-comparable uniform QP. Pass a mode explicitly to experiment
@@ -251,6 +264,8 @@ Implemented:
 
 - still-image lossy CQP encode and decode;
 - stock BPG-compatible output streams;
+- item-based HEIC encode with HEVC configuration, clean aperture, color and
+  pixel properties, EXIF/XMP, orientation, and thumbnails;
 - decode of third-party BPG/HEIC/HEIF still images covered by the supported HEVC
   intra feature set;
 - gray, 4:2:0, 4:2:2, and 4:4:4;

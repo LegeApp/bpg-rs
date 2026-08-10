@@ -53,13 +53,17 @@ fn write_rbsp_trailing_bits(w: &mut BitWriter) {
 }
 
 /// `profile_tier_level(profilePresentFlag=1, maxNumSubLayersMinus1=0)`
-/// (H.265 7.3.3), with the general profile/level constants from the oracle
-/// dump (Main profile, level 4.0 == `general_level_idc=120`).
+/// (H.265 7.3.3). Still pictures use Main Still Picture for 8-bit 4:2:0
+/// and Main Range Extensions for the wider still265 format matrix.
 ///
 /// `max_sub_layers_minus1` must be 0: the per-sub-layer profile/level loop
 /// and the `reserved_zero_2bits` padding loop (present only when
 /// `max_sub_layers_minus1 > 0`) are not implemented.
-fn write_profile_tier_level(w: &mut BitWriter, max_sub_layers_minus1: u8) {
+fn write_profile_tier_level(
+    w: &mut BitWriter,
+    max_sub_layers_minus1: u8,
+    config: &StillHevcConfig,
+) {
     assert_eq!(
         max_sub_layers_minus1, 0,
         "write_profile_tier_level: only max_sub_layers_minus1 == 0 is implemented"
@@ -67,10 +71,17 @@ fn write_profile_tier_level(w: &mut BitWriter, max_sub_layers_minus1: u8) {
 
     w.write_bits(2, 0); // general_profile_space
     w.write_bit(0); // general_tier_flag
-    w.write_bits(5, 1); // general_profile_idc (Main)
+    let main_still_picture = config.chroma == ChromaFormat::Yuv420 && config.bit_depth == 8;
+    let profile_idc = if main_still_picture { 3 } else { 4 };
+    w.write_bits(5, profile_idc); // Main Still Picture or MainRExt
 
-    for _ in 0..32 {
-        w.write_bit(0); // general_profile_compatibility_flag[i]
+    for i in 0..32 {
+        let compatible = if main_still_picture {
+            matches!(i, 1 | 2 | 3)
+        } else {
+            i == 4
+        };
+        w.write_bit(compatible as u32);
     }
 
     w.write_bit(1); // general_progressive_source_flag
@@ -78,12 +89,29 @@ fn write_profile_tier_level(w: &mut BitWriter, max_sub_layers_minus1: u8) {
     w.write_bit(0); // general_non_packed_constraint_flag
     w.write_bit(1); // general_frame_only_constraint_flag
 
-    // 44 reserved bits (general_reserved_zero_44bits, here split as the
-    // decoder reads it: 32 bits then 12 bits).
-    w.write_bits(32, 0);
-    w.write_bits(12, 0);
+    if profile_idc == 4 {
+        let max_422 = matches!(
+            config.chroma,
+            ChromaFormat::Gray | ChromaFormat::Yuv420 | ChromaFormat::Yuv422
+        );
+        let max_420 = matches!(config.chroma, ChromaFormat::Gray | ChromaFormat::Yuv420);
+        w.write_bit((config.bit_depth <= 12) as u32);
+        w.write_bit((config.bit_depth <= 10) as u32);
+        w.write_bit((config.bit_depth <= 8 && config.chroma != ChromaFormat::Yuv422) as u32);
+        w.write_bit(max_422 as u32);
+        w.write_bit(max_420 as u32);
+        w.write_bit((config.chroma == ChromaFormat::Gray) as u32);
+        w.write_bit(1); // general_intra_constraint_flag
+        w.write_bit(1); // general_one_picture_only_constraint_flag
+        w.write_bit(1); // general_lower_bit_rate_constraint_flag
+        w.write_bits(32, 0);
+        w.write_bits(3, 0);
+    } else {
+        w.write_bits(32, 0);
+        w.write_bits(12, 0);
+    }
 
-    w.write_bits(8, 120); // general_level_idc
+    w.write_bits(8, level_idc(config));
     // max_sub_layers_minus1 == 0: no sub-layer profile/level info, and no
     // reserved_zero_2bits padding loop.
 }
@@ -94,7 +122,7 @@ fn write_profile_tier_level(w: &mut BitWriter, max_sub_layers_minus1: u8) {
 /// bitstream that conformant decoders parse in full — so the VPS body must be
 /// well-formed (not just `profile_tier_level` + `rbsp_trailing_bits`) or a
 /// strict decoder misaligns on everything that follows.
-pub fn write_vps() -> Vec<u8> {
+pub fn write_vps(config: &StillHevcConfig) -> Vec<u8> {
     let mut w = BitWriter::new();
 
     w.write_bits(4, 0); // vps_video_parameter_set_id
@@ -105,7 +133,7 @@ pub fn write_vps() -> Vec<u8> {
     w.write_bit(1); // vps_temporal_id_nesting_flag
     w.write_bits(16, 0xFFFF); // vps_reserved_0xffff_16bits
 
-    write_profile_tier_level(&mut w, 0);
+    write_profile_tier_level(&mut w, 0, config);
 
     w.write_bit(1); // vps_sub_layer_ordering_info_present_flag
     w.write_ue_golomb(0); // vps_max_dec_pic_buffering_minus1[0]
@@ -347,6 +375,33 @@ fn chroma_format_idc(chroma: ChromaFormat) -> u32 {
     }
 }
 
+/// Smallest HEVC level whose maximum luma picture size and dimension bound
+/// contain this single picture. Temporal sample-rate limits do not tighten a
+/// one-picture stream.
+fn level_idc(config: &StillHevcConfig) -> u32 {
+    const LEVELS: &[(u32, u64)] = &[
+        (30, 36_864),
+        (60, 122_880),
+        (63, 245_760),
+        (90, 552_960),
+        (93, 983_040),
+        (120, 2_228_224),
+        (150, 8_912_896),
+        (180, 35_651_584),
+    ];
+    let samples = config.width as u64 * config.height as u64;
+    for &(idc, max_samples) in LEVELS {
+        let max_dimension = ((max_samples * 8) as f64).sqrt().floor() as u64;
+        if samples <= max_samples
+            && config.width as u64 <= max_dimension
+            && config.height as u64 <= max_dimension
+        {
+            return idc;
+        }
+    }
+    186 // Level 6.2; callers still apply their own allocation limits.
+}
+
 /// `seq_parameter_set_rbsp()` (H.265 7.3.2.2), single-layer / single
 /// sub-layer, no scaling lists / PCM / long-term ref pics / short-term ref
 /// pic sets. Field order mirrors `parse_sps` exactly.
@@ -357,7 +412,7 @@ pub fn write_sps(config: &StillHevcConfig) -> Vec<u8> {
     w.write_bits(3, 0); // sps_max_sub_layers_minus1
     w.write_bit(1); // sps_temporal_id_nesting_flag
 
-    write_profile_tier_level(&mut w, 0);
+    write_profile_tier_level(&mut w, 0, config);
 
     w.write_ue_golomb(0); // sps_seq_parameter_set_id
 

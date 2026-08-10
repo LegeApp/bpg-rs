@@ -11,6 +11,7 @@ use std::{fs::OpenOptions, io::Write};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use bpg_decode::{detect_container_kind, ContainerKind, DecodedFrame, DecoderConfig};
+use bpg_encode::heic::{encode_heic_still_image, HeicEncodeOptions, ImageOrientation};
 use bpg_encode::{encode_still_image, EncoderTuning, HevcEncoder};
 use bpg_image::{ChromaFormat, ColorSpace, Image};
 use still265::backend::RustStillHevcEncoder;
@@ -154,6 +155,13 @@ enum DecodeFormat {
     Bgra,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ContainerArg {
+    Auto,
+    Bpg,
+    Heic,
+}
+
 #[derive(clap::Args)]
 struct EncodeArgs {
     /// Input image file (PNG or JPEG).
@@ -162,6 +170,18 @@ struct EncodeArgs {
     /// Output BPG file.
     #[arg(short = 'o', long = "output")]
     output: PathBuf,
+
+    /// Output container. `auto` selects HEIC for .heic/.heif and BPG otherwise.
+    #[arg(long, value_enum, default_value_t = ContainerArg::Auto)]
+    container: ContainerArg,
+
+    /// Do not embed the default max-edge-320 HEIC thumbnail.
+    #[arg(long)]
+    no_thumbnail: bool,
+
+    /// Do not copy source EXIF/XMP metadata into HEIC output.
+    #[arg(long)]
+    strip_metadata: bool,
 
     /// Quantizer parameter (0-51).
     #[arg(short = 'q', long, default_value_t = 28)]
@@ -329,6 +349,9 @@ struct LoadedImage {
     /// (chroma centered at 128), not RGB. Set only by `open_jpeg` for YCbCr
     /// JPEGs so the encoder can ingest them without an RGB round-trip.
     is_ycbcr: bool,
+    exif: Option<Vec<u8>>,
+    xmp: Option<Vec<u8>>,
+    orientation: ImageOrientation,
 }
 
 /// Read a PNG file using zune-png. Accepts Gray, GrayAlpha, RGB, RGBA at
@@ -339,6 +362,7 @@ fn open_png(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::E
     let pixels = decoder
         .decode_raw()
         .map_err(|e| format!("PNG decode error: {e}"))?;
+    let info = decoder.get_info().cloned();
 
     let (w, h) = decoder.get_dimensions().ok_or("PNG: missing dimensions")?;
     let width = u32::try_from(w).map_err(|_| format!("PNG width {w} exceeds u32"))?;
@@ -363,6 +387,17 @@ fn open_png(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::E
         }
     };
 
+    let mut exif = info.as_ref().and_then(|i| i.exif.clone());
+    let orientation = exif.as_mut().map_or(ImageOrientation::Normal, |bytes| {
+        normalize_exif_orientation(bytes)
+    });
+    let xmp = info.as_ref().and_then(|i| {
+        i.itxt_chunk
+            .iter()
+            .find(|chunk| chunk.keyword == b"XML:com.adobe.xmp")
+            .map(|chunk| chunk.text.clone())
+    });
+
     Ok(LoadedImage {
         width,
         height,
@@ -370,6 +405,9 @@ fn open_png(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::E
         bit_depth,
         pixels,
         is_ycbcr: false,
+        exif,
+        xmp,
+        orientation,
     })
 }
 
@@ -406,6 +444,11 @@ fn open_jpeg(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::
     let pixels = decoder
         .decode()
         .map_err(|e| format!("JPEG decode error: {e}"))?;
+    let mut exif = decoder.exif().cloned();
+    let orientation = exif.as_mut().map_or(ImageOrientation::Normal, |bytes| {
+        normalize_exif_orientation(bytes)
+    });
+    let xmp = extract_jpeg_xmp(&data);
     let (w, h) = decoder.dimensions().ok_or("JPEG: missing dimensions")?;
     let width = u32::try_from(w).map_err(|_| format!("JPEG width {w} exceeds u32"))?;
     let height = u32::try_from(h).map_err(|_| format!("JPEG height {h} exceeds u32"))?;
@@ -417,7 +460,103 @@ fn open_jpeg(path: &std::path::Path) -> Result<LoadedImage, Box<dyn std::error::
         bit_depth: 8,
         pixels,
         is_ycbcr,
+        exif,
+        xmp,
+        orientation,
     })
+}
+
+fn extract_jpeg_xmp(data: &[u8]) -> Option<Vec<u8>> {
+    const XMP_ID: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+    if data.get(..2) != Some(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut pos = 2usize;
+    while pos + 4 <= data.len() {
+        while data.get(pos) == Some(&0xff) {
+            pos += 1;
+        }
+        let marker = *data.get(pos)?;
+        pos += 1;
+        if marker == 0xda || marker == 0xd9 {
+            break;
+        }
+        if matches!(marker, 0x01 | 0xd0..=0xd7) {
+            continue;
+        }
+        let len = u16::from_be_bytes([*data.get(pos)?, *data.get(pos + 1)?]) as usize;
+        if len < 2 || pos + len > data.len() {
+            return None;
+        }
+        let segment = &data[pos + 2..pos + len];
+        if marker == 0xe1 && segment.starts_with(XMP_ID) {
+            let packet = &segment[XMP_ID.len()..];
+            if std::str::from_utf8(packet).is_ok() {
+                return Some(packet.to_vec());
+            }
+        }
+        pos += len;
+    }
+    None
+}
+
+fn normalize_exif_orientation(exif: &mut [u8]) -> ImageOrientation {
+    let Some((value, value_offset, little)) = find_exif_orientation(exif) else {
+        return ImageOrientation::Normal;
+    };
+    let one = if little {
+        1u16.to_le_bytes()
+    } else {
+        1u16.to_be_bytes()
+    };
+    exif[value_offset..value_offset + 2].copy_from_slice(&one);
+    match value {
+        2 => ImageOrientation::MirrorHorizontal,
+        3 => ImageOrientation::Rotate180,
+        4 => ImageOrientation::MirrorVertical,
+        5 => ImageOrientation::Transpose,
+        6 => ImageOrientation::Rotate90,
+        7 => ImageOrientation::Transverse,
+        8 => ImageOrientation::Rotate270,
+        _ => ImageOrientation::Normal,
+    }
+}
+
+fn find_exif_orientation(exif: &[u8]) -> Option<(u16, usize, bool)> {
+    let little = match exif.get(..4) {
+        Some(b"II*\0") => true,
+        Some(b"MM\0*") => false,
+        _ => return None,
+    };
+    let read_u16 = |bytes: &[u8]| -> Option<u16> {
+        let pair: [u8; 2] = bytes.get(..2)?.try_into().ok()?;
+        Some(if little {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        })
+    };
+    let read_u32 = |bytes: &[u8]| -> Option<u32> {
+        let quad: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+        Some(if little {
+            u32::from_le_bytes(quad)
+        } else {
+            u32::from_be_bytes(quad)
+        })
+    };
+    let ifd = read_u32(exif.get(4..)?)? as usize;
+    let count = read_u16(exif.get(ifd..)?)? as usize;
+    for i in 0..count {
+        let entry = ifd.checked_add(2)?.checked_add(i.checked_mul(12)?)?;
+        let bytes = exif.get(entry..entry + 12)?;
+        if read_u16(bytes)? != 0x0112 || read_u16(&bytes[2..])? != 3 || read_u32(&bytes[4..])? != 1
+        {
+            continue;
+        }
+        let value = read_u16(&bytes[8..])?;
+        return Some((value, entry + 8, little));
+    }
+    None
 }
 
 /// BT.709 luma coefficients (same as the image crate's to_luma8/16).
@@ -449,6 +588,22 @@ fn is_gray_image(img: &LoadedImage) -> bool {
             u16::from_be_bytes([p[0], p[1]]) == u16::from_be_bytes([p[2], p[3]])
                 && u16::from_be_bytes([p[2], p[3]]) == u16::from_be_bytes([p[4], p[5]])
         }),
+    }
+}
+
+fn has_nonopaque_alpha(img: &LoadedImage) -> bool {
+    match (img.color_type, img.bit_depth) {
+        (ColorType::GrayAlpha, 8) => img.pixels.chunks_exact(2).any(|p| p[1] != u8::MAX),
+        (ColorType::Rgba, 8) => img.pixels.chunks_exact(4).any(|p| p[3] != u8::MAX),
+        (ColorType::GrayAlpha, _) => img
+            .pixels
+            .chunks_exact(4)
+            .any(|p| u16::from_be_bytes([p[2], p[3]]) != u16::MAX),
+        (ColorType::Rgba, _) => img
+            .pixels
+            .chunks_exact(8)
+            .any(|p| u16::from_be_bytes([p[6], p[7]]) != u16::MAX),
+        _ => false,
     }
 }
 
@@ -617,6 +772,67 @@ fn save_png(
 // Encode command
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
+struct HeicSideData {
+    exif: Option<Vec<u8>>,
+    xmp: Option<Vec<u8>>,
+    orientation: ImageOrientation,
+    thumbnail: bool,
+}
+
+fn resolved_container(args: &EncodeArgs) -> ContainerArg {
+    match args.container {
+        ContainerArg::Auto => {
+            let ext = args
+                .output
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or_default();
+            if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif") {
+                ContainerArg::Heic
+            } else {
+                ContainerArg::Bpg
+            }
+        }
+        explicit => explicit,
+    }
+}
+
+fn encode_output(
+    image: Image,
+    backend: &RustStillHevcEncoder,
+    args: &EncodeArgs,
+    qp: u8,
+    container: ContainerArg,
+    side_data: &HeicSideData,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    match container {
+        ContainerArg::Heic => {
+            let thumbnail = side_data.thumbnail.then(|| image.resize_to_fit(320));
+            Ok(encode_heic_still_image(
+                image,
+                backend,
+                qp,
+                args.compress_level,
+                EncoderTuning::neutral(),
+                HeicEncodeOptions {
+                    thumbnail,
+                    exif: side_data.exif.clone(),
+                    xmp: side_data.xmp.clone(),
+                    orientation: side_data.orientation,
+                },
+            )?)
+        }
+        ContainerArg::Bpg | ContainerArg::Auto => Ok(encode_still_image(
+            image,
+            backend,
+            qp,
+            args.compress_level,
+            EncoderTuning::neutral(),
+        )?),
+    }
+}
+
 fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     if ![8, 10, 12].contains(&args.bit_depth) {
         return Err(format!("--bit-depth must be 8, 10, or 12 (got {})", args.bit_depth).into());
@@ -663,6 +879,21 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let img = match ext.as_str() {
         "jpg" | "jpeg" => open_jpeg(&args.input)?,
         _ => open_png(&args.input)?,
+    };
+    let container = resolved_container(args);
+    if container != ContainerArg::Heic && (args.no_thumbnail || args.strip_metadata) {
+        return Err("--no-thumbnail and --strip-metadata apply only to HEIC output".into());
+    }
+    if container == ContainerArg::Heic && has_nonopaque_alpha(&img) {
+        return Err(
+            "HEIC alpha encoding is not available yet; use an opaque input or remove alpha".into(),
+        );
+    }
+    let side_data = HeicSideData {
+        exif: (!args.strip_metadata).then(|| img.exif.clone()).flatten(),
+        xmp: (!args.strip_metadata).then(|| img.xmp.clone()).flatten(),
+        orientation: img.orientation,
+        thumbnail: !args.no_thumbnail,
     };
     let color_space = match args.color_space {
         CsArg::Ycbcr => ColorSpace::YCbCr,
@@ -828,17 +1059,11 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let t0 = std::time::Instant::now();
-    let (bpg, chosen_qp) = if let Some(target) = target_bytes {
-        encode_to_target(&image, &backend, args, target)?
+    let (output, chosen_qp) = if let Some(target) = target_bytes {
+        encode_to_target(&image, &backend, args, target, container, &side_data)?
     } else {
-        let bpg = encode_still_image(
-            image,
-            &backend,
-            args.qp,
-            args.compress_level,
-            EncoderTuning::neutral(),
-        )?;
-        (bpg, args.qp)
+        let output = encode_output(image, &backend, args, args.qp, container, &side_data)?;
+        (output, args.qp)
     };
     let elapsed = t0.elapsed();
 
@@ -851,21 +1076,21 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 encoded_height,
                 encoded_chroma,
                 encoded_bit_depth,
-                bpg.len(),
+                output.len(),
                 elapsed.as_secs_f64(),
                 &last,
             )?;
         }
     }
 
-    std::fs::write(&args.output, &bpg)?;
+    std::fs::write(&args.output, &output)?;
     // Flush the TU leaf-vs-split diagnostic CSV if BPG_TU_DIAG was set.
     still265::tu_diag::flush();
     if let Some(target) = target_bytes {
         eprintln!(
             "wrote {} ({} bytes, effort {:?}, qp {} [target {} B], {:.2}s)",
             args.output.display(),
-            bpg.len(),
+            output.len(),
             args.effort,
             chosen_qp,
             target,
@@ -875,7 +1100,7 @@ fn run_encode(args: &EncodeArgs) -> Result<(), Box<dyn std::error::Error>> {
         eprintln!(
             "wrote {} ({} bytes, effort {:?}, {:.2}s)",
             args.output.display(),
-            bpg.len(),
+            output.len(),
             args.effort,
             elapsed.as_secs_f64()
         );
@@ -895,6 +1120,8 @@ fn encode_to_target(
     backend: &RustStillHevcEncoder,
     args: &EncodeArgs,
     target_bytes: u64,
+    container: ContainerArg,
+    side_data: &HeicSideData,
 ) -> Result<(Vec<u8>, u8), Box<dyn std::error::Error>> {
     use std::collections::HashMap;
     let mut cache: HashMap<u8, Vec<u8>> = HashMap::new();
@@ -902,15 +1129,9 @@ fn encode_to_target(
         if let Some(b) = cache.get(&qp) {
             return Ok(b.clone());
         }
-        let bpg = encode_still_image(
-            image.clone(),
-            backend,
-            qp,
-            args.compress_level,
-            EncoderTuning::neutral(),
-        )?;
-        cache.insert(qp, bpg.clone());
-        Ok(bpg)
+        let encoded = encode_output(image.clone(), backend, args, qp, container, side_data)?;
+        cache.insert(qp, encoded.clone());
+        Ok(encoded)
     };
 
     let (mut lo, mut hi) = (1u8, 51u8);
@@ -1401,5 +1622,60 @@ mod tests {
             "auto-variance-biased".into(),
         ]));
         assert_eq!(args.aq, AqArg::AutoVarianceBiased);
+    }
+
+    #[test]
+    fn output_extension_selects_heic_and_explicit_container_overrides_it() {
+        let automatic = encode_args(parse_cli_from(vec![
+            "bpgenc".into(),
+            "input.png".into(),
+            "-o".into(),
+            "output.heic".into(),
+        ]));
+        assert_eq!(resolved_container(&automatic), ContainerArg::Heic);
+
+        let overridden = encode_args(parse_cli_from(vec![
+            "bpgenc".into(),
+            "input.png".into(),
+            "-o".into(),
+            "output.heic".into(),
+            "--container".into(),
+            "bpg".into(),
+        ]));
+        assert_eq!(resolved_container(&overridden), ContainerArg::Bpg);
+    }
+
+    #[test]
+    fn exif_orientation_is_extracted_and_normalized() {
+        let mut exif = vec![
+            b'I', b'I', 42, 0, 8, 0, 0, 0, // TIFF header and IFD offset
+            1, 0, // one IFD entry
+            0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0, // orientation = 6
+            0, 0, 0, 0, // no next IFD
+        ];
+
+        assert_eq!(
+            normalize_exif_orientation(&mut exif),
+            ImageOrientation::Rotate90
+        );
+        assert_eq!(&exif[18..20], &[1, 0]);
+    }
+
+    #[test]
+    fn heic_alpha_gate_accepts_only_opaque_alpha() {
+        let loaded = |alpha| LoadedImage {
+            width: 1,
+            height: 1,
+            color_type: ColorType::Rgba,
+            bit_depth: 8,
+            pixels: vec![12, 34, 56, alpha],
+            is_ycbcr: false,
+            exif: None,
+            xmp: None,
+            orientation: ImageOrientation::Normal,
+        };
+
+        assert!(!has_nonopaque_alpha(&loaded(u8::MAX)));
+        assert!(has_nonopaque_alpha(&loaded(u8::MAX - 1)));
     }
 }

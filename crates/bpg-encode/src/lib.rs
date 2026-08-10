@@ -11,6 +11,8 @@ use bpg_format::{BpgHeader, ColorSpaceCode, PixelFormat};
 use bpg_hevc::{build_modified_hevc, HevcError};
 use bpg_image::{ChromaFormat, ColorSpace, Image};
 
+pub mod heic;
+
 /// Encoder-tuning knobs resolved from a `bpg-tune::EncodePlan`. These are the
 /// *soft* parameters a tune is allowed to set; the mandatory BPG/structural
 /// params (intra-only, AMP, CQP, csp, bit depth, repeat-headers) are always
@@ -138,6 +140,8 @@ pub enum EncodeError {
     Hevc(HevcError),
     /// An input the M1 pipeline does not support.
     Unsupported(&'static str),
+    /// HEIF/ISOBMFF container construction failed.
+    Container(String),
 }
 
 impl From<HevcError> for EncodeError {
@@ -152,6 +156,7 @@ impl std::fmt::Display for EncodeError {
             EncodeError::Backend(m) => write!(f, "HEVC backend error: {m}"),
             EncodeError::Hevc(e) => write!(f, "HEVC rewrite error: {e:?}"),
             EncodeError::Unsupported(w) => write!(f, "unsupported: {w}"),
+            EncodeError::Container(m) => write!(f, "container error: {m}"),
         }
     }
 }
@@ -162,32 +167,40 @@ impl std::error::Error for EncodeError {}
 /// requires the HEVC encoder to use the same value.
 pub const CB_SIZE: u32 = 8;
 
-/// Encode an in-memory `image` (4:4:4 or already-subsampled YCbCr) to a
-/// complete `.bpg` byte stream using the given HEVC `backend`.
+/// Raw single-picture HEVC plus the image metadata needed by a container.
 ///
-/// The `image` is consumed/mutated: it is CTU-padded in place. The original
-/// (pre-padding) dimensions are captured for the container header before
-/// padding, matching the C code's `width = img->w; height = img->h;` taken
-/// before `image_pad`.
-pub fn encode_still_image(
+/// The encoder consumes a padded [`Image`], but BPG and HEIF both need the
+/// pre-padding display dimensions. Keeping the two dimensions together here
+/// prevents a container from accidentally exposing replicated edge pixels.
+#[derive(Debug)]
+pub(crate) struct EncodedHevcStill {
+    pub annexb: Vec<u8>,
+    pub display_width: u32,
+    pub display_height: u32,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub chroma_format: ChromaFormat,
+    pub bit_depth: u8,
+    pub color_space: ColorSpace,
+    pub limited_range: bool,
+}
+
+fn encode_annexb_still(
     mut image: Image,
     backend: &dyn HevcEncoder,
     qp: u8,
     compress_level: u8,
     tuning: EncoderTuning,
-) -> Result<Vec<u8>, EncodeError> {
+) -> Result<EncodedHevcStill, EncodeError> {
     if ![8, 10, 12].contains(&image.bit_depth) {
         return Err(EncodeError::Unsupported("bit depth must be 8, 10, or 12"));
     }
     if image.has_alpha {
-        return Err(EncodeError::Unsupported("alpha not supported (M1)"));
+        return Err(EncodeError::Unsupported("alpha not supported"));
     }
 
-    // Pre-padding dimensions go into the container header.
-    let width = image.width;
-    let height = image.height;
-
-    // CTU-align the planes (replicating edge samples).
+    let display_width = image.width;
+    let display_height = image.height;
     image.pad_to_cb_size(CB_SIZE);
 
     let params = HevcEncodeParams {
@@ -201,22 +214,49 @@ pub fn encode_still_image(
         verbose: false,
         tuning,
     };
-
-    // Encode -> raw Annex-B -> modified-HEVC payload.
     let annexb = backend.encode_still(&image, &params)?;
-    let payload = build_modified_hevc(&annexb)?;
+
+    Ok(EncodedHevcStill {
+        annexb,
+        display_width,
+        display_height,
+        coded_width: image.width,
+        coded_height: image.height,
+        chroma_format: image.chroma_format,
+        bit_depth: image.bit_depth,
+        color_space: image.color_space,
+        limited_range: image.limited_range,
+    })
+}
+
+/// Encode an in-memory `image` (4:4:4 or already-subsampled YCbCr) to a
+/// complete `.bpg` byte stream using the given HEVC `backend`.
+///
+/// The `image` is consumed/mutated: it is CTU-padded in place. The original
+/// (pre-padding) dimensions are captured for the container header before
+/// padding, matching the C code's `width = img->w; height = img->h;` taken
+/// before `image_pad`.
+pub fn encode_still_image(
+    image: Image,
+    backend: &dyn HevcEncoder,
+    qp: u8,
+    compress_level: u8,
+    tuning: EncoderTuning,
+) -> Result<Vec<u8>, EncodeError> {
+    let encoded = encode_annexb_still(image, backend, qp, compress_level, tuning)?;
+    let payload = build_modified_hevc(&encoded.annexb)?;
 
     // Container header (pre-padding dimensions) + payload.
     let header = BpgHeader {
-        pixel_format: pixel_format_of(image.chroma_format),
+        pixel_format: pixel_format_of(encoded.chroma_format),
         alpha1_flag: false,
-        bit_depth_minus_8: image.bit_depth - 8,
-        color_space: color_space_code_of(image.color_space),
+        bit_depth_minus_8: encoded.bit_depth - 8,
+        color_space: color_space_code_of(encoded.color_space),
         alpha2_flag: false,
-        limited_range: image.limited_range,
+        limited_range: encoded.limited_range,
         animation_flag: false,
-        width,
-        height,
+        width: encoded.display_width,
+        height: encoded.display_height,
     };
 
     let mut out = Vec::with_capacity(16 + payload.len());

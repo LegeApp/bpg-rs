@@ -37,3 +37,4 @@ wide-simd = []
 
 [dev-dependencies]
 bpg-hevc = { path = "../bpg-hevc" }
+bpg-decode = { path = "../bpg-decode" }

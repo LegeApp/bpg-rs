@@ -886,7 +886,7 @@ fn encode_inner(
     payload.extend_from_slice(&slice_data);
 
     let mut out = Vec::new();
-    nal::write_annexb_nal(&mut out, nal::NalType::Vps, &params::write_vps());
+    nal::write_annexb_nal(&mut out, nal::NalType::Vps, &params::write_vps(config));
     nal::write_annexb_nal(&mut out, nal::NalType::Sps, &params::write_sps(config));
     nal::write_annexb_nal(
         &mut out,
